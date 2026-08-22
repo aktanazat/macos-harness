@@ -10,4 +10,4 @@ bump a release, and no runtime path ever falls back to
 
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
