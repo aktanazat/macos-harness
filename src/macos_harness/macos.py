@@ -30,6 +30,7 @@ from .errors import (
     FocusChangedError,
     MacOSError,
 )
+from .handoff import HandoffReason, HumanHandoff
 from .overlay import LivePointerOverlay
 from .pointer import POINTER_HOTSPOT, pointer_points
 
@@ -565,6 +566,67 @@ class MacOS:
             "permissions": self.permissions(),
             "input_monitoring_required": False,
         }
+
+    def handoff(
+        self,
+        *,
+        reason: HandoffReason | str,
+        app: str | int,
+    ) -> HumanHandoff:
+        """Describe a known human-only security boundary without acting.
+
+        This reads only running-application identity and current frontmost
+        identity. It never opens, activates, inspects, or changes the target.
+        """
+        try:
+            normalized_reason = HandoffReason(reason)
+        except (TypeError, ValueError):
+            raise MacOSError(
+                "Handoff reason must be 'authentication_required' or "
+                "'account_recovery_required'",
+                code=ErrorCode.BAD_REQUEST,
+                details={
+                    "parameter": "reason",
+                    "valid_reasons": [item.value for item in HandoffReason],
+                },
+            ) from None
+
+        invalid_app = (
+            isinstance(app, bool)
+            or not isinstance(app, (str, int))
+            or (isinstance(app, str) and not app.strip())
+            or (isinstance(app, int) and app <= 0)
+        )
+        if invalid_app:
+            raise MacOSError(
+                "Handoff app must be a nonempty app name, bundle ID, path, or "
+                "positive PID",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "app"},
+            )
+
+        try:
+            _, target = self._resolve_app(app)
+        except ApplicationNotFoundError:
+            raise ApplicationNotFoundError(
+                "Handoff target app is not running",
+                details={"parameter": "app"},
+            ) from None
+        except MacOSError as exc:
+            if exc.code != ErrorCode.APP_AMBIGUOUS:
+                raise
+            raise MacOSError(
+                "Handoff target app is ambiguous",
+                code=ErrorCode.APP_AMBIGUOUS,
+                details={"parameter": "app"},
+            ) from None
+        frontmost = self._frontmost_app()
+        return HumanHandoff(
+            reason=normalized_reason,
+            target_is_frontmost=(
+                frontmost is not None and int(frontmost["pid"]) == int(target["pid"])
+            ),
+        )
 
     def list_apps(self) -> list[dict[str, Any]]:
         if self._backend != "python":

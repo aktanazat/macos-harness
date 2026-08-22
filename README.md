@@ -192,7 +192,86 @@ target makes itself frontmost, `press` detects that change and raises
 
 These calls act only on accessible UI that macOS already rendered. They cannot
 make secure UI appear in an inactive app. They cannot bypass Touch ID, passkeys,
-CAPTCHA, account recovery, or another check that requires the user.
+CAPTCHA, account recovery, or another check that requires the user. Declare a
+handoff at that boundary instead of waiting on a timeout -- see
+[Human handoff for authentication boundaries](#human-handoff-for-authentication-boundaries).
+
+## Human handoff for authentication boundaries
+
+`mac.handoff(reason=..., app=...)` declares that a task has reached a boundary
+only a human can cross: Touch ID, a passkey, a CAPTCHA, a verification code, a
+Google or other sign-in approval, a temporary PIN, or account recovery. Call
+it the moment you recognize the boundary. Do not wait out a `mac.do`/`ax.wait`
+timeout first, and do not infer a handoff from a timeout that happened for an
+unrelated reason -- a generic timeout stays a timeout and is never promoted.
+
+```python
+from macos_harness import HandoffReason
+
+handoff = mac.handoff(reason=HandoffReason.AUTHENTICATION_REQUIRED, app="Google Chrome")
+print(handoff)
+```
+
+```python
+from macos_harness import HandoffReason
+
+handoff = mac.handoff(reason=HandoffReason.ACCOUNT_RECOVERY_REQUIRED, app=1842)
+print(handoff)
+```
+
+`reason` accepts exactly two values, or their equal string form
+(`"authentication_required"`, `"account_recovery_required"`):
+
+- `HandoffReason.AUTHENTICATION_REQUIRED` -- foreground AutoFill, a Google or
+  other sign-in approval, Touch ID, a passkey, a CAPTCHA, or a verification
+  code.
+- `HandoffReason.ACCOUNT_RECOVERY_REQUIRED` -- a temporary PIN or an account
+  recovery flow.
+
+`app` is required and cannot be empty. Pass a PID when you already have one --
+it is the fastest, least ambiguous way to identify the target. Pass a name
+when that is the easy path; a bundle ID or path also works. `mac.handoff`
+resolves that already-running app the same way every other primitive does; it
+never launches an app and never reuses a previous call's cached app.
+
+The call is representation-only and returns immediately. It resolves the
+named app, samples the current frontmost app, and compares their PIDs --
+that comparison is the entire call. It never takes a screenshot, reads AX
+text, touches the clipboard, sends keyboard or pointer input, activates or
+raises anything, opens a URL, sends a notification, requests a permission,
+talks to the native agent, or creates a `mac.do` receipt or once-token
+ledger entry. There is no polling and no blocking wait for the human.
+
+`mac.handoff` returns a frozen, JSON-safe `HumanHandoff` with exactly five
+machine fields:
+
+```python
+handoff.state                # "human_action_required"
+handoff.reason                # "authentication_required" | "account_recovery_required"
+handoff.retry                 # "wait_for_user_then_rediscover"
+handoff.target_is_frontmost   # True | False, from the PID comparison above
+handoff.automation_acted      # False, always
+handoff.to_json()             # the same five fields, ready for json.dumps
+```
+
+No app name, window title, AX text, prompt, timestamp, ID, or secret-derived
+data enters `to_json()`. `str(handoff)` renders one of four fixed,
+library-owned prompts, selected only by `reason` and `target_is_frontmost` --
+never by anything the target app controls:
+
+```text
+A secure authentication step is waiting in the app currently in front.
+Complete it yourself. Do not share passwords, passkeys, verification codes,
+temporary PINs, or recovery details with the agent. Return here and reply
+only "done" or "cancelled".
+```
+
+Print the prompt and end the turn there. Accept only `done` or `cancelled`
+back from the human. After `done`, rediscover state from scratch through the
+surface that owns it (`mac.see`, `mac.ax`, ...) -- the handoff is an
+acknowledgement, not proof the human succeeded, and it carries no once-token,
+receipt, or resume method to skip that rediscovery. After `cancelled`, stop;
+do not rediscover or retry.
 
 ## Native backend
 
@@ -307,6 +386,8 @@ silently aliasing a different element.
   idempotency — see [Machine-first](#machine-first-macdo-for-mutations-raw-primitives-underneath)
 - Can hand a fixed set of Accessibility calls to a supervised native agent
   over a local socket; off by default, see [Native backend](#native-backend)
+- Declares an explicit human handoff at a known authentication boundary
+  instead of guessing from a timeout — see [Human handoff](#human-handoff-for-authentication-boundaries)
 
 ## Permissions and privacy
 

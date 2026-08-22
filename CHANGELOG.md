@@ -3,6 +3,36 @@
 All notable changes to macOS Harness are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-08-22
+
+### Added
+
+- `mac.handoff(reason=, app=)`: an explicit, representation-only handoff for
+  a boundary only a human can cross -- Touch ID, a passkey, a CAPTCHA, a
+  verification code, a Google or other sign-in approval
+  (`HandoffReason.AUTHENTICATION_REQUIRED`), or a temporary PIN or account
+  recovery flow (`HandoffReason.ACCOUNT_RECOVERY_REQUIRED`). Agents call it
+  the moment they recognize the boundary; a generic timeout is never
+  promoted to a handoff -- only an explicit call creates one. `app` is
+  required and nonempty; the call resolves that already-running app,
+  samples the current frontmost app, and compares PIDs -- nothing else. It
+  never activates, raises, opens, or notifies anything; never reads AX
+  text, a screenshot, or the clipboard; never sends keyboard or pointer
+  input; never requests a permission; never uses the native agent; and
+  never touches a `mac.do` receipt or once-token ledger. It returns
+  immediately, with no polling and no blocking wait. The return value is a
+  frozen, JSON-safe `HumanHandoff` with exactly five machine fields --
+  `state`, `reason`, `retry` (`wait_for_user_then_rediscover`),
+  `target_is_frontmost`, and `automation_acted` (always `False`) -- and no
+  app, window, AX, prompt, timestamp, ID, or secret-derived data.
+  `str(handoff)` renders one of four fixed, library-owned prompts chosen
+  only by `reason` and `target_is_frontmost`; the prompt never interpolates
+  app names, window titles, or AX text the target app controls. Agents
+  print the prompt, end the turn, and accept only `done` or `cancelled`
+  from the human: `done` authorizes fresh rediscovery through the owning
+  surface with no proof of success implied, and `cancelled` stops the
+  task.
+
 ## [0.2.0] - 2026-08-22
 
 ### Added
