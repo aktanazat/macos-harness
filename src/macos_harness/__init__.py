@@ -9,6 +9,7 @@ from .errors import (
     FocusChangedError,
     MacOSError,
 )
+from .handoff import HandoffReason, HumanHandoff
 from .macos import MacOS
 from .receipts import (
     Acted,
@@ -38,6 +39,8 @@ __all__ = [
     "Executor",
     "FocusChangedError",
     "Gone",
+    "HandoffReason",
+    "HumanHandoff",
     "JSONValue",
     "MacOS",
     "MacOSError",

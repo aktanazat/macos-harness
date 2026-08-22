@@ -69,7 +69,7 @@ def test_common_navigation_keys_are_supported() -> None:
 def test_agent_surface_is_flat_and_explicit() -> None:
     mac = MacOS()
 
-    for verb in ("see", "key", "type", "click", "script"):
+    for verb in ("see", "key", "type", "click", "script", "handoff"):
         assert callable(getattr(mac, verb))
     for verb in (
         "at",

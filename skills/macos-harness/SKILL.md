@@ -173,7 +173,8 @@ repeated keys, clicks, deletion loops, or bulk input.
 - Inactive apps may reject raw clicks. After one verified failure, switch mode.
 - Never launch a closed app or use a custom URL scheme when focus is forbidden.
 - `mac.ax.query_all/wait/press/wait_gone` never bypass Touch ID, passkeys,
-  CAPTCHA, account recovery, or other checks that need the real user present.
+  CAPTCHA, account recovery, or other checks that need the real user present;
+  declare a `mac.handoff` at that boundary instead of guessing from a timeout.
 - Screenshot coordinates come from the latest `mac.see()` and preserve window
   bounds and Retina scaling.
 
@@ -182,6 +183,41 @@ Secondary primitives are `mac.move`, `drag`, `scroll`, `show_pointer`, and
 traversal; lower `max_nodes` for especially large apps. `mac.ax.query_all()`,
 `.wait()`, `.press()`, and `.wait_gone()` extend that traversal across every
 running process for background AutoFill and system popovers.
+
+## Declare a human handoff at a known boundary
+
+Call `mac.handoff(reason=..., app=...)` the moment a task hits Touch ID, a
+passkey, a CAPTCHA, a verification code, a Google or other sign-in approval,
+a temporary PIN, or account recovery. Do this immediately -- do not burn a
+`mac.do`/`ax.wait` timeout first, and do not infer a handoff from a timeout
+that happened for an unrelated reason. An absence you cannot identify stays
+a plain timeout.
+
+```python
+from macos_harness import HandoffReason
+
+handoff = mac.handoff(reason=HandoffReason.AUTHENTICATION_REQUIRED, app="Google Chrome")
+print(handoff)
+```
+
+Use `HandoffReason.ACCOUNT_RECOVERY_REQUIRED` for a temporary PIN or account
+recovery flow; use `AUTHENTICATION_REQUIRED` for everything else above. A
+PID is the fastest, least ambiguous `app`; a name is the easy path when
+that is what you have.
+
+The call is representation-only and returns immediately: it resolves the
+named app, compares its PID to the current frontmost app, and does nothing
+else -- no AX read, screenshot, clipboard, input, activation, raise, open,
+notification, permission request, native agent call, or `mac.do`
+receipt/once-token. `print(handoff)` shows one of four fixed prompts,
+chosen only by `reason` and `target_is_frontmost`. Print it and end the
+turn there; accept only `done` or `cancelled` from the human.
+
+After `done`, rediscover state from scratch through the surface that owns
+it (`mac.see`, `mac.ax`, ...). The handoff is an acknowledgement, not proof
+the human succeeded, and carries no once-token, receipt, or resume method
+to skip that rediscovery. After `cancelled`, stop; do not rediscover or
+retry.
 
 ## Browser and permissions
 
