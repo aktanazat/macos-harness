@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pwd
@@ -145,28 +146,49 @@ class _Runner:
 
     Injected through `CredentialBroker(_run=...)`, so the tests exercise
     the real broker against a real seam instead of patching a module.
+
+    `stage` makes it stand in for a worker that refused somewhere: the
+    token is written into the file the broker named in the job, which is
+    the only channel a real worker has for saying where it stopped.
     """
 
     def __init__(
-        self, *, status: int = 0, failure: BaseException | None = None
+        self,
+        *,
+        status: int = 0,
+        failure: BaseException | None = None,
+        stage: str | None = None,
     ) -> None:
         self.status = status
         self.failure = failure
+        self.stage = stage
         self.commands: list[list[str]] = []
         self.jobs: list[bytes] = []
         self.timeouts: list[float] = []
+        self.stage_paths: list[str] = []
 
     def __call__(self, command: list[str], *, job: bytes, timeout: float) -> int:
         self.commands.append(command)
         self.jobs.append(job)
         self.timeouts.append(timeout)
+        path = json.loads(job).get("stage_path")
+        if isinstance(path, str):
+            self.stage_paths.append(path)
+            if self.stage is not None:
+                Path(path).write_text(self.stage)
         if self.failure is not None:
             raise self.failure
         return self.status
 
     @property
     def job(self) -> dict[str, object]:
-        return json.loads(self.jobs[-1])
+        """The policy half of the job: everything but the stage plumbing,
+        which is a fresh temporary path on every call and is asserted on
+        its own.
+        """
+        sent = json.loads(self.jobs[-1])
+        sent.pop("stage_path", None)
+        return sent
 
 
 def _sent_job(body: str, ref: str) -> dict[str, object]:
@@ -252,13 +274,268 @@ def test_importing_the_package_does_not_load_the_credential_module() -> None:
 
 
 def test_no_credential_surface_can_fill_or_load_outside_the_fixed_policy() -> None:
-    """There is no native sink and no path argument left to reach for."""
-    for absent in ("fill_native", "fill", "fill_app", "_fill"):
+    """There is still no *working* native sink, and no path argument left
+    to reach for. `fill_native` exists only to refuse in the same fixed
+    vocabulary as everything else -- see the test below.
+    """
+    for absent in ("fill", "fill_app", "_fill"):
         assert not hasattr(CredentialBroker, absent)
     with pytest.raises(TypeError):
         CredentialBroker("/tmp/elsewhere.toml")  # type: ignore[call-arg]
     with pytest.raises(TypeError):
         CredentialManifest.load("/tmp/elsewhere.toml")  # type: ignore[call-arg]
+
+
+def test_a_native_fill_is_refused_before_anything_is_read_or_run() -> None:
+    """The refusal is unconditional and first. A broker whose policy loader
+    and worker runner both fail loudly still refuses with
+    `credential.unsupported_sink`, which proves nothing was consulted:
+    not the manifest, not the vault, not a process. A ref typo must not
+    be reported as the reason either, because the reason is the sink.
+    """
+
+    def never_load() -> CredentialManifest:
+        raise AssertionError("a native fill must not read policy")
+
+    def never_run(command: list[str], *, job: bytes, timeout: float) -> int:
+        raise AssertionError("a native fill must not spawn anything")
+
+    broker = CredentialBroker(_policy=never_load, _run=never_run)
+    for ref in ("github", "no-such-ref", "NOT A REF"):
+        with pytest.raises(CredentialError) as excinfo:
+            broker.fill_native(ref, app="1Password")
+        assert excinfo.value.code == "credential.unsupported_sink"
+        message = str(excinfo.value)
+        # The two sanctioned paths, named, so an agent that asked has
+        # somewhere to go instead of a bare refusal.
+        assert "AutoFill" in message
+        assert "human" in message
+        assert ref not in message
+
+
+def test_a_failed_fill_reports_the_stage_the_worker_named(tmp_path: Path) -> None:
+    """A bare `credential.fill_failed` tells an agent nothing it can act
+    on. Every stage in the worker's vocabulary maps to one fixed code.
+    """
+    body = _document(_password())
+    path = _trusted(tmp_path, body)
+    expected = {
+        "bad_job": "credential.fill_failed/bad_job",
+        "not_authorized": "credential.fill_failed/not_authorized",
+        "mailbox_mismatch": "credential.fill_failed/not_authorized",
+        "secret_missing": "credential.fill_failed/secret_missing",
+        "otp_not_found": "credential.fill_failed/otp_fetch",
+        "sink_failed": "credential.fill_failed/sink",
+        "locate_space": "credential.fill_failed/locate_space",
+        "origin": "credential.fill_failed/origin",
+        "locate_field": "credential.fill_failed/locate_field",
+        "focus": "credential.fill_failed/focus",
+        "type_verify": "credential.fill_failed/type_verify",
+        "timeout_stage": "credential.fill_failed/timeout_stage",
+        "dialog_blocked": "credential.fill_failed/dialog_blocked",
+        "handoff_passkey": "credential.handoff_required/passkey",
+    }
+    for stage, code in expected.items():
+        runner = _Runner(status=1, stage=stage)
+        broker = CredentialBroker(_run=runner, _policy=_policy(path))
+        with pytest.raises(CredentialError) as caught:
+            broker.fill_browser("acme-login", space="my-task")
+        assert caught.value.code == code
+        assert str(caught.value)  # a fixed sentence, not just the code
+
+
+@pytest.mark.parametrize(
+    "written",
+    ["", "unknown_stage", "LOCATE_FIELD", "locate_field\n", "x" * 4096, "/etc/passwd"],
+)
+def test_a_stage_this_module_does_not_know_is_reported_unnamed(
+    tmp_path: Path, written: str
+) -> None:
+    """The stage file comes from another process, so what makes it safe is
+    that this side only ever *selects* one of its own codes from it.
+    Anything else is a failure with no stage, which is what it is.
+    """
+    body = _document(_password())
+    path = _trusted(tmp_path, body)
+    broker = CredentialBroker(_run=_Runner(status=1, stage=written), _policy=_policy(path))
+
+    with pytest.raises(CredentialError) as caught:
+        broker.fill_browser("acme-login", space="my-task")
+
+    assert caught.value.code == "credential.fill_failed"
+
+
+def test_the_stage_file_is_private_and_gone_when_the_fill_returns(tmp_path: Path) -> None:
+    """The channel that carries a stage back is a 0600 file in a 0700
+    directory only this process can name, and it does not outlive the
+    fill it belonged to.
+    """
+    body = _document(_password())
+    path = _trusted(tmp_path, body)
+    observed: list[tuple[int, int]] = []
+    seen: list[str] = []
+
+    def peek(command: list[str], *, job: bytes, timeout: float) -> int:
+        stage_path = json.loads(job)["stage_path"]
+        seen.append(stage_path)
+        observed.append(
+            (
+                os.stat(stage_path).st_mode & 0o777,
+                os.stat(os.path.dirname(stage_path)).st_mode & 0o777,
+            )
+        )
+        return 0
+
+    CredentialBroker(_run=peek, _policy=_policy(path)).fill_browser(
+        "acme-login", space="my-task"
+    )
+
+    assert observed == [(0o600, 0o700)]
+    assert not os.path.exists(seen[0])
+    assert not os.path.exists(os.path.dirname(seen[0]))
+
+
+def test_the_worker_environment_is_reconstructed_not_inherited() -> None:
+    """`mem-secret` resolves its vault through ENGRAM_ROOT/HOME and the
+    pinned ego wrapper resolves the real browser CLI through HOME, so an
+    inherited environment chooses which vault is read and which program
+    receives the value. Neither may come from the caller.
+    """
+    assert dict(credentials._CHILD_ENV) == {
+        "HOME": str(Path(pwd.getpwuid(os.getuid()).pw_dir)),
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "en_US.UTF-8",
+    }
+    for hostile in (
+        "ENGRAM_ROOT",
+        "ENGRAM_SECRETS_DIR",
+        "SOPS_AGE_KEY",
+        "SOPS_AGE_KEY_FILE",
+        "SOPS_AGE_KEY_CMD",
+        "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE",
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+        "EGO_NO_SHIM",
+        "TMPDIR",
+    ):
+        assert hostile not in credentials._CHILD_ENV
+
+
+def test_the_worker_really_runs_under_that_environment_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """Not just the constant: the spawn has to use it. A hostile value for
+    every variable that matters is set here, and none of it may reach the
+    child.
+    """
+    seen = tmp_path / "env.json"
+    script = tmp_path / "show-env.py"
+    script.write_text(
+        "import json, os, sys\n"
+        "sys.stdin.read()\n"
+        f"json.dump(dict(os.environ), open({str(seen)!r}, 'w'))\n"
+    )
+    hostile = {
+        "HOME": "/tmp/attacker",
+        "ENGRAM_ROOT": "/tmp/attacker/memory",
+        "SOPS_AGE_KEY": "AGE-SECRET-KEY-NOT-REAL",
+        "PYTHONPATH": "/tmp/attacker",
+    }
+    environment = {**os.environ, **hostile}
+    child = subprocess.run(
+        [sys.executable, "-c", "import sys; sys.exit(0)"],
+        env=environment,
+        check=False,
+    )
+    assert child.returncode == 0  # the hostile env is otherwise usable
+
+    saved = dict(os.environ)
+    try:
+        os.environ.update(hostile)
+        credentials._run_worker(
+            [sys.executable, str(script)], job=b"{}", timeout=30.0
+        )
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+    passed_through = json.loads(seen.read_text())
+    # macOS itself adds __CF_USER_TEXT_ENCODING to every process; every
+    # other variable in the child is one this module chose.
+    assert {
+        name: value
+        for name, value in passed_through.items()
+        if name != "__CF_USER_TEXT_ENCODING"
+    } == dict(credentials._CHILD_ENV)
+    assert not set(hostile) - set(credentials._CHILD_ENV) & set(passed_through)
+    assert passed_through["HOME"] != "/tmp/attacker"
+
+
+def test_one_field_keeps_the_digest_it_had_before_lists_existed() -> None:
+    """The vault name is derived from the digest, so a digest that moves
+    silently repoints a live credential at a key nobody enrolled. A
+    one-field entry must hash exactly as it always did, and `field = "x"`
+    and `field = ["x"]` must agree, because they authorize the same fill.
+    """
+    legacy = hashlib.sha256(
+        json.dumps(
+            {
+                "field": "#password",
+                "kind": "password",
+                "origins": ["https://acme.example"],
+                "ref": "acme-login",
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    single = _manifest(_document(_password()))
+    listed = _manifest(_document(_password(field='["#password"]')))
+
+    assert single.enrollment("acme-login").env == credentials._vault_env(legacy)
+    assert listed.enrollment("acme-login").env == single.enrollment("acme-login").env
+
+
+def test_a_multi_field_entry_is_a_policy_of_its_own_in_that_order() -> None:
+    """One enrollment authorizes exactly that ordered set. Adding a field,
+    removing one, or swapping two names a key nobody has enrolled.
+    """
+    one = _manifest(_document(_password())).enrollment("acme-login").env
+    pair = _manifest(
+        _document(_password(field='["#password", "#confirm"]'))
+    ).enrollment("acme-login").env
+    reversed_pair = _manifest(
+        _document(_password(field='["#confirm", "#password"]'))
+    ).enrollment("acme-login").env
+
+    assert len({one, pair, reversed_pair}) == 3
+
+
+def test_a_multi_field_entry_sends_its_fields_in_order() -> None:
+    body = _document(_password(field='["#password", "#confirm"]'))
+
+    assert _sent_job(body, "acme-login")["fields"] == ["#password", "#confirm"]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "[]",
+        '["#password", "#password"]',  # one element named twice
+        '["#password", ""]',
+        '["#password", 7]',
+        '["#password", "#a", "#b", "#c", "#d"]',  # past the ceiling
+        '["#password", "input,textarea"]',  # a selector that means a set
+        '"#password, #confirm"',  # the same, spelled as one string
+    ],
+)
+def test_a_field_list_that_cannot_mean_one_ordered_set_is_refused(field: str) -> None:
+    with pytest.raises(CredentialError) as caught:
+        _manifest(_document(_password(field=field)))
+
+    assert caught.value.code == "credential.manifest_invalid"
 
 
 def test_a_default_broker_reads_the_same_fixed_policy_as_load() -> None:
@@ -752,11 +1029,11 @@ def test_password_fill_scopes_mem_secret_to_exactly_its_own_derived_key(
     # A vault fill waits on no provider, so it gets the short bound.
     assert runner.timeouts == [45.0]
     assert runner.job == {
-        "version": 1,
+        "version": 2,
         "kind": "password",
         "space": "my-task",
         "origins": ["https://acme.example"],
-        "field": "#password",
+        "fields": ["#password"],
         "secret_env": derived,
     }
     assert receipt.to_json() == {
@@ -788,11 +1065,11 @@ def test_totp_fill_scopes_mem_secret_to_one_derived_key(tmp_path: Path) -> None:
     assert runner.commands == [[_MEM_SECRET, "run", derived, "--", *_WORKER]]
     assert runner.timeouts == [45.0]
     assert runner.job == {
-        "version": 1,
+        "version": 2,
         "kind": "totp",
         "space": "my-task",
         "origins": ["https://acme.example"],
-        "field": "#otp",
+        "fields": ["#otp"],
         "secret_env": derived,
     }
     assert receipt.provider == "mem-secret"
@@ -817,11 +1094,11 @@ def test_gmail_fill_runs_under_the_authorization_its_enrollment_wrote(
     # A Gmail fill waits for mail to arrive, so it gets the long bound.
     assert runner.timeouts == [120.0]
     assert runner.job == {
-        "version": 1,
+        "version": 2,
         "kind": "gmail_otp",
         "space": "my-task",
         "origins": ["https://acme.example"],
-        "field": "#otp",
+        "fields": ["#otp"],
         "mailbox": "me@acme.example",
         "sender": "noreply@acme.example",
         "subject_regex": "verification code",

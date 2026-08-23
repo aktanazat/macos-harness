@@ -293,16 +293,26 @@ def test_credential_subcommand_is_required() -> None:
     assert excinfo.value.code == 2
 
 
-def test_credential_surface_is_exactly_check_fill_browser_and_enroll() -> None:
+def test_credential_surface_is_exactly_check_fill_and_enroll() -> None:
     for rejected in (
-        ["credential", "fill-native", "github", "--app", "1234"],
-        ["credential", "fill-native", "github"],
+        ["credential", "fill-native", "github"],  # --app is required
         ["credential", "delete", "github"],
         ["credential", "authorize", "gmail"],
     ):
         with pytest.raises(SystemExit) as excinfo:
             cli._build_parser().parse_args(rejected)
         assert excinfo.value.code == 2
+
+
+def test_fill_native_parses_so_that_its_refusal_is_prose_not_a_usage_dump() -> None:
+    """The refusal is the point: an agent that asks for a native fill has
+    to be told which two paths do work, and an argparse "invalid choice"
+    tells it only that it guessed a subcommand name wrong.
+    """
+    args = cli._build_parser().parse_args(
+        ["credential", "fill-native", "github", "--app", "1Password"]
+    )
+    assert (args.credential_command, args.ref, args.app) == ("fill-native", "github", "1Password")
 
 
 def test_no_credential_subcommand_takes_a_manifest_override() -> None:
@@ -455,7 +465,48 @@ def test_credential_error_prints_redacted_code_and_exits_one(
     assert command.run(_args("check")) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == '{"error":"credential.manifest_invalid"}\n'
+    assert json.loads(captured.err)["error"] == "credential.manifest_invalid"
+
+
+def test_fill_native_is_refused_by_the_broker_and_never_reaches_a_sink(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The CLI does not own this refusal, and must not: it forwards the
+    request and prints whatever the broker says, so there is exactly one
+    place that decides a native fill is out of scope.
+    """
+    seen: dict[str, object] = {}
+
+    class Broker:
+        def fill_native(self, ref: str, *, app: str) -> object:
+            seen["ref"] = ref
+            seen["app"] = app
+            raise _FakeCredentialError("credential.unsupported_sink")
+
+    command = _cli(credentials=_FakeCredentials(broker=Broker))
+    assert command.run(_args("fill-native", "github", "--app", "Slack")) == 1
+    assert seen == {"ref": "github", "app": "Slack"}
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err)["error"] == "credential.unsupported_sink"
+
+
+def test_a_credential_failure_prints_its_fixed_message_beside_its_code(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A code alone tells an agent that something is wrong, not what to do
+    instead. The message is fixed prose from a closed table -- here the
+    real one -- so printing it cannot leak anything the run observed.
+    """
+    from macos_harness import credentials
+
+    assert cli.main(["credential", "fill-native", "github", "--app", "Slack"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload["error"] == "credential.unsupported_sink"
+    assert payload["message"] == str(credentials.CredentialError("credential.unsupported_sink"))
+    assert "AutoFill" in payload["message"] and "human" in payload["message"]
 
 
 def test_main_dispatches_the_credential_command(
@@ -536,7 +587,11 @@ def test_enroll_reports_a_redacted_failure_and_still_zeroes_the_secret(
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == '{"error":"credential.enroll_failed"}\n'
+    payload = json.loads(captured.err)
+    assert payload["error"] == "credential.enroll_failed"
+    # This module's own code, so this module's own fixed prose -- and
+    # still nothing the vault said, which is the point of redacting it.
+    assert payload["message"] == cli._CLI_MESSAGES["credential.enroll_failed"]
     assert CANARY not in captured.err
     wiped = spawner.only(cli._MEM_SECRET).payload
     assert isinstance(wiped, bytearray)
@@ -561,7 +616,7 @@ def test_enroll_rejects_a_bad_ref_without_spawning_anything(
     assert spawner.children == []
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert json.loads(captured.err) == {"error": code}
+    assert json.loads(captured.err)["error"] == code
 
 
 # --- enrollment: a derived, nonsecret marker (Gmail) ------------------------
@@ -640,7 +695,7 @@ def test_enroll_refuses_the_clipboard_for_a_marker_it_authors_itself(
     assert spawner.children == []
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == '{"error":"credential.enroll_not_authored"}\n'
+    assert json.loads(captured.err)["error"] == "credential.enroll_not_authored"
 
 
 def test_marker_enrollment_reports_a_redacted_vault_failure(
@@ -654,7 +709,7 @@ def test_marker_enrollment_reports_a_redacted_vault_failure(
         secrets=_ExplodingSecret(),
     )
     assert command.run(_args("enroll", "gmail-login")) == 1
-    assert capsys.readouterr().err == '{"error":"credential.enroll_failed"}\n'
+    assert json.loads(capsys.readouterr().err)["error"] == "credential.enroll_failed"
 
 
 # --- enrollment: --clipboard -----------------------------------------------
@@ -715,7 +770,7 @@ def test_clipboard_enrollment_fails_when_the_pasteboard_is_not_proven_empty(
     spawner = _FakeSpawner(grep=grep)
     assert _clipboard_cli(spawner).run(_args("enroll", "github", "--clipboard")) == 1
     assert [cli._GREP, "-q", "."] in spawner.commands()
-    assert capsys.readouterr().err == '{"error":"credential.enroll_failed"}\n'
+    assert json.loads(capsys.readouterr().err)["error"] == "credential.enroll_failed"
 
 
 def test_clipboard_enrollment_fails_when_the_pasteboard_cannot_be_emptied(
@@ -724,7 +779,7 @@ def test_clipboard_enrollment_fails_when_the_pasteboard_cannot_be_emptied(
     spawner = _FakeSpawner(pbcopy=1)
     assert _clipboard_cli(spawner).run(_args("enroll", "github", "--clipboard")) == 1
     assert [cli._GREP, "-q", "."] not in spawner.commands()
-    assert capsys.readouterr().err == '{"error":"credential.enroll_failed"}\n'
+    assert json.loads(capsys.readouterr().err)["error"] == "credential.enroll_failed"
 
 
 def test_clipboard_enrollment_drains_the_producer_when_the_vault_hangs(
@@ -740,7 +795,7 @@ def test_clipboard_enrollment_drains_the_producer_when_the_vault_hangs(
     assert [cli._PBCOPY] in spawner.commands()
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == '{"error":"credential.enroll_failed"}\n'
+    assert json.loads(captured.err)["error"] == "credential.enroll_failed"
 
 
 def test_clipboard_enrollment_fails_when_the_producer_exits_nonzero(
@@ -749,7 +804,7 @@ def test_clipboard_enrollment_fails_when_the_producer_exits_nonzero(
     spawner = _FakeSpawner(producer=1)
     assert _clipboard_cli(spawner).run(_args("enroll", "github", "--clipboard")) == 1
     assert [cli._PBCOPY] in spawner.commands()
-    assert capsys.readouterr().err == '{"error":"credential.enroll_failed"}\n'
+    assert json.loads(capsys.readouterr().err)["error"] == "credential.enroll_failed"
 
 
 def test_clipboard_enrollment_clears_the_pasteboard_when_pbpaste_cannot_start(
@@ -758,7 +813,7 @@ def test_clipboard_enrollment_clears_the_pasteboard_when_pbpaste_cannot_start(
     spawner = _FakeSpawner(spawn_failures=1)
     assert _clipboard_cli(spawner).run(_args("enroll", "github", "--clipboard")) == 1
     assert [cli._PBCOPY] in spawner.commands()
-    assert capsys.readouterr().err == '{"error":"credential.enroll_failed"}\n'
+    assert json.loads(capsys.readouterr().err)["error"] == "credential.enroll_failed"
 
 
 def test_clipboard_enrollment_leaves_the_pasteboard_alone_for_a_rejected_ref(
@@ -778,7 +833,7 @@ def test_clipboard_enrollment_leaves_the_pasteboard_alone_for_a_rejected_ref(
     assert command.run(_args("enroll", "typo", "--clipboard")) == 1
     assert spawner.ran == []
     assert spawner.children == []
-    assert capsys.readouterr().err == '{"error":"credential.ref_unknown"}\n'
+    assert json.loads(capsys.readouterr().err)["error"] == "credential.ref_unknown"
 
 
 # --- the production spawner, against real harmless binaries -----------------

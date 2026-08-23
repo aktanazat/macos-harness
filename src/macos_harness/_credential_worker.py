@@ -33,13 +33,20 @@ Contract with the broker (the broker owns the other side):
   ``mem-secret``: `_authorize_gmail` pops the enrolled authorization
   marker and requires it to equal the policy digest the job carries, so
   editing the manifest alone cannot repoint a live Gmail credential.
-* Exit 0 means the fill genuinely completed -- the intended field held
-  exactly the intended value, on the intended origin, at the end. Every
-  other outcome is exit 1 with nothing on stdout or stderr: `main` never
-  prints, and both of the children it spawns have their own output sent
-  to ``/dev/null``, so there is no diagnostic channel a secret, a
-  one-time code, an email body, or a child's own chatter could leak
-  through.
+* Exit 0 means the fill genuinely completed -- every intended field held
+  exactly the intended value, on the intended document, at the end.
+  Every other outcome is a nonzero exit out of the closed `_EXITS` table
+  naming *which stage* refused, and nothing at all on stdout or stderr:
+  `main` never prints, and both of the children it spawns have their own
+  output sent to ``/dev/null``, so there is no diagnostic channel a
+  secret, a one-time code, an email body, or a child's own chatter could
+  leak through. A stage name is a keyword compiled into this file, never
+  anything a run observed, which is what makes saying it free.
+* An entry may name more than one field. They are filled in the order
+  the job lists them, inside one bounded window, on one document proven
+  not to have changed between them -- and the digest that authorized the
+  entry covered that whole ordered list, so filling the set is exactly
+  what was enrolled.
 
 The boundary this design does *not* claim: another process running as
 this same user is not an adversary it can exclude. Such a process can
@@ -128,6 +135,13 @@ _REAP_TIMEOUT_S = 2.0
 #: EOF is the one unbounded input this process has; this bounds it.
 _MAX_JOB_BYTES = 64 * 1024
 
+#: The one job `version` this release understands, and the ceiling on the
+#: ordered field list it carries. The broker owns the other side of both
+#: (`credentials._JOB_VERSION`, `credentials._MAX_FIELDS`); a job stamped
+#: with anything else is refused outright rather than read half-way.
+_JOB_VERSION = 2
+_MAX_FIELDS = 4
+
 _MAX_AGE_SECONDS_CAP = 3600
 
 #: A message may legitimately be stamped slightly in the future when the
@@ -161,13 +175,30 @@ _CODE = re.compile(r"[A-Za-z0-9-]{4,32}")
 #: lower-case hex.
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 
-#: The single entry in the one private directory each fill creates. A
-#: FIFO has a filesystem *name* but no filesystem *contents*: the bytes
-#: live in a kernel pipe buffer and pass straight from this process to
-#: the one child reading the other end, so the value never touches disk,
-#: never appears in argv, and never appears in the script text -- which
-#: carries only this path.
+#: The two entries in the one private directory each fill creates.
+#:
+#: `_FIFO_NAME` is where the value crosses. A FIFO has a filesystem
+#: *name* but no filesystem *contents*: the bytes live in a kernel pipe
+#: buffer and pass straight from this process to the one child reading
+#: the other end, so the value never touches disk, never appears in
+#: argv, and never appears in the script text -- which carries only this
+#: path.
+#:
+#: `_STAGE_NAME` is where the child says *which stage refused*, and it
+#: is the only thing the browser side ever reports back. It has to be a
+#: plain file rather than a second FIFO because writing a FIFO blocks
+#: until a reader opens it, and the moment the child has to report is
+#: precisely the moment it is about to exit. That is safe here for one
+#: reason and one reason only: `_read_stage` accepts nothing outside
+#: `_EXITS`, so the channel cannot carry a page's text, a value, or a
+#: Node stack trace -- a token that is not already a compiled-in
+#: keyword is discarded unread. ego's own exit status could not carry
+#: this: measured 2026-08-22, `ego-browser nodejs` collapses every
+#: nonzero script exit to 1 and prints the real code on stdout, which
+#: this process deliberately routes to /dev/null.
 _FIFO_NAME = "fill"
+_STAGE_NAME = "stage"
+_MAX_STAGE_BYTES = 64
 
 #: The input types a fill may legitimately land in. A password goes
 #: nowhere but a password field. A one-time code goes into an ordinary
@@ -184,9 +215,75 @@ _INPUT_TYPES: Mapping[str, tuple[str, ...]] = MappingProxyType(
 _TOTP_STEP_SECONDS = 30
 _TOTP_DIGITS = 6
 
-#: What `execute` needs from the outside world, and all it needs.
+#: Which stage refused, as one keyword. This is the whole
+#: worker-to-broker channel, and it is a *file* the broker owns and names
+#: in the job -- deliberately not this process's exit status.
+#:
+#: An exit status cannot carry it. `mem-secret run` execs, so a status
+#: does survive the trip (measured), but the worker is not the only thing
+#: that can produce one: mem-secret itself, sops, or the shell can exit
+#: nonzero *before* this module runs at all, and a number chosen here
+#: would then be read as a stage that never happened. A token this
+#: process writes only when it has actually reached a failure cannot be
+#: forged that way -- an absent or empty file is exactly the "something
+#: upstream failed" case, and reads as such.
+#:
+#: A stage is a keyword chosen here at author time, so naming it
+#: discloses nothing the caller did not already send: the two closed
+#: sets below are the entire vocabulary.
+_EXIT_OK = 0
+_EXIT_FAILED = 1
+
+#: Every stage this process may report to the broker. The broker owns the
+#: matching table (`credentials._STAGE_CODES`); the two are checked
+#: against each other by test rather than shared at runtime, because this
+#: module is spawned as an isolated script and may not import a sibling.
+_STAGES = frozenset(
+    {
+        # Refused here, before or instead of a browser.
+        "bad_job",
+        "not_authorized",
+        "mailbox_mismatch",
+        "secret_missing",
+        "bad_totp_secret",
+        "gws_failed",
+        "otp_not_found",
+        "unbounded_match",
+        "sink_failed",
+        # Refused by the browser side, relayed from its own stage file.
+        "locate_space",
+        "origin",
+        "locate_field",
+        "focus",
+        "type_verify",
+        "timeout_stage",
+        "dialog_blocked",
+        "handoff_passkey",
+    }
+)
+
+#: The stages the browser side may report. A narrower set than `_STAGES`:
+#: nothing the child says may claim a stage only this process can reach,
+#: so a compromised or confused script cannot report "not_authorized"
+#: for a fill that was never authorized.
+_SINK_STAGES = frozenset(
+    {
+        "locate_space",
+        "origin",
+        "locate_field",
+        "focus",
+        "type_verify",
+        "timeout_stage",
+        "dialog_blocked",
+        "handoff_passkey",
+    }
+)
+
+#: What `execute` needs from the outside world, and all it needs. The
+#: value is passed as a *resolver* rather than a string: see `execute`.
 _GwsRunner = Callable[[list[str]], Mapping[str, object]]
-_FillRunner = Callable[[Callable[[str], str], str], None]
+_Resolver = Callable[[], str]
+_FillRunner = Callable[[Callable[[str, str], str], _Resolver], None]
 
 
 class _WorkerError(Exception):
@@ -261,11 +358,35 @@ def _parse_job(raw: str) -> dict[str, object]:
         job = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise _WorkerError("bad_job") from exc
-    if not isinstance(job, dict) or job.get("version") != 1:
+    if not isinstance(job, dict) or job.get("version") != _JOB_VERSION:
         raise _WorkerError("bad_job")
     if job.get("kind") not in _INPUT_TYPES:
         raise _WorkerError("bad_job")
     return job
+
+
+def _report_stage(job: Mapping[str, object] | None, stage: str) -> None:
+    """Name the stage that refused, in the file the broker set aside.
+
+    Best effort by design: the fill has already failed, and failing to
+    say where must not turn into failing differently. A missing path, an
+    unwritable file, a stage outside `_STAGES` -- each simply leaves the
+    broker with an unnamed failure, which is exactly what it means.
+
+    ``stage_path`` arrives in the job, so a job this process could not
+    parse has nowhere to report to; that too is the right answer, since a
+    job it could not read is a job whose stage it cannot vouch for.
+    """
+    if job is None or stage not in _STAGES:
+        return
+    path = job.get("stage_path")
+    if not isinstance(path, str) or not path:
+        return
+    try:
+        with open(path, "w", encoding="ascii") as stream:
+            stream.write(stage)
+    except OSError:
+        pass
 
 
 def _validate_job(job: Mapping[str, object]) -> str:
@@ -279,12 +400,17 @@ def _validate_job(job: Mapping[str, object]) -> str:
         raise _WorkerError("bad_job")
     space = job.get("space")
     origins = job.get("origins")
-    field = job.get("field")
+    fields = job.get("fields")
     if not isinstance(space, str) or not space:
         raise _WorkerError("bad_job")
     if not isinstance(origins, list) or not origins or not all(isinstance(o, str) and o for o in origins):
         raise _WorkerError("bad_job")
-    if not isinstance(field, str) or not field:
+    # The broker already bounded and de-duplicated this list; refusing
+    # the same shapes again is what makes the two sides independent
+    # rather than one side trusting the other's validator.
+    if not isinstance(fields, list) or not 1 <= len(fields) <= _MAX_FIELDS:
+        raise _WorkerError("bad_job")
+    if not all(isinstance(f, str) and f for f in fields) or len(set(fields)) != len(fields):
         raise _WorkerError("bad_job")
     return kind
 
@@ -662,8 +788,8 @@ def _gmail_code(payload: Mapping[str, object], policy: _GmailPolicy) -> str | No
     return found.pop() if found else None
 
 
-def _gmail_otp_value(
-    job: Mapping[str, object],
+def _gmail_code_for(
+    policy: _GmailPolicy,
     *,
     run_gws: _GwsRunner,
     now: float | None,
@@ -675,9 +801,13 @@ def _gmail_otp_value(
     the mailbox and only the later one still works, so treating the pair
     as ambiguous would fail exactly the flow resending exists to rescue.
     ``internalDate`` orders them, not list position.
+
+    Takes an already-validated policy rather than the job, because
+    `execute` authorizes the read and validates the policy up front and
+    defers only the read itself -- so nothing here can run against a
+    policy nobody enrolled, and the mailbox is not touched at all for a
+    fill the browser side refuses.
     """
-    _authorize_gmail(job)
-    policy = _gmail_policy(job)
 
     profile = run_gws(["gmail", "users", "getProfile", "--params", json.dumps({"userId": "me"}), "--format", "json"])
     email = profile.get("emailAddress")
@@ -747,22 +877,118 @@ def _gmail_otp_value(
 
 # --- browser sink: an ego-browser task space the caller already owns,
 # entered but never created and never closed, and one trusted CDP
-# insertion into one proven field on one proven origin. The value crosses
-# into the child through a one-use FIFO; the script text below names only
-# that FIFO's path.
+# insertion into each proven field on one proven document. The value
+# crosses into the child through a one-use FIFO; the script text below
+# names only that FIFO's path and the stage file's.
+
+#: The browser side's own bounds, in milliseconds.
+#:
+#: Nothing here used to have a bound at all: the only ceiling was this
+#: process's 40-second `_BROWSER_TIMEOUT_S`, so one ego helper call that
+#: hung for fifteen seconds was invisible, unattributed, and spent out of
+#: the whole fill's budget. ego's own CDP timeout is ~15s, several of its
+#: helpers are documented as able to hang a caller indefinitely
+#: (`ego-toolkit.js`: "Bounded pageInfo(): a wedged tab must not hang the
+#: caller forever"), and helper calls issued while another is in flight
+#: *queue behind it* -- so abandoning a stalled call cannot recover this
+#: script's ability to do anything else. Exiting can. Every step
+#: therefore races a timer and a blown bound exits immediately with the
+#: ``timeout_stage`` stage, which turns a 15-to-40 second silent stall
+#: into a bounded, named refusal the caller can act on.
+#:
+#: `_ARM_DEADLINE_MS` is tighter because arming is measured at 0-1ms
+#: (`Page.bringToFront`, measured by the ego toolkit's own arm audit
+#: after `Page.captureScreenshot` was found to stall multi-second-to-15s
+#: about one call in five). Two seconds is a 2000x margin on a healthy
+#: arm, and refusing at two seconds is strictly better than the fill it
+#: replaces: a fill that had to wait fifteen seconds for a compositor
+#: frame is one to run again deliberately, not one to finish blindly.
+#:
+#: `_SCRIPT_BUDGET_MS` is the whole script's share of
+#: `_BROWSER_TIMEOUT_S`, kept well under it so the script always reports
+#: its own stage before this process would otherwise SIGKILL it and have
+#: nothing to report.
+_STEP_DEADLINE_MS = 5000
+_ARM_DEADLINE_MS = 2000
+_SCRIPT_BUDGET_MS = 30000
 
 
 _BROWSER_SCRIPT = Template(
     r"""'use strict';
 (async () => {
-  try {
-    const fail = () => { throw new Error('refused'); };
-    const SPACE = $space;
-    const ORIGINS = $origins;
-    const FIELD = $field;
-    const TYPES = $types;
-    const FIFO = $fifo;
+  const SPACE = $space;
+  const ORIGINS = $origins;
+  const FIELDS = $fields;
+  const TYPES = $types;
+  const FIFO = $fifo;
+  const STAGE = $stage;
+  const STEP_MS = $step_ms;
+  const ARM_MS = $arm_ms;
+  const BUDGET_MS = $budget_ms;
 
+  // The script's own budget for the work it controls. Reset once, after
+  // the handoff, because the handoff is the one wait whose length belongs
+  // to somebody else: a Gmail code takes as long as Gmail takes, and
+  // charging that to the browser side would refuse a healthy fill for
+  // being slow somewhere this script has no say over. The worker's
+  // `_BROWSER_TIMEOUT_S` and the broker's per-kind deadline are what
+  // bound the whole thing.
+  let deadline = Date.now() + BUDGET_MS;
+
+  // `fs` first, before anything can fail: it is both how the value
+  // arrives and how a refusal is named, and a refusal nobody can name is
+  // exactly the failure this script exists to stop reporting.
+  let fs = null;
+  try {
+    fs = typeof process.getBuiltinModule === 'function'
+      ? process.getBuiltinModule('node:fs')
+      : (await import('node:fs')).default;
+  } catch { /* no stage channel; the exit status still says "refused" */ }
+
+  // The stage file is the only thing this script ever tells the worker,
+  // and it can only ever hold one of the keywords written into the source
+  // below -- never a URL, a selector, a page's text, or a value. The
+  // worker refuses any token that is not already one of its own
+  // compiled-in stages, so this channel cannot be widened from the page
+  // side even in principle.
+  const report = (stage) => {
+    try { if (fs) fs.writeFileSync(STAGE, stage); } catch { /* unnamed, then */ }
+  };
+  class Refusal extends Error {
+    constructor (stage) { super('refused'); this.stage = stage; }
+  }
+  const fail = (stage) => { throw new Refusal(stage); };
+
+  // Every await in this script goes through here. Two jobs: give the
+  // step a wall-clock ceiling, and give whatever it throws the name of
+  // the stage it threw in, so no failure reaches the worker anonymous.
+  // The extra no-op catch on the work promise is not decoration: once
+  // the timer has won the race, the abandoned call's own rejection would
+  // otherwise be an unhandled rejection printing a Node stack trace.
+  const step = async (stage, ms, work) => {
+    let timer = null;
+    const running = (async () => {
+      try {
+        return await work();
+      } catch (error) {
+        throw error instanceof Refusal ? error : new Refusal(stage);
+      }
+    })();
+    running.catch(() => {});
+    try {
+      return await Promise.race([
+        running,
+        new Promise((_, reject) => {
+          const left = Math.min(ms, deadline - Date.now());
+          timer = setTimeout(() => reject(new Refusal('timeout_stage')), Math.max(0, left));
+        }),
+      ]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  };
+
+  try {
     // The ego-browser wrapper injects an already-hardened T plus the raw
     // helpers into this scope. Capture them the way the wrapper itself
     // does -- typeof-guarded, so a helper this build never injected is
@@ -778,15 +1004,15 @@ _BROWSER_SCRIPT = Template(
       completeTaskSpace: typeof completeTaskSpace === 'undefined' ? undefined : completeTaskSpace,
       wait: typeof wait === 'undefined' ? undefined : wait,
     };
-    if (!H.cdp || !H.pageInfo || !H.listTaskSpaces || !H.listTabs) fail();
+    if (!H.cdp || !H.pageInfo || !H.listTaskSpaces || !H.listTabs) fail('locate_space');
     let TK = typeof T === 'undefined' ? null : T;
     if (!TK || typeof TK.session !== 'function') {
-      const mod = await import($toolkit);
+      const mod = await step('locate_space', STEP_MS, () => import($toolkit));
       const init = mod && mod.default && mod.default.init;
-      if (typeof init !== 'function') fail();
+      if (typeof init !== 'function') fail('locate_space');
       TK = init(H);
     }
-    if (!TK || typeof TK.session !== 'function') fail();
+    if (!TK || typeof TK.session !== 'function') fail('locate_space');
 
     // The caller's space must already exist, exactly once, and still be
     // the agent's own. A missing name would make T.session CREATE one, a
@@ -794,12 +1020,12 @@ _BROWSER_SCRIPT = Template(
     // agentDelegatedToUser space is a session a human is driving right
     // now -- typing a password into any of those is not the fill that
     // was asked for.
-    const spaces = await H.listTaskSpaces();
-    if (!Array.isArray(spaces)) fail();
+    const spaces = await step('locate_space', STEP_MS, () => H.listTaskSpaces());
+    if (!Array.isArray(spaces)) fail('locate_space');
     const matches = spaces.filter((s) => s && s.name === SPACE);
-    if (matches.length !== 1) fail();
+    if (matches.length !== 1) fail('locate_space');
     const wanted = matches[0];
-    if (wanted.ownership !== 'agent' || !Number.isInteger(wanted.id)) fail();
+    if (wanted.ownership !== 'agent' || !Number.isInteger(wanted.id)) fail('locate_space');
 
     // Enter through the toolkit's ownership-checked path, then prove the
     // numeric id did not move: T.session creates on a miss and resolves
@@ -808,125 +1034,199 @@ _BROWSER_SCRIPT = Template(
     // Refused either way, and never completed or handed off -- the space
     // is the caller's, and its 30-minute lease expiring is ego-reap's
     // business, not this process's.
-    const handle = await TK.session(SPACE);
-    if (!handle || handle.id !== wanted.id) fail();
-    const tabs = await handle.tabs();
-    if (!Array.isArray(tabs) || tabs.length === 0) fail();
+    const handle = await step('locate_space', STEP_MS, () => TK.session(SPACE));
+    if (!handle || handle.id !== wanted.id) fail('locate_space');
+    const tabs = await step('locate_space', STEP_MS, () => handle.tabs());
+    if (!Array.isArray(tabs) || tabs.length === 0) fail('locate_space');
 
-    const originNow = async () => {
-      const info = await H.pageInfo();
-      if (!info || info.dialog || typeof info.url !== 'string') return null;
+    // One pageInfo, for the one thing only pageInfo reports: whether a
+    // native dialog is holding this renderer. Page script does not run
+    // while one is up, so every check below would stall rather than
+    // answer -- and clicking it away is not this harness's call, because
+    // nothing here can read what it says. Its own stage, deliberately
+    // separate from the passkey handoff: an alert is a page blocking
+    // itself, not a physical authenticator only a person can satisfy,
+    // and conflating the two would tell an operator to go press a button
+    // that is not there.
+    const info = await step('origin', STEP_MS, () => H.pageInfo());
+    if (info && info.dialog) fail('dialog_blocked');
+
+    // Identity of the document, not merely its origin: the main frame's
+    // id plus its loaderId, both of which change on a real navigation
+    // and differ between two tabs showing the same URL. One cheap CDP
+    // query answers "is this still an allowed origin" and "is this still
+    // the same document" together, so a reload of the same URL -- which
+    // an origin comparison alone accepts -- is caught, and the two
+    // rechecks that used to cost an ego helper call each now cost one
+    // round trip each.
+    const docKey = async (stage) => {
+      const tree = await step(stage, STEP_MS, () => H.cdp('Page.getFrameTree', {}));
+      const frame = tree && tree.frameTree && tree.frameTree.frame;
+      if (!frame || !frame.id || typeof frame.url !== 'string') return null;
       let origin;
-      try { origin = new URL(info.url).origin; } catch { return null; }
-      return ORIGINS.includes(origin) ? origin : null;
+      try { origin = new URL(frame.url).origin; } catch { return null; }
+      if (!ORIGINS.includes(origin)) return null;
+      return frame.id + ':' + (frame.loaderId || '');
     };
-    const origin = await originNow();
-    if (!origin) fail();
+    const opened = await docKey('origin');
+    if (!opened) fail('origin');
 
-    // Resolve the field to ONE remote object and hold that object for
-    // the rest of the fill. Every step after this -- arming, the
-    // recheck, the readback -- is a call on this same objectId, so a
-    // page that swaps a different element in behind an identical
-    // selector cannot become the thing that receives the value: the
-    // object held here is detached, and every later check fails.
-    const doc = await H.cdp('DOM.getDocument', { depth: 1 });
+    // Resolve every configured field to ONE remote object and hold those
+    // objects for the rest of the fill. Every step after this -- the
+    // shape check, the arm, the insertion, the readback -- is a call on
+    // one of these objectIds, so a page that swaps a different element
+    // in behind an identical selector cannot become the thing that
+    // receives the value: the object held here is detached, and every
+    // later check on it fails.
+    const doc = await step('locate_field', STEP_MS, () => H.cdp('DOM.getDocument', { depth: 1 }));
     const rootId = doc && doc.root && doc.root.nodeId;
-    if (!rootId) fail();
-    const hits = await H.cdp('DOM.querySelectorAll', { nodeId: rootId, selector: FIELD });
-    if (!hits || !Array.isArray(hits.nodeIds) || hits.nodeIds.length !== 1) fail();
-    const resolved = await H.cdp('DOM.resolveNode', { nodeId: hits.nodeIds[0] });
-    const objectId = resolved && resolved.object && resolved.object.objectId;
-    if (!objectId) fail();
+    if (!rootId) fail('locate_field');
+    const targets = [];
+    for (const selector of FIELDS) {
+      const hits = await step('locate_field', STEP_MS,
+        () => H.cdp('DOM.querySelectorAll', { nodeId: rootId, selector }));
+      if (!hits || !Array.isArray(hits.nodeIds) || hits.nodeIds.length !== 1) fail('locate_field');
+      const resolved = await step('locate_field', STEP_MS,
+        () => H.cdp('DOM.resolveNode', { nodeId: hits.nodeIds[0] }));
+      const objectId = resolved && resolved.object && resolved.object.objectId;
+      if (!objectId) fail('locate_field');
+      targets.push(objectId);
+    }
 
-    // One declaration, run twice against that one object: it must be an
-    // attached, enabled, writable, visible INPUT of an expected type,
-    // and it must end up focused and empty. Anything else -- a hidden or
-    // readonly field, a textarea, a contenteditable div, the wrong input
-    // type, an element detached since it was resolved -- is a page that
-    // does not look like the one this entry was written for. Armed, the
-    // field is focused and cleared; unarmed, the same facts are simply
-    // reproven.
+    // One declaration, run against one object at a time, answering with
+    // one small integer: 0 it is the field this entry was written for,
+    // 1 it is not, 2 it is a field only a human can satisfy. It must be
+    // an attached, enabled, writable, visible INPUT of an expected type;
+    // a hidden or readonly field, a textarea, a contenteditable div, the
+    // wrong input type, or an element detached since it was resolved is a
+    // page that does not look like the one this entry was written for.
+    // Armed, the field is additionally focused and cleared and has to end
+    // up that way; unarmed, only the shape is judged, because focus can
+    // only ever belong to one field and every field is armed in its turn.
     const CHECK = 'function (types, arm) {' +
       'const el = this;' +
-      'if (!el || el.nodeType !== 1 || el.tagName !== "INPUT" || !el.isConnected) return false;' +
-      'if (el.disabled || el.readOnly) return false;' +
+      'if (!el || el.nodeType !== 1 || el.tagName !== "INPUT" || !el.isConnected) return 1;' +
+      'if (el.disabled || el.readOnly) return 1;' +
       'const type = (el.getAttribute("type") || "text").toLowerCase();' +
-      'if (!types.includes(type)) return false;' +
+      'if (!types.includes(type)) return 1;' +
       'const box = el.getBoundingClientRect();' +
-      'if (box.width <= 0 || box.height <= 0) return false;' +
+      'if (box.width <= 0 || box.height <= 0) return 1;' +
       'const style = getComputedStyle(el);' +
-      'if (style.visibility === "hidden" || style.display === "none") return false;' +
-      'if (Number(style.opacity) === 0) return false;' +
-      'if (arm) {' +
-        'el.focus({ preventScroll: false });' +
-        'if (el.value !== "") { el.value = ""; el.dispatchEvent(new Event("input", { bubbles: true })); }' +
-      '}' +
-      'return document.activeElement === el && el.value === "";' +
+      'if (style.visibility === "hidden" || style.display === "none") return 1;' +
+      'if (Number(style.opacity) === 0) return 1;' +
+      // A "webauthn" token in autocomplete is the page asking the browser
+      // for conditional passkey mediation on this very field. Whatever is
+      // typed there, the ceremony that follows is a platform-authenticator
+      // sheet -- Touch ID, a security key -- that only the human at this
+      // Mac can answer, and that this harness deliberately cannot drive.
+      // Refusing here is free; typing first would spend the whole
+      // deadline and still log nobody in.
+      'const hint = (el.getAttribute("autocomplete") || "").toLowerCase();' +
+      'if (hint.trim().split(/\\s+/).indexOf("webauthn") >= 0) return 2;' +
+      'if (!arm) return 0;' +
+      'el.focus({ preventScroll: false });' +
+      'if (el.value !== "") { el.value = ""; el.dispatchEvent(new Event("input", { bubbles: true })); }' +
+      'return document.activeElement === el && el.value === "" ? 0 : 1;' +
     '}';
-    const check = async (arm) => {
-      const done = await H.cdp('Runtime.callFunctionOn', {
+    const check = async (objectId, arm) => {
+      const done = await step('focus', STEP_MS, () => H.cdp('Runtime.callFunctionOn', {
         objectId,
         functionDeclaration: CHECK,
         arguments: [{ value: TYPES }, { value: arm }],
         returnByValue: true,
-      });
-      return !!done && !done.exceptionDetails && !!done.result && done.result.value === true;
+      }));
+      if (!done || done.exceptionDetails || !done.result) return 1;
+      return done.result.value === 0 || done.result.value === 2 ? done.result.value : 1;
     };
-    if (!await check(true)) fail();
-
-    // Force-arm this document: without a hit-tested compositor surface
-    // the browser side drops synthesized input and still reports
-    // success, which is the one failure mode a credential fill must
-    // never report as done.
-    // Page.captureScreenshot used to arm this surface, but it can stall
-    // until ego's 15-second CDP timeout. Page.bringToFront arms the
-    // compositor without activating the macOS app; the default background
-    // override is the measured fallback when CDP refuses it.
-    try {
-      await H.cdp('Page.bringToFront', {});
-    } catch {
-      await H.cdp('Emulation.setDefaultBackgroundColorOverride', {
-        color: { r: 255, g: 255, b: 255, a: 1 },
-      });
+    for (const objectId of targets) {
+      const verdict = await check(objectId, false);
+      if (verdict === 2) fail('handoff_passkey');
+      if (verdict !== 0) fail('locate_field');
     }
 
-    // Collect the value only now, with every check already passed: a
+    // Force-arm this document: without a hit-tested compositor surface
+    // the browser side can drop synthesized input and still report
+    // success, which is the one failure mode a credential fill must
+    // never report as done. Page.captureScreenshot used to arm it and
+    // stalled; Page.bringToFront arms the compositor in about a
+    // millisecond without activating the macOS app, and the default
+    // background override is the measured fallback when CDP refuses it.
+    // Bounded, because an arm that has to be waited for is not an arm --
+    // and the readback below, not this, is what actually proves the
+    // value landed.
+    await step('focus', ARM_MS, async () => {
+      try {
+        await H.cdp('Page.bringToFront', {});
+      } catch {
+        await H.cdp('Emulation.setDefaultBackgroundColorOverride', {
+          color: { r: 255, g: 255, b: 255, a: 1 },
+        });
+      }
+    });
+
+    // Collect the value only now, with every field already proven: a
     // refused fill never reads the FIFO at all. Reading it is what
-    // releases the writer on the other end, and unlinking it right after
-    // makes the handoff single-use -- a second reader would find nothing
-    // to open.
-    const fs = typeof process.getBuiltinModule === 'function'
-      ? process.getBuiltinModule('node:fs')
-      : (await import('node:fs')).default;
+    // releases the writer on the other end -- and what makes the worker
+    // resolve the value in the first place, so a one-time code is
+    // generated here rather than before any of the checks above.
+    // Unlinking it right after makes the handoff single-use: a second
+    // reader would find nothing to open. A handoff that carried nothing
+    // is the sink's own failure, not a stage of the fill, so it is thrown
+    // unnamed on purpose.
+    if (!fs) throw new Error('no handoff');
     const secret = fs.readFileSync(FIFO, 'utf8');
     try { fs.unlinkSync(FIFO); } catch { /* the worker's own cleanup won the race */ }
-    if (!secret) fail();
+    if (!secret) throw new Error('empty handoff');
 
-    // That read is the one step here that waits on another process, so
-    // it is the one window in which the page can have moved on. Reprove
-    // the origin, then reprove the object itself, and only then type --
-    // as tight as this gets without the browser offering an atomic
-    // check-and-insert.
-    if (await originNow() !== origin) fail();
-    if (!await check(false)) fail();
-    await H.cdp('Input.insertText', { text: secret });
+    // That read is the one wait whose length is somebody else's: a Gmail
+    // code takes as long as the mailbox takes. The budget for the work
+    // this script controls starts again here, so a slow provider cannot
+    // make the browser side look like it timed out.
+    deadline = Date.now() + BUDGET_MS;
 
-    // Read back on that same object, by comparing inside the page and
-    // returning one boolean. The value is passed as a call argument,
-    // never spliced into evaluated source, and never returned across
-    // CDP -- a fill is only done when that field holds exactly this
-    // string, and knowing that it does requires learning nothing else
-    // about it.
-    const equal = await H.cdp('Runtime.callFunctionOn', {
-      objectId,
-      functionDeclaration: 'function (expected) { return this.value === expected }',
-      arguments: [{ value: secret }],
-      returnByValue: true,
-    });
-    if (!equal || equal.exceptionDetails || !equal.result || equal.result.value !== true) fail();
-    if (await originNow() !== origin) fail();
+    // Each field after the first waits on the one before it, so between
+    // any two insertions the page can have moved on. The document is
+    // reproven, and the field armed and reproven, immediately before each
+    // insertion -- as tight as this gets without the browser offering an
+    // atomic check-and-insert.
+    //
+    // The one gap left is between that check and the insertion itself:
+    // focus lives in the page and the insertion is a browser-level call,
+    // so they cannot be one turn. A page that moves focus in that window
+    // gets the keystrokes instead, which the readback below then catches
+    // -- the fill is refused rather than reported done, but the value did
+    // land somewhere on an allowed origin. That residual is named in
+    // SECURITY.md rather than papered over; closing it would mean giving
+    // up trusted input for a scripted value assignment, which real login
+    // forms treat differently.
+    //
+    // So the readback proves three things in one page turn, on the object
+    // that was armed: it is still that object, it is still the focused
+    // one, and it holds exactly this string. The value is passed as a
+    // call argument, never spliced into evaluated source, and never
+    // returned across CDP -- knowing the field holds it requires learning
+    // nothing else about it.
+    const LANDED = 'function (expected) {'
+      + 'return this.isConnected && document.activeElement === this && this.value === expected;'
+    + '}';
+    for (const objectId of targets) {
+      if (await docKey('origin') !== opened) fail('origin');
+      const verdict = await check(objectId, true);
+      if (verdict === 2) fail('handoff_passkey');
+      if (verdict !== 0) fail('focus');
+      await step('type_verify', STEP_MS, () => H.cdp('Input.insertText', { text: secret }));
+      const landed = await step('type_verify', STEP_MS, () => H.cdp('Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: LANDED,
+        arguments: [{ value: secret }],
+        returnByValue: true,
+      }));
+      if (!landed || landed.exceptionDetails || !landed.result || landed.result.value !== true) fail('type_verify');
+    }
+    if (await docKey('origin') !== opened) fail('origin');
     process.exit(0);
-  } catch {
+  } catch (error) {
+    if (error instanceof Refusal) report(error.stage);
     process.exit(1);
   }
 })();
@@ -934,44 +1234,71 @@ _BROWSER_SCRIPT = Template(
 )
 
 
-def _browser_script(job: Mapping[str, object], fifo: str) -> str:
+def _browser_script(job: Mapping[str, object], fifo: str, stage: str) -> str:
     """The whole browser side of one fill, as one script for one child.
 
     Dispatch only: `_validate_job` has already confirmed
-    ``kind``/``space``/``origins``/``field``.
+    ``kind``/``space``/``origins``/``fields``.
     """
     return _BROWSER_SCRIPT.substitute(
         space=json.dumps(job["space"]),
         origins=json.dumps(list(job["origins"])),
-        field=json.dumps(job["field"]),
+        fields=json.dumps(list(job["fields"])),
         types=json.dumps(list(_INPUT_TYPES[str(job["kind"])])),
         toolkit=json.dumps(_EGO_TOOLKIT_PATH.as_uri()),
         fifo=json.dumps(fifo),
+        stage=json.dumps(stage),
+        step_ms=_STEP_DEADLINE_MS,
+        arm_ms=_ARM_DEADLINE_MS,
+        budget_ms=_SCRIPT_BUDGET_MS,
     )
 
 
-def _hand_off(fifo: str, secret: str) -> None:
-    """Write the value into `fifo` once, then close it.
+@dataclass(slots=True)
+class _Handoff:
+    """The writing half of one FIFO, and whatever went wrong in it.
 
-    Opening a FIFO for writing blocks until a reader opens the other end,
-    so this cannot run ahead of the child: by the time the write happens,
-    the process on the other side is the Node reader that was just
-    spawned. The value is far smaller than ``PIPE_BUF``, so the write is
-    atomic and cannot block once that reader exists, and closing is what
-    gives the reader its EOF.
+    The value is resolved *inside* the thread, once a reader is on the
+    other end, so nothing computes a one-time code for a fill the
+    browser side is going to refuse -- and nothing computes one seconds
+    before it is typed. `failure` is how a resolver's own refusal
+    (a mailbox that does not match, a code that never arrived) reaches
+    the main thread, which would otherwise see only an empty handoff and
+    report the sink.
     """
-    try:
-        handle = os.open(fifo, os.O_WRONLY)
-    except OSError:
-        return
-    payload = secret.encode()
-    try:
-        while payload:
-            payload = payload[os.write(handle, payload) :]
-    except OSError:
-        pass
-    finally:
-        os.close(handle)
+
+    resolve: _Resolver
+    failure: _WorkerError | None = None
+
+    def __call__(self, fifo: str) -> None:
+        """Write the value into `fifo` once, then close it.
+
+        Opening a FIFO for writing blocks until a reader opens the other
+        end, so this cannot run ahead of the child: by the time the write
+        happens, the process on the other side is the Node reader that was
+        just spawned. The value is far smaller than ``PIPE_BUF``, so the
+        write is atomic and cannot block once that reader exists, and
+        closing is what gives the reader its EOF.
+        """
+        try:
+            handle = os.open(fifo, os.O_WRONLY)
+        except OSError:
+            return
+        try:
+            try:
+                payload = self.resolve().encode()
+            except _WorkerError as exc:
+                self.failure = exc
+                return
+            except Exception:  # noqa: BLE001 - a resolver may only ever fail as a stage
+                self.failure = _WorkerError("sink_failed")
+                return
+            while payload:
+                payload = payload[os.write(handle, payload) :]
+        except OSError:
+            pass
+        finally:
+            os.close(handle)
 
 
 def _release(fifo: str, writer: threading.Thread) -> None:
@@ -996,6 +1323,24 @@ def _release(fifo: str, writer: threading.Thread) -> None:
         os.unlink(fifo)
     except OSError:
         pass
+
+
+def _read_stage(path: str) -> str | None:
+    """The stage the browser child named, if it named one this side knows.
+
+    The whole redaction argument for this channel lives in these three
+    lines: whatever the file holds is compared against `_SINK_STAGES`,
+    and anything else -- a longer token, a page's text, a Node stack
+    trace, an empty file, no file at all -- becomes `None`. The child can
+    therefore only ever select one of this module's own compiled-in
+    keywords, never contribute a string of its own.
+    """
+    try:
+        with open(path, "rb") as stream:
+            token = stream.read(_MAX_STAGE_BYTES + 1).decode("ascii", errors="replace")
+    except OSError:
+        return None
+    return token if token in _SINK_STAGES else None
 
 
 def _kill_child(process: subprocess.Popen[str]) -> None:
@@ -1029,31 +1374,55 @@ class _EgoBrowser:
     path, the bytes never reach a regular file, and the private 0700
     directory holding it -- named by `tempfile.mkdtemp`, so unguessable
     and unshared -- is gone before the call returns either way.
+
+    Alongside it, in the same private directory, one 0600 file the child
+    may write one keyword into: ego collapses every nonzero script exit
+    to 1, so a browser-side refusal has no other way to say *which* stage
+    refused, and a fill that fails without saying where is a fill nobody
+    can act on. `_read_stage` is what keeps that channel to a keyword.
     """
 
     binary: Path = _EGO_BROWSER_BIN
     timeout: float = _BROWSER_TIMEOUT_S
 
-    def __call__(self, make_script: Callable[[str], str], secret: str) -> None:
+    def __call__(self, make_script: Callable[[str, str], str], resolve: _Resolver) -> None:
         directory = tempfile.mkdtemp(prefix="macos-harness-cred-")
         fifo = os.path.join(directory, _FIFO_NAME)
+        stage_path = os.path.join(directory, _STAGE_NAME)
+        handoff = _Handoff(resolve)
         try:
             os.mkfifo(fifo, 0o600)
-            writer = threading.Thread(target=_hand_off, args=(fifo, secret), daemon=True)
+            os.close(os.open(stage_path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600))
+            writer = threading.Thread(target=handoff, args=(fifo,), daemon=True)
             writer.start()
+            spawn_error: _WorkerError | None = None
             try:
-                self._spawn(make_script(fifo))
+                self._spawn(make_script(fifo, stage_path), stage_path)
+            except _WorkerError as exc:
+                spawn_error = exc
             finally:
                 _release(fifo, writer)
+            # A resolver that refused is the real reason the child had
+            # nothing to read, and it names its own stage; the sink can
+            # only report that the handoff was empty. So the resolver's
+            # account wins whenever there is one.
+            if handoff.failure is not None:
+                raise handoff.failure
+            if spawn_error is not None:
+                raise spawn_error
         except OSError as exc:
             raise _WorkerError("sink_failed") from exc
         finally:
+            try:
+                os.unlink(stage_path)
+            except OSError:
+                pass
             try:
                 os.rmdir(directory)
             except OSError:
                 pass
 
-    def _spawn(self, script: str) -> None:
+    def _spawn(self, script: str, stage_path: str) -> None:
         """Run one script in one ego-browser child, deaf and mute.
 
         ``stdout``/``stderr`` go to ``/dev/null`` at the OS level rather
@@ -1066,6 +1435,10 @@ class _EgoBrowser:
         here would be a second owner of the same tree. The ceiling below
         is this process finishing first, not a second owner -- it kills
         the child it started and refuses the fill.
+
+        A child that exited nonzero is asked which stage refused. A child
+        this process had to kill is not: it never reached its own catch,
+        so whatever is in that file belongs to no completed stage.
         """
         try:
             process = subprocess.Popen(
@@ -1081,9 +1454,9 @@ class _EgoBrowser:
             process.communicate(input=script, timeout=self.timeout)
         except subprocess.TimeoutExpired:
             _kill_child(process)
-            raise _WorkerError("sink_failed") from None
+            raise _WorkerError("timeout_stage") from None
         if process.returncode != 0:
-            raise _WorkerError("sink_failed")
+            raise _WorkerError(_read_stage(stage_path) or "sink_failed")
 
 
 # --- orchestration -------------------------------------------------------
@@ -1099,32 +1472,67 @@ def execute(
     run_ego_browser: _FillRunner = _FILL,
     now: float | None = None,
 ) -> None:
-    """Resolve `job`'s provider value and fill it into `job`'s field.
+    """Fill `job`'s provider value into `job`'s fields.
+
+    The value is handed over as a *resolver*, not a string, and that is
+    the point rather than a style choice. `_hand_off` calls it at the
+    moment the browser child opens the FIFO, which is the moment every
+    preflight check has already passed -- so a TOTP code is generated
+    against the clock it will be typed under rather than against the one
+    the fill started under, and a fill that was going to be refused
+    never reads a mailbox or spends a code at all. A six-digit TOTP is
+    valid for a 30-second step; a browser preflight that took four
+    seconds used to eat an eighth of that window for nothing.
 
     Raises `_WorkerError` on any failure; returns normally only once the
-    browser child reported the fill actually completed.
+    browser child reported every configured field actually holds it.
     """
     kind = _validate_job(job)
     if kind == "password":
-        secret = _take_secret(job.get("secret_env"))
+        # Popped now, and nothing deferred: a stored password does not go
+        # stale, and taking it here means an entry nobody enrolled is
+        # refused before a browser child is ever spawned.
+        stored = _take_secret(job.get("secret_env"))
+        resolve: _Resolver = lambda: stored  # noqa: E731
     elif kind == "totp":
-        secret = _totp_code(_take_secret(job.get("secret_env")), now=now)
+        # The seed is taken now -- popping it before any child is spawned
+        # is what keeps it out of an inherited environment -- and only the
+        # code is computed late.
+        seed = _take_secret(job.get("secret_env"))
+        resolve = lambda: _totp_code(seed, now=now)  # noqa: E731
     else:
-        secret = _gmail_otp_value(job, run_gws=run_gws, now=now)
-    run_ego_browser(lambda fifo: _browser_script(job, fifo), secret)
+        # The authorization marker is likewise popped now, so the read
+        # itself is already authorized by the time it is deferred.
+        _authorize_gmail(job)
+        policy = _gmail_policy(job)
+        resolve = lambda: _gmail_code_for(policy, run_gws=run_gws, now=now)  # noqa: E731
+    run_ego_browser(lambda fifo, stage: _browser_script(job, fifo, stage), resolve)
 
 
 def main(*, run_gws: _GwsRunner = _GWS, run_ego_browser: _FillRunner = _FILL) -> int:
     """Read one job from stdin, attempt the fill, report only an exit
-    code. Deliberately prints nothing on either stream in any outcome --
-    the broker discards both anyway, but nothing this process might have
-    seen should depend on that.
+    code and, in the file the broker named, which stage refused.
+    Deliberately prints nothing on either stream in any outcome -- the
+    broker discards both anyway, but nothing this process might have seen
+    should depend on that.
+
+    A stage is a keyword out of `_STAGES`, so an operator learns where a
+    fill stopped without this process having to print one word about what
+    it saw there. Anything unclassified -- an exception this module never
+    raises on purpose -- names no stage, and the broker reports the
+    failure unnamed rather than guessing.
     """
+    job: dict[str, object] | None = None
     try:
-        execute(_parse_job(_read_job()), run_gws=run_gws, run_ego_browser=run_ego_browser)
+        job = _parse_job(_read_job())
+        execute(job, run_gws=run_gws, run_ego_browser=run_ego_browser)
+    except _WorkerError as exc:
+        stage = exc.args[0] if exc.args and isinstance(exc.args[0], str) else ""
+        _report_stage(job, stage)
+        return _EXIT_FAILED
     except Exception:  # noqa: BLE001 - the process boundary: report exit code only, never a message
-        return 1
-    return 0
+        return _EXIT_FAILED
+    return _EXIT_OK
 
 
 if __name__ == "__main__":

@@ -60,22 +60,24 @@ POLICY_DIGEST = hashlib.sha256(b"acme-otp policy").hexdigest()
 SPACE = "acme-space"
 ORIGIN = "https://accounts.acme.example"
 FIELD = "#password"
+CONFIRM_FIELD = "#confirm"
 FAKE_FIFO = "/tmp/macos-harness-cred-test/fill"
+FAKE_STAGE = "/tmp/macos-harness-cred-test/stage"
 
 _NODE = shutil.which("node")
 requires_node = pytest.mark.skipif(_NODE is None, reason="the browser script is executed by the real Node")
 
-_MakeScript = Callable[[str], str]
+_MakeScript = Callable[[str, str], str]
 _GwsRun = Callable[[list[str]], Mapping[str, object]]
 
 
 def _browser_job(**overrides: object) -> dict[str, object]:
     job: dict[str, object] = {
-        "version": 1,
+        "version": 2,
         "kind": "password",
         "space": SPACE,
         "origins": [ORIGIN],
-        "field": FIELD,
+        "fields": [FIELD],
         "secret_env": SOURCE_ENV,
     }
     job.update(overrides)
@@ -84,11 +86,11 @@ def _browser_job(**overrides: object) -> dict[str, object]:
 
 def _gmail_job(**overrides: object) -> dict[str, object]:
     job: dict[str, object] = {
-        "version": 1,
+        "version": 2,
         "kind": "gmail_otp",
         "space": SPACE,
         "origins": [ORIGIN],
-        "field": "#otp",
+        "fields": ["#otp"],
         "mailbox": "user@example.com",
         "sender": "noreply@acme.example",
         "subject_regex": "verification code",
@@ -111,13 +113,16 @@ class _Fill:
         self.secret: str | None = None
         self.fifos: list[str] = []
 
-    def __call__(self, make_script: _MakeScript, secret: str) -> None:
-        self.script = make_script(FAKE_FIFO)
-        self.secret = secret
+    def __call__(self, make_script: _MakeScript, resolve: worker._Resolver) -> None:
+        self.script = make_script(FAKE_FIFO, FAKE_STAGE)
+        # The real sink resolves the value only once a reader is on the
+        # other end of the FIFO, so resolving it here is what a real fill
+        # that got that far would do.
+        self.secret = resolve()
         self.fifos.append(FAKE_FIFO)
 
 
-def _refuse_fill(make_script: _MakeScript, secret: str) -> None:
+def _refuse_fill(make_script: _MakeScript, resolve: object) -> None:
     pytest.fail("must not reach the browser")
 
 
@@ -211,11 +216,12 @@ def test_read_job_stops_at_its_own_ceiling(tmp_path: Path) -> None:
         "not json",
         "42",
         '["not", "a", "dict"]',
-        json.dumps({"version": 2, "kind": "password"}),
+        json.dumps({"version": 3, "kind": "password"}),
+        json.dumps({"version": 1, "kind": "password"}),  # the single-field job shape
         json.dumps({"kind": "password"}),  # missing version
-        json.dumps({"version": 1, "kind": "bogus"}),
-        json.dumps({"version": 1, "kind": "native"}),  # the deleted sink is not a kind
-        json.dumps({"version": 1}),  # missing kind
+        json.dumps({"version": 2, "kind": "bogus"}),
+        json.dumps({"version": 2, "kind": "native"}),  # the refused sink is not a kind
+        json.dumps({"version": 2}),  # missing kind
     ],
 )
 def test_parse_job_rejects_malformed_input(raw: str) -> None:
@@ -240,8 +246,13 @@ def test_parse_job_accepts_the_brokers_exact_browser_job() -> None:
         {"origins": None},
         {"origins": [ORIGIN, ""]},
         {"origins": ORIGIN},  # a bare string, not a list
-        {"field": ""},
-        {"field": None},
+        {"fields": []},
+        {"fields": None},
+        {"fields": FIELD},  # a bare string, not a list
+        {"fields": [FIELD, ""]},
+        {"fields": [FIELD, FIELD]},  # one element named twice
+        {"fields": [FIELD, None]},
+        {"fields": [FIELD] * (worker._MAX_FIELDS + 1)},
         {"kind": "bogus"},
     ],
 )
@@ -722,14 +733,44 @@ def test_gmail_otp_never_fetches_more_candidates_than_the_bounded_limit(enrolled
     ids = [f"m{i}" for i in range(worker._GMAIL_CANDIDATE_LIMIT + 5)]  # a hostile/buggy list response
     messages = {message_id: _gmail_message(subject="unrelated") for message_id in ids}
     fetched: list[str] = []
+
+    # The mailbox is read from inside the sink, once a reader is on the
+    # other end of the FIFO, so this is the runner that gets to that
+    # point and then asks for the value.
+    def resolving_fill(make_script: _MakeScript, resolve: worker._Resolver) -> None:
+        resolve()
+
     with pytest.raises(worker._WorkerError, match="otp_not_found"):
         worker.execute(
             _gmail_job(),
             run_gws=_fake_gws(messages, ids, on_get=fetched.append),
-            run_ego_browser=_refuse_fill,
+            run_ego_browser=resolving_fill,
             now=_NOW,
         )
     assert len(fetched) <= worker._GMAIL_CANDIDATE_LIMIT
+
+
+def test_a_gmail_mailbox_is_not_read_at_all_for_a_fill_the_browser_refuses(enrolled: None) -> None:
+    """The read is deferred to the moment the browser child asks for the
+    value, which is after every preflight check has passed. A fill the
+    browser side refuses therefore spends no code and touches no mailbox
+    -- and a code that *is* spent is fetched seconds fresher than it used
+    to be.
+    """
+    messages = {"m1": _gmail_message(body_text="Your code is 123456")}
+    fetched: list[str] = []
+
+    with pytest.raises(worker._WorkerError, match="locate_field"):
+        worker.execute(
+            _gmail_job(),
+            run_gws=_fake_gws(messages, ["m1"], on_get=fetched.append),
+            run_ego_browser=lambda make_script, resolve: (_ for _ in ()).throw(
+                worker._WorkerError("locate_field")
+            ),
+            now=_NOW,
+        )
+
+    assert fetched == []
 
 
 def test_worst_case_provider_and_browser_fit_inside_the_brokers_deadlines() -> None:
@@ -897,11 +938,12 @@ def test_ego_browser_hands_the_exact_bytes_across_a_one_use_fifo(
     binary = fake_binary("ego-browser", _fifo_reader_ego(out))
     seen_paths: list[str] = []
 
-    def make_script(fifo: str) -> str:
+    def make_script(fifo: str, stage: str) -> str:
         seen_paths.append(fifo)
-        return worker._browser_script(_browser_job(), fifo)
+        seen_paths.append(stage)
+        return worker._browser_script(_browser_job(), fifo, stage)
 
-    worker._EgoBrowser(binary=binary)(make_script, CANARY_SECRET)
+    worker._EgoBrowser(binary=binary)(make_script, lambda: CANARY_SECRET)
 
     seen = json.loads(out.read_text())
     assert seen["crossed"] == CANARY_SECRET  # exact bytes, no truncation, no newline
@@ -926,7 +968,9 @@ def test_ego_browser_leaves_no_fifo_dir_or_writer_behind_when_the_child_never_re
     before = threading.active_count()
 
     with pytest.raises(worker._WorkerError, match="sink_failed"):
-        worker._EgoBrowser(binary=binary)(lambda fifo: seen_paths.append(fifo) or "script", CANARY_SECRET)
+        worker._EgoBrowser(binary=binary)(
+            lambda fifo, stage: seen_paths.append(fifo) or "script", lambda: CANARY_SECRET
+        )
 
     fifo = seen_paths[0]
     assert not os.path.exists(fifo)
@@ -951,7 +995,7 @@ def test_ego_browser_discards_the_childs_own_output(
         """,
     )
 
-    worker._EgoBrowser(binary=binary)(lambda fifo: "harmless", CANARY_SECRET)
+    worker._EgoBrowser(binary=binary)(lambda fifo, stage: "harmless", lambda: CANARY_SECRET)
 
     captured = capfd.readouterr()
     assert captured.out == ""
@@ -960,7 +1004,9 @@ def test_ego_browser_discards_the_childs_own_output(
 
 def test_ego_browser_reports_sink_failed_when_the_binary_is_not_there(tmp_path: Path) -> None:
     with pytest.raises(worker._WorkerError, match="sink_failed"):
-        worker._EgoBrowser(binary=tmp_path / "definitely-not-here")(lambda fifo: "script", CANARY_SECRET)
+        worker._EgoBrowser(binary=tmp_path / "definitely-not-here")(
+            lambda fifo, stage: "script", lambda: CANARY_SECRET
+        )
 
 
 def test_ego_browser_kills_the_child_it_started_when_the_fill_outruns_its_ceiling(
@@ -987,8 +1033,8 @@ def test_ego_browser_kills_the_child_it_started_when_the_fill_outruns_its_ceilin
     )
 
     started = time.monotonic()
-    with pytest.raises(worker._WorkerError, match="sink_failed"):
-        worker._EgoBrowser(binary=binary, timeout=1.0)(lambda fifo: "script", CANARY_SECRET)
+    with pytest.raises(worker._WorkerError, match="timeout_stage"):
+        worker._EgoBrowser(binary=binary, timeout=1.0)(lambda fifo, stage: "script", lambda: CANARY_SECRET)
     elapsed = time.monotonic() - started
 
     recorded = json.loads(facts.read_text())
@@ -1005,7 +1051,7 @@ def test_hand_off_writes_nothing_anywhere_when_no_reader_ever_arrives(tmp_path: 
     """
     fifo = tmp_path / "fill"
     os.mkfifo(fifo, 0o600)
-    writer = threading.Thread(target=worker._hand_off, args=(str(fifo), CANARY_SECRET), daemon=True)
+    writer = threading.Thread(target=worker._Handoff(lambda: CANARY_SECRET), args=(str(fifo),), daemon=True)
     writer.start()
 
     worker._release(str(fifo), writer)
@@ -1048,8 +1094,8 @@ def test_main_fills_and_reports_zero_without_printing_anything(
     assert SOURCE_ENV not in os.environ
 
 
-@pytest.mark.parametrize("raw", ["", "not json", json.dumps({"version": 1})])
-def test_main_reports_one_and_prints_nothing_on_a_malformed_job(
+@pytest.mark.parametrize("raw", ["", "not json", json.dumps({"version": 2})])
+def test_main_reports_the_bad_job_stage_and_prints_nothing_on_a_malformed_job(
     tmp_path: Path, capfd: pytest.CaptureFixture[str], raw: str
 ) -> None:
     saved = _feed_stdin(raw.encode(), tmp_path)
@@ -1058,7 +1104,7 @@ def test_main_reports_one_and_prints_nothing_on_a_malformed_job(
     finally:
         _restore_stdin(saved)
 
-    assert code == 1
+    assert code == worker._EXIT_FAILED
     captured = capfd.readouterr()
     assert captured.out == ""
     assert captured.err == ""
@@ -1067,9 +1113,9 @@ def test_main_reports_one_and_prints_nothing_on_a_malformed_job(
 def test_main_never_prints_a_canary_carried_by_a_chained_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:
-    def _boom(make_script: _MakeScript, secret: str) -> None:
+    def _boom(make_script: _MakeScript, resolve: worker._Resolver) -> None:
         try:
-            raise RuntimeError(f"leak attempt {secret}")
+            raise RuntimeError(f"leak attempt {resolve()}")
         except RuntimeError as exc:
             raise worker._WorkerError("sink_failed") from exc
 
@@ -1080,10 +1126,50 @@ def test_main_never_prints_a_canary_carried_by_a_chained_failure(
     finally:
         _restore_stdin(saved)
 
-    assert code == 1
+    assert code == worker._EXIT_FAILED
     captured = capfd.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+def test_main_reports_unclassified_for_a_failure_no_stage_covers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """A stage is a claim about where a fill stopped. An exception this
+    module never raises on purpose has no such claim to make, so it stays
+    the unnamed code rather than borrowing the nearest stage.
+    """
+
+    def _boom(make_script: _MakeScript, resolve: worker._Resolver) -> None:
+        raise ZeroDivisionError("something nobody planned for")
+
+    monkeypatch.setenv(SOURCE_ENV, CANARY_SECRET)
+    saved = _feed_stdin(json.dumps(_browser_job()).encode(), tmp_path)
+    try:
+        code = worker.main(run_ego_browser=_boom)
+    finally:
+        _restore_stdin(saved)
+
+    assert code == worker._EXIT_FAILED
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_the_stage_vocabulary_is_closed_and_the_sink_half_is_narrower() -> None:
+    """A stage is only useful if both sides mean the same thing by it, and
+    only safe if the browser child cannot claim one the worker alone can
+    reach -- reporting "not_authorized" for a fill that was never
+    authorized would be a lie a page could tell.
+    """
+    from macos_harness import credentials
+
+    assert worker._EXIT_OK == 0
+    assert worker._EXIT_FAILED == 1
+    assert worker._SINK_STAGES < worker._STAGES
+    assert set(worker._STAGES) == set(credentials._STAGE_CODES)
+    assert "not_authorized" not in worker._SINK_STAGES
+    assert "secret_missing" not in worker._SINK_STAGES
 
 
 def test_the_worker_runs_as_the_isolated_script_the_broker_spawns(tmp_path: Path) -> None:
@@ -1105,7 +1191,7 @@ def test_the_worker_runs_as_the_isolated_script_the_broker_spawns(tmp_path: Path
         check=False,
     )
 
-    assert proc.returncode == 1
+    assert proc.returncode == worker._EXIT_FAILED
     assert proc.stdout == b""
     assert proc.stderr == b""
 
@@ -1120,7 +1206,7 @@ const S = JSON.parse(readFileSync(process.env.HARNESS_SCENARIO, 'utf8'));
 const EXPECTED = process.env.HARNESS_EXPECT;
 
 const trace = {
-  cdp: [], pageInfo: 0, listTaskSpaces: 0, listTabs: 0,
+  cdp: [], pageInfo: 0, listTaskSpaces: 0, listTabs: 0, frames: 0,
   enters: [], sessions: [], lifecycle: [], inserts: 0,
   filledExactly: null, fifoGone: null, events: [],
 };
@@ -1135,6 +1221,7 @@ const makeNode = (spec) => ({
   value: spec.value === undefined ? '' : spec.value,
   maxLength: spec.maxLength === undefined ? null : spec.maxLength,
   focusable: spec.focusable !== false,
+  autocomplete: spec.autocomplete === undefined ? null : spec.autocomplete,
   style: {
     visibility: spec.visibility === undefined ? 'visible' : spec.visibility,
     display: spec.display === undefined ? 'block' : spec.display,
@@ -1145,24 +1232,38 @@ const makeNode = (spec) => ({
     height: spec.height === undefined ? 28 : spec.height,
   },
   type: spec.type === undefined ? 'text' : spec.type,
-  getAttribute (name) { return name === 'type' ? this.type : null },
+  getAttribute (name) {
+    if (name === 'type') return this.type;
+    if (name === 'autocomplete') return this.autocomplete;
+    return null;
+  },
   getBoundingClientRect () { return this.box },
   focus () { if (this.focusable) document.activeElement = this },
   dispatchEvent (event) { trace.events.push(event.type); return true },
 });
 
-let nodes = (S.nodes || []).map(makeNode);
+// One entry per selector the page answers for, in the order the scenario
+// wrote them -- so a multi-field form is a real multi-selector page and
+// not one selector pretending.
+let dom = (S.dom || []).map((entry) => ({
+  selector: entry.selector,
+  nodes: (entry.nodes || []).map(makeNode),
+}));
 const document = {
   activeElement: null,
-  querySelectorAll (selector) { return selector === S.field ? nodes : [] },
+  querySelectorAll (selector) {
+    const hit = dom.find((entry) => entry.selector === selector);
+    return hit ? hit.nodes : [];
+  },
 };
 const getComputedStyle = (el) => el.style;
 class Event { constructor (type) { this.type = type } }
 
 // What the page does to itself while the worker is blocked reading the
-// FIFO -- the one window the fill cannot hold still.
+// FIFO -- the one window the fill cannot hold still. Always the first
+// selector's first node, which is the field every scenario aims at.
 const mutate = (op) => {
-  const el = nodes[0];
+  const el = dom[(S.after && S.after.field) || 0].nodes[0];
   if (op === 'detach') { el.isConnected = false }
   else if (op === 'blur') { document.activeElement = null }
   else if (op === 'disable') { el.disabled = true }
@@ -1170,18 +1271,20 @@ const mutate = (op) => {
   else if (op === 'hide') { el.style.display = 'none' }
   else if (op === 'retype') { el.type = 'password' }
   else if (op === 'refill') { el.value = 'prefilled' }
+  else if (op === 'passkey') { el.autocomplete = 'current-password webauthn' }
+  else if (op === 'navigate') { frameIndex += 1 }
   else if (op === 'swap') {
     el.isConnected = false;
-    nodes = [makeNode(S.swapWith || { type: 'text' })];
-    document.activeElement = nodes[0];
+    dom[(S.after && S.after.field) || 0].nodes = [makeNode(S.swapWith || { type: 'text' })];
+    document.activeElement = dom[(S.after && S.after.field) || 0].nodes[0];
   } else { throw new Error('unknown mutation: ' + op) }
 };
-
 // --- a fake CDP that keeps node identity straight ---------------------
 const byNodeId = new Map();
 const byObjectId = new Map();
 let nextNodeId = 100;
-let resolvedNode = null;
+const resolvedNodes = [];
+let frameIndex = 0;
 
 const dispatch = (method, params) => {
   if (method === 'Page.bringToFront') {
@@ -1189,6 +1292,11 @@ const dispatch = (method, params) => {
     return {};
   }
   if (method === 'Emulation.setDefaultBackgroundColorOverride') return {};
+  if (method === 'Page.getFrameTree') {
+    trace.frames += 1;
+    const frames = S.frames || [];
+    return { frameTree: { frame: frames[Math.min(frameIndex, frames.length - 1)] } };
+  }
   if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
   if (method === 'DOM.querySelectorAll') {
     if (params.nodeId !== 1) return {};
@@ -1205,7 +1313,7 @@ const dispatch = (method, params) => {
     if (!node) return {};
     const objectId = 'obj-' + params.nodeId;
     byObjectId.set(objectId, node);
-    resolvedNode = node;
+    resolvedNodes.push(node);
     return { object: { objectId } };
   }
   if (method === 'Runtime.callFunctionOn') {
@@ -1232,8 +1340,15 @@ const dispatch = (method, params) => {
   throw new Error('unexpected cdp method: ' + method);
 };
 
+// A call the scenario can make stall. It resolves late rather than
+// blocking this event loop, which is what a real ego helper call does:
+// the queueing happens in the browser app, not in this process, so the
+// script's own timer is free to fire and is the only thing that can end
+// the wait.
 const cdp = async (method, params) => {
   trace.cdp.push(method);
+  const stall = (S.stall || {})[method];
+  if (stall) await new Promise((resolve) => setTimeout(resolve, stall));
   const result = dispatch(method, params);
   if (S.after && S.after.call === method) mutate(S.after.do);
   return result;
@@ -1279,8 +1394,12 @@ const T = {
 };
 
 process.on('exit', () => {
-  const target = resolvedNode || nodes[0] || null;
-  trace.filledExactly = target ? target.value === EXPECTED : null;
+  // Every field the script resolved has to hold exactly the value, not
+  // just the first: a multi-field fill that filled one and skipped the
+  // rest must not read as done.
+  trace.filledExactly = resolvedNodes.length
+    ? resolvedNodes.every((node) => node.value === EXPECTED)
+    : null;
   trace.fifoGone = !existsSync(S.fifo);
   writeFileSync(process.env.HARNESS_TRACE, JSON.stringify(trace));
 });
@@ -1298,12 +1417,19 @@ new Function(...names, readFileSync(process.env.HARNESS_SCRIPT, 'utf8'))(
 
 
 def _scenario(**overrides: object) -> dict[str, object]:
+    """One fake page, as the harness reads it.
+
+    `field`/`nodes` stay the single-field spelling most tests want;
+    `dom` is the explicit multi-selector form underneath them.
+    """
+    field = overrides.pop("field", FIELD)
+    nodes = overrides.pop("nodes", [{"type": "password", "value": "stale"}])
     scenario: dict[str, object] = {
         "spaces": [{"id": 41, "name": SPACE, "ownership": "agent"}],
         "tabs": [{"id": 7, "url": f"{ORIGIN}/login"}],
         "pageInfo": [{"url": f"{ORIGIN}/login", "title": "Sign in"}],
-        "field": FIELD,
-        "nodes": [{"type": "password", "value": "stale"}],
+        "frames": [{"id": "F1", "loaderId": "L1", "url": f"{ORIGIN}/login"}],
+        "dom": [{"selector": field, "nodes": nodes}],
     }
     scenario.update(overrides)
     return scenario
@@ -1316,9 +1442,12 @@ class _Run:
     code: int
     out: str
     err: str
+    stage: str | None = None
+    seconds: float = 0.0
     cdp: list[str] = field(default_factory=list)
     inserts: int = 0
     page_info: int = 0
+    frames: int = 0
     sessions: list[str] = field(default_factory=list)
     enters: list[object] = field(default_factory=list)
     lifecycle: list[object] = field(default_factory=list)
@@ -1341,7 +1470,9 @@ class _RunScript(Protocol):
 def run_script(tmp_path: Path) -> _RunScript:
     """Execute the generated script in real Node against the fake runtime,
     with the value crossing a real FIFO written by the module's own
-    `_hand_off` -- the same transport the real child is fed by.
+    `_hand_off` -- the same transport the real child is fed by, and the
+    stage read back with the module's own `_read_stage`, which is the only
+    thing the real worker will accept from that file either.
     """
     harness = tmp_path / "harness.mjs"
     harness.write_text(_HARNESS_JS)
@@ -1356,14 +1487,16 @@ def run_script(tmp_path: Path) -> _RunScript:
         nonlocal runs
         runs += 1
         fifo = tmp_path / f"fill{runs}"
+        stage = tmp_path / f"stage{runs}"
+        stage.write_bytes(b"")
         writer: threading.Thread | None = None
         if secret is not None:
             os.mkfifo(fifo, 0o600)
-            writer = threading.Thread(target=worker._hand_off, args=(str(fifo), secret), daemon=True)
+            writer = threading.Thread(target=worker._Handoff(lambda: secret), args=(str(fifo),), daemon=True)
             writer.start()
 
         script = tmp_path / f"script{runs}.js"
-        script.write_text(worker._browser_script(dict(job or _browser_job()), str(fifo)))
+        script.write_text(worker._browser_script(dict(job or _browser_job()), str(fifo), str(stage)))
         scenario_path = tmp_path / f"scenario{runs}.json"
         scenario_path.write_text(json.dumps({**scenario, "fifo": str(fifo)}))
         trace_path = tmp_path / f"trace{runs}.json"
@@ -1373,11 +1506,13 @@ def run_script(tmp_path: Path) -> _RunScript:
         env["HARNESS_SCENARIO"] = str(scenario_path)
         env["HARNESS_TRACE"] = str(trace_path)
         env["HARNESS_EXPECT"] = secret or ""
+        started = time.monotonic()
         try:
             proc = subprocess.run(
-                [str(_NODE), str(harness)], env=env, capture_output=True, text=True, timeout=30, check=False
+                [str(_NODE), str(harness)], env=env, capture_output=True, text=True, timeout=60, check=False
             )
         finally:
+            elapsed = time.monotonic() - started
             if writer is not None:
                 worker._release(str(fifo), writer)
         trace: Mapping[str, object] = json.loads(trace_path.read_text()) if trace_path.exists() else {}
@@ -1385,9 +1520,12 @@ def run_script(tmp_path: Path) -> _RunScript:
             code=proc.returncode,
             out=proc.stdout,
             err=proc.stderr,
+            stage=worker._read_stage(str(stage)),
+            seconds=elapsed,
             cdp=list(trace.get("cdp", [])),
             inserts=int(trace.get("inserts", 0)),
             page_info=int(trace.get("pageInfo", 0)),
+            frames=int(trace.get("frames", 0)),
             sessions=list(trace.get("sessions", [])),
             enters=list(trace.get("enters", [])),
             lifecycle=list(trace.get("lifecycle", [])),
@@ -1399,38 +1537,50 @@ def run_script(tmp_path: Path) -> _RunScript:
     return run
 
 
+#: The whole browser side of one single-field fill, as CDP calls. Fixed,
+#: so a long value costs exactly what a short one does -- and short: the
+#: two origin rechecks that used to be ego `pageInfo()` helper calls are
+#: now `Page.getFrameTree` queries, which also prove the *document* did
+#: not change rather than only its origin.
 _HAPPY_PATH_CDP = [
+    "Page.getFrameTree",
     "DOM.getDocument",
     "DOM.querySelectorAll",
     "DOM.resolveNode",
     "Runtime.callFunctionOn",
     "Page.bringToFront",
+    "Page.getFrameTree",
     "Runtime.callFunctionOn",
     "Input.insertText",
     "Runtime.callFunctionOn",
+    "Page.getFrameTree",
 ]
 
 
 @requires_node
 def test_script_fills_the_field_with_a_constant_number_of_cdp_calls(run_script: _RunScript) -> None:
-    """The happy path, end to end, in the real Node: the field is resolved
-    to one object and armed, the document is force-armed, the value
-    crosses a real FIFO, the same object is reproven, the value goes in
-    with one trusted insertion, and the readback runs against that same
-    object -- on a fixed CDP sequence, so a long value costs exactly what
-    a short one does.
+    """The happy path, end to end, in the real Node: the document is keyed
+    and its origin checked, the field is resolved to one object and its
+    shape proven, the document is force-armed, the value crosses a real
+    FIFO, the document key and that same object are reproven, the value
+    goes in with one trusted insertion, and the readback runs against
+    that same object -- on a fixed CDP sequence, so a long value costs
+    exactly what a short one does.
     """
     run = run_script(_scenario())
 
     assert run.code == 0
     assert run.out == ""
     assert run.err == ""
+    assert run.stage is None  # nothing refused, so nothing named a stage
     assert run.cdp == _HAPPY_PATH_CDP
     assert run.inserts == 1
     assert run.filled_exactly is True
     assert run.fifo_gone is True  # single use: the script unlinks it
-    assert run.page_info == 3  # before the field, after the handoff, after the value
+    assert run.page_info == 1  # one ego helper call, for the dialog check alone
+    assert run.frames == 3  # opened, before the insertion, after the value
     assert run.events == ["input"]  # the stale value was cleared
+
 
 @requires_node
 def test_script_uses_the_nonactivating_compositor_arm_fallback(run_script: _RunScript) -> None:
@@ -1519,26 +1669,80 @@ def test_script_refuses_a_space_with_no_live_tab(run_script: _RunScript) -> None
 
 @requires_node
 @pytest.mark.parametrize(
-    "page",
+    "frame",
     [
-        [{"dialog": "confirm"}],
-        [{"url": "https://evil.example/login"}],
-        [{"url": "http://accounts.acme.example/login"}],
-        [{"url": f"{ORIGIN}.evil.example/login"}],
-        [{"title": "no url at all"}],
-        [{"url": "not a url"}],
+        {"id": "F1", "loaderId": "L1", "url": "https://evil.example/login"},
+        {"id": "F1", "loaderId": "L1", "url": "http://accounts.acme.example/login"},
+        {"id": "F1", "loaderId": "L1", "url": f"{ORIGIN}.evil.example/login"},
+        {"id": "F1", "loaderId": "L1"},
+        {"id": "F1", "loaderId": "L1", "url": "not a url"},
+        {"loaderId": "L1", "url": f"{ORIGIN}/login"},  # no frame id: no identity
     ],
-    ids=["dialog", "other-origin", "downgraded-scheme", "suffix-origin", "no-url", "unparseable"],
+    ids=["other-origin", "downgraded-scheme", "suffix-origin", "no-url", "unparseable", "no-frame-id"],
 )
 def test_script_refuses_a_page_that_is_not_exactly_an_allowlisted_origin(
-    run_script: _RunScript, page: list[dict[str, object]]
+    run_script: _RunScript, frame: dict[str, object]
 ) -> None:
-    run = run_script(_scenario(pageInfo=page))
+    run = run_script(_scenario(frames=[frame]))
 
     assert run.code == 1
+    assert run.stage == "origin"
+    assert run.cdp == ["Page.getFrameTree"]  # nothing else is even asked
+    assert run.inserts == 0
+    assert run.fifo_gone is False
+
+
+@requires_node
+def test_script_names_a_blocking_dialog_as_a_human_handoff_instead_of_stalling(
+    run_script: _RunScript,
+) -> None:
+    """Page script does not run while a native dialog is up, so every
+    check after this one would wait rather than answer. Answering the
+    dialog is a person's decision, so it is reported as one immediately
+    -- and before the value is ever collected.
+    """
+    run = run_script(_scenario(pageInfo=[{"url": f"{ORIGIN}/login", "dialog": "confirm"}]))
+
+    assert run.code == 1
+    assert run.stage == "dialog_blocked"
     assert run.cdp == []
     assert run.inserts == 0
     assert run.fifo_gone is False
+
+
+@requires_node
+@pytest.mark.parametrize(
+    "autocomplete",
+    ["webauthn", "current-password webauthn", "username webauthn", " webauthn  "],
+)
+def test_script_names_a_passkey_field_as_a_human_handoff_before_reading_the_value(
+    run_script: _RunScript, autocomplete: str
+) -> None:
+    """A field asking for conditional passkey mediation answers whatever
+    is typed with a platform-authenticator sheet only the human at this
+    Mac can satisfy. Refusing before the FIFO is read is what turns a
+    fill that would have spent its whole deadline into one typed answer.
+    """
+    run = run_script(_scenario(nodes=[{"type": "password", "autocomplete": autocomplete}]))
+
+    assert run.code == 1
+    assert run.stage == "handoff_passkey"
+    assert run.inserts == 0
+    assert run.fifo_gone is False  # the value was never collected
+
+
+@requires_node
+def test_script_fills_a_field_whose_autocomplete_merely_mentions_a_passkey_word(
+    run_script: _RunScript,
+) -> None:
+    """`webauthn` is one token of a space-separated list, not a substring
+    match: refusing every field whose autocomplete happens to contain
+    those letters would refuse ordinary pages.
+    """
+    run = run_script(_scenario(nodes=[{"type": "password", "autocomplete": "webauthnish current-password"}]))
+
+    assert run.code == 0
+    assert run.filled_exactly is True
 
 
 @requires_node
@@ -1561,7 +1765,6 @@ def test_script_refuses_a_page_that_is_not_exactly_an_allowlisted_origin(
         [{"type": "password", "visibility": "hidden"}],
         [{"type": "password", "display": "none"}],
         [{"type": "password", "opacity": "0"}],
-        [{"type": "password", "focusable": False}],
     ],
     ids=[
         "no-match",
@@ -1580,7 +1783,6 @@ def test_script_refuses_a_page_that_is_not_exactly_an_allowlisted_origin(
         "visibility-hidden",
         "display-none",
         "transparent",
-        "refuses-focus",
     ],
 )
 def test_script_refuses_any_field_that_is_not_one_writable_visible_expected_input(
@@ -1589,6 +1791,7 @@ def test_script_refuses_any_field_that_is_not_one_writable_visible_expected_inpu
     run = run_script(_scenario(nodes=nodes))
 
     assert run.code == 1
+    assert run.stage == "locate_field"
     assert run.out == ""
     assert run.err == ""
     assert run.inserts == 0
@@ -1596,17 +1799,17 @@ def test_script_refuses_any_field_that_is_not_one_writable_visible_expected_inpu
 
 
 @requires_node
-@pytest.mark.parametrize("mutation", ["detach", "swap", "blur", "disable", "readonly", "hide", "retype", "refill"])
+@pytest.mark.parametrize("mutation", ["detach", "swap", "disable", "readonly", "hide", "retype"])
 def test_script_refuses_when_the_field_changed_while_the_handoff_was_blocking(
     run_script: _RunScript, mutation: str
 ) -> None:
     """Reading the FIFO waits on another process, so it is the one window
-    in which the page can move on. The identity, focus and shape of the
-    exact object that was armed are all reproven immediately before the
-    single insertion -- a swapped, detached, blurred, disabled, readonly,
-    hidden, retyped or refilled field never receives the value.
+    in which the page can move on. The identity and shape of the exact
+    object that was resolved are reproven immediately before the single
+    insertion -- a swapped, detached, disabled, readonly, hidden or
+    retyped field never receives the value.
     """
-    job = _browser_job(kind="totp", field="#otp")
+    job = _browser_job(kind="totp", fields=["#otp"])
     scenario = _scenario(
         field="#otp",
         nodes=[{"type": "text"}],
@@ -1616,19 +1819,61 @@ def test_script_refuses_when_the_field_changed_while_the_handoff_was_blocking(
     run = run_script(scenario, job=job, secret="123456")
 
     assert run.code == 1
+    assert run.stage == "focus"
     assert run.inserts == 0
     assert run.fifo_gone is True  # the value was collected, and then went nowhere
-    assert run.cdp[-1] == "Runtime.callFunctionOn"
+
+
+@requires_node
+@pytest.mark.parametrize("mutation", ["blur", "refill"])
+def test_script_rearms_a_field_the_page_blurred_or_refilled_in_the_window(
+    run_script: _RunScript, mutation: str
+) -> None:
+    """Focus and emptiness are established *after* the handoff, not
+    before it, so the two things a page most plausibly does to a login
+    form while a fill is in flight -- moving focus, or autofilling the
+    field itself -- are recovered from rather than refused. What is still
+    refused is anything that changes the field's identity or shape; that
+    is the test above.
+    """
+    job = _browser_job(kind="totp", fields=["#otp"])
+    scenario = _scenario(
+        field="#otp",
+        nodes=[{"type": "text"}],
+        after={"call": "Page.bringToFront", "do": mutation},
+    )
+
+    run = run_script(scenario, job=job, secret="123456")
+
+    assert run.code == 0
+    assert run.stage is None
+    assert run.inserts == 1
+    assert run.filled_exactly is True
+
+
+@requires_node
+def test_script_refuses_a_field_that_cannot_take_focus_when_it_is_armed(run_script: _RunScript) -> None:
+    """A field whose `focus()` does nothing has the right shape and the
+    wrong behaviour, so it is refused at the arm rather than at the
+    lookup -- and named as the arm, which is where it actually failed.
+    """
+    run = run_script(_scenario(nodes=[{"type": "password", "focusable": False}]))
+
+    assert run.code == 1
+    assert run.stage == "focus"
+    assert run.inserts == 0
+    assert run.filled_exactly is False
 
 
 @requires_node
 @pytest.mark.parametrize("kind", ["totp", "gmail_otp"])
 def test_script_refuses_a_masked_field_for_a_one_time_code(run_script: _RunScript, kind: str) -> None:
-    job = _browser_job(kind=kind, field="#otp")
+    job = _browser_job(kind=kind, fields=["#otp"])
 
     masked = run_script(_scenario(field="#otp", nodes=[{"type": "password"}]), job=job, secret="123456")
 
     assert masked.code == 1
+    assert masked.stage == "locate_field"
     assert masked.inserts == 0
 
 
@@ -1637,7 +1882,7 @@ def test_script_refuses_a_masked_field_for_a_one_time_code(run_script: _RunScrip
 def test_script_accepts_the_plain_field_shapes_a_one_time_code_belongs_in(
     run_script: _RunScript, accepted: str | None
 ) -> None:
-    job = _browser_job(kind="gmail_otp", field="#otp")
+    job = _browser_job(kind="gmail_otp", fields=["#otp"])
 
     run = run_script(_scenario(field="#otp", nodes=[{"type": accepted}]), job=job, secret="123456")
 
@@ -1647,13 +1892,23 @@ def test_script_accepts_the_plain_field_shapes_a_one_time_code_belongs_in(
 
 @requires_node
 def test_script_refuses_a_navigation_that_lands_before_the_value_goes_in(run_script: _RunScript) -> None:
-    """The origin is reproven after the handoff and again at the end. A
-    page that navigated while the handoff was blocking is no longer the
-    page the field was validated on.
+    """The document key is reproven after the handoff and again at the
+    end. A page that navigated while the handoff was blocking is not the
+    document the field was validated on -- even when it kept its origin,
+    which is what keying on the loader rather than the URL buys.
     """
-    run = run_script(_scenario(pageInfo=[{"url": f"{ORIGIN}/login"}, {"url": "https://evil.example/login"}]))
+    run = run_script(
+        _scenario(
+            frames=[
+                {"id": "F1", "loaderId": "L1", "url": f"{ORIGIN}/login"},
+                {"id": "F1", "loaderId": "L2", "url": f"{ORIGIN}/login"},
+            ],
+            after={"call": "Page.bringToFront", "do": "navigate"},
+        )
+    )
 
     assert run.code == 1
+    assert run.stage == "origin"
     assert run.inserts == 0
 
 
@@ -1661,17 +1916,17 @@ def test_script_refuses_a_navigation_that_lands_before_the_value_goes_in(run_scr
 def test_script_refuses_a_navigation_that_lands_after_the_value_went_in(run_script: _RunScript) -> None:
     run = run_script(
         _scenario(
-            pageInfo=[
-                {"url": f"{ORIGIN}/login"},
-                {"url": f"{ORIGIN}/login"},
-                {"url": "https://evil.example/done"},
-            ]
+            frames=[
+                {"id": "F1", "loaderId": "L1", "url": f"{ORIGIN}/login"},
+                {"id": "F9", "loaderId": "L9", "url": "https://evil.example/done"},
+            ],
+            after={"call": "Input.insertText", "do": "navigate"},
         )
     )
 
     assert run.code == 1
+    assert run.stage == "origin"
     assert run.inserts == 1  # it went in, and the fill is still refused
-    assert run.cdp[-1] == "Runtime.callFunctionOn"
 
 
 @requires_node
@@ -1683,6 +1938,7 @@ def test_script_refuses_when_the_field_does_not_hold_exactly_what_was_inserted(r
     run = run_script(_scenario(nodes=[{"type": "password", "maxLength": 8}]))
 
     assert run.code == 1
+    assert run.stage == "type_verify"
     assert run.inserts == 1
     assert run.filled_exactly is False
     assert run.cdp[-1] == "Runtime.callFunctionOn"
@@ -1692,11 +1948,14 @@ def test_script_refuses_when_the_field_does_not_hold_exactly_what_was_inserted(r
 @pytest.mark.parametrize("secret", ["", None], ids=["empty", "absent"])
 def test_script_refuses_when_the_handoff_carried_nothing(run_script: _RunScript, secret: str | None) -> None:
     """An empty FIFO -- a writer that closed without writing -- is not a
-    value, and neither is a FIFO that is not there at all.
+    value, and neither is a FIFO that is not there at all. Neither is a
+    stage of the fill either: the sink's own transport failed, so nothing
+    claims a stage and the worker reports its unnamed sink failure.
     """
     run = run_script(_scenario(), secret=secret)
 
     assert run.code == 1
+    assert run.stage is None
     assert run.inserts == 0
     assert run.cdp == _HAPPY_PATH_CDP[: _HAPPY_PATH_CDP.index("Page.bringToFront") + 1]
 
@@ -1710,3 +1969,256 @@ def test_script_refuses_a_runtime_missing_a_helper_it_needs(run_script: _RunScri
     assert run.out == ""
     assert run.err == ""
     assert run.inserts == 0
+
+
+# --- more than one field, one value, one bounded window ----------------
+
+
+def _confirm_scenario(**overrides: object) -> dict[str, object]:
+    """A reset form: a new-password field and its confirmation."""
+    scenario = _scenario(
+        dom=[
+            {"selector": FIELD, "nodes": [{"type": "password", "value": "stale"}]},
+            {"selector": CONFIRM_FIELD, "nodes": [{"type": "password"}]},
+        ]
+    )
+    scenario.update(overrides)
+    return scenario
+
+
+@requires_node
+def test_script_fills_every_configured_field_in_order_from_one_handoff(
+    run_script: _RunScript,
+) -> None:
+    """A confirmation form is one credential going into two fields, so it
+    is one enrollment, one worker, one FIFO read, and one document -- not
+    two fills racing each other with two windows for the page to move in.
+    Each field is armed and reproven in its turn, immediately before it
+    receives the value.
+    """
+    job = _browser_job(fields=[FIELD, CONFIRM_FIELD])
+
+    run = run_script(_confirm_scenario(), job=job)
+
+    assert run.code == 0
+    assert run.stage is None
+    assert run.inserts == 2
+    assert run.filled_exactly is True  # both of them, not just the first
+    assert run.fifo_gone is True  # read once
+    assert run.page_info == 1  # still one ego helper call for the whole form
+    # Both fields are resolved before the value is collected, and each is
+    # armed and verified in its turn afterwards.
+    assert run.cdp == [
+        "Page.getFrameTree",
+        "DOM.getDocument",
+        "DOM.querySelectorAll",
+        "DOM.resolveNode",
+        "DOM.querySelectorAll",
+        "DOM.resolveNode",
+        "Runtime.callFunctionOn",
+        "Runtime.callFunctionOn",
+        "Page.bringToFront",
+        "Page.getFrameTree",
+        "Runtime.callFunctionOn",
+        "Input.insertText",
+        "Runtime.callFunctionOn",
+        "Page.getFrameTree",
+        "Runtime.callFunctionOn",
+        "Input.insertText",
+        "Runtime.callFunctionOn",
+        "Page.getFrameTree",
+    ]
+
+
+@requires_node
+def test_script_refuses_the_whole_form_before_the_value_when_any_field_is_wrong(
+    run_script: _RunScript,
+) -> None:
+    """Every field is proven before the FIFO is read, so a form with one
+    bad field never collects the value at all -- rather than filling the
+    good fields and discovering the rest.
+    """
+    job = _browser_job(fields=[FIELD, CONFIRM_FIELD])
+    scenario = _confirm_scenario(
+        dom=[
+            {"selector": FIELD, "nodes": [{"type": "password"}]},
+            {"selector": CONFIRM_FIELD, "nodes": [{"type": "password", "readOnly": True}]},
+        ]
+    )
+
+    run = run_script(scenario, job=job)
+
+    assert run.code == 1
+    assert run.stage == "locate_field"
+    assert run.inserts == 0
+    assert run.fifo_gone is False
+
+
+@requires_node
+def test_script_refuses_a_form_where_a_configured_field_is_missing(run_script: _RunScript) -> None:
+    job = _browser_job(fields=[FIELD, "#nowhere"])
+
+    run = run_script(_confirm_scenario(), job=job)
+
+    assert run.code == 1
+    assert run.stage == "locate_field"
+    assert run.inserts == 0
+    assert run.fifo_gone is False
+
+
+@requires_node
+def test_script_refuses_a_second_field_that_went_bad_after_the_first_was_filled(
+    run_script: _RunScript,
+) -> None:
+    """Two fields are two moments, so the second can go bad after the
+    first is already filled. That is refused rather than reported as
+    done, and the stage says where -- the one thing this cannot do is
+    unfill the first field, which is why the refusal has to be loud.
+    """
+    job = _browser_job(fields=[FIELD, CONFIRM_FIELD])
+    scenario = _confirm_scenario(after={"call": "Input.insertText", "do": "disable", "field": 1})
+
+    run = run_script(scenario, job=job)
+
+    assert run.code == 1
+    assert run.stage in {"focus", "type_verify"}
+    assert run.inserts == 1  # the first went in; the second never did
+    assert run.filled_exactly is False
+
+
+# --- bounds: a stalled browser call is a named refusal, not a stall ----
+
+
+@requires_node
+def test_script_refuses_a_stalled_arm_at_its_own_deadline_instead_of_waiting(
+    run_script: _RunScript,
+) -> None:
+    """The measurement this exists for. `Page.bringToFront` is 0-1ms when
+    it works; the failure mode it replaced could hold the connection for
+    fifteen seconds while reporting nothing. Here it stalls for twenty,
+    and the script gives up at its own arm deadline with `timeout_stage`
+    -- so the caller learns where it stopped in about two seconds instead
+    of spending the whole fill's budget.
+    """
+    stall_ms = 20_000
+    run = run_script(_scenario(stall={"Page.bringToFront": stall_ms}))
+
+    assert run.code == 1
+    assert run.stage == "timeout_stage"
+    assert run.inserts == 0
+    assert run.fifo_gone is False  # a stalled arm never collects the value
+    bound = worker._ARM_DEADLINE_MS / 1000
+    assert run.seconds < bound + 2.0
+    assert run.seconds < stall_ms / 1000 / 2
+
+
+@requires_node
+def test_script_refuses_a_stalled_helper_call_at_the_step_deadline(run_script: _RunScript) -> None:
+    """Not just the arm: every await in the script has a ceiling, so a
+    wedged tab cannot turn any single step into the whole deadline.
+    """
+    run = run_script(_scenario(stall={"Page.getFrameTree": 20_000}))
+
+    assert run.code == 1
+    assert run.stage == "timeout_stage"
+    assert run.inserts == 0
+    assert run.seconds < worker._STEP_DEADLINE_MS / 1000 + 2.0
+
+
+@requires_node
+def test_a_stalled_step_prints_nothing_even_though_it_abandoned_a_promise(
+    run_script: _RunScript,
+) -> None:
+    """Giving up on a call leaves its rejection behind. Node prints an
+    unhandled rejection to stderr, which is exactly the channel this
+    process must never put anything on.
+    """
+    run = run_script(_scenario(stall={"Page.getFrameTree": 20_000}))
+
+    assert run.out == ""
+    assert run.err == ""
+
+
+def test_read_stage_accepts_nothing_but_this_modules_own_keywords(tmp_path: Path) -> None:
+    """The stage file is a channel from a browser child, so what makes it
+    safe is not who writes it but what this side will read out of it.
+    """
+    path = tmp_path / "stage"
+    for token in worker._SINK_STAGES:
+        path.write_text(token)
+        assert worker._read_stage(str(path)) == token
+    for rejected in (
+        "",
+        "locate_field\n",
+        "LOCATE_FIELD",
+        "not_authorized",  # a stage only the worker itself may claim
+        "secret_missing",
+        CANARY_SECRET,
+        "x" * 4096,
+        "https://accounts.acme.example/login?token=abc",
+    ):
+        path.write_text(rejected)
+        assert worker._read_stage(str(path)) is None
+    path.unlink()
+    assert worker._read_stage(str(path)) is None
+
+
+def test_the_sink_reports_the_stage_its_child_named(tmp_path: Path, fake_binary: _WriteExecutable) -> None:
+    """End to end on the Python side: ego collapses every nonzero script
+    exit to 1, so the stage file is the only thing that can carry which
+    stage refused -- and the runner has to actually read it.
+    """
+    binary = fake_binary(
+        "ego-browser",
+        """
+        import re
+        import sys
+
+        script = sys.stdin.read()
+        path = re.search(r'const STAGE = "([^"]+)";', script).group(1)
+        open(path, "w").write("locate_field")
+        sys.exit(1)
+        """,
+    )
+
+    with pytest.raises(worker._WorkerError, match="locate_field"):
+        worker._EgoBrowser(binary=binary)(
+            lambda fifo, stage: worker._browser_script(_browser_job(), fifo, stage), lambda: CANARY_SECRET
+        )
+
+
+def test_the_sink_ignores_a_stage_its_child_had_no_right_to_claim(
+    tmp_path: Path, fake_binary: _WriteExecutable
+) -> None:
+    binary = fake_binary(
+        "ego-browser",
+        f"""
+        import re
+        import sys
+
+        script = sys.stdin.read()
+        path = re.search(r'const STAGE = "([^"]+)";', script).group(1)
+        open(path, "w").write({CANARY_SECRET!r})
+        sys.exit(1)
+        """,
+    )
+
+    with pytest.raises(worker._WorkerError, match="sink_failed"):
+        worker._EgoBrowser(binary=binary)(
+            lambda fifo, stage: worker._browser_script(_browser_job(), fifo, stage), lambda: CANARY_SECRET
+        )
+
+
+def test_the_sink_leaves_no_stage_file_behind(tmp_path: Path, fake_binary: _WriteExecutable) -> None:
+    """The stage file lives in the same private directory as the FIFO and
+    goes with it, or the directory could not be removed at all.
+    """
+    seen: list[str] = []
+    binary = fake_binary("ego-browser", "import sys\nsys.stdin.read()")
+
+    worker._EgoBrowser(binary=binary)(
+        lambda fifo, stage: seen.append(stage) or "harmless", lambda: CANARY_SECRET
+    )
+
+    assert seen and not os.path.exists(seen[0])
+    assert not os.path.exists(os.path.dirname(seen[0]))

@@ -98,6 +98,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     credential_fill_browser.add_argument("ref")
     credential_fill_browser.add_argument("--space", required=True)
+    credential_fill_native = credential_sub.add_parser(
+        "fill-native",
+        help="refuse a native-app fill, and say which two paths do work",
+    )
+    credential_fill_native.add_argument("ref")
+    credential_fill_native.add_argument("--app", required=True)
     credential_enroll = credential_sub.add_parser(
         "enroll",
         help="store a secret, or authorize a derived credential, in the vault",
@@ -133,6 +139,18 @@ _PASTEBOARD_TIMEOUT = 5.0
 _ENROLL_FAILED = "credential.enroll_failed"
 _ENROLL_NOT_AUTHORED = "credential.enroll_not_authored"
 
+#: Fixed prose for this module's own two codes, so every credential
+#: failure prints one machine code *and* one sentence a human can act
+#: on. Both tables this envelope draws from -- here, and
+#: `credentials._MESSAGES` -- are compile-time constants that interpolate
+#: nothing, which is the whole reason printing the message is safe: there
+#: is no path by which a vault diagnostic, a pasteboard's contents, or a
+#: page's text becomes one of these strings.
+_CLI_MESSAGES: Mapping[str, str] = {
+    _ENROLL_FAILED: "The vault refused the enrollment",
+    _ENROLL_NOT_AUTHORED: "That credential's value is derived from policy, so there is nothing to paste",
+}
+
 
 class _Receipt(Protocol):
     def to_json(self) -> Mapping[str, object]: ...
@@ -142,6 +160,8 @@ class _Broker(Protocol):
     def check(self) -> Sequence[str]: ...
 
     def fill_browser(self, ref: str, *, space: str) -> _Receipt: ...
+
+    def fill_native(self, ref: str, *, app: str) -> _Receipt: ...
 
 
 class _Enrollment(Protocol):
@@ -341,9 +361,20 @@ class _CredentialCli:
                 )
                 _print_json_line(receipt.to_json(), file=sys.stdout)
                 return 0
+            if args.credential_command == "fill-native":
+                # Always raises. The broker owns that refusal, so this
+                # path is one call rather than a message duplicated here.
+                self.credentials.CredentialBroker().fill_native(args.ref, app=args.app)
+                return 1
             return self._enroll(args.ref, clipboard=args.clipboard)
         except (self.credentials.CredentialError, _CredentialCliError) as exc:
-            _print_json_line({"error": exc.code}, file=sys.stderr)
+            # The code is the machine contract; the message says what to
+            # do about it. Both come from closed compile-time tables, so
+            # neither can carry a subprocess's or a page's own words.
+            _print_json_line(
+                {"error": exc.code, "message": _CLI_MESSAGES.get(exc.code) or str(exc)},
+                file=sys.stderr,
+            )
             return 1
 
     def _enroll(self, ref: str, *, clipboard: bool) -> int:

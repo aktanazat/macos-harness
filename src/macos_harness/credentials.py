@@ -18,12 +18,20 @@ eagerly, so a malformed manifest fails once, at the boundary, instead of
 half-way through a login.
 
 Every entry has one identity: the SHA-256 digest of its whole canonical
-policy -- ref, kind, sorted origins, field selector, and, for a Gmail
-entry, its mailbox, sender, patterns, and age bound. Both vault names
-this module can ask mem-secret for are derived from that digest, so a
-manifest edit alone rebinds nothing: change any source or any destination
-and the entry names a different vault key, which stays empty until a
-human runs `credential enroll` for the edited policy.
+policy -- ref, kind, sorted origins, the ordered field selectors, and,
+for a Gmail entry, its mailbox, sender, patterns, and age bound. Both
+vault names this module can ask mem-secret for are derived from that
+digest, so a manifest edit alone rebinds nothing: change any source or
+any destination and the entry names a different vault key, which stays
+empty until a human runs `credential enroll` for the edited policy.
+
+An entry may declare more than one field, because a confirmation or
+reset form asks for the same new value twice. The digest covers that
+whole ordered list, so one enrollment authorizes exactly that set in
+exactly that order and nothing else, and one `fill_browser` call fills
+them all inside one bounded window on one proven document. A one-field
+entry keeps the digest it had before lists existed, so this costs no
+re-enrollment.
 
 For a password or TOTP seed that derived name is the secret's own vault
 key. A Gmail entry stores no secret -- its value exists only in an email
@@ -58,14 +66,21 @@ handed an injected value outlives its deadline.
 
 The worker's stdout and stderr are attached to `/dev/null`, so provider
 prose (a browser error, an email body, a mem-secret diagnostic) cannot be
-read back into this process even by accident, and every failure -- a
-missing binary, a nonzero exit, a hung child -- collapses to one of the
-closed set of fixed codes in `_Code`. What a caller gets back is fixed
+read back into this process even by accident. What reaches this process
+instead is the worker's exit status, and the closed `_EXIT_CODES` table
+turns it into one of the fixed codes in `_Code` -- including which
+*stage* refused, since a stage name is a closed-set author-time constant
+rather than anything the run observed. What a caller gets back is fixed
 vocabulary and nothing else: a five-field `CredentialReceipt`, or a
 `CredentialError` whose message comes from the table in this module. No
 manifest entry body, secret, one-time code, email body, provider output,
 taskspace name, or caller-supplied prose ever reaches a return value, an
 exception, `argv`, or this process's own stdout or stderr.
+
+The browser is the only sink. `fill_native` exists to refuse in that
+same fixed vocabulary -- `credential.unsupported_sink`, naming the
+system AutoFill sheet and a human handoff -- because a native text field
+offers none of the checks the browser path is built on.
 
 None of this defends against a hostile process running as this same user:
 such a process can already invoke `mem-secret` and `gws` itself, which is
@@ -87,13 +102,14 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import ClassVar, Literal, Protocol
+from typing import ClassVar, Literal, NoReturn, Protocol
 
 from .errors import MacOSError
 
@@ -128,8 +144,11 @@ _FOREIGN_WRITE = stat.S_IWGRP | stat.S_IWOTH
 _MANIFEST_VERSION = 1
 
 #: The `version` stamped into every job handed to the worker, so the pair
-#: can disagree in a later release without either side guessing.
-_JOB_VERSION = 1
+#: can disagree in a later release without either side guessing. Bumped
+#: to 2 when the job's single `field` became an ordered `fields` list: a
+#: worker that still expects 1 refuses rather than filling the first
+#: selector and silently skipping the rest.
+_JOB_VERSION = 2
 
 #: Both halves of the fill command are absolute and resolved, and the
 #: interpreter is isolated (`-I` implies `-E` and `-s`, and keeps the
@@ -141,6 +160,47 @@ _WORKER = (
     sys.executable,
     "-I",
     str(Path(__file__).with_name("_credential_worker.py").resolve()),
+)
+
+#: The whole environment a fill runs in, built here rather than
+#: inherited.
+#:
+#: `-I` and absolute paths settle what *this* process's child executes,
+#: but they say nothing about what the pinned helpers below it resolve,
+#: and both of them read the environment to decide:
+#:
+#: * ``mem-secret`` takes its vault root from ``ENGRAM_ROOT``, falling
+#:   back to ``$HOME/memory``, and its vault directory from
+#:   ``ENGRAM_SECRETS_DIR``. An inherited value for either points the
+#:   vault at a store somebody else wrote, so what mem-secret injects
+#:   under this entry's derived name is a value nobody enrolled -- and
+#:   the fill types it into a real login form.
+#: * the pinned ``ego-browser`` wrapper resolves the real CLI under
+#:   ``$HOME`` (measured: ``HOME=/tmp/attacker`` makes it look for
+#:   ``/tmp/attacker/.local/share/ego/...``). Under a writable ``HOME``
+#:   that is an attacker-chosen program being handed the path of the FIFO
+#:   the value is about to cross.
+#: * ``SOPS_AGE_KEY*`` short-circuits mem-secret's own key discovery, and
+#:   ``GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE`` points ``gws`` at an
+#:   arbitrary OAuth identity -- which would be reading one-time codes
+#:   out of somebody else's mailbox.
+#:
+#: So the child gets a reconstructed environment of reviewed variables
+#: only: this uid's real home from the password database, a fixed PATH
+#: containing just the directories the pinned helpers live in, and a
+#: UTF-8 locale so text handling does not depend on the caller's. An
+#: allowlist rather than a denylist, because the next variable one of
+#: these helpers learns to read will not be in any denylist written
+#: today. A Gmail entry whose ``gws`` credentials are reachable only
+#: through an environment pointer has to be configured on disk instead;
+#: that is the cost of not letting a caller choose the identity a
+#: one-time code is read under.
+_CHILD_ENV: Mapping[str, str] = MappingProxyType(
+    {
+        "HOME": str(_HOME),
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "en_US.UTF-8",
+    }
 )
 
 #: Every vault name is derived from policy, never authored: 128 bits of
@@ -164,6 +224,12 @@ _GMAIL_TIMEOUT_SECONDS = 120.0
 _REAP_TIMEOUT_SECONDS = 2.0
 
 _MAX_SELECTOR = 256
+
+#: How many fields one entry may declare. A confirmation or reset form
+#: asks for the same new value twice, occasionally three times; past that
+#: this is not one credential going into one form, and a caller wanting
+#: more is asking for a second entry and a second authorization.
+_MAX_FIELDS = 4
 _MAX_ORIGIN = 255
 _MAX_EMAIL = 254
 _MAX_PATTERN = 512
@@ -236,6 +302,14 @@ class _Code(StrEnum):
     message in `_MESSAGES` is fixed prose that never interpolates
     anything. Nothing outside this module can add a code, so nothing
     outside this module can put text into a `CredentialError`.
+
+    The `credential.fill_failed/<stage>` family names *which worker stage
+    refused*, and nothing else. A stage name is a member of a closed set
+    decided at author time -- never a selector, an origin, a field value,
+    a provider message, or any other runtime string -- so naming the
+    stage cannot widen what a failure discloses. `credential.fill_failed`
+    without a stage remains what an older worker, a signal, or an
+    unclassified refusal reports.
     """
 
     MANIFEST_MISSING = "credential.manifest_missing"
@@ -247,6 +321,20 @@ class _Code(StrEnum):
     TARGET_INVALID = "credential.target_invalid"
     WORKER_UNAVAILABLE = "credential.worker_unavailable"
     FILL_FAILED = "credential.fill_failed"
+    FILL_BAD_JOB = "credential.fill_failed/bad_job"
+    FILL_NOT_AUTHORIZED = "credential.fill_failed/not_authorized"
+    FILL_SECRET_MISSING = "credential.fill_failed/secret_missing"
+    FILL_OTP_FETCH = "credential.fill_failed/otp_fetch"
+    FILL_SINK = "credential.fill_failed/sink"
+    FILL_LOCATE_SPACE = "credential.fill_failed/locate_space"
+    FILL_ORIGIN = "credential.fill_failed/origin"
+    FILL_LOCATE_FIELD = "credential.fill_failed/locate_field"
+    FILL_FOCUS = "credential.fill_failed/focus"
+    FILL_TYPE_VERIFY = "credential.fill_failed/type_verify"
+    FILL_TIMEOUT_STAGE = "credential.fill_failed/timeout_stage"
+    FILL_DIALOG_BLOCKED = "credential.fill_failed/dialog_blocked"
+    HANDOFF_PASSKEY = "credential.handoff_required/passkey"
+    UNSUPPORTED_SINK = "credential.unsupported_sink"
     TIMEOUT = "credential.timeout"
     UNAVAILABLE = "credential.unavailable"
 
@@ -262,10 +350,74 @@ _MESSAGES: Mapping[str, str] = MappingProxyType(
         _Code.TARGET_INVALID: "The fill target is malformed",
         _Code.WORKER_UNAVAILABLE: "The credential worker could not be started",
         _Code.FILL_FAILED: "The credential fill did not complete",
+        _Code.FILL_BAD_JOB: "The credential fill did not complete: the worker refused the job",
+        _Code.FILL_NOT_AUTHORIZED: "The credential fill did not complete: this policy is not enrolled",
+        _Code.FILL_SECRET_MISSING: "The credential fill did not complete: the vault holds no value for this policy",
+        _Code.FILL_OTP_FETCH: "The credential fill did not complete: no one-time code could be obtained",
+        _Code.FILL_SINK: "The credential fill did not complete: the browser sink could not be run",
+        _Code.FILL_LOCATE_SPACE: "The credential fill did not complete: the named browser taskspace was refused",
+        _Code.FILL_ORIGIN: "The credential fill did not complete: the page is not an allowed origin",
+        _Code.FILL_LOCATE_FIELD: "The credential fill did not complete: a configured field was not found exactly once",
+        _Code.FILL_FOCUS: "The credential fill did not complete: a configured field could not be focused and cleared",
+        _Code.FILL_TYPE_VERIFY: "The credential fill did not complete: the field did not hold what was typed",
+        _Code.FILL_TIMEOUT_STAGE: "The credential fill did not complete: one browser stage exceeded its bound",
+        _Code.FILL_DIALOG_BLOCKED: (
+            "The credential fill did not complete: a dialog is blocking the page and a human must answer it"
+        ),
+        _Code.HANDOFF_PASSKEY: (
+            "That field expects a passkey or platform authenticator, which only the human at this Mac can satisfy"
+        ),
+        _Code.UNSUPPORTED_SINK: (
+            "This harness fills credentials into browser fields only. For a native app, use the system AutoFill "
+            "sheet yourself, or hand the step to the human"
+        ),
         _Code.TIMEOUT: "The credential fill exceeded its time bound",
         _Code.UNAVAILABLE: "The credential broker is unavailable",
     }
 )
+
+#: Which worker stage a fill stopped in. The worker owns the other side
+#: of this table (`_credential_worker._STAGES`) and the two are checked
+#: against each other by test, not at runtime: coupling the broker's
+#: import graph to the isolated worker script to share sixteen keywords
+#: would cost more than it proves.
+#:
+#: A stage arrives in a file this module creates and names in the job,
+#: never in the worker's exit status. The status would be ambiguous: the
+#: direct child is `mem-secret`, and mem-secret, sops, or the shell can
+#: exit nonzero *before* the worker runs at all, so any number the worker
+#: might choose could also be somebody else's failure. A token only the
+#: worker writes cannot be confused that way -- and an absent or empty
+#: file is exactly the "something upstream failed" case, reported as
+#: `credential.fill_failed` with no stage, which is what it is.
+_STAGE_CODES: Mapping[str, _Code] = MappingProxyType(
+    {
+        "bad_job": _Code.FILL_BAD_JOB,
+        "not_authorized": _Code.FILL_NOT_AUTHORIZED,
+        "mailbox_mismatch": _Code.FILL_NOT_AUTHORIZED,
+        "secret_missing": _Code.FILL_SECRET_MISSING,
+        "bad_totp_secret": _Code.FILL_OTP_FETCH,
+        "gws_failed": _Code.FILL_OTP_FETCH,
+        "otp_not_found": _Code.FILL_OTP_FETCH,
+        "unbounded_match": _Code.FILL_OTP_FETCH,
+        "sink_failed": _Code.FILL_SINK,
+        "locate_space": _Code.FILL_LOCATE_SPACE,
+        "origin": _Code.FILL_ORIGIN,
+        "locate_field": _Code.FILL_LOCATE_FIELD,
+        "focus": _Code.FILL_FOCUS,
+        "type_verify": _Code.FILL_TYPE_VERIFY,
+        "timeout_stage": _Code.FILL_TIMEOUT_STAGE,
+        "dialog_blocked": _Code.FILL_DIALOG_BLOCKED,
+        "handoff_passkey": _Code.HANDOFF_PASSKEY,
+    }
+)
+
+#: The one entry in the private directory each fill gets: a 0600 file the
+#: worker may write one of the keywords above into. Bounded because the
+#: only legitimate contents are one short token, and read back through
+#: `_read_stage`, which accepts nothing else.
+_STAGE_NAME = "stage"
+_MAX_STAGE_BYTES = 64
 
 
 class CredentialError(MacOSError):
@@ -383,6 +535,30 @@ def _require_selector(value: object) -> str:
     return selector
 
 
+def _require_selectors(value: object) -> tuple[str, ...]:
+    """The ordered fields one entry's value is authorized to reach.
+
+    A bare string is one field, exactly as before. A list is a form that
+    asks for the same value more than once -- a new password and its
+    confirmation -- filled in the order written, inside one bounded
+    window, on one proven document. Duplicates are refused: two entries
+    naming one element is a manifest typo, and the worker requires each
+    selector to match exactly once anyway.
+
+    Order is part of the policy, so it is preserved rather than sorted:
+    the digest covers the whole list, and a reordered list is a different
+    policy that has to be enrolled on its own.
+    """
+    if isinstance(value, str):
+        return (_require_selector(value),)
+    if not isinstance(value, list) or not 1 <= len(value) <= _MAX_FIELDS:
+        raise CredentialError(_Code.MANIFEST_INVALID)
+    selectors = tuple(_require_selector(item) for item in value)
+    if len(set(selectors)) != len(selectors):
+        raise CredentialError(_Code.MANIFEST_INVALID)
+    return selectors
+
+
 def _require_origin(value: object) -> str:
     origin = _require_trimmed(value, limit=_MAX_ORIGIN)
     matched = _ORIGIN.fullmatch(origin)
@@ -468,7 +644,7 @@ def _policy_digest(
     ref: str,
     kind: _Kind,
     origins: tuple[str, ...],
-    field_selector: str,
+    field_selectors: tuple[str, ...],
     source: Mapping[str, _JobValue],
 ) -> str:
     """This entry's identity: a digest over its whole canonical policy.
@@ -476,18 +652,31 @@ def _policy_digest(
     Everything the entry declares is an input -- where the value comes
     from *and* where it is allowed to go -- so no manifest edit can
     rebind a vault name to a policy nobody authorized: touch the ref, the
-    kind, the origins, the field, or any Gmail source field, and the
-    entry names a key that has never been enrolled. Origins are sorted,
-    so tidying a list is free, and the entry-wide keys are written last,
-    so a source can never shadow one.
+    kind, the origins, any field, the *order* of the fields, or any Gmail
+    source field, and the entry names a key that has never been enrolled.
+    Origins are sorted, so tidying a list is free, and the entry-wide
+    keys are written last, so a source can never shadow one.
+
+    A one-field entry is canonicalized under `field` and a multi-field
+    entry under `fields`, which is not cosmetic: it keeps every digest
+    already enrolled against the single-field release byte-identical, so
+    adding this feature does not silently re-derive a live credential's
+    vault name into one nobody has enrolled. `field = "x"` and
+    `field = ["x"]` are the same policy and hash the same, because they
+    authorize the same fill.
     """
+    target: dict[str, _JobValue] = (
+        {"field": field_selectors[0]}
+        if len(field_selectors) == 1
+        else {"fields": list(field_selectors)}
+    )
     policy = json.dumps(
         {
             **source,
             "ref": ref,
             "kind": kind,
             "origins": sorted(origins),
-            "field": field_selector,
+            **target,
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -610,7 +799,7 @@ class _Entry:
 
     kind: _Kind
     origins: tuple[str, ...]
-    field_selector: str
+    field_selectors: tuple[str, ...]
     source: _Source
     policy_digest: str
 
@@ -637,19 +826,19 @@ def _parse_entry(ref: str, table: Mapping[str, object]) -> _Entry:
     if not set(table) <= (_COMMON_KEYS | _KIND_KEYS[kind]):
         raise CredentialError(_Code.MANIFEST_INVALID)
     origins = _require_origins(table.get("origins"))
-    selector = _require_selector(table.get("field"))
+    selectors = _require_selectors(table.get("field"))
     # The last time anything in this module looks at `kind`.
     source: _Source = _parse_gmail(table) if kind == "gmail_otp" else _VAULT_SOURCE
     return _Entry(
         kind=kind,
         origins=origins,
-        field_selector=selector,
+        field_selectors=selectors,
         source=source,
         policy_digest=_policy_digest(
             ref=ref,
             kind=kind,
             origins=origins,
-            field_selector=selector,
+            field_selectors=selectors,
             source=source.source_policy(),
         ),
     )
@@ -834,12 +1023,19 @@ def _run_worker(command: list[str], *, job: bytes, timeout: float) -> int:
     one-time code, an email body, or a provider's prose to land in --
     not even long enough to be logged by mistake. `stdin` is the one
     channel, and it carries only the nonsecret job.
+
+    `env` is `_CHILD_ENV` and nothing else: an inherited ``HOME``,
+    ``ENGRAM_ROOT``, ``SOPS_AGE_KEY``, or ``gws`` credential pointer
+    would let whoever set it choose which vault is read and which program
+    receives the value, which is the one thing every other pin in this
+    module exists to prevent.
     """
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=dict(_CHILD_ENV),
         start_new_session=True,
     )
     try:
@@ -848,6 +1044,23 @@ def _run_worker(command: list[str], *, job: bytes, timeout: float) -> int:
         _kill_session(process)
         raise
     return process.returncode
+
+
+def _read_stage(path: str) -> _Code | None:
+    """Which stage the worker said refused, if it said one this side knows.
+
+    The whole argument for this channel is in this function: whatever is
+    in that file is compared against `_STAGE_CODES`, and anything else --
+    a longer token, a path, a provider's prose, an empty file, no file at
+    all -- becomes `None`. So the worker can only ever *select* one of
+    this module's own compiled-in codes, never contribute a string to one.
+    """
+    try:
+        with open(path, "rb") as stream:
+            token = stream.read(_MAX_STAGE_BYTES + 1).decode("ascii", errors="replace")
+    except OSError:
+        return None
+    return _STAGE_CODES.get(token)
 
 
 def _command(entry: _Entry) -> list[str]:
@@ -861,14 +1074,22 @@ def _command(entry: _Entry) -> list[str]:
     return [_MEM_SECRET, "run", *names, "--", *_WORKER]
 
 
-def _job(entry: _Entry, *, space: str) -> dict[str, _JobValue]:
-    """The nonsecret job the worker reads on stdin."""
+def _job(entry: _Entry, *, space: str, stage_path: str) -> dict[str, _JobValue]:
+    """The nonsecret job the worker reads on stdin.
+
+    `stage_path` names a file this process just created, in a private
+    directory only it can name, for the worker to write one keyword into.
+    It is policy-free and value-free in both directions: nothing about it
+    tells the worker anything, and nothing it can hold tells this process
+    anything beyond which of its own codes to report.
+    """
     job: dict[str, _JobValue] = {
         "version": _JOB_VERSION,
         "kind": entry.kind,
         "space": space,
         "origins": list(entry.origins),
-        "field": entry.field_selector,
+        "fields": list(entry.field_selectors),
+        "stage_path": stage_path,
     }
     job.update(entry.source.source_policy())
     job.update(entry.source.job_auth(entry.policy_digest))
@@ -915,21 +1136,65 @@ class CredentialBroker:
         return self._policy().refs
 
     def fill_browser(self, ref: str, *, space: str) -> CredentialReceipt:
-        """Fill `ref` into a field in a live ego-browser taskspace."""
+        """Fill `ref` into its configured fields in a live ego-browser taskspace.
+
+        One call, one worker, one bounded window: an entry declaring more
+        than one field has them filled in the declared order on one
+        proven document, because the digest that authorized the entry
+        covered that whole ordered list. One value, too -- a form asking
+        for two *different* secrets is two refs, each authorized on its
+        own, never one value repeated.
+
+        A failed fill says which stage it stopped in. The private
+        directory that carries that answer back is created here and gone
+        before this returns, either way.
+        """
         validated = _require_ref(ref)
         target = _require_space(space)
         entry = self._policy()._require(validated)
-        job = json.dumps(
-            _job(entry, space=target),
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-        if self._invoke(_command(entry), job, entry.source.timeout_seconds) != 0:
-            raise CredentialError(_Code.FILL_FAILED)
+        directory = tempfile.mkdtemp(prefix="macos-harness-fill-")
+        stage_path = os.path.join(directory, _STAGE_NAME)
+        try:
+            os.close(os.open(stage_path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600))
+            job = json.dumps(
+                _job(entry, space=target, stage_path=stage_path),
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            if self._invoke(_command(entry), job, entry.source.timeout_seconds) != 0:
+                raise CredentialError(_read_stage(stage_path) or _Code.FILL_FAILED)
+        except OSError:
+            raise CredentialError(_Code.UNAVAILABLE) from None
+        finally:
+            try:
+                os.unlink(stage_path)
+            except OSError:
+                pass
+            try:
+                os.rmdir(directory)
+            except OSError:
+                pass
         return CredentialReceipt(
             credential_ref=validated,
             provider=entry.source.provider,
         )
+
+    def fill_native(self, ref: str, *, app: str) -> NoReturn:
+        """Refuse, always, and say which two paths do work.
+
+        Typing a provisioned credential into a native app is out of scope
+        by review, not by omission: see SECURITY.md. A native text field
+        offers nothing this harness could check before typing -- no
+        origin, no document identity, no readback that proves *which*
+        process received the keystrokes -- so the browser sink's whole
+        proof chain has no native equivalent.
+
+        This exists so that asking gets a typed answer naming the two
+        sanctioned paths rather than an `AttributeError` and a guess. It
+        never validates its arguments first: a ref typo must not be
+        reported as the reason, because the reason is the sink.
+        """
+        raise CredentialError(_Code.UNSUPPORTED_SINK)
 
     def _invoke(self, command: list[str], job: bytes, timeout: float) -> int:
         """Run the worker, collapsing every possible failure to a fixed code.

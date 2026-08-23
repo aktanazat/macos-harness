@@ -3,6 +3,90 @@
 All notable changes to macOS Harness are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-08-22
+
+### Added
+
+- A failed credential fill now says *where* it stopped.
+  `credential.fill_failed` gained a stage suffix from a closed set --
+  `/bad_job`, `/not_authorized`, `/secret_missing`, `/otp_fetch`,
+  `/sink`, `/locate_space`, `/origin`, `/locate_field`, `/focus`,
+  `/type_verify`, `/timeout_stage`, `/dialog_blocked` -- plus
+  `credential.handoff_required/passkey` and
+  `credential.unsupported_sink`. A stage name is a keyword chosen at
+  author time, never a selector, origin, field value, or provider
+  message, and it travels in a 0600 file the broker creates in a 0700
+  directory and names in the job: an exit status could not carry it,
+  because `mem-secret`, sops, or the shell can exit nonzero before the
+  worker runs at all. An unnamed failure stays plain
+  `credential.fill_failed`, which is what it is.
+- One entry may declare more than one field:
+  `field = ["#new", "#confirm"]`. The policy digest covers the whole
+  ordered list, so one enrollment authorizes exactly that set in exactly
+  that order, and one `fill-browser` call fills them in order inside one
+  bounded window on one document proven not to have changed between
+  them. A one-field entry keeps the digest it had before lists existed,
+  so no live credential needs re-enrolling, and `field = "x"` and
+  `field = ["x"]` agree. One value into several fields is the whole
+  feature: a form asking for two *different* secrets is two refs, each
+  authorized on its own.
+- `credential fill-native <ref> --app <app>` and
+  `CredentialBroker.fill_native` refuse, always, with
+  `credential.unsupported_sink` and a message naming the two paths that
+  do work: the system AutoFill sheet, or a handoff to the human. Asking
+  now gets a typed answer instead of an `AttributeError`.
+- A field asking for conditional passkey mediation (a `webauthn` token
+  in `autocomplete`) is refused as
+  `credential.handoff_required/passkey` *before* the value is collected,
+  and a native dialog blocking the page is refused as
+  `credential.fill_failed/dialog_blocked`. Both used to stall until a
+  deadline; both are now immediate and typed.
+- Every credential CLI failure prints its fixed message beside its code:
+  `{"error":"<code>","message":"<fixed sentence>"}`. Both come from
+  closed compile-time tables that interpolate nothing.
+
+### Changed
+
+- The credential worker and its browser child now run under a
+  reconstructed environment -- `HOME` from the password database, a
+  fixed `PATH`, a UTF-8 locale -- rather than an inherited one.
+  `mem-secret` takes its vault root from `ENGRAM_ROOT` or `$HOME`, and
+  the pinned `ego-browser` wrapper resolves the real browser CLI under
+  `$HOME` (measured: `HOME=/tmp/attacker` sends it looking there), so an
+  inherited value for either chose which vault was read and which
+  program was handed the path the value crosses. An allowlist, because
+  the next variable one of those helpers learns to read will not be in
+  any denylist written today.
+- Every step of the browser side is now bounded and named. There was no
+  ceiling below the worker's 40-second one, so a single wedged ego
+  helper call was invisible, unattributed, and charged to the whole
+  fill's budget; a stalled arm now refuses in about two seconds as
+  `/timeout_stage` instead. The handoff wait is excluded from that
+  budget, since a Gmail code takes as long as the mailbox takes.
+- The two origin rechecks are `Page.getFrameTree` document keys
+  (main-frame id plus loaderId) instead of ego `pageInfo()` helper
+  calls: one cheap CDP round trip each instead of a vendor helper, and
+  strictly stronger -- a reload to the same URL is now caught, which an
+  origin comparison alone accepted. `pageInfo()` is still called once,
+  for the one thing only it reports: whether a dialog is blocking the
+  page.
+- A field is focused and cleared immediately *before* it receives the
+  value rather than before the handoff wait, so a page that moves focus
+  or refills the field while the fill is in flight is recovered from
+  rather than refused. The readback now proves identity, focus, and
+  exact value in one page turn.
+- A TOTP code is generated when the browser child asks for it, after
+  every preflight check has passed, rather than before the browser is
+  even started -- a six-digit code is valid for a 30-second step, and a
+  four-second preflight used to spend an eighth of that window. A Gmail
+  mailbox is likewise not read at all for a fill the browser side
+  refuses.
+- `SECURITY.md` names the one race that is not closed: focus lives in
+  the page and the insertion is a browser-level call, so a page that
+  moves focus between them receives the keystrokes. The fill is refused
+  rather than reported done, but the value reached another element on an
+  already-allowed origin.
+
 ## [0.4.0] - 2026-08-22
 
 ### Added
