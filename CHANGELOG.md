@@ -3,6 +3,198 @@
 All notable changes to macOS Harness are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-08-22
+
+### Added
+
+- A failed credential fill now says *where* it stopped.
+  `credential.fill_failed` gained a stage suffix from a closed set --
+  `/bad_job`, `/not_authorized`, `/secret_missing`, `/otp_fetch`,
+  `/sink`, `/locate_space`, `/origin`, `/locate_field`, `/focus`,
+  `/type_verify`, `/timeout_stage`, `/dialog_blocked` -- plus
+  `credential.handoff_required/passkey` and
+  `credential.unsupported_sink`. A stage name is a keyword chosen at
+  author time, never a selector, origin, field value, or provider
+  message, and it travels in a 0600 file the broker creates in a 0700
+  directory and names in the job: an exit status could not carry it,
+  because `mem-secret`, sops, or the shell can exit nonzero before the
+  worker runs at all. An unnamed failure stays plain
+  `credential.fill_failed`, which is what it is.
+- One entry may declare more than one field:
+  `field = ["#new", "#confirm"]`. The policy digest covers the whole
+  ordered list, so one enrollment authorizes exactly that set in exactly
+  that order, and one `fill-browser` call fills them in order inside one
+  bounded window on one document proven not to have changed between
+  them. A one-field entry keeps the digest it had before lists existed,
+  so no live credential needs re-enrolling, and `field = "x"` and
+  `field = ["x"]` agree. One value into several fields is the whole
+  feature: a form asking for two *different* secrets is two refs, each
+  authorized on its own.
+- `credential fill-native <ref> --app <app>` and
+  `CredentialBroker.fill_native` refuse, always, with
+  `credential.unsupported_sink` and a message naming the two paths that
+  do work: the system AutoFill sheet, or a handoff to the human. Asking
+  now gets a typed answer instead of an `AttributeError`.
+- A field asking for conditional passkey mediation (a `webauthn` token
+  in `autocomplete`) is refused as
+  `credential.handoff_required/passkey` *before* the value is collected,
+  and a native dialog blocking the page is refused as
+  `credential.fill_failed/dialog_blocked`. Both used to stall until a
+  deadline; both are now immediate and typed.
+- Every credential CLI failure prints its fixed message beside its code:
+  `{"error":"<code>","message":"<fixed sentence>"}`. Both come from
+  closed compile-time tables that interpolate nothing.
+
+### Changed
+
+- The credential worker and its browser child now run under a
+  reconstructed environment -- `HOME` from the password database, a
+  fixed `PATH`, a UTF-8 locale -- rather than an inherited one.
+  `mem-secret` takes its vault root from `ENGRAM_ROOT` or `$HOME`, and
+  the pinned `ego-browser` wrapper resolves the real browser CLI under
+  `$HOME` (measured: `HOME=/tmp/attacker` sends it looking there), so an
+  inherited value for either chose which vault was read and which
+  program was handed the path the value crosses. An allowlist, because
+  the next variable one of those helpers learns to read will not be in
+  any denylist written today.
+- Every step of the browser side is now bounded and named. There was no
+  ceiling below the worker's 40-second one, so a single wedged ego
+  helper call was invisible, unattributed, and charged to the whole
+  fill's budget; a stalled arm now refuses in about two seconds as
+  `/timeout_stage` instead. The handoff wait is excluded from that
+  budget, since a Gmail code takes as long as the mailbox takes.
+- The two origin rechecks are `Page.getFrameTree` document keys
+  (main-frame id plus loaderId) instead of ego `pageInfo()` helper
+  calls: one cheap CDP round trip each instead of a vendor helper, and
+  strictly stronger -- a reload to the same URL is now caught, which an
+  origin comparison alone accepted. `pageInfo()` is still called once,
+  for the one thing only it reports: whether a dialog is blocking the
+  page.
+- A field is focused and cleared immediately *before* it receives the
+  value rather than before the handoff wait, so a page that moves focus
+  or refills the field while the fill is in flight is recovered from
+  rather than refused. The readback now proves identity, focus, and
+  exact value in one page turn.
+- A TOTP code is generated when the browser child asks for it, after
+  every preflight check has passed, rather than before the browser is
+  even started -- a six-digit code is valid for a 30-second step, and a
+  four-second preflight used to spend an eighth of that window. A Gmail
+  mailbox is likewise not read at all for a fill the browser side
+  refuses.
+- `SECURITY.md` names the one race that is not closed: focus lives in
+  the page and the insertion is a browser-level call, so a page that
+  moves focus between them receives the keystrokes. The fill is refused
+  rather than reported done, but the value reached another element on an
+  already-allowed origin.
+
+## [0.4.0] - 2026-08-22
+
+### Added
+
+- `macos-harness credential`: a broker that fills a browser login field
+  from a configured ref, backed by the shared mem-secret sops+age vault.
+  `check` lists the configured refs; `fill-browser <ref> --space <space>`
+  fills a password, TOTP code, or Gmail-delivered one-time code and
+  returns a frozen five-field `CredentialReceipt` (`state="filled"`,
+  `credential_ref`, `provider`, `sink="browser"`, `acted=True`);
+  `enroll <ref>` stores a password or TOTP secret from a hidden TTY prompt
+  or from stdin when piped, and `enroll <ref> --clipboard` provisions
+  instead from whatever secret is already on the clipboard -- typically the
+  agent's own copy of an already-unlocked Passwords entry, revealed and
+  copied through ordinary UI automation in the same bounded burst, with no
+  separate human step unless macOS itself puts up a physical-presence
+  prompt (Touch ID, the account password, a passkey). `--clipboard` pipes
+  the clipboard into mem-secret at the OS level, so the value never enters
+  the CLI's own process, and clears the clipboard afterward on every path,
+  success or failure. Every command prints exactly one compact JSON line on
+  success and one fixed, redacted `{"error":"<code>"}` line on failure --
+  no secret, secret length, OTP, email body, provider output, clipboard
+  value, or derived fingerprint ever crosses into an argument, receipt,
+  error, log, or return value.
+- `enroll <gmail-ref>` reads nothing at all: no prompt, no stdin, no
+  clipboard -- `--clipboard` on a `gmail_otp` ref fails before anything is
+  spawned, with `credential.enroll_not_authored`. An emailed
+  code is read live and never stored, so that one command stores only the
+  nonsecret authorization for that exact policy. A Gmail fill then runs
+  under mem-secret with that authorization in its environment and compares
+  it against the digest of the policy it was handed before it opens the
+  mailbox, so editing the manifest alone cannot repoint a live code at a
+  different mailbox, sender, pattern, origin, or field -- the rebound
+  policy has no authorization until someone enrolls it again.
+- Credentials are declared once in
+  `~/.config/macos-harness/credentials.toml` (`version = 1`,
+  `[credentials.<ref>]`, `kind = "password" | "totp" | "gmail_otp"`,
+  `origins`, `field`); each kind's key set is closed, so an unknown or
+  misspelled key is rejected rather than half-honored. That path is fixed
+  and is the only policy any command reads. It is also checked for privacy
+  before it is parsed (regular non-symlink file, this uid, mode exactly
+  0600, in a directory owned by the same uid and not group- or
+  world-writable) and otherwise refused with
+  `credential.manifest_untrusted`.
+- One policy digest owns one ref: a SHA-256 over the entry's canonical
+  full policy -- ref, `kind`, sorted `origins`, `field`, and, for
+  `gmail_otp`, its `mailbox`, `sender`, `subject_regex`, `body_regex`, and
+  `max_age_seconds`. A password or TOTP secret is stored under a vault
+  name derived from that whole digest and a Gmail authorization is derived
+  from the same digest, so one enrollment authorizes exactly one source
+  and one destination and no manifest can name, borrow, or rebind
+  another's. Changing any of those fields derives a digest with nothing
+  enrolled behind it, so the fill fails instead of sending an old secret to
+  a new origin or field, or reading a code from an unauthorized mailbox --
+  re-enroll after any edit. Only reordering `origins` is free.
+- The manifest, `mem-secret` (at its pinned absolute path
+  `~/.local/bin/mem-secret`, never resolved through `PATH`), and the
+  browser toolkit are all located from the account's own home directory in
+  the passwd record rather than from `$HOME`, so an exported `HOME` cannot
+  move the policy, the vault, or the code that types into the page.
+- Browser fills run in an existing agent-owned ego-browser taskspace that
+  the broker never creates or hands off, require an exact live-origin
+  match and exactly one visible, enabled, writable field of the expected
+  type, and inject through a single trusted CDP `Input.insertText`. The
+  field is resolved, then validated, focused, cleared, and force-armed as
+  one DOM object before the secret is read; the origin and that same
+  object's connected, focused, enabled, writable, visible, empty,
+  expected-type state are rechecked through `Runtime.callFunctionOn`
+  between the read and the keystroke; equality is then verified on that
+  same object -- the expected value passed as a call argument, never
+  spliced into page source -- and the origin once more, without the value
+  ever leaving CDP. The only sink is a web field: a CSS selector
+  cannot identify a native control, and typing a secret at whatever holds
+  first responder is unsafe, so system AutoFill or a `mac.handoff(...)`
+  owns app windows.
+- Every fill is bounded from the outside -- 45 seconds for a password or
+  TOTP, 120 seconds for a Gmail code -- and the broker owns one process
+  group for the whole tree it starts (mem-secret, the worker, `gws`,
+  ego-browser), so a wedged provider or stalled browser is killed as a
+  group and reported as `credential.timeout`. The worker starts no session
+  of its own; it keeps only its own step bounds (10 seconds per `gws` call,
+  40 seconds on the browser child) and reads its nonsecret job from stdin
+  bounded at 64 KiB.
+- `gmail_otp` patterns are bounded in length, must compile, and
+  `body_regex` must carry a `code` group; matching one message runs under a
+  one-second wall-clock alarm in the worker, and a message whose alarm
+  cannot be armed is refused rather than matched unbounded. Bodies are
+  matched as visible text: a `text/plain` part as it is, `text/html`
+  reduced with the standard library only when there is no plain part
+  (`script`, `style`, `head`, `title`, `template`, `noscript`, and
+  `hidden`, `aria-hidden`, `display:none`, or `visibility:hidden` elements
+  dropped, entities resolved, tag boundaries becoming whitespace) -- and a
+  message is used only when it yields exactly one distinct code-shaped
+  capture.
+- Apple Passwords remains the provisioning source, reached only through
+  its own UI: the broker never unlocks Passwords, bypasses Touch ID or a
+  passkey, or acts while a physical-presence prompt is on screen, but
+  provisioning a ref -- including revealing and copying an
+  already-unlocked entry -- is otherwise autonomous.
+- TOTP is RFC 6238 (SHA-1, 6 digits, 30-second step), implemented with the
+  standard library and verified against the RFC test vectors.
+- `SECURITY.md` states the credential broker's threat boundary: it defends
+  against leaked or model-visible values, a wrong page or mailbox, a stale
+  or mistaken policy, and a hung step, and it does not claim to defend
+  against a hostile process already running as the same user or against an
+  agent deliberately misusing tools the user authorized -- the requested
+  setup grants same-user agents that access directly.
+
 ## [0.3.0] - 2026-08-22
 
 ### Added

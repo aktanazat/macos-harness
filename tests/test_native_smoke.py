@@ -18,6 +18,7 @@ from macos_harness.macos import (
     MacOS,
     MacOSError,
 )
+from macos_harness.receipts import Acted, Executor, Outcome, gone
 
 
 class _FakeNativeClient:
@@ -867,7 +868,10 @@ def test_query_parity_on_finder_bounded_fallback() -> None:
 # shows the window without ever activating (and so never focus-stealing)
 # the helper app itself. The button's target-action really flips its own
 # title on press, so a round trip through AXPress is verified by an actual
-# state change, not just a non-error return.
+# state change, not just a non-error return -- and it counts its own
+# presses, encoding every press past the first into a distinct title
+# ("harness-pressed-2", ...), so a second dispatch is something a test can
+# observe rather than merely assume never happened.
 _HARNESS_PROBE_HELPER = r'''
 import os
 
@@ -887,9 +891,16 @@ from AppKit import (
 )
 
 
+_presses = 0
+
+
 class _Target(NSObject):
     def pressed_(self, sender):
-        sender.setTitle_("harness-pressed")
+        global _presses
+        _presses += 1
+        sender.setTitle_(
+            "harness-pressed" if _presses == 1 else f"harness-pressed-{_presses}"
+        )
 
 
 def main():
@@ -963,11 +974,20 @@ def _read_ready_line(proc: subprocess.Popen[str], *, timeout: float = 10.0) -> s
 @pytest.mark.native
 @pytest.mark.smoke
 def test_native_press_round_trip_without_activation() -> None:
-    """A native single-shot press on a background AppKit helper window
+    """A receipted ``mac.do.press`` on a background AppKit helper window
     never steals focus, and its button's target-action really fires: the
-    title flips from "harness-ok" to "harness-pressed", confirmed via
-    wait/wait_gone -- never by polling -- and the frontmost app is
-    unchanged before and after."""
+    title flips from "harness-ok" to "harness-pressed", confirmed by the
+    operation's own ``Gone`` postcondition -- never by polling -- and the
+    frontmost app is unchanged before and after.
+
+    The receipt itself is the contract under test: a real dispatch
+    (``acted``), a postcondition that actually confirmed the effect
+    (``verified``/``changed``), the native agent named as the executor
+    that carried it out, and a second identical call under the same
+    ``once`` token replaying that exact receipt instead of pressing the
+    button again -- which the helper's own press counter would otherwise
+    expose as a "harness-pressed-2" title.
+    """
     _require_trusted_native_agent()
 
     before = MacOS._frontmost_app()
@@ -981,20 +1001,55 @@ def test_native_press_round_trip_without_activation() -> None:
         ready = _read_ready_line(proc)
         assert ready.startswith("READY "), f"unexpected helper output: {ready!r}"
         helper_pid = int(ready.split(" ", 1)[1])
+        # One request for both calls: an at-most-once replay is only a
+        # replay for a byte-identical canonical request, so a second call
+        # site drifting by one argument would raise instead of replaying.
+        request = {
+            "app": helper_pid,
+            "text": "harness-ok",
+            "timeout": 20.0,
+            "postcondition": gone("harness-ok"),
+            "once": f"native-smoke-press-{helper_pid}",
+        }
 
         with MacOS(backend="native") as mac:
             before_match = mac.ax.wait("harness-ok", app=helper_pid, timeout=10.0)
             old_title = mac.ax.get(before_match["element_index"], "AXTitle")
 
-            pressed = mac.ax.press("harness-ok", app=helper_pid, timeout=10.0)
-            assert pressed["role"] == "AXButton"
+            receipt = mac.do.press(**request)
 
-            mac.ax.wait_gone("harness-ok", app=helper_pid, timeout=10.0)
             after_match = mac.ax.wait("harness-pressed", app=helper_pid, timeout=10.0)
             new_title = mac.ax.get(after_match["element_index"], "AXTitle")
 
+            replay = mac.do.press(**request)
+            # A replay never reaches the agent at all, so `after_match`'s
+            # handle -- which any real search would have invalidated --
+            # is still live to read the final title through.
+            final_title = mac.ax.get(after_match["element_index"], "AXTitle")
+
+        assert receipt.op == "press"
+        assert receipt.outcome is Outcome.DONE
+        assert receipt.acted is Acted.YES
+        assert receipt.changed is True
+        assert receipt.verified is True
+        assert receipt.executor is Executor.NATIVE
+        assert receipt.backend == "native"
+        assert receipt.once == request["once"]
+        assert receipt.replayed is False
+        assert receipt.error is None
+        assert receipt.target["role"] == "AXButton"
+        assert receipt.target["title"] == "harness-ok"
+        assert receipt.target["app"]["pid"] == helper_pid
+
         assert old_title == "harness-ok"
         assert new_title == "harness-pressed"
+
+        # Same token, same request: the finished receipt comes back off
+        # the ledger, stamped as a replay and otherwise identical, and
+        # the button was never pressed a second time.
+        assert replay.replayed is True
+        assert {**replay.to_json(), "replayed": False} == receipt.to_json()
+        assert final_title == "harness-pressed"
 
         after = MacOS._frontmost_app()
         before_pid = before["pid"] if before else None
