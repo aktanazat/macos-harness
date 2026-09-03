@@ -161,9 +161,18 @@ def test_postcondition_rejects_more_than_one_scope_selector(
 def test_postcondition_accepts_a_single_scope_selector(
     postcondition_class: type[Present | Gone],
 ) -> None:
-    postcondition_class(app="Notes")
-    postcondition_class(all_apps=True)
-    postcondition_class(apps=["Notes"])
+    by_app = postcondition_class(app="Notes")
+    assert (by_app.app, by_app.all_apps, by_app.apps) == ("Notes", False, None)
+
+    by_all_apps = postcondition_class(all_apps=True)
+    assert (by_all_apps.app, by_all_apps.all_apps, by_all_apps.apps) == (
+        None,
+        True,
+        None,
+    )
+
+    by_apps = postcondition_class(apps=["Notes"])
+    assert (by_apps.app, by_apps.all_apps, by_apps.apps) == (None, False, ("Notes",))
 
 
 @pytest.mark.parametrize("postcondition_class", [Present, Gone])
@@ -176,11 +185,15 @@ def test_postcondition_rejects_bad_direction(
 
 
 @pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("direction", ["Next", "PREVIOUS"])
 def test_postcondition_accepts_direction_case_insensitively(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: type[Present | Gone], direction: str
 ) -> None:
-    postcondition_class(direction="Next")
-    postcondition_class(direction="PREVIOUS")
+    # Validation casefolds only to decide acceptance; the field keeps the
+    # caller's spelling, because `ops` serializes `postcondition.direction`
+    # into the receipt verbatim and `MacOS.ax` casefolds again at the point
+    # of use.
+    assert postcondition_class(direction=direction).direction == direction
 
 
 @pytest.mark.parametrize("postcondition_class", [Present, Gone])
