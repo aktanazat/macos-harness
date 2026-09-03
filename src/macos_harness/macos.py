@@ -543,8 +543,10 @@ class MacOS:
         extra_attributes: Iterable[str] = (),
         include_actions: bool = True,
         include_settable: bool = True,
+        reset_elements: bool = True,
     ) -> list[dict[str, Any]]:
-        self._elements = {}
+        if reset_elements:
+            self._elements = {}
         nodes: list[dict[str, Any]] = []
         seen: set[int] = set()
         requested_attributes = tuple(
@@ -566,8 +568,7 @@ class MacOS:
             raw = self._copy_attributes(element, requested_attributes)
             if raw["AXRole"] == "AXMenuBar" and not include_menu_bar:
                 return
-            index = len(nodes)
-            self._elements[index] = element
+            index = self._remember_element(element)
             node: dict[str, Any] = {
                 "element_index": index,
                 "depth": depth,
@@ -866,6 +867,10 @@ class MacOS:
             extra_attributes=attributes,
             include_actions=include_actions,
             include_settable=False,
+            # A search is a read. It hands out new handles, like the optimized
+            # path above, but must not renumber the handles a prior snapshot
+            # gave the caller.
+            reset_elements=False,
         )[1:]
         if direction.casefold() == "previous":
             nodes.reverse()
