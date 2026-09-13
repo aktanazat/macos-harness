@@ -2,9 +2,19 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import macos_harness.overlay as overlay_module
-from macos_harness.overlay import LivePointerOverlay
+from macos_harness.overlay import IDLE_HIDE_SECONDS, LivePointerOverlay
 from macos_harness.pointer import POINTER_HOTSPOT, POINTER_PRESS_SCALE, pointer_points
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
 
 
 class _FakeStdin:
@@ -66,6 +76,42 @@ def test_overlay_uses_tiny_json_protocol_and_closes_with_parent(monkeypatch) -> 
     assert process.stdin.closed
 
 
+def test_pointer_reads_hidden_once_the_idle_timeout_passes(monkeypatch) -> None:
+    clock = _Clock()
+    monkeypatch.setattr(overlay_module, "time", clock)
+    overlay = LivePointerOverlay()
+    monkeypatch.setattr(overlay, "_send", lambda payload, **kwargs: None)
+
+    overlay.show(10, 20)
+    assert overlay.visible is True
+
+    clock.now += IDLE_HIDE_SECONDS - 0.5
+    overlay.click()
+    clock.now += IDLE_HIDE_SECONDS - 0.5
+    assert overlay.visible is True
+
+    clock.now += 0.5
+    assert overlay.visible is False
+
+
+def test_hide_drops_pointer_updates_until_the_next_show(monkeypatch) -> None:
+    sent = []
+    overlay = LivePointerOverlay()
+    monkeypatch.setattr(overlay, "_send", lambda payload, **kwargs: sent.append(payload["cmd"]))
+
+    overlay.show(1, 2)
+    overlay.hide()
+    overlay.move(3, 4)
+    overlay.click()
+
+    assert overlay.visible is False
+    assert sent == ["show"]
+
+    overlay.show(5, 6)
+    assert overlay.visible is True
+    assert sent == ["show", "show"]
+
+
 def test_pressed_pointer_scales_around_the_hotspot() -> None:
     normal = pointer_points()
     pressed = pointer_points(pressed=True)
@@ -73,5 +119,5 @@ def test_pressed_pointer_scales_around_the_hotspot() -> None:
 
     assert pressed[0] == POINTER_HOTSPOT
     for (x, y), (pressed_x, pressed_y) in zip(normal, pressed, strict=True):
-        assert pressed_x - hot_x == (x - hot_x) * POINTER_PRESS_SCALE
-        assert pressed_y - hot_y == (y - hot_y) * POINTER_PRESS_SCALE
+        assert pressed_x - hot_x == pytest.approx((x - hot_x) * POINTER_PRESS_SCALE)
+        assert pressed_y - hot_y == pytest.approx((y - hot_y) * POINTER_PRESS_SCALE)

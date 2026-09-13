@@ -8,9 +8,11 @@ from pathlib import Path
 from typing import Never
 
 import pytest
-from PIL import Image
+import Quartz
+from Foundation import NSURL
 
 import macos_harness.macos as macos_module
+from macos_harness.capture import WindowCapture
 from macos_harness.errors import ErrorCode
 from macos_harness.macos import (
     _KEYCODES,
@@ -18,17 +20,8 @@ from macos_harness.macos import (
     FocusChangedError,
     MacOS,
     MacOSError,
-    _png_size,
     _split_scroll_delta,
 )
-
-
-def test_png_size(tmp_path: Path) -> None:
-    path = tmp_path / "image.png"
-    path.write_bytes(
-        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x02\x80\x00\x00\x01\xe0"
-    )
-    assert _png_size(path) == (640, 480)
 
 
 def test_render_tree() -> None:
@@ -727,6 +720,43 @@ def test_background_click_posts_to_pid_without_warp_or_activate(monkeypatch) -> 
     assert posted == [42, 42]
 
 
+@pytest.mark.parametrize(
+    ("frontmost_after", "activated"),
+    [
+        ({"name": "Test", "bundle_id": None, "pid": 42, "path": None}, True),
+        ({"name": "Other", "bundle_id": None, "pid": 7, "path": None}, False),
+    ],
+)
+def test_activate_makes_one_request_and_reports_what_macos_did(
+    monkeypatch, frontmost_after, activated
+) -> None:
+    mac = MacOS()
+    requests = []
+    other = {"name": "Other", "bundle_id": None, "pid": 7, "path": None}
+    info = {"name": "Test", "bundle_id": None, "pid": 42, "path": None}
+
+    class _Running:
+        def activateWithOptions_(self, options: int) -> bool:
+            requests.append(options)
+            return True
+
+    monkeypatch.setattr(mac, "_resolve_app", lambda app: (_Running(), info))
+    # Frontmost stays on the other app for the first poll, then settles.
+    polls = iter([other, other, frontmost_after])
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: next(polls, frontmost_after))
+    clock = iter(range(10_000))
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: next(clock) * 0.1)
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+
+    result = mac.activate("Test", timeout=0.5)
+
+    assert requests == [macos_module.NSApplicationActivateIgnoringOtherApps]
+    assert result["activated"] is activated
+    assert result["previous"] == other
+    assert result["frontmost"] == frontmost_after
+    assert result["app"] == info
+
+
 def test_input_without_target_is_refused(monkeypatch) -> None:
     mac = MacOS()
     monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
@@ -943,12 +973,14 @@ def test_move_is_logical_only(monkeypatch) -> None:
     overlay_moves = []
     mac._last_screenshot = {
         "pid": 42,
+        "window_id": 7,
         "bounds": {"x": 100.0, "y": 200.0, "width": 400.0, "height": 300.0},
         "width": 800,
         "height": 600,
         "scale_x": 2.0,
         "scale_y": 2.0,
     }
+    monkeypatch.setattr(mac, "_require_window_unchanged", lambda shot: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(
         mac,
@@ -1064,67 +1096,108 @@ def test_pointer_overlay_controls(monkeypatch) -> None:
     ]
 
 
-def test_see_bounds_image_and_draws_virtual_pointer(
-    tmp_path: Path, monkeypatch
-) -> None:
-    mac = MacOS()
-    path = tmp_path / "window.png"
-    Image.new("RGB", (800, 600), "white").save(path)
+_SRGB = Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB)
+_RGBA = Quartz.kCGImageAlphaPremultipliedLast | Quartz.kCGBitmapByteOrder32Big
 
-    def fake_capture(*args, **kwargs):
-        return {
-            "path": str(path),
-            "app": {"name": "Test", "pid": 42},
-            "pid": 42,
-            "window_id": 7,
-            "width": 800,
-            "height": 600,
-            "bounds": {
-                "x": 100.0,
-                "y": 200.0,
-                "width": 400.0,
-                "height": 300.0,
-            },
-            "scale_x": 2.0,
-            "scale_y": 2.0,
-        }
 
-    monkeypatch.setattr(mac, "capture_screenshot", fake_capture)
+def _white_image(width: int, height: int):
+    context = Quartz.CGBitmapContextCreate(None, width, height, 8, 0, _SRGB, _RGBA)
+    Quartz.CGContextSetRGBFillColor(context, 1, 1, 1, 1)
+    Quartz.CGContextFillRect(context, Quartz.CGRectMake(0, 0, width, height))
+    return Quartz.CGBitmapContextCreateImage(context)
+
+
+def _png_pixel(path: Path, x: int, y: int) -> tuple[int, ...]:
+    """Return the RGBA bytes of top-left pixel (x, y) in the PNG at ``path``."""
+    source = Quartz.CGImageSourceCreateWithURL(NSURL.fileURLWithPath_(str(path)), None)
+    image = Quartz.CGImageSourceCreateImageAtIndex(source, 0, None)
+    width = Quartz.CGImageGetWidth(image)
+    height = Quartz.CGImageGetHeight(image)
+    context = Quartz.CGBitmapContextCreate(None, 1, 1, 8, 4, _SRGB, _RGBA)
+    # Core Graphics draws bottom-up; shift so the wanted pixel lands at (0, 0).
+    Quartz.CGContextDrawImage(
+        context, Quartz.CGRectMake(-x, -(height - 1 - y), width, height), image
+    )
+    pixel = Quartz.CGBitmapContextCreateImage(context)
+    data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(pixel))
+    return tuple(bytes(data)[:4])
+
+
+_WHITE = (255, 255, 255, 255)
+
+
+def _fake_window_capture(mac: MacOS, monkeypatch) -> None:
+    """Stand in for the OS: a 400x300pt window on another Space, rendered 2x."""
+    monkeypatch.setattr(mac, "_ensure_screen_recording", lambda: None)
+    monkeypatch.setattr(
+        mac, "_resolve_app", lambda app: (object(), {"name": "Test", "pid": 42})
+    )
+    monkeypatch.setattr(
+        mac, "windows", lambda app: [{"window_id": 7, "title": "Doc", "pid": 42}]
+    )
     monkeypatch.setattr(
         mac,
         "_frontmost_app",
         lambda: {"name": "Test", "bundle_id": "test", "pid": 42, "path": None},
     )
-    monkeypatch.setattr(mac._overlay, "move", lambda *args, **kwargs: None)
+    monkeypatch.setattr(mac._overlay, "_send", lambda payload, *, start=True: None)
+
+    def capture_window(window_id, *, max_width, max_height, timeout=5.0):
+        return WindowCapture(
+            image=_white_image(800, 600),
+            width=800,
+            height=600,
+            bounds={"x": 100.0, "y": 200.0, "width": 400.0, "height": 300.0},
+            on_screen=False,
+            captured_at=1234.5,
+        )
+
+    monkeypatch.setattr(macos_module, "capture_window", capture_window)
+
+
+def test_see_reports_pointer_position_and_draws_it_only_on_request(
+    tmp_path: Path, monkeypatch
+) -> None:
+    mac = MacOS()
+    _fake_window_capture(mac, monkeypatch)
+    path = tmp_path / "window.png"
     mac.move(300, 350, coordinate_space="screen")
 
-    result = mac.see("Test", max_width=400, max_height=400)
+    plain = mac.see("Test", path=path, max_width=800, max_height=800)
 
-    assert (result["width"], result["height"]) == (400, 300)
-    assert result["virtual_pointer"] == {
+    assert (plain["width"], plain["height"]) == (800, 600)
+    assert plain["virtual_pointer"] == {
         "screen": {"x": 300.0, "y": 350.0},
-        "image": {"x": 200.0, "y": 150.0},
+        "image": {"x": 400.0, "y": 300.0},
         "inside": True,
         "visible": True,
     }
-    assert result["focus"] == {
-        "frontmost": {
-            "name": "Test",
-            "bundle_id": "test",
-            "pid": 42,
-            "path": None,
-        },
+    assert plain["focus"] == {
+        "frontmost": {"name": "Test", "bundle_id": "test", "pid": 42, "path": None},
         "target_is_frontmost": True,
     }
-    with Image.open(path) as image:
-        assert image.getpixel((205, 170)) != (255, 255, 255, 255)
+    assert (plain["on_screen"], plain["captured_at"]) == (False, 1234.5)
+    assert _png_pixel(path, 404, 312) == _WHITE
 
-    Image.new("RGB", (800, 600), "white").save(path)
+    drawn = mac.see("Test", path=path, max_width=800, max_height=800, show_pointer=True)
+
+    assert drawn["virtual_pointer"]["visible"] is True
+    assert _png_pixel(path, 404, 312) != _WHITE
+
+
+def test_see_does_not_draw_a_hidden_pointer(tmp_path: Path, monkeypatch) -> None:
+    mac = MacOS()
+    _fake_window_capture(mac, monkeypatch)
+    path = tmp_path / "window.png"
+    mac.move(300, 350, coordinate_space="screen")
     mac.hide_pointer()
-    hidden = mac.see("Test", max_width=400, max_height=400)
+
+    hidden = mac.see(
+        "Test", path=path, max_width=800, max_height=800, show_pointer=True
+    )
+
     assert hidden["virtual_pointer"]["visible"] is False
-    with Image.open(path) as image:
-        assert image.getpixel((205, 170)) == (255, 255, 255, 255)
+    assert _png_pixel(path, 404, 312) == _WHITE
 
 
 def test_unknown_element_index_carries_element_unknown_code() -> None:
@@ -1372,6 +1445,71 @@ def test_click_accepts_a_screenshot_from_the_same_app(monkeypatch) -> None:
     monkeypatch.setattr(mac, "_post", lambda event, pid: posted.append(pid))
     mac._last_screenshot = {
         "pid": 42,
+        "window_id": 7,
+        "bounds": {"x": 100.0, "y": 200.0, "width": 400.0, "height": 300.0},
+        "width": 400,
+        "height": 300,
+        "scale_x": 1.0,
+        "scale_y": 1.0,
+    }
+    monkeypatch.setattr(mac, "_require_window_unchanged", lambda shot: None)
+
+    mac.click(10, 20, app="SameApp")
+
+    assert posted == [42, 42]
+
+
+@pytest.mark.parametrize(
+    ("described", "reason"),
+    [
+        ([], "closed"),
+        (
+            [
+                {
+                    "kCGWindowBounds": {
+                        "X": 100,
+                        "Y": 240,
+                        "Width": 400,
+                        "Height": 300,
+                    },
+                    "kCGWindowIsOnscreen": True,
+                }
+            ],
+            "moved",
+        ),
+        (
+            [
+                {
+                    "kCGWindowBounds": {
+                        "X": 100,
+                        "Y": 200,
+                        "Width": 400,
+                        "Height": 300,
+                    },
+                    "kCGWindowIsOnscreen": False,
+                }
+            ],
+            "off_screen",
+        ),
+    ],
+)
+def test_click_refuses_screenshot_coordinates_once_the_window_changed(
+    monkeypatch, described, reason
+) -> None:
+    mac = MacOS()
+    posted = []
+    monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
+    monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
+    monkeypatch.setattr(mac, "_pid", lambda app: 42)
+    monkeypatch.setattr(mac, "_post", lambda event, pid: posted.append(pid))
+    monkeypatch.setattr(
+        macos_module.AS,
+        "CGWindowListCreateDescriptionFromArray",
+        lambda window_ids: described if list(window_ids) == [7] else [],
+    )
+    mac._last_screenshot = {
+        "pid": 42,
+        "window_id": 7,
         "bounds": {"x": 100.0, "y": 200.0, "width": 400.0, "height": 300.0},
         "width": 400,
         "height": 300,
@@ -1379,9 +1517,14 @@ def test_click_accepts_a_screenshot_from_the_same_app(monkeypatch) -> None:
         "scale_y": 1.0,
     }
 
-    mac.click(10, 20, app="SameApp")
+    with pytest.raises(
+        MacOSError, match="take a fresh screenshot|cannot land"
+    ) as exc_info:
+        mac.click(10, 20, app="SameApp")
 
-    assert posted == [42, 42]
+    assert exc_info.value.code == "window.changed"
+    assert exc_info.value.details["reason"] == reason
+    assert posted == []
 
 
 def test_get_app_state_never_invalidates_a_still_valid_screenshot(monkeypatch) -> None:

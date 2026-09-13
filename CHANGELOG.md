@@ -3,6 +3,47 @@
 All notable changes to macOS Harness are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- `mac.see()` and `capture_screenshot()` render one window through
+  ScreenCaptureKit at the requested output size instead of running
+  `screencapture` and shrinking a full Retina PNG with Pillow. A 1280px
+  `see` of a 880x448pt window takes 67ms warm (138ms cold) in an 85MB
+  process; the old path took 480ms in 186MB. A window behind others or
+  on another Space still captures, and the result carries `on_screen`
+  (from ScreenCaptureKit) and `captured_at` so a stale render is
+  visible. `raw_width`/`raw_height` are gone; `width`/`height` are the
+  image size, `bounds` the window's points. Pillow is no longer a
+  dependency; `pyobjc-framework-ScreenCaptureKit` is.
+- The live pointer overlay draws the system arrow cursor at the user's
+  Accessibility pointer size instead of a fixed hand-drawn 44pt arrow,
+  sits at status-window level on every Space, honors Reduce Motion, and
+  hides itself after three idle seconds. `hide_pointer()` is sticky: no
+  helper is spawned again until `show_pointer()`.
+- `see(show_pointer=...)` defaults to `False`; the CLI flag is `see
+  --pointer`. Sessions passed `show_pointer=False` 78 times for every
+  `True`, and the drawn arrow was the "huge pointer" in screenshots.
+- Window and screenshot coordinates are checked against the window
+  before input: a click, drag, scroll, or move after the window closed,
+  moved, resized, or left the screen raises `MacOSError` with the new
+  code `window.changed` (`details.reason` is `closed`, `moved`, or
+  `off_screen`) instead of posting to the wrong place. The wire
+  vocabulary is ten codes.
+- Local event suppression is disabled on the harness event source, so a
+  posted click no longer pauses the user's own mouse for the system's
+  default suppression interval.
+
+### Added
+
+- `mac.activate(app, timeout=0.5)`: one explicit activation request that
+  reports `activated`, `previous`, `frontmost`, and `elapsed_ms` from
+  what macOS actually did. It never retries: since macOS 14 activation
+  is a request the system may decline while the user is busy elsewhere.
+  Sessions were forcing this through `osascript` 88 times, some in a
+  ten-attempt loop.
+
 ## [0.5.0] - 2026-08-22
 
 ### Added

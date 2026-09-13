@@ -1,17 +1,25 @@
-"""Shared geometry for the live and captured virtual pointer."""
+"""Geometry for the pointer drawn onto a captured screenshot.
+
+The polygon traces the black core of the macOS arrow cursor in its 1x
+28 x 40 point canvas, hotspot included, so the annotation matches the
+live overlay (which draws the system cursor image itself). The overlay
+helper imports the hotspot and press scale from here too, so this module
+stays free of AppKit and Quartz.
+"""
 
 from __future__ import annotations
 
-POINTER_WIDTH = 42.0
-POINTER_HEIGHT = 50.0
-POINTER_HOTSPOT = (5.0, 3.0)
+POINTER_HOTSPOT = (5.0, 5.0)
 POINTER_POINTS = (
-    (5.0, 3.0),
-    (5.0, 46.0),
-    (18.0, 33.0),
-    (37.0, 33.0),
+    (5.0, 5.0),  # tip
+    (5.0, 16.5),  # left base
+    (8.0, 14.5),  # notch
+    (10.0, 19.25),  # tail, bottom left
+    (11.5, 18.75),  # tail, bottom right
+    (10.0, 13.75),  # tail, top
+    (13.0, 13.0),  # shoulder
 )
-POINTER_PRESS_SCALE = 0.96
+POINTER_PRESS_SCALE = 0.9
 
 
 def pointer_points(*, pressed: bool = False) -> tuple[tuple[float, float], ...]:

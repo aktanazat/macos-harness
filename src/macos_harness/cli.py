@@ -79,7 +79,9 @@ def _build_parser() -> argparse.ArgumentParser:
     see.add_argument("app")
     see.add_argument("--max-width", type=int, default=1280)
     see.add_argument("--max-height", type=int, default=1280)
-    see.add_argument("--no-pointer", action="store_true")
+    see.add_argument(
+        "--pointer", action="store_true", help="draw the virtual pointer onto the image"
+    )
     state = subparsers.add_parser(
         "state", help="print an application's AX state as JSON"
     )
@@ -508,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.app,
                 max_width=args.max_width,
                 max_height=args.max_height,
-                show_pointer=not args.no_pointer,
+                show_pointer=args.pointer,
             )
             print(json.dumps(result, indent=2, ensure_ascii=False))
             result = 0

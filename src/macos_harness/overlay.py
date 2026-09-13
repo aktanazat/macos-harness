@@ -1,4 +1,9 @@
-"""A tiny click-through AppKit overlay for the harness pointer."""
+"""A tiny click-through AppKit overlay for the harness pointer.
+
+The helper draws the system arrow cursor at the user's cursor size, on
+every Space, above ordinary windows, and hides itself after a few idle
+seconds so a finished action never leaves a stray arrow on screen.
+"""
 
 from __future__ import annotations
 
@@ -10,32 +15,42 @@ import threading
 import time
 from typing import Any, TextIO
 
-from .pointer import (
-    POINTER_HEIGHT,
-    POINTER_HOTSPOT,
-    POINTER_WIDTH,
-    pointer_points,
-)
+from .pointer import POINTER_HOTSPOT, POINTER_PRESS_SCALE
+
+# Seconds without a move, show, or click before the helper hides the arrow.
+IDLE_HIDE_SECONDS = 3.0
 
 
 class LivePointerOverlay:
-    """Send pointer updates to a disposable AppKit helper process."""
+    """Send pointer updates to a disposable AppKit helper process.
+
+    ``hide()`` is sticky: nothing is drawn, and no helper is spawned, until
+    ``show()`` re-enables the pointer. ``visible`` mirrors the helper's own
+    idle timer, so it reads ``False`` once the arrow has faded on screen.
+    """
 
     def __init__(self) -> None:
         self._process: subprocess.Popen[str] | None = None
-        self._visible = True
+        self._enabled = True
+        self._last_shown: float | None = None
         atexit.register(self.close)
 
     @property
     def visible(self) -> bool:
-        return self._visible
+        return (
+            self._enabled
+            and self._last_shown is not None
+            and time.monotonic() - self._last_shown < IDLE_HIDE_SECONDS
+        )
 
     @property
     def running(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
     def move(self, x: float, y: float, *, duration: float = 0.16) -> None:
-        self._visible = True
+        if not self._enabled:
+            return
+        self._last_shown = time.monotonic()
         self._send(
             {
                 "cmd": "move",
@@ -46,17 +61,21 @@ class LivePointerOverlay:
         )
 
     def show(self, x: float, y: float) -> None:
-        self._visible = True
+        self._enabled = True
+        self._last_shown = time.monotonic()
         self._send({"cmd": "show", "x": float(x), "y": float(y)})
 
     def hide(self) -> None:
-        self._visible = False
+        self._enabled = False
+        self._last_shown = None
         if self.running:
             self._send({"cmd": "hide"}, start=False)
 
     def click(self) -> None:
-        if self._visible:
-            self._send({"cmd": "click"})
+        if not self._enabled:
+            return
+        self._last_shown = time.monotonic()
+        self._send({"cmd": "click"})
 
     def close(self) -> None:
         process = self._process
@@ -119,10 +138,38 @@ def _read_commands(stream: TextIO, controller: Any) -> None:
     )
 
 
+def _cursor_magnification() -> float:
+    """The user's pointer size from Accessibility settings, 1x to 4x."""
+    from CoreFoundation import CFPreferencesCopyAppValue
+
+    value = CFPreferencesCopyAppValue(
+        "mouseDriverCursorSize", "com.apple.universalaccess"
+    )
+    try:
+        return min(4.0, max(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def _run_helper() -> None:  # pragma: no cover - exercised by the live smoke test
     import AppKit
     import objc
     import Quartz
+
+    app = AppKit.NSApplication.sharedApplication()
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+
+    cursor = AppKit.NSCursor.arrowCursor()
+    cursor_image = cursor.image()
+    magnification = _cursor_magnification()
+    size = cursor_image.size()
+    width = float(size.width) * magnification
+    height = float(size.height) * magnification
+    hot_x = POINTER_HOTSPOT[0] * magnification
+    hot_y = POINTER_HOTSPOT[1] * magnification
+    reduce_motion = (
+        AppKit.NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+    )
 
     class PointerView(AppKit.NSView):
         pressed = False
@@ -131,37 +178,26 @@ def _run_helper() -> None:  # pragma: no cover - exercised by the live smoke tes
             return False
 
         def drawRect_(self, rect: Any) -> None:
-            bounds = self.bounds()
-            AppKit.NSColor.clearColor().set()
-            AppKit.NSRectFill(bounds)
-
-            points = pointer_points(pressed=self.pressed)
-            path = AppKit.NSBezierPath.bezierPath()
-            first_x, first_y = points[0]
-            path.moveToPoint_(AppKit.NSMakePoint(first_x, POINTER_HEIGHT - first_y))
-            for x, y in points[1:]:
-                path.lineToPoint_(AppKit.NSMakePoint(x, POINTER_HEIGHT - y))
-            path.closePath()
-            path.setLineJoinStyle_(AppKit.NSRoundLineJoinStyle)
-
-            AppKit.NSGraphicsContext.saveGraphicsState()
-            shadow = AppKit.NSShadow.alloc().init()
-            shadow.setShadowOffset_(AppKit.NSMakeSize(0.0, -1.0))
-            shadow.setShadowBlurRadius_(2.5)
-            shadow.setShadowColor_(
-                AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(0, 0, 0, 0.42)
+            scale = POINTER_PRESS_SCALE if self.pressed else 1.0
+            # View coordinates run bottom-up; the hotspot sits `hot_y`
+            # below the top edge. Shrink the pressed arrow around it so
+            # the tip stays put.
+            anchor_x = hot_x
+            anchor_y = height - hot_y
+            target = AppKit.NSMakeRect(
+                anchor_x * (1.0 - scale),
+                anchor_y * (1.0 - scale),
+                width * scale,
+                height * scale,
             )
-            shadow.set()
-            AppKit.NSColor.blackColor().setFill()
-            path.fill()
-            AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(1, 1, 1, 0.94).setStroke()
-            path.setLineWidth_(2.5)
-            path.stroke()
-            AppKit.NSGraphicsContext.restoreGraphicsState()
-
-            AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(0, 0, 0, 0.9).setStroke()
-            path.setLineWidth_(0.65)
-            path.stroke()
+            cursor_image.drawInRect_fromRect_operation_fraction_respectFlipped_hints_(
+                target,
+                AppKit.NSZeroRect,
+                AppKit.NSCompositingOperationSourceOver,
+                1.0,
+                True,
+                None,
+            )
 
         def endPress_(self, sender: Any) -> None:
             self.pressed = False
@@ -172,7 +208,7 @@ def _run_helper() -> None:  # pragma: no cover - exercised by the live smoke tes
             controller = objc.super(OverlayController, self).init()
             if controller is None:
                 return None
-            frame = AppKit.NSMakeRect(-100, -100, POINTER_WIDTH, POINTER_HEIGHT)
+            frame = AppKit.NSMakeRect(-100, -100, width, height)
             style = (
                 AppKit.NSWindowStyleMaskBorderless
                 | AppKit.NSWindowStyleMaskNonactivatingPanel
@@ -183,7 +219,7 @@ def _run_helper() -> None:  # pragma: no cover - exercised by the live smoke tes
                 )
             )
             controller.view = PointerView.alloc().initWithFrame_(
-                AppKit.NSMakeRect(0, 0, POINTER_WIDTH, POINTER_HEIGHT)
+                AppKit.NSMakeRect(0, 0, width, height)
             )
             controller.panel.setContentView_(controller.view)
             controller.panel.setTitle_("macOS Harness Pointer")
@@ -193,10 +229,13 @@ def _run_helper() -> None:  # pragma: no cover - exercised by the live smoke tes
             controller.panel.setIgnoresMouseEvents_(True)
             controller.panel.setHidesOnDeactivate_(False)
             controller.panel.setReleasedWhenClosed_(False)
-            controller.panel.setLevel_(AppKit.NSStatusWindowLevel + 1)
+            controller.panel.setLevel_(AppKit.NSStatusWindowLevel)
             controller.panel.setCollectionBehavior_(
                 AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+                | AppKit.NSWindowCollectionBehaviorCanJoinAllApplications
                 | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
+                | AppKit.NSWindowCollectionBehaviorTransient
+                | AppKit.NSWindowCollectionBehaviorIgnoresCycle
                 | AppKit.NSWindowCollectionBehaviorStationary
             )
             controller.shown = False
@@ -221,13 +260,12 @@ def _run_helper() -> None:  # pragma: no cover - exercised by the live smoke tes
                     local_x = x - min_x
                     local_y = y - min_y
                     ns_frame = screen.frame()
-                    hot_x, hot_y = POINTER_HOTSPOT
                     return AppKit.NSMakePoint(
                         float(ns_frame.origin.x) + local_x - hot_x,
                         float(ns_frame.origin.y)
                         + float(ns_frame.size.height)
                         - local_y
-                        - (POINTER_HEIGHT - hot_y),
+                        - (height - hot_y),
                     )
             return None
 
@@ -236,6 +274,27 @@ def _run_helper() -> None:  # pragma: no cover - exercised by the live smoke tes
             if self.animation_timer is not None:
                 self.animation_timer.invalidate()
                 self.animation_timer = None
+
+        @objc.python_method
+        def _touch(self) -> None:
+            AppKit.NSObject.cancelPreviousPerformRequestsWithTarget_selector_object_(
+                self, "idleHide:", None
+            )
+            self.performSelector_withObject_afterDelay_(
+                "idleHide:", None, IDLE_HIDE_SECONDS
+            )
+
+        @objc.python_method
+        def _hide(self) -> None:
+            AppKit.NSObject.cancelPreviousPerformRequestsWithTarget_selector_object_(
+                self, "idleHide:", None
+            )
+            self._stop_animation()
+            self.panel.orderOut_(None)
+            self.shown = False
+
+        def idleHide_(self, sender: Any) -> None:
+            self._hide()
 
         def tick_(self, timer: Any) -> None:
             elapsed = time.monotonic() - self.animation_started
@@ -256,12 +315,10 @@ def _run_helper() -> None:  # pragma: no cover - exercised by the live smoke tes
         def _place(self, command: dict[str, Any], *, animate: bool) -> None:
             origin = self._origin(float(command["x"]), float(command["y"]))
             if origin is None:
-                self._stop_animation()
-                self.panel.orderOut_(None)
-                self.shown = False
+                self._hide()
                 return
             duration = max(0.0, float(command.get("duration", 0.0)))
-            if animate and self.shown and duration > 0:
+            if animate and self.shown and duration > 0 and not reduce_motion:
                 self._stop_animation()
                 current = self.panel.frame().origin
                 self.animation_start = (float(current.x), float(current.y))
@@ -276,28 +333,25 @@ def _run_helper() -> None:  # pragma: no cover - exercised by the live smoke tes
                 self.panel.setFrameOrigin_(origin)
             self.panel.orderFrontRegardless()
             self.shown = True
+            self._touch()
 
         def handleCommand_(self, command: dict[str, Any]) -> None:
             action = command.get("cmd")
             if action in {"move", "show"}:
                 self._place(command, animate=action == "move")
             elif action == "hide":
-                self._stop_animation()
-                self.panel.orderOut_(None)
-                self.shown = False
+                self._hide()
             elif action == "click" and self.shown:
                 self.view.pressed = True
                 self.view.setNeedsDisplay_(True)
                 self.view.performSelector_withObject_afterDelay_(
                     "endPress:", None, 0.11
                 )
+                self._touch()
             elif action == "quit":
-                self._stop_animation()
-                self.panel.orderOut_(None)
+                self._hide()
                 AppKit.NSApplication.sharedApplication().terminate_(None)
 
-    app = AppKit.NSApplication.sharedApplication()
-    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyProhibited)
     controller = OverlayController.alloc().init()
     reader = threading.Thread(
         target=_read_commands, args=(sys.stdin, controller), daemon=True

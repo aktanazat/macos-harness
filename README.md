@@ -186,9 +186,11 @@ Multiple matches fail closed with owner, role, and title details.
 
 `wait_gone` requires two consecutive empty polls. A named app that exits counts
 as gone. `press` waits for one match, requires `AXPress`, performs it, and
-returns the match. The harness never calls an activate or raise API. If the
-target makes itself frontmost, `press` detects that change and raises
-`FocusChangedError`. It cannot undo a focus change initiated by the target.
+returns the match. The harness never activates an app on its own;
+`mac.activate(app)` is the one explicit request and reports whether macOS
+honored it. If the target makes itself frontmost, `press` detects that change
+and raises `FocusChangedError`. It cannot undo a focus change initiated by the
+target.
 
 These calls act only on accessible UI that macOS already rendered. They cannot
 make secure UI appear in an inactive app. They cannot bypass Touch ID, passkeys,
@@ -596,9 +598,11 @@ silently aliasing a different element.
               native + Electron apps
 ```
 
-- Captures background app windows without bringing them forward
+- Captures one app window through ScreenCaptureKit, behind other windows or
+  on another Space, without bringing it forward
 - Sends keyboard and coordinate input directly to an app PID
-- Draws an animated, click-through pointer without moving your real cursor
+- Draws an animated, click-through pointer at the system cursor size without
+  moving your real cursor
 - Exposes raw Apple Accessibility and Apple Events when vision is not enough
 - Uses Browser Harness for the real, logged-in browser
 - Keeps ordinary Python and the local filesystem within reach
@@ -614,7 +618,8 @@ silently aliasing a different element.
 ## Permissions and privacy
 
 `macos-harness doctor` reports the macOS permissions actually needed. The harness
-never activates or raises a target app and never moves the physical pointer.
+never activates a target app on its own (`mac.activate()` is explicit and reports
+the observed result) and never moves the physical pointer.
 
 Telemetry is off by default. Nothing is sent until you run `macos-harness
 telemetry enable`, and a kill switch always wins even after that:

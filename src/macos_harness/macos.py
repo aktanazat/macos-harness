@@ -1,8 +1,8 @@
 """Direct macOS control through public ApplicationServices APIs.
 
 No Codex or OpenAI Computer Use runtime is used here. Accessibility supplies
-the semantic tree/actions; Core Graphics supplies raw input; the system
-``screencapture`` executable captures a specific window.
+the semantic tree/actions; Core Graphics supplies raw input; ScreenCaptureKit
+renders a specific window (see ``capture.py``).
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ import json
 import math
 import os
 import re
-import struct
 import subprocess
 import tempfile
 import threading
@@ -21,8 +20,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
-from PIL import Image, ImageDraw
-
+from .capture import capture_window, draw_pointer, write_png
 from .errors import (
     AccessibilityPermissionError,
     ApplicationNotFoundError,
@@ -32,7 +30,6 @@ from .errors import (
 )
 from .handoff import HandoffReason, HumanHandoff
 from .overlay import LivePointerOverlay
-from .pointer import POINTER_HOTSPOT, pointer_points
 
 if TYPE_CHECKING:
     # Only for annotations -- `native.py` imports from this module at
@@ -44,9 +41,14 @@ if TYPE_CHECKING:
 
 try:
     import ApplicationServices as AS
-    from AppKit import NSRunningApplication, NSWorkspace
+    from AppKit import (
+        NSApplicationActivateIgnoringOtherApps,
+        NSRunningApplication,
+        NSWorkspace,
+    )
 except ImportError as exc:  # pragma: no cover - exercised on non-macOS hosts
     AS = None  # type: ignore[assignment]
+    NSApplicationActivateIgnoringOtherApps = 0
     NSRunningApplication = None  # type: ignore[assignment]
     NSWorkspace = None  # type: ignore[assignment]
     _IMPORT_ERROR: ImportError | None = exc
@@ -304,18 +306,6 @@ def _truncate(value: str, limit: int = 160) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
-def _png_size(path: Path) -> tuple[int, int]:
-    with path.open("rb") as handle:
-        header = handle.read(24)
-    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
-        raise MacOSError(
-            f"Screenshot is not a PNG: {path}",
-            code=ErrorCode.AX_ERROR,
-            details={"path": str(path)},
-        )
-    return struct.unpack(">II", header[16:24])
-
-
 def _ax_error(operation: str, error: int, **details: object) -> MacOSError:
     return MacOSError(
         f"{operation} failed with AXError {error}",
@@ -439,6 +429,18 @@ class MacOS:
             raise MacOSError(
                 "Could not create a private Core Graphics event source",
                 code=ErrorCode.AX_ERROR,
+            )
+        # A fresh private source suppresses the user's own hardware input
+        # for 250 ms after every posted event. Nothing here needs that
+        # quiet window, and a typing loop would turn it into a stuck
+        # keyboard, so let every local event through in both states.
+        AS.CGEventSourceSetLocalEventsSuppressionInterval(self._event_source, 0.0)
+        for state in (
+            AS.kCGEventSuppressionStateRemoteMouseDrag,
+            AS.kCGEventSuppressionStateSuppressionInterval,
+        ):
+            AS.CGEventSourceSetLocalEventsFilterDuringSuppressionState(
+                self._event_source, AS.kCGEventFilterMaskPermitAllEvents, state
             )
 
         from .controls import Accessibility
@@ -773,6 +775,13 @@ class MacOS:
         messaging_timeout: float | None = None,
         enhance: bool = True,
     ) -> Any:
+        """Create the AX root for ``pid``.
+
+        ``enhance`` sets ``AXEnhancedUserInterface``, the "a screen reader
+        is running" signal Chromium and Electron use to build their full
+        tree. It also changes how AppKit apps animate and lay out, so a
+        caller that only needs the root can pass ``enhance=False``.
+        """
         root = AS.AXUIElementCreateApplication(pid)
         if messaging_timeout is not None:
             error = AS.AXUIElementSetMessagingTimeout(root, messaging_timeout)
@@ -2159,6 +2168,57 @@ class MacOS:
         window_index: int = 0,
         path: str | Path | None = None,
     ) -> dict[str, Any]:
+        """Capture one window at its native pixel size, without the pointer."""
+        return self._capture(
+            app,
+            window_index=window_index,
+            path=path,
+            max_width=None,
+            max_height=None,
+            show_pointer=False,
+        )
+
+    def see(
+        self,
+        app: str | None = None,
+        *,
+        window_index: int = 0,
+        path: str | Path | None = None,
+        max_width: int = 1280,
+        max_height: int = 1280,
+        show_pointer: bool = False,
+    ) -> dict[str, Any]:
+        """Capture a bounded window image; ``show_pointer`` draws the pointer onto it.
+
+        The result's ``on_screen`` is the only freshness signal: an
+        off-screen window (minimized, hidden, or on another Space) still
+        renders, but from whatever the app last drew.
+        """
+        if max_width <= 0 or max_height <= 0:
+            raise MacOSError(
+                "max_width and max_height must be positive",
+                code=ErrorCode.BAD_REQUEST,
+                details={"max_width": max_width, "max_height": max_height},
+            )
+        return self._capture(
+            app,
+            window_index=window_index,
+            path=path,
+            max_width=max_width,
+            max_height=max_height,
+            show_pointer=show_pointer,
+        )
+
+    def _capture(
+        self,
+        app: str | None,
+        *,
+        window_index: int,
+        path: str | Path | None,
+        max_width: int | None,
+        max_height: int | None,
+        show_pointer: bool,
+    ) -> dict[str, Any]:
         self._ensure_screen_recording()
         _, info = self._resolve_app(app)
         windows = self.windows(str(info["pid"]))
@@ -2186,147 +2246,55 @@ class MacOS:
                 prefix="macos-harness-", suffix=".png", delete=False
             ) as handle:
                 output = Path(handle.name)
-            output.unlink(missing_ok=True)
         else:
             output = Path(path).expanduser().resolve()
             output.parent.mkdir(parents=True, exist_ok=True)
 
-        result = subprocess.run(
-            [
-                "/usr/sbin/screencapture",
-                "-x",
-                "-o",
-                "-l",
-                str(window["window_id"]),
-                str(output),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+        captured = capture_window(
+            window["window_id"], max_width=max_width, max_height=max_height
         )
-        if result.returncode != 0 or not output.exists():
-            output.unlink(missing_ok=True)
-            detail = (result.stderr or result.stdout or "no image returned").strip()
-            raise MacOSError(
-                f"Window screenshot failed: {detail}",
-                code=ErrorCode.AX_ERROR,
-                details={"reason": detail},
-            )
-
-        width, height = _png_size(output)
-        bounds = window["bounds"]
-        screenshot = {
+        bounds = captured.bounds
+        frontmost = self._frontmost_app()
+        screenshot: dict[str, Any] = {
             "path": str(output),
             "app": info,
             "pid": info["pid"],
             "window_id": window["window_id"],
-            "width": width,
-            "height": height,
+            "title": window["title"],
+            "width": captured.width,
+            "height": captured.height,
             "bounds": bounds,
-            "scale_x": width / bounds["width"],
-            "scale_y": height / bounds["height"],
+            "scale_x": captured.width / bounds["width"],
+            "scale_y": captured.height / bounds["height"],
+            "on_screen": captured.on_screen,
+            "captured_at": captured.captured_at,
+            "virtual_pointer": None,
+            "focus": {
+                "frontmost": frontmost,
+                "target_is_frontmost": (
+                    frontmost is not None and int(frontmost["pid"]) == int(info["pid"])
+                ),
+            },
         }
-        self._last_app = info
-        self._last_windows = windows
-        self._last_screenshot = screenshot
-        return screenshot
 
-    def see(
-        self,
-        app: str | None = None,
-        *,
-        window_index: int = 0,
-        path: str | Path | None = None,
-        max_width: int = 1280,
-        max_height: int = 1280,
-        show_pointer: bool = True,
-    ) -> dict[str, Any]:
-        """Capture a bounded window image and draw the harness pointer onto it."""
-        if max_width <= 0 or max_height <= 0:
-            raise MacOSError(
-                "max_width and max_height must be positive",
-                code=ErrorCode.BAD_REQUEST,
-                details={"max_width": max_width, "max_height": max_height},
-            )
-        screenshot = self.capture_screenshot(app, window_index=window_index, path=path)
-        output = Path(screenshot["path"])
-        raw_width = int(screenshot["width"])
-        raw_height = int(screenshot["height"])
-
-        with Image.open(output) as source:
-            image = source.convert("RGBA")
-        ratio = min(1.0, max_width / image.width, max_height / image.height)
-        if ratio < 1.0:
-            size = (
-                max(1, round(image.width * ratio)),
-                max(1, round(image.height * ratio)),
-            )
-            image = image.resize(size, Image.Resampling.LANCZOS)
-
-        bounds = screenshot["bounds"]
-        scale_x = image.width / float(bounds["width"])
-        scale_y = image.height / float(bounds["height"])
-        pointer = self._pointer_position
-        pointer_info: dict[str, Any] | None = None
-        if pointer is not None:
-            image_x = (pointer[0] - float(bounds["x"])) * scale_x
-            image_y = (pointer[1] - float(bounds["y"])) * scale_y
-            inside = 0 <= image_x < image.width and 0 <= image_y < image.height
-            pointer_info = {
-                "screen": {"x": pointer[0], "y": pointer[1]},
+        image = captured.image
+        if self._pointer_position is not None:
+            pointer_x, pointer_y = self._pointer_position
+            image_x, image_y, inside = self._image_point(screenshot, pointer_x, pointer_y)
+            visible = self._overlay.visible
+            screenshot["virtual_pointer"] = {
+                "screen": {"x": pointer_x, "y": pointer_y},
                 "image": {"x": image_x, "y": image_y},
                 "inside": inside,
-                "visible": self._overlay.visible,
+                "visible": visible,
             }
-            if show_pointer and self._overlay.visible and inside:
-                draw = ImageDraw.Draw(image)
-                hot_x, hot_y = POINTER_HOTSPOT
-                points = [
-                    (
-                        round(image_x + (x - hot_x) * scale_x),
-                        round(image_y + (y - hot_y) * scale_y),
-                    )
-                    for x, y in pointer_points()
-                ]
-                shadow = [
-                    (x + max(1, round(scale_x)), y + max(1, round(scale_y)))
-                    for x, y in points
-                ]
-                draw.polygon(shadow, fill=(0, 0, 0, 72))
-                outline_width = max(2, round(2.5 * (scale_x + scale_y) / 2))
-                draw.polygon(
-                    points,
-                    fill=(0, 0, 0, 255),
-                    outline=(255, 255, 255, 240),
-                    width=outline_width,
-                )
-                draw.line(
-                    [*points, points[0]],
-                    fill=(0, 0, 0, 230),
-                    width=max(1, round(0.65 * (scale_x + scale_y) / 2)),
-                    joint="curve",
-                )
+            if show_pointer and visible and inside:
+                scale = (screenshot["scale_x"] + screenshot["scale_y"]) / 2
+                image = draw_pointer(image, image_x, image_y, scale)
+        write_png(image, output)
 
-        image.save(output, format="PNG", optimize=True)
-        frontmost = self._frontmost_app()
-        screenshot.update(
-            {
-                "raw_width": raw_width,
-                "raw_height": raw_height,
-                "width": image.width,
-                "height": image.height,
-                "scale_x": scale_x,
-                "scale_y": scale_y,
-                "virtual_pointer": pointer_info,
-                "focus": {
-                    "frontmost": frontmost,
-                    "target_is_frontmost": (
-                        frontmost is not None
-                        and int(frontmost["pid"]) == int(screenshot["pid"])
-                    ),
-                },
-            }
-        )
+        self._last_app = info
+        self._last_windows = windows
         self._last_screenshot = screenshot
         return screenshot
 
@@ -2383,6 +2351,8 @@ class MacOS:
                     "target_pid": int(pid),
                 },
             )
+        if pid is not None:
+            self._require_window_unchanged(shot)
         bounds = shot["bounds"]
         if coordinate_space == "screenshot":
             x = float(x) / float(shot["scale_x"])
@@ -2394,6 +2364,65 @@ class MacOS:
                 details={"parameter": "coordinate_space", "value": coordinate_space},
             )
         return bounds["x"] + float(x), bounds["y"] + float(y)
+
+    @staticmethod
+    def _require_window_unchanged(shot: dict[str, Any]) -> None:
+        """Refuse screenshot coordinates once their window moved or left the screen.
+
+        A coordinate taken from a screenshot is only meaningful while the
+        window still sits where the screenshot saw it. A closed, moved,
+        resized, minimized, or other-Space window gets a fresh ``see()``
+        instead of a click that lands somewhere else or nowhere.
+        """
+        window_id = int(shot["window_id"])
+        values = AS.CGWindowListCreateDescriptionFromArray([window_id])
+        current = next(iter(values or ()), None)
+        if current is None:
+            raise MacOSError(
+                f"Window {window_id} from the last screenshot is gone; "
+                "take a fresh screenshot",
+                code=ErrorCode.WINDOW_CHANGED,
+                details={"window_id": window_id, "reason": "closed"},
+            )
+        raw = current.get(AS.kCGWindowBounds) or {}
+        bounds = {
+            "x": float(raw.get("X", 0)),
+            "y": float(raw.get("Y", 0)),
+            "width": float(raw.get("Width", 0)),
+            "height": float(raw.get("Height", 0)),
+        }
+        if bounds != shot["bounds"]:
+            raise MacOSError(
+                f"Window {window_id} moved or resized since the last screenshot; "
+                "take a fresh screenshot",
+                code=ErrorCode.WINDOW_CHANGED,
+                details={
+                    "window_id": window_id,
+                    "reason": "moved",
+                    "was": shot["bounds"],
+                    "now": bounds,
+                },
+            )
+        if not bool(current.get(AS.kCGWindowIsOnscreen, False)):
+            raise MacOSError(
+                f"Window {window_id} is not on screen (minimized, hidden, or on "
+                "another Space); input at its coordinates cannot land",
+                code=ErrorCode.WINDOW_CHANGED,
+                details={"window_id": window_id, "reason": "off_screen"},
+            )
+
+    @staticmethod
+    def _image_point(
+        shot: dict[str, Any], screen_x: float, screen_y: float
+    ) -> tuple[float, float, bool]:
+        """Map a screen point into ``shot``'s image pixels; the flag says it lands inside."""
+        bounds = shot["bounds"]
+        image_x = (screen_x - float(bounds["x"])) * float(shot["scale_x"])
+        image_y = (screen_y - float(bounds["y"])) * float(shot["scale_y"])
+        inside = 0 <= image_x < float(shot["width"]) and 0 <= image_y < float(
+            shot["height"]
+        )
+        return image_x, image_y, inside
 
     def _pointer_info(self, *, pid: int | None = None) -> dict[str, object] | None:
         """Describe the current virtual pointer position.
@@ -2416,13 +2445,9 @@ class MacOS:
         result: dict[str, object] = {"screen": {"x": screen_x, "y": screen_y}}
         shot = self._last_screenshot
         if shot is not None and (pid is None or int(shot["pid"]) == int(pid)):
-            bounds = shot["bounds"]
-            image_x = (screen_x - float(bounds["x"])) * float(shot["scale_x"])
-            image_y = (screen_y - float(bounds["y"])) * float(shot["scale_y"])
+            image_x, image_y, inside = self._image_point(shot, screen_x, screen_y)
             result["image"] = {"x": image_x, "y": image_y}
-            result["inside"] = 0 <= image_x < float(
-                shot["width"]
-            ) and 0 <= image_y < float(shot["height"])
+            result["inside"] = inside
         return result
 
     def move(
@@ -2475,6 +2500,40 @@ class MacOS:
 
     def hide_pointer(self) -> None:
         self._overlay.hide()
+
+    def activate(
+        self, app: str | int | None = None, *, timeout: float = 0.5
+    ) -> dict[str, Any]:
+        """Ask macOS to bring ``app`` frontmost and report what actually happened.
+
+        Since macOS 14 activation is a request the system may decline,
+        typically while the user is busy in another app. One request is
+        made and the frontmost app is observed for up to ``timeout``
+        seconds; ``activated`` says whether it took. Nothing here retries
+        or loops -- a declined request means the person at the keyboard
+        has priority, so hand off instead of asking again.
+        """
+        running, info = self._resolve_app(app)
+        previous = self._frontmost_app()
+        started = time.monotonic()
+        running.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        deadline = started + max(0.0, timeout)
+        while True:
+            frontmost = self._frontmost_app()
+            activated = frontmost is not None and int(frontmost["pid"]) == int(
+                info["pid"]
+            )
+            if activated or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        self._last_app = info
+        return {
+            "app": info,
+            "activated": activated,
+            "previous": previous,
+            "frontmost": frontmost,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+        }
 
     def click(
         self,
