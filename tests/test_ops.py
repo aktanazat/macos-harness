@@ -851,6 +851,7 @@ def test_press_equals_polls_the_attribute_until_it_reads_the_expected_value() ->
     assert receipt.verified is True
     assert receipt.changed is True
     assert sleeps == [0.02, 0.02]
+    assert [call["text"] for call in host.wait_calls] == ["Mailboxes"] * 3
     assert host.wait_calls[-1]["app"] == "Demo"
     assert host.wait_calls[-1]["search_key"] == "AXTableSearchKey"
     assert receipt.request["postcondition"]["attribute"] == "AXSelectedRows"
@@ -881,8 +882,9 @@ def test_press_equals_fails_at_the_deadline_with_summaries_and_never_the_value()
     assert error.receipt.error["details"]["attribute"] == "AXValue"
     assert error.receipt.error["details"]["expected"] == _value_summary("hello")
     assert error.receipt.error["details"]["observed"] == _value_summary("hunter2")
-    assert clock.sleeps == pytest.approx([0.125, 0.125, 0.05])
     assert error.receipt.duration_s == pytest.approx(0.3)
+    assert max(clock.sleeps) <= 0.125
+    assert [call["text"] for call in host.wait_calls] == ["Name"] * 4
     assert "hunter2" not in json.dumps(error.receipt.to_json())
 
 

@@ -390,15 +390,16 @@ class Equals(_PostconditionBase):
     (compared canonically, the way `set` judges convergence) or the
     deadline passes. Scope inheritance and deadline behavior are as
     for `Present`; a zero `timeout` means one look. ``value`` is frozen
-    with `canonicalize` at construction, so it must be JSON-safe, and a
-    receipt only ever carries its length and hash, never the value.
+    with `canonicalize` at construction, so it must be JSON-safe, and
+    neither a receipt nor this object's ``repr`` ever carries it: a
+    receipt only ever holds its length and hash.
     The comparison itself uses the real value, so ``Equals`` tells a
     receipt whether a field holds the requested text, whether a
     selection sits where a click should have put it, or whether a
     control reads the requested state -- without a separate readback.
     """
 
-    value: JSONValue
+    value: JSONValue = dataclasses.field(repr=False)
     attribute: str = "AXValue"
 
     def __post_init__(self) -> None:

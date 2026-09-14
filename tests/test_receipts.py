@@ -4,10 +4,11 @@ postcondition, and operation-error contract ``mac.do`` is built on.
 
 from __future__ import annotations
 
+import functools
 import json
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import FrozenInstanceError
 from types import MappingProxyType
 
@@ -144,7 +145,7 @@ def test_present_and_gone_helpers_freeze_app_scope() -> None:
     assert present("x", apps=None).apps is None
 
 
-def test_equals_factory_freezes_the_expected_value() -> None:
+def test_equals_factory_freezes_the_expected_value_and_keeps_it_out_of_repr() -> None:
     postcondition = equals("Name", role="textfield", value={"location": 3, "length": 0})
 
     assert isinstance(postcondition, Equals)
@@ -154,6 +155,7 @@ def test_equals_factory_freezes_the_expected_value() -> None:
     assert postcondition == Equals(
         text="Name", role="textfield", value={"location": 3, "length": 0}
     )
+    assert "location" not in repr(postcondition)
 
 
 @pytest.mark.parametrize(
@@ -174,9 +176,18 @@ def test_equals_rejects_an_unsafe_value_or_an_empty_attribute(
     assert excinfo.value.details["parameter"] == parameter
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+#: Every postcondition shares `_PostconditionBase`'s validation; `Equals`
+#: only differs in needing a `value` to be constructed at all.
+_POSTCONDITIONS = [
+    pytest.param(Present, id="Present"),
+    pytest.param(Gone, id="Gone"),
+    pytest.param(functools.partial(Equals, value="x"), id="Equals"),
+]
+
+
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 def test_postcondition_rejects_more_than_one_scope_selector(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: Callable[..., Postcondition],
 ) -> None:
     with pytest.raises(MacOSError) as excinfo:
         postcondition_class(app="Notes", all_apps=True)
@@ -189,45 +200,46 @@ def test_postcondition_rejects_more_than_one_scope_selector(
         postcondition_class(all_apps=True, apps=["Notes"])
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 def test_postcondition_accepts_a_single_scope_selector(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: Callable[..., Postcondition],
 ) -> None:
     assert postcondition_class(app="Notes").app == "Notes"
     assert postcondition_class(all_apps=True).all_apps is True
     assert postcondition_class(apps=["Notes"]).apps == ("Notes",)
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 def test_postcondition_rejects_bad_direction(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: Callable[..., Postcondition],
 ) -> None:
     with pytest.raises(MacOSError) as excinfo:
         postcondition_class(direction="sideways")
     assert excinfo.value.code == "bad_request"
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 def test_postcondition_accepts_direction_case_insensitively(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: Callable[..., Postcondition],
 ) -> None:
     assert postcondition_class(direction="Next").direction == "Next"
     assert postcondition_class(direction="PREVIOUS").direction == "PREVIOUS"
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 def test_postcondition_rejects_negative_timeout(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: Callable[..., Postcondition],
 ) -> None:
     with pytest.raises(MacOSError) as excinfo:
         postcondition_class(timeout=-1)
     assert excinfo.value.code == "bad_request"
 
 
-def test_present_allows_a_zero_timeout() -> None:
-    """`Present` only ever needs one look, so a zero timeout is a
-    normal, satisfiable "check right now" request."""
+def test_present_and_equals_allow_a_zero_timeout() -> None:
+    """`Present` and `Equals` only ever need one look, so a zero timeout
+    is a normal, satisfiable "check right now" request."""
     assert Present(timeout=0).timeout == 0
+    assert Equals(value="x", timeout=0).timeout == 0
 
 
 def test_gone_rejects_a_zero_timeout() -> None:
@@ -243,9 +255,9 @@ def test_gone_allows_a_positive_or_inherited_timeout() -> None:
     assert Gone().timeout is None
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 def test_postcondition_rejects_non_positive_interval(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: Callable[..., Postcondition],
 ) -> None:
     with pytest.raises(MacOSError) as excinfo:
         postcondition_class(interval=0)
@@ -254,32 +266,33 @@ def test_postcondition_rejects_non_positive_interval(
         postcondition_class(interval=-0.1)
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
 def test_postcondition_rejects_nonfinite_timeout(
-    postcondition_class: type[Present | Gone], bad: float
+    postcondition_class: Callable[..., Postcondition], bad: float
 ) -> None:
     with pytest.raises(MacOSError) as excinfo:
         postcondition_class(timeout=bad)
     assert excinfo.value.code == "bad_request"
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
 def test_postcondition_rejects_nonfinite_interval(
-    postcondition_class: type[Present | Gone], bad: float
+    postcondition_class: Callable[..., Postcondition], bad: float
 ) -> None:
     with pytest.raises(MacOSError) as excinfo:
         postcondition_class(interval=bad)
     assert excinfo.value.code == "bad_request"
 
 
-def test_postcondition_type_alias_covers_both_variants() -> None:
+def test_postcondition_type_alias_covers_every_variant() -> None:
     def describe(postcondition: Postcondition) -> str:
         return type(postcondition).__name__
 
     assert describe(present("x")) == "Present"
     assert describe(gone("x")) == "Gone"
+    assert describe(equals("x", value="y")) == "Equals"
 
 
 # --- Receipt -------------------------------------------------------------

@@ -74,7 +74,7 @@ import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Literal, Protocol
+from typing import IO, Literal, Protocol, TypeVar
 
 from .errors import ErrorCode, FocusChangedError, MacOSError
 from .receipts import (
@@ -94,6 +94,8 @@ from .receipts import (
 )
 
 __all__ = ["Operations"]
+
+_Reading = TypeVar("_Reading")
 
 
 # --- small pure helpers ------------------------------------------------
@@ -2731,14 +2733,14 @@ class Operations:
         Each poll resolves the match again rather than holding the first
         element: an app that rebuilds a control after the action would
         otherwise leave a dead reference, and the one-match rule already
-        refuses to certify a look-alike. A read the app refuses raises
-        out to the caller's ``except`` -- the same bounded failure a
-        `Present` search gets -- rather than polling an error that will
-        not heal.
+        refuses to certify a look-alike. A read the app refuses, and a
+        deadline that runs out first, both raise out to the caller's
+        ``except`` -- the same bounded failure a `Present` search gets.
         """
         attribute = postcondition.attribute
-        deadline = self._monotonic() + timeout
-        while True:
+        deadline = _Deadline(timeout, self._monotonic)
+
+        def read() -> tuple[Mapping[str, JSONValue], object]:
             match = host.ax_wait(
                 app=app,
                 all_apps=all_apps,
@@ -2748,36 +2750,56 @@ class Operations:
                 visible_only=postcondition.visible_only,
                 direction=postcondition.direction,
                 immediate_descendants_only=postcondition.immediate_descendants_only,
-                timeout=max(0.0, deadline - self._monotonic()),
+                timeout=deadline.remaining(),
                 interval=postcondition.interval,
             )
-            observed = host.get(int(match["element_index"]), attribute)
-            if canonicalize(observed) == postcondition.value:
-                return _Verification(
-                    ok=True,
-                    observed={
-                        **self._match_summary_payload(match),
-                        "attribute": attribute,
-                        "value": _value_summary(observed),
-                    },
-                    error=None,
-                )
-            remaining = deadline - self._monotonic()
+            return match, host.get(int(match["element_index"]), attribute)
+
+        (match, observed), converged = self._read_until(
+            deadline,
+            postcondition.interval,
+            read,
+            lambda reading: canonicalize(reading[1]) == postcondition.value,
+        )
+        if not converged:
+            raise MacOSError(
+                f"{attribute} did not equal the expected value before the deadline",
+                code=ErrorCode.TIMEOUT,
+                details={
+                    "attribute": attribute,
+                    "expected": _value_summary(postcondition.value),
+                    "observed": _value_summary(observed),
+                },
+            )
+        return _Verification(
+            ok=True,
+            observed={
+                **self._match_summary_payload(match),
+                "attribute": attribute,
+                "value": _value_summary(observed),
+            },
+            error=None,
+        )
+
+    def _read_until(
+        self,
+        deadline: _Deadline,
+        interval: float,
+        read: Callable[[], _Reading],
+        converged: Callable[[_Reading], bool],
+    ) -> tuple[_Reading, bool]:
+        """Call ``read`` every ``interval`` until ``converged`` accepts a
+        reading or ``deadline`` runs out, never sleeping past either; the
+        last reading comes back with whether it converged. A refused read
+        raises straight through."""
+        while True:
+            reading = read()
+            if converged(reading):
+                return reading, True
+            remaining = deadline.remaining()
             if remaining <= 0:
-                return _Verification(
-                    ok=False,
-                    observed=None,
-                    error={
-                        "code": ErrorCode.TIMEOUT.value,
-                        "message": f"{attribute} did not equal the expected value before the deadline",
-                        "details": {
-                            "attribute": attribute,
-                            "expected": _value_summary(postcondition.value),
-                            "observed": _value_summary(observed),
-                        },
-                    },
-                )
-            self._sleep(min(postcondition.interval, remaining))
+                return reading, False
+            self._sleep(min(interval, remaining))
 
     @staticmethod
     def _match_summary_payload(match: Mapping[str, JSONValue]) -> JSONValue:
