@@ -102,6 +102,7 @@ class FakeHost:
         self.press_hook: Callable[[], None] | None = None
         # A `MacOSError` queued here is raised by that `_focus_sample` call.
         self.focus_samples: deque[dict[str, object] | MacOSError] = deque()
+        self.focus_hook: Callable[[], None] | None = None
         self.focus_sample: dict[str, object] = {
             "frontmost_pid": 41,
             "window": "Untitled",
@@ -172,6 +173,8 @@ class FakeHost:
     def _focus_sample(self, pid: int) -> dict[str, object]:
         assert pid == 41
         self.focus_sample_calls += 1
+        if self.focus_hook is not None:
+            self.focus_hook()
         if self.focus_samples:
             sample = self.focus_samples.popleft()
             if isinstance(sample, MacOSError):
@@ -1586,6 +1589,8 @@ def test_key_deadline_exhausted_before_dispatch_fails_without_acting_or_burning_
     assert error.receipt.error["code"] == ErrorCode.TIMEOUT.value
     assert error.receipt.error["details"]["reason"] == "deadline_exhausted_before_dispatch"
     assert host.key_calls == []
+    # A spent budget never spends AX time on the app either.
+    assert host.focus_sample_calls == 0
 
     receipt = operations.key("return", app="Demo", once="deadline-key")
 
@@ -1667,6 +1672,95 @@ def test_input_verb_gives_up_on_focus_after_its_polling_budget() -> None:
     assert host.focus_sample_calls == 12
     assert still.changed is None
     assert still.observed["focus"]["changed"] == ()
+
+
+def test_input_verb_clips_focus_polling_to_the_remaining_deadline() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    before = copy.deepcopy(host.focus_sample)
+    host.focus_samples.extend([before, *(copy.deepcopy(before) for _ in range(20))])
+
+    still = operations.key("cmd+s", app="Demo", timeout=0.025)
+
+    assert still.outcome is Outcome.DONE
+    assert clock.sleeps == pytest.approx([0.01, 0.01, 0.005])
+    assert host.focus_sample_calls == 5
+    assert still.changed is None
+    assert host.key_calls == [("cmd+s", 41)]
+
+
+def test_input_verb_refuses_to_dispatch_when_the_focus_sample_spends_the_deadline() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    delays = deque([0.06])
+
+    def slow_app() -> None:
+        if delays:
+            clock.now += delays.popleft()
+
+    host.focus_hook = slow_app
+
+    error = _failed(
+        lambda: operations.key("return", app="Demo", timeout=0.05, once="late")
+    )
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.changed is False
+    assert error.receipt.error["code"] == ErrorCode.TIMEOUT.value
+    assert error.receipt.error["details"]["reason"] == "deadline_exhausted_before_dispatch"
+    assert host.key_calls == []
+    assert host.focus_sample_calls == 1
+
+    receipt = operations.key("return", app="Demo", timeout=0.05, once="late")
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.replayed is False
+    assert host.key_calls == [("return", 41)]
+
+
+def test_input_verb_reserves_the_once_token_after_the_focus_sample_and_before_dispatch() -> None:
+    host, operations = _ops()
+    before = copy.deepcopy(host.focus_sample)
+    landed = copy.deepcopy(before)
+    landed["window"] = "Renamed"
+    host.focus_samples.extend([before, landed])
+    seen: list[str] = []
+
+    def observe() -> None:
+        status, _op, _receipt = operations._ledger.peek("order")
+        seen.append(status)
+
+    host.focus_hook = observe
+    host.key_hook = observe
+
+    operations.key("return", app="Demo", once="order")
+
+    # The before-sample sees no reservation, the dispatch and the
+    # after-sample both see it in flight.
+    assert seen == ["unknown", "in_flight", "in_flight"]
+
+
+def test_input_verb_verifies_an_explicit_postcondition_without_waiting_on_focus() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    before = copy.deepcopy(host.focus_sample)
+    host.focus_samples.extend([before, *(copy.deepcopy(before) for _ in range(20))])
+    host.get_results.extend(["old", "ready"])
+
+    receipt = operations.key(
+        "return",
+        app="Demo",
+        timeout=0.025,
+        postcondition=equals("Status", value="ready", interval=0.01),
+    )
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.verified is True
+    assert receipt.changed is True
+    assert clock.sleeps == [0.01]
+    assert host.focus_sample_calls == 2
+    assert receipt.observed["focus"]["changed"] == ()
+    assert host.key_calls == [("return", 41)]
 
 
 def test_input_verb_survives_a_failed_focus_reading() -> None:

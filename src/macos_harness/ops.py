@@ -285,9 +285,12 @@ def _changed_after_dispatch(postcondition: Postcondition | None, verified: _Veri
 # How a raw-input verb watches for its effect on focus. The first reading
 # right after dispatch missed 70 of 80 effects that later showed; across
 # 360 key, click and packed-typing trials over four apps the effect showed
-# within 20ms in most, 47ms at p95 and 62ms at the latest. So the receipt
-# samples every 10ms for up to 100ms and stops at the first reading that
-# differs from the one before dispatch.
+# within 20ms in most, 47ms at p95 and 62ms at the latest. So when the
+# caller gave no postcondition the receipt samples every 10ms for up to
+# 100ms -- never past the shared deadline -- and stops at the first reading
+# that differs from the one before dispatch. An explicit postcondition is
+# the effect the caller asked about, so it is verified straight after the
+# one immediate reading instead of waiting behind this witness.
 _FOCUS_POLL_SECONDS = 0.01
 _FOCUS_POLLS = 10
 
@@ -2352,6 +2355,12 @@ class Operations:
                     )
                 )
 
+            # The focus reading before dispatch is a witness, but it is
+            # AX work against the app, so it counts against the budget:
+            # it runs only while time remains and the deadline is checked
+            # again after it, before the token is reserved, so a slow
+            # sample never turns into a late mutation or a spent token.
+            before = None if deadline.exhausted() else _sample_focus(host, pid)
             if deadline.exhausted():
                 return self._finish(
                     builder.build(
@@ -2372,7 +2381,6 @@ class Operations:
                 if action == "in_flight":
                     return self._finish(self._in_flight_receipt(builder, target=target))
 
-            before = _sample_focus(host, pid)
             try:
                 dispatch(host, pid)
             except FocusChangedError as exc:
@@ -2386,7 +2394,9 @@ class Operations:
                     target=target, error=exc.to_json(),
                 )
             else:
-                focus = self._focus_effect(host, pid, before)
+                focus = self._focus_effect(
+                    host, pid, before, deadline, poll=postcondition is None
+                )
                 verified = self._verify_postcondition(
                     host, postcondition, deadline, app=app, all_apps=False, apps=None
                 )
@@ -2407,22 +2417,33 @@ class Operations:
             return self._finish(receipt)
 
     def _focus_effect(
-        self, host: _Host, pid: int, before: Mapping[str, JSONValue] | None
+        self,
+        host: _Host,
+        pid: int,
+        before: Mapping[str, JSONValue] | None,
+        deadline: _Deadline,
+        *,
+        poll: bool,
     ) -> dict[str, JSONValue]:
         """Read focus again after a raw input landed and report what moved.
 
-        Polls every `_FOCUS_POLL_SECONDS` for up to `_FOCUS_POLLS` readings
-        and stops at the first that differs from ``before``, so the app's
-        run loop gets up to 100ms to process the event before the receipt
-        calls the effect unobserved. Either reading failing leaves
-        ``changed`` empty: no witness, not a witness of nothing.
+        Always takes one reading straight away. With ``poll`` it then
+        re-reads every `_FOCUS_POLL_SECONDS` for up to `_FOCUS_POLLS`
+        readings, stopping at the first that differs from ``before``, so
+        the app's run loop gets up to 100ms to process the event before
+        the receipt calls the effect unobserved; no sleep runs past
+        ``deadline``. Either reading failing leaves ``changed`` empty:
+        no witness, not a witness of nothing.
         """
         after = _sample_focus(host, pid)
-        if before is not None:
+        if poll and before is not None:
             for _ in range(_FOCUS_POLLS):
                 if after is not None and after != before:
                     break
-                self._sleep(_FOCUS_POLL_SECONDS)
+                remaining = deadline.remaining()
+                if remaining <= 0:
+                    break
+                self._sleep(min(_FOCUS_POLL_SECONDS, remaining))
                 after = _sample_focus(host, pid)
         changed = [] if before is None or after is None else _changed_focus_fields(before, after)
         return {

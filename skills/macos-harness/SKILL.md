@@ -72,8 +72,10 @@ receipt = mac.do.type(
   before and after -- frontmost pid, focused window, focused element's
   role, value summary, selected range, character count, position, size;
   a secure field gives role and subrole only -- and report the fields
-  that moved under `observed.focus`. The after-reading repeats every
-  10ms for up to 100ms until it differs from the before. `changed` is
+  that moved under `observed.focus`. Without a `postcondition` the
+  after-reading repeats every 10ms for up to 100ms until it differs from
+  the before, never past the deadline; with one, the postcondition is
+  verified right after the single after-reading instead. `changed` is
   `True` when a postcondition verified the effect or focus moved, and
   `None` when nothing observable moved, which is how a key AppKit
   silently dropped shows up. `press`/`run` have no readback of their own,
@@ -95,11 +97,14 @@ receipt = mac.do.type(
 - Pass `dry_run=True` to validate and resolve (and, for `run`, compile)
   without ever dispatching, when you need to confirm a target exists before
   committing to the action. `press`/`set`/`toggle` take an `interval` for
-  their own AX polling (resolution, and the readback after a `set` or a
-  press); `run` and `key` do not poll, so neither takes one.
-- `timeout` is a cooperative budget. No mutation starts after it expires,
-  polling and script process groups are bounded by it, but a synchronous
-  macOS AX/input call already in progress cannot be preempted safely.
+  their own AX polling (resolution, and for `set`/`toggle` the readback
+  after the mutation); `key`/`click`/`type` watch focus on a fixed 10ms
+  cadence and `run` polls for nothing, so none of those takes one.
+- `timeout` is a cooperative budget. No mutation starts after it expires
+  -- `key`/`click`/`type` check it again after their focus reading and
+  before the `once` token is reserved -- polling and script process
+  groups are bounded by it, but a synchronous macOS AX/input call already
+  in progress cannot be preempted safely.
 - `run` receipts keep source, arguments, and output as length/SHA-256
   metadata by default. Pass `capture_output=True` only when you need bounded
   stdout/stderr text and accept that it can contain sensitive data.

@@ -90,13 +90,16 @@ PY
   value summary, selected range, character count, position, and size; a
   secure field gives its role and subrole only — and report the fields
   that moved under `observed.focus`.
-  The after-reading repeats every 10ms for up to 100ms until it differs,
-  so an app's run loop gets time to process the event. `changed` is
-  `True` when focus moved or a postcondition verified the effect, `None`
-  when nothing observable moved, which is how a key AppKit silently
-  dropped shows up. `press`/`run` have no readback of their own, so
-  `changed` is `None` unless you pass a `postcondition` that confirms the
-  effect actually took hold.
+  Without a `postcondition` the after-reading repeats every 10ms for up
+  to 100ms until it differs, never past the deadline, so an app's run
+  loop gets time to process the event. With one, the single after-reading
+  is taken and the postcondition is verified straight away: it is the
+  effect you asked about, so it never waits behind the focus witness.
+  `changed` is `True` when focus moved or a postcondition verified the
+  effect, `None` when nothing observable moved, which is how a key AppKit
+  silently dropped shows up. `press`/`run` have no readback of their own,
+  so `changed` is `None` unless you pass a `postcondition` that confirms
+  the effect actually took hold.
 - A bad argument — an unknown role, a malformed postcondition, reusing a
   `once` token for a genuinely different request — raises `MacOSError`
   directly, before anything is dispatched: there is no receipt, because
@@ -108,8 +111,9 @@ PY
   — except for `run`, which has no scope of its own, so its postcondition
   must set `app=`, `all_apps=True`, or `apps=` explicitly. `press`/`set`/
   `toggle` accept an `interval` for their own AX polling — resolution,
-  and for `set`/`toggle` the readback after the mutation; `run` and `key`
-  poll for nothing of their own, so neither takes one.
+  and for `set`/`toggle` the readback after the mutation. `key`/`click`/
+  `type` watch focus on a fixed 10ms cadence and `run` polls for nothing,
+  so none of those takes one; a postcondition carries its own `interval`.
 - `equals(..., value=, attribute="AXValue")` verifies a value, not just a
   presence: it resolves one match the way `present` does, reads
   `attribute` back every `interval`, and is satisfied once the reading
@@ -120,9 +124,12 @@ PY
   summaries, never the values themselves.
 - `timeout` is one cooperative budget across resolution, dispatch, and
   verification. The harness does not start a mutation after the budget
-  expires and it terminates a timed-out script process group. A synchronous
-  macOS Accessibility or input call that is already in progress cannot be
-  preempted safely and can return after the budget.
+  expires — `key`/`click`/`type` check it again after their focus reading,
+  before the `once` token is reserved, so a slow app's AX tree costs the
+  call its dispatch, not its token — and it terminates a timed-out script
+  process group. A synchronous macOS Accessibility or input call that is
+  already in progress cannot be preempted safely and can return after the
+  budget.
 - `press`, `run`, and `key` accept a nonempty `once` keyword for
   at-most-once dispatch. The ledger lives only in the memory of the one
   live `MacOS` instance that dispatched the call — a crash, a fresh
