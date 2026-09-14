@@ -1086,7 +1086,7 @@ def test_background_click_uses_private_event_source(monkeypatch) -> None:
     monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_post", lambda event, pid: None)
-    monkeypatch.setattr(mac, "_route_to_window", lambda event, window, point: event)
+    monkeypatch.setattr(mac, "_route_to_window", lambda event, window, point: None)
     _on_screen_windows(monkeypatch, (42, 7, 0, 0, 800, 600))
     monkeypatch.setattr(
         macos_module.AS,

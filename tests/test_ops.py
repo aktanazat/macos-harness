@@ -13,7 +13,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import pytest
 
@@ -48,6 +48,11 @@ class FakeAX:
             return self._ALIASES[normalized]
         except KeyError as exc:
             raise MacOSError("Unsupported role", code=ErrorCode.BAD_REQUEST) from exc
+
+
+class _Window(NamedTuple):
+    window_id: int
+    origin: tuple[float, float]
 
 
 class FakeHost:
@@ -146,11 +151,11 @@ class FakeHost:
             return float(x), float(y)
         return float(x) + 100.0, float(y) + 200.0
 
-    def _target_window(self, pid: int, point: tuple[float, float]) -> dict[str, object]:
+    def _target_window(self, pid: int, point: tuple[float, float]) -> _Window:
         self.target_window_calls.append((pid, point))
         if self.target_window_error is not None:
             raise self.target_window_error
-        return {"window_id": 7, "origin": (100.0, 200.0)}
+        return _Window(7, (100.0, 200.0))
 
     def _focus_sample(self, pid: int) -> dict[str, object]:
         assert pid == 41

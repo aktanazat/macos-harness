@@ -17,9 +17,9 @@ import tempfile
 import threading
 import time
 import weakref
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
 from .capture import capture_window, draw_pointer, write_png
 from .errors import (
@@ -31,6 +31,7 @@ from .errors import (
 )
 from .handoff import HandoffReason, HumanHandoff
 from .overlay import LivePointerOverlay
+from .receipts import JSONValue
 
 if TYPE_CHECKING:
     # Only for annotations -- `native.py` imports from this module at
@@ -63,6 +64,13 @@ class _CGPoint(ctypes.Structure):
     _fields_ = (("x", ctypes.c_double), ("y", ctypes.c_double))
 
 
+class _TargetWindow(NamedTuple):
+    """The window a posted mouse or scroll event is bound to."""
+
+    window_id: int
+    origin: tuple[float, float]  # top-left screen point
+
+
 # A mouse or scroll event posted with ``CGEventPostToPid`` skips the window
 # server's hit test, so AppKit has to learn the destination window from the
 # event itself: the window number in this private ``CGEventField`` plus the
@@ -75,7 +83,7 @@ _CG_EVENT_WINDOW_NUMBER = 51
 _CORE_GRAPHICS = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
 
 
-def _load_window_location_setter() -> Any:
+def _load_window_location_setter() -> Callable[[int, _CGPoint], None] | None:
     """Resolve ``CGEventSetWindowLocation``; ``None`` on a macOS that dropped it."""
     try:
         setter = ctypes.CDLL(_CORE_GRAPHICS).CGEventSetWindowLocation
@@ -945,7 +953,7 @@ class MacOS:
         error, value = AS.AXUIElementIsAttributeSettable(element, attribute, None)
         return bool(value) if error == _AX_SUCCESS else False
 
-    def _focus_sample(self, pid: int) -> dict[str, Any]:
+    def _focus_sample(self, pid: int) -> dict[str, JSONValue]:
         """What has keyboard focus in ``pid`` right now, in one cheap reading.
 
         Two AX round trips (the app root, then the focused element) and
@@ -959,7 +967,7 @@ class MacOS:
         frontmost = self._frontmost_app()
         window = raw.get("AXFocusedWindow")
         focused = raw.get("AXFocusedUIElement")
-        sample: dict[str, Any] = {
+        sample: dict[str, JSONValue] = {
             "frontmost_pid": None if frontmost is None else int(frontmost["pid"]),
             "window": None
             if window is None
@@ -2496,14 +2504,14 @@ class MacOS:
         AS.CGEventPostToPid(pid, event)
 
     @staticmethod
-    def _target_window(pid: int, point: tuple[float, float]) -> dict[str, Any]:
+    def _target_window(pid: int, point: tuple[float, float]) -> _TargetWindow:
         """Find the frontmost on-screen window of ``pid`` under ``point``.
 
-        Returns ``{"window_id", "origin"}``; ``origin`` is the window's
-        top-left screen point, which ``_route_to_window`` needs to express
-        each event in window coordinates. Other apps' windows over the
-        point do not matter: input posted to a pid only ever reaches that
-        pid, so the covered window is still the one the event lands in.
+        ``origin`` is the window's top-left screen point, which
+        ``_route_to_window`` needs to express each event in window
+        coordinates. Other apps' windows over the point do not matter:
+        input posted to a pid only ever reaches that pid, so the covered
+        window is still the one the event lands in.
         """
         if _set_window_location is None:
             raise MacOSError(
@@ -2526,10 +2534,7 @@ class MacOS:
                 left <= x < left + float(bounds.get("Width", 0))
                 and top <= y < top + float(bounds.get("Height", 0))
             ):
-                return {
-                    "window_id": int(value[AS.kCGWindowNumber]),
-                    "origin": (left, top),
-                }
+                return _TargetWindow(int(value[AS.kCGWindowNumber]), (left, top))
         raise MacOSError(
             f"No on-screen window of pid {pid} contains screen point "
             f"({x:.0f}, {y:.0f}); pointer input there cannot land",
@@ -2539,17 +2544,14 @@ class MacOS:
 
     @staticmethod
     def _route_to_window(
-        event: Any, window: dict[str, Any], point: tuple[float, float]
-    ) -> Any:
+        event: Any, window: _TargetWindow, point: tuple[float, float]
+    ) -> None:
         """Bind a mouse or scroll ``event`` at screen ``point`` to ``window``."""
-        AS.CGEventSetIntegerValueField(
-            event, _CG_EVENT_WINDOW_NUMBER, window["window_id"]
-        )
-        left, top = window["origin"]
+        AS.CGEventSetIntegerValueField(event, _CG_EVENT_WINDOW_NUMBER, window.window_id)
+        left, top = window.origin
         _set_window_location(
             objc.pyobjc_id(event), _CGPoint(point[0] - left, point[1] - top)
         )
-        return event
 
     def _screen_point(
         self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
@@ -2816,13 +2818,10 @@ class MacOS:
         down_type, up_type, _ = _MOUSE_EVENTS[button]
         for click_count in range(1, max(1, int(clicks)) + 1):
             for event_type in (down_type, up_type):
-                event = self._route_to_window(
-                    AS.CGEventCreateMouseEvent(
-                        self._event_source, event_type, point, _BUTTONS[button]
-                    ),
-                    window,
-                    point,
+                event = AS.CGEventCreateMouseEvent(
+                    self._event_source, event_type, point, _BUTTONS[button]
                 )
+                self._route_to_window(event, window, point)
                 AS.CGEventSetIntegerValueField(
                     event, AS.kCGMouseEventClickState, click_count
                 )
@@ -2832,7 +2831,7 @@ class MacOS:
         self._overlay.click()
         pointer = self._pointer_info(pid=pid)
         assert pointer is not None
-        pointer["window_id"] = window["window_id"]
+        pointer["window_id"] = window.window_id
         return pointer
 
     def drag(
@@ -2870,16 +2869,11 @@ class MacOS:
         down_type, up_type, drag_type = _MOUSE_EVENTS[button]
 
         def post(event_type: int, point: tuple[float, float]) -> None:
-            self._post(
-                self._route_to_window(
-                    AS.CGEventCreateMouseEvent(
-                        self._event_source, event_type, point, _BUTTONS[button]
-                    ),
-                    window,
-                    point,
-                ),
-                pid,
+            event = AS.CGEventCreateMouseEvent(
+                self._event_source, event_type, point, _BUTTONS[button]
             )
+            self._route_to_window(event, window, point)
+            self._post(event, pid)
 
         post(down_type, start)
         self._pointer_position = end
@@ -2971,7 +2965,8 @@ class MacOS:
                 self._event_source, scroll_unit, 2, int(step_y), int(step_x)
             )
             AS.CGEventSetLocation(event, point)
-            self._post(self._route_to_window(event, window, point), pid)
+            self._route_to_window(event, window, point)
+            self._post(event, pid)
             time.sleep(0.01)
             self._guard_focus(focus_before, pid, "scroll")
 

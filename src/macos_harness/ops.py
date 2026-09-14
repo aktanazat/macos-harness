@@ -982,6 +982,13 @@ class _AXSurface(Protocol):
     def _search_key(self, search_key: str | None, role: str | None) -> str: ...
 
 
+class _TargetWindow(Protocol):
+    """What `MacOS._target_window` resolves a click to; only the id is recorded."""
+
+    @property
+    def window_id(self) -> int: ...
+
+
 class _Host(Protocol):
     """The exact private/public `MacOS` surface `Operations` calls.
 
@@ -1074,9 +1081,7 @@ class _Host(Protocol):
     def _screen_point(
         self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
     ) -> tuple[float, float]: ...
-    def _target_window(
-        self, pid: int, point: tuple[float, float]
-    ) -> dict[str, JSONValue]: ...
+    def _target_window(self, pid: int, point: tuple[float, float]) -> _TargetWindow: ...
 
 
 # --- receipt construction ---------------------------------------------
@@ -2117,7 +2122,7 @@ class Operations:
             window = host._target_window(pid, screen)
             return {
                 "point": {"x": screen[0], "y": screen[1]},
-                "window_id": window["window_id"],
+                "window_id": window.window_id,
             }
 
         def dispatch(host: _Host, pid: int) -> None:
