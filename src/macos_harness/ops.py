@@ -2003,6 +2003,49 @@ class Operations:
         Unlike the AX verbs, ``key`` has no ``all_apps``/``apps`` scope: a
         key combo always targets one exact process, so ``app`` is required.
         """
+
+        def prepare(host: _Host, pid: int) -> None:
+            del pid
+            host._validate_key(key)
+
+        def dispatch(host: _Host, pid: int) -> None:
+            host.key(key, app=pid)
+
+        return self._input_verb(
+            op="key",
+            app=app,
+            request={"key": key},
+            timeout=timeout,
+            postcondition=postcondition,
+            once=once,
+            dry_run=dry_run,
+            prepare=prepare,
+            dispatch=dispatch,
+        )
+
+    def _input_verb(
+        self,
+        *,
+        op: str,
+        app: str | int,
+        request: dict[str, JSONValue],
+        timeout: float,
+        postcondition: Postcondition | None,
+        once: str | None,
+        dry_run: bool,
+        prepare: Callable[[_Host, int], JSONValue],
+        dispatch: Callable[[_Host, int], None],
+    ) -> Receipt:
+        """The pipeline every raw-input verb (``key``, ``click``, ``type``)
+        shares: one exact ``app``, no AX target to resolve, an `Executor.INPUT`
+        receipt, and ``acted`` judged from whether the posted events raised.
+
+        ``prepare`` runs once the app is resolved and before anything is
+        reserved or dispatched: it validates what is about to be sent and
+        may return extra ``target`` fields (a click's resolved screen
+        point), so a dry run reports them too. ``dispatch`` posts the
+        input to ``pid``.
+        """
         self._check_owner()
         host = self._host
         _validate_app_selector(app, parameter="app")
@@ -2011,16 +2054,16 @@ class Operations:
         once = self._normalize_once(once)
         deadline = _Deadline(timeout, self._monotonic)
         backend = host._backend
-        request: dict[str, JSONValue] = {
-            "op": "key",
+        request = {
+            "op": op,
             "app": app,
-            "key": key,
+            **request,
             "timeout": timeout,
             "postcondition": self._postcondition_payload(postcondition),
         }
         fingerprint = request_fingerprint(request) if once is not None else None
         builder = _ReceiptBuilder(
-            op="key",
+            op=op,
             backend=backend,
             executor=Executor.INPUT,
             request=request,
@@ -2029,7 +2072,7 @@ class Operations:
         )
         if once is not None and not dry_run:
             # Nonblocking on purpose -- see the matching comment in `press`.
-            action = self._ledger.inspect(once, "key", fingerprint)
+            action = self._ledger.inspect(once, op, fingerprint)
             if action == "replay":
                 return self._finish(self._ledger.stored(once).replayed_as())
             if action == "in_flight":
@@ -2039,7 +2082,6 @@ class Operations:
         # against every other mutating call on this one `Operations`.
         with self._dispatch_lock:
             try:
-                host._validate_key(key)
                 host._ensure_accessibility()
                 host._ensure_post_events()
                 _, info = host._resolve_app(app)
@@ -2051,15 +2093,7 @@ class Operations:
                     )
                 )
 
-            target: JSONValue = {"app": info}
-
-            if dry_run:
-                return self._finish(
-                    builder.build(
-                        outcome=Outcome.PLANNED, acted=Acted.NO, changed=False,
-                        verified=False, target=target,
-                    )
-                )
+            target: dict[str, JSONValue] = {"app": info}
 
             try:
                 pid = int(info["pid"])
@@ -2076,6 +2110,26 @@ class Operations:
                     )
                 )
 
+            try:
+                extras = prepare(host, pid)
+            except MacOSError as exc:
+                return self._finish(
+                    builder.build(
+                        outcome=Outcome.FAILED, acted=Acted.NO, changed=False,
+                        verified=False, target=target, error=exc.to_json(),
+                    )
+                )
+            if isinstance(extras, Mapping):
+                target.update(extras)
+
+            if dry_run:
+                return self._finish(
+                    builder.build(
+                        outcome=Outcome.PLANNED, acted=Acted.NO, changed=False,
+                        verified=False, target=target,
+                    )
+                )
+
             if deadline.exhausted():
                 return self._finish(
                     builder.build(
@@ -2083,21 +2137,21 @@ class Operations:
                         target=target,
                         error=_deadline_exhausted_error(
                             "deadline_exhausted_before_dispatch",
-                            "No time remained on the shared deadline to dispatch this key",
+                            f"No time remained on the shared deadline to dispatch this {op}",
                         ),
                     )
                 )
 
             if once is not None:
                 assert fingerprint is not None
-                action = self._ledger.reserve(once, "key", fingerprint)
+                action = self._ledger.reserve(once, op, fingerprint)
                 if action == "replay":
                     return self._finish(self._ledger.stored(once).replayed_as())
                 if action == "in_flight":
                     return self._finish(self._in_flight_receipt(builder, target=target))
 
             try:
-                host.key(key, app=pid)
+                dispatch(host, pid)
             except FocusChangedError as exc:
                 receipt = builder.build(
                     outcome=Outcome.FAILED, acted=Acted.YES, changed=None, verified=False,
