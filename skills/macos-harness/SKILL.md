@@ -187,6 +187,11 @@ repeated keys, clicks, deletion loops, or bulk input.
 - `mac.see()` renders one window on its own, even behind other windows or on
   another Space, and reports `on_screen`. An off-screen window shows what the
   app last drew, so treat `on_screen=False` as possibly stale.
+- An app launched under five seconds ago with no window yet makes `mac.see()`
+  wait up to two seconds for its first window. Elsewhere, call
+  `mac.wait_for_window(app)` before the first capture of a fresh launch.
+- An ambiguous app name raises with the matches ranked (frontmost, then
+  on-screen windows, then newest) and their pids; pass the pid you mean.
 
 Secondary primitives are `mac.move`, `drag`, `scroll`, `activate`,
 `show_pointer`, and `hide_pointer`. `mac.ax.query()` returns compact matches

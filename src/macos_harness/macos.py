@@ -94,6 +94,10 @@ _AX_SAFE_ATTRIBUTES = (
     "AXFrame",
 )
 _AX_CROSS_APP_MESSAGING_TIMEOUT = 0.5
+# A process younger than this with no window is presumed still launching,
+# and a capture waits for its first window instead of failing at once.
+_LAUNCH_GRACE_SECONDS = 5.0
+_LAUNCH_WINDOW_TIMEOUT = 2.0
 _AX_NODE_MAPPING = {
     "AXSubrole": "subrole",
     "AXRoleDescription": "role_description",
@@ -727,18 +731,70 @@ class MacOS:
                 details={"query": query},
             )
         if len(matches) > 1:
-            names = ", ".join(
-                f"{item[1]['name']} ({item[1]['pid']})" for item in matches[:8]
-            )
+            ranked = self._rank_matches(matches)
+            names = ", ".join(self._describe_match(info) for info in ranked[:8])
             raise MacOSError(
-                f"Application query {query!r} is ambiguous: {names}",
+                f"Application query {query!r} is ambiguous; pass a pid: {names}",
                 code=ErrorCode.APP_AMBIGUOUS,
-                details={
-                    "query": query,
-                    "matches": [info for _, info in matches],
-                },
+                details={"query": query, "matches": ranked},
             )
         return matches[0]
+
+    @staticmethod
+    def _launched_seconds_ago(app: Any) -> float | None:
+        launched = app.launchDate()
+        if launched is None:
+            return None
+        return max(0.0, -float(launched.timeIntervalSinceNow()))
+
+    def _rank_matches(
+        self, matches: list[tuple[Any, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        """Order ambiguous matches by the evidence a caller picks a pid on.
+
+        Two processes with one name are common: a relaunch that has not
+        exited yet, or a helper beside its parent. The frontmost one, then
+        the one with on-screen windows, then the newest, is almost always
+        the one meant -- but the choice stays with the caller, so this
+        only ranks and reports, never picks.
+        """
+        frontmost = self._frontmost_app()
+        frontmost_pid = None if frontmost is None else int(frontmost["pid"])
+        ranked: list[dict[str, Any]] = []
+        for app, info in matches:
+            on_screen = [
+                window for window in self.windows(info["pid"]) if window["on_screen"]
+            ]
+            ranked.append(
+                {
+                    **info,
+                    "frontmost": info["pid"] == frontmost_pid,
+                    "on_screen_windows": len(on_screen),
+                    "launched_seconds_ago": self._launched_seconds_ago(app),
+                }
+            )
+        ranked.sort(
+            key=lambda item: (
+                not item["frontmost"],
+                -item["on_screen_windows"],
+                math.inf
+                if item["launched_seconds_ago"] is None
+                else item["launched_seconds_ago"],
+                item["pid"],
+            )
+        )
+        return ranked
+
+    @staticmethod
+    def _describe_match(info: dict[str, Any]) -> str:
+        notes = []
+        if info["frontmost"]:
+            notes.append("frontmost")
+        notes.append(f"{info['on_screen_windows']} on-screen window(s)")
+        age = info["launched_seconds_ago"]
+        if age is not None:
+            notes.append(f"launched {age:.0f}s ago")
+        return f"{info['name']} ({info['pid']}: {', '.join(notes)})"
 
     # --- AX tree ---------------------------------------------------------
 
@@ -2163,6 +2219,35 @@ class MacOS:
             ),
         )
 
+    def wait_for_window(
+        self, app: str | int | None = None, *, timeout: float = 2.0
+    ) -> list[dict[str, Any]]:
+        """Return ``windows(app)`` once it is non-empty, polling until ``timeout``.
+
+        ``open -a`` returns before the app draws anything: TextEdit's first
+        window appeared 335ms after launch and Notes' 792ms, so a capture
+        issued straight after a launch finds nothing.
+        """
+        _, info = self._resolve_app(app)
+        return self._wait_for_windows(info, timeout=timeout)
+
+    def _wait_for_windows(
+        self, info: dict[str, Any], *, timeout: float
+    ) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            windows = self.windows(int(info["pid"]))
+            if windows:
+                return windows
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MacOSError(
+                    f"{info['name']} showed no window within {timeout:g}s",
+                    code=ErrorCode.TIMEOUT,
+                    details={"app": info, "timeout": timeout},
+                )
+            time.sleep(min(0.05, remaining))
+
     def capture_screenshot(
         self,
         app: str | None = None,
@@ -2222,14 +2307,20 @@ class MacOS:
         show_pointer: bool,
     ) -> dict[str, Any]:
         self._ensure_screen_recording()
-        _, info = self._resolve_app(app)
+        running, info = self._resolve_app(app)
         windows = self.windows(int(info["pid"]))
         if not windows:
-            raise MacOSError(
-                f"No capturable windows found for {app or self._last_app}",
-                code=ErrorCode.ELEMENT_UNKNOWN,
-                details={"app": info},
-            )
+            # An app this young is most likely still drawing its first
+            # window; wait for it rather than report an empty app.
+            age = self._launched_seconds_ago(running)
+            if age is not None and age < _LAUNCH_GRACE_SECONDS:
+                windows = self._wait_for_windows(info, timeout=_LAUNCH_WINDOW_TIMEOUT)
+            else:
+                raise MacOSError(
+                    f"No capturable windows found for {app or self._last_app}",
+                    code=ErrorCode.ELEMENT_UNKNOWN,
+                    details={"app": info},
+                )
         try:
             window = windows[window_index]
         except IndexError as exc:

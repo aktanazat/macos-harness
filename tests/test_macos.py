@@ -80,14 +80,32 @@ def test_agent_surface_is_flat_and_explicit() -> None:
     assert not hasattr(mac, "keyboard")
 
 
-class _FakeRunningApp:
-    """Minimal stand-in for NSRunningApplication: only what `_app_info`
-    and `_resolve_app`'s exact-pid fast path ever touch."""
+class _FakeDate:
+    """The one NSDate method `_launched_seconds_ago` reads."""
 
-    def __init__(self, pid: int, *, name: str = "HelperApp", terminated: bool = False) -> None:
+    def __init__(self, seconds_ago: float) -> None:
+        self._seconds_ago = seconds_ago
+
+    def timeIntervalSinceNow(self) -> float:
+        return -self._seconds_ago
+
+
+class _FakeRunningApp:
+    """Minimal stand-in for NSRunningApplication: only what `_app_info`,
+    `_resolve_app`'s exact-pid fast path, and match ranking ever touch."""
+
+    def __init__(
+        self,
+        pid: int,
+        *,
+        name: str = "HelperApp",
+        terminated: bool = False,
+        launched_seconds_ago: float | None = None,
+    ) -> None:
         self._pid = pid
         self._name = name
         self._terminated = terminated
+        self._launched_seconds_ago = launched_seconds_ago
 
     def localizedName(self) -> str:
         return self._name
@@ -103,6 +121,11 @@ class _FakeRunningApp:
 
     def isTerminated(self) -> bool:
         return self._terminated
+
+    def launchDate(self) -> _FakeDate | None:
+        if self._launched_seconds_ago is None:
+            return None
+        return _FakeDate(self._launched_seconds_ago)
 
 
 def test_resolve_app_exact_pid_hit_never_enumerates_workspace(monkeypatch) -> None:
@@ -1254,6 +1277,8 @@ def test_resolve_app_ambiguous_carries_code_query_and_matches(monkeypatch) -> No
 
     monkeypatch.setattr(macos_module, "NSWorkspace", _FakeWorkspace)
     monkeypatch.setattr(macos_module, "NSRunningApplication", _FakeRunningApplication)
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: None)
+    monkeypatch.setattr(mac, "windows", lambda app: [])
 
     with pytest.raises(MacOSError, match="ambiguous") as exc_info:
         mac._resolve_app("Helper")
@@ -1261,6 +1286,83 @@ def test_resolve_app_ambiguous_carries_code_query_and_matches(monkeypatch) -> No
     assert exc_info.value.code == ErrorCode.APP_AMBIGUOUS
     assert exc_info.value.details["query"] == "Helper"
     assert {match["pid"] for match in exc_info.value.details["matches"]} == {11, 22}
+
+
+def test_resolve_app_ambiguous_ranks_frontmost_then_windows_then_newest(
+    monkeypatch,
+) -> None:
+    """Two TextEdits after a relaunch: the caller needs the likely one first,
+    with the evidence, and no pid chosen on its behalf."""
+    mac = MacOS()
+    stale = _FakeRunningApp(44, name="Helper", launched_seconds_ago=900.0)
+    frontmost = _FakeRunningApp(33, name="Helper", launched_seconds_ago=600.0)
+    windowed = _FakeRunningApp(22, name="Helper", launched_seconds_ago=300.0)
+    newest = _FakeRunningApp(11, name="Helper", launched_seconds_ago=2.0)
+    on_screen = {"window_id": 1, "on_screen": True}
+    hidden = {"window_id": 2, "on_screen": False}
+    windows_by_pid = {44: [hidden], 33: [], 22: [on_screen, on_screen], 11: []}
+
+    class _FakeWorkspace:
+        @staticmethod
+        def sharedWorkspace() -> type[_FakeWorkspace]:
+            return _FakeWorkspace
+
+        @staticmethod
+        def runningApplications() -> list[_FakeRunningApp]:
+            return [stale, frontmost, windowed, newest]
+
+    monkeypatch.setattr(macos_module, "NSWorkspace", _FakeWorkspace)
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "Helper", "pid": 33})
+    monkeypatch.setattr(mac, "windows", lambda app: windows_by_pid[app])
+
+    with pytest.raises(MacOSError, match=r"pass a pid: Helper \(33: frontmost") as exc_info:
+        mac._resolve_app("Helper")
+
+    matches = exc_info.value.details["matches"]
+    assert [match["pid"] for match in matches] == [33, 22, 11, 44]
+    assert matches[1] == {
+        "name": "Helper",
+        "bundle_id": None,
+        "pid": 22,
+        "path": None,
+        "frontmost": False,
+        "on_screen_windows": 2,
+        "launched_seconds_ago": 300.0,
+    }
+
+
+def test_wait_for_window_returns_the_first_non_empty_poll(monkeypatch) -> None:
+    mac = MacOS()
+    monkeypatch.setattr(
+        mac, "_resolve_app", lambda app: (object(), {"name": "TextEdit", "pid": 42})
+    )
+    polls = iter([[], [], [{"window_id": 7, "on_screen": True}]])
+    monkeypatch.setattr(mac, "windows", lambda app: next(polls))
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+
+    assert mac.wait_for_window("TextEdit", timeout=1.0) == [{"window_id": 7, "on_screen": True}]
+
+
+def test_wait_for_window_times_out_at_the_deadline_with_the_app_in_details(
+    monkeypatch,
+) -> None:
+    mac = MacOS()
+    info = {"name": "TextEdit", "pid": 42}
+    monkeypatch.setattr(mac, "_resolve_app", lambda app: (object(), info))
+    polls: list[int] = []
+    monkeypatch.setattr(mac, "windows", lambda app: polls.append(app) or [])
+    clock = iter(float(tick) * 0.5 for tick in range(100))
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(MacOSError, match="TextEdit showed no window within 1s") as exc_info:
+        mac.wait_for_window("TextEdit", timeout=1.0)
+
+    assert exc_info.value.code == ErrorCode.TIMEOUT
+    assert exc_info.value.details == {"app": info, "timeout": 1.0}
+    # The clock reads 0.0 at the start and 1.0 after the second poll, which
+    # is the deadline; a third poll would mean the wait overshot it.
+    assert polls == [42, 42]
 
 
 def test_ax_wait_ambiguous_and_timeout_carry_machine_readable_codes(monkeypatch) -> None:

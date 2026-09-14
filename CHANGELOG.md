@@ -34,6 +34,17 @@ follows [Semantic Versioning](https://semver.org/).
 - Local event suppression is disabled on the harness event source, so a
   posted click no longer pauses the user's own mouse for the system's
   default suppression interval.
+- `mac.see()` on an app launched less than five seconds ago waits up to
+  two seconds for its first window instead of failing with "No
+  capturable windows". `open -a` returns about 50ms after launch, but
+  TextEdit's first window appears 335ms later and Notes' 792ms later, so
+  a capture straight after a launch used to fail every time.
+- An ambiguous app query ranks its matches -- frontmost first, then most
+  on-screen windows, then newest -- and reports `frontmost`,
+  `on_screen_windows`, and `launched_seconds_ago` for each, so the
+  caller can pick the pid. Nothing is picked on its behalf.
+- `mac.ax.get(handle, "AXSelectedTextRange")` returns
+  `{"location", "length"}`; it raised `AttributeError` before.
 
 ### Added
 
@@ -43,6 +54,9 @@ follows [Semantic Versioning](https://semver.org/).
   is a request the system may decline while the user is busy elsewhere.
   Sessions were forcing this through `osascript` 88 times, some in a
   ten-attempt loop.
+- `mac.wait_for_window(app, timeout=2.0)`: `windows(app)` once it is
+  non-empty, polled every 50ms; `MacOSError` with code `timeout`
+  otherwise.
 
 ## [0.5.0] - 2026-08-22
 
