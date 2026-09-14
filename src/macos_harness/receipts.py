@@ -498,11 +498,13 @@ class Receipt:
             `False` on the `Outcome.ALREADY`-satisfied convergent fast
             path (`set`/`toggle`) or any predispatch failure, the real
             before/after comparison once `set`/`toggle` has read both
-            (`True` or `False`), and `None` whenever a dispatch (or its
-            own readback) is ambiguous -- `press`/`key` with no
-            postcondition, one that never verified, or a `set`/`toggle`
-            dispatch/readback failure -- rather than a confident but
-            unconfirmed guess.
+            (`True` or `False`), `True` when a raw input (`key`/`click`/
+            `type`) with no postcondition moved the app's focus (the
+            `observed["focus"]` witness), and `None` whenever a dispatch
+            (or its own readback) is ambiguous -- `press`, or a raw input
+            whose focus witness saw nothing, with no postcondition, one
+            that never verified, or a `set`/`toggle` dispatch/readback
+            failure -- rather than a confident but unconfirmed guess.
         verified: Whether a postcondition was checked and confirmed the
             intended effect actually took hold.
         duration_s: Wall-clock seconds this operation spent, start to finish.

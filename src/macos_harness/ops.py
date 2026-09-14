@@ -15,7 +15,7 @@ different request -- raises a plain `MacOSError` instead, with no
 receipt: nothing was ever attempted (see `OperationError`).
 
 ``mac.do`` is deliberately small: `press`, `set`, `toggle`, `run`, `key`,
-and `recall`. It is not a workflow engine, a selector language of its own,
+`click`, `type`, and `recall`. It is not a workflow engine, a selector language of its own,
 or an app-adapter framework -- it reuses `MacOS.ax`'s role/search-key
 vocabulary and `MacOS`'s own AX scope rules verbatim (see `_require_scope`
 and `Accessibility._search_key`) rather than inventing a second one, and it
@@ -32,7 +32,7 @@ Every verb shares:
   - An optional `Postcondition` (`Present`/`Gone`) confirming the mutation's
     real effect, not just that the underlying call returned without
     raising; unscoped, it inherits the operation's own scope.
-  - `press`/`run`/`key` additionally accept a nonempty `once` token for
+  - `press`/`run`/`key`/`click`/`type` additionally accept a nonempty `once` token for
     at-most-once dispatch (`_Ledger`); `set`/`toggle` are convergent
     (read, act only if needed, read back) and so are already safe to call
     more than once without one.
@@ -279,10 +279,26 @@ def _changed_after_dispatch(postcondition: Postcondition | None, verified: _Veri
     return True if postcondition is not None and verified.ok else None
 
 
-# How long a raw-input verb waits before its one resample when the focus
-# sample right after dispatch still equals the one before it: long enough
-# for a posted key to land in the app's run loop, short enough to be free.
-_FOCUS_RESAMPLE_SECONDS = 0.03
+# How a raw-input verb watches for its effect on focus. The first reading
+# right after dispatch missed 70 of 80 effects that later showed; across
+# 360 key, click and packed-typing trials over four apps the effect showed
+# within 20ms in most, 47ms at p95 and 62ms at the latest. So the receipt
+# samples every 10ms for up to 100ms and stops at the first reading that
+# differs from the one before dispatch.
+_FOCUS_POLL_SECONDS = 0.01
+_FOCUS_POLLS = 10
+
+
+def _sample_focus(host: _Host, pid: int) -> dict[str, JSONValue] | None:
+    """`MacOS._focus_sample`, or `None` when the app's AX tree would not
+    answer (a non-finite geometry raises ``ax_error``, for one). The
+    reading is a witness for the receipt, never the action, so a failed
+    read must not fail -- or strand the `once` token of -- the input it
+    was meant to observe."""
+    try:
+        return host._focus_sample(pid)
+    except MacOSError:
+        return None
 
 
 def _changed_focus_fields(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> list[str]:
@@ -375,6 +391,11 @@ def _perform_guarded(host: _Host, element_index: int, action: str, target_pid: i
 _MAX_SOURCE_CHARS = 262_144
 _MAX_ARGS = 256
 _MAX_ARG_CHARS = 65_536
+# The most text one `type` call sends. Packed typing lands 128 characters
+# in about 30ms, so this bound is a few seconds of key events at the
+# 10ms-per-character pace an inactive app gets, not a ceiling anyone
+# writing a form hits.
+_MAX_TYPE_CHARS = 4096
 
 
 def _validate_utf8_text(value: str, *, parameter: str, details: dict[str, JSONValue] | None = None) -> None:
@@ -455,6 +476,20 @@ def _validate_run_input(source: str, argv: Sequence[str]) -> None:
                 details={"parameter": "args", "index": index, "length": len(item), "limit": _MAX_ARG_CHARS},
             )
         _validate_utf8_text(item, parameter="args", details={"index": index})
+
+
+def _validate_type_text(text: str) -> None:
+    """Reject an oversized or malformed ``type`` ``text`` before the
+    ``once`` token is reserved, for the same reason `_validate_run_input`
+    runs first: the text is what the key events carry, and a lone
+    surrogate cannot be encoded into one."""
+    if len(text) > _MAX_TYPE_CHARS:
+        raise MacOSError(
+            f"text must be at most {_MAX_TYPE_CHARS} characters, not {len(text)}",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": "text", "length": len(text), "limit": _MAX_TYPE_CHARS},
+        )
+    _validate_utf8_text(text, parameter="text")
 
 
 class _Process(Protocol):
@@ -892,7 +927,8 @@ class _LedgerEntry:
 
 
 class _Ledger:
-    """Thread-safe at-most-once dispatch ledger for ``press``/``run``/``key``.
+    """Thread-safe at-most-once dispatch ledger for the ``once`` verbs:
+    ``press``, ``run``, ``key``, ``click`` and ``type``.
 
     A single lock guards the bookkeeping only: `reserve` writes an entry
     (or reports what the caller should do instead) while holding the lock,
@@ -982,8 +1018,9 @@ class _AXSurface(Protocol):
     def _search_key(self, search_key: str | None, role: str | None) -> str: ...
 
 
-class _TargetWindow(Protocol):
-    """What `MacOS._target_window` resolves a click to; only the id is recorded."""
+class _RoutedWindow(Protocol):
+    """What `MacOS._target_window` resolves a click to: the window the
+    events are bound to, of which only the id is recorded."""
 
     @property
     def window_id(self) -> int: ...
@@ -1065,23 +1102,23 @@ class _Host(Protocol):
     def set(self, element_index: int, value: object, attribute: str = "AXValue") -> None: ...
     def perform_action(self, element_index: int, action: str = "AXPress") -> None: ...
     def key(self, key: str, *, app: str | int | None = None) -> None: ...
-    def click(
-        self,
-        x: float,
-        y: float,
-        *,
-        app: str | int | None = None,
-        button: str = "left",
-        clicks: int = 1,
-        coordinate_space: str = "screenshot",
-    ) -> dict[str, JSONValue]: ...
     def type(self, text: str, *, app: str | int | None = None) -> None: ...
     def _validate_button(self, button: str) -> str: ...
+    def _validate_clicks(self, clicks: int) -> int: ...
     def _focus_sample(self, pid: int) -> dict[str, JSONValue]: ...
     def _screen_point(
         self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
     ) -> tuple[float, float]: ...
-    def _target_window(self, pid: int, point: tuple[float, float]) -> _TargetWindow: ...
+    def _target_window(self, pid: int, point: tuple[float, float]) -> _RoutedWindow: ...
+    def _post_click(
+        self,
+        pid: int,
+        point: tuple[float, float],
+        window: _RoutedWindow,
+        *,
+        button: str,
+        clicks: int,
+    ) -> None: ...
 
 
 # --- receipt construction ---------------------------------------------
@@ -1139,7 +1176,7 @@ class _ReceiptBuilder:
 
 
 class Operations:
-    """``mac.do``: press, set, toggle, run, key, recall -- receipted.
+    """``mac.do``: press, set, toggle, run, key, click, type, recall -- receipted.
 
     Once a call's arguments pass preflight and it actually begins
     resolving or dispatching something, it returns -- or raises with --
@@ -2107,28 +2144,34 @@ class Operations:
         """Post one coordinate click to exactly ``app`` -- the ``mac.do``
         counterpart to ``mac.click``.
 
-        The point and the window of ``app`` under it resolve before
-        anything is reserved or posted, so a stale screenshot, a moved
-        window, or a point over none of the app's windows fails with
-        ``acted=NO``, and the resolved screen point and ``window_id``
-        show up in ``target`` even on a dry run.
+        The point, the window of ``app`` under it, and the button and
+        click count resolve before anything is reserved or posted, so a
+        stale screenshot, a moved window, a point over none of the app's
+        windows, or a click count past a triple fails with ``acted=NO``,
+        and the resolved screen point and ``window_id`` show up in
+        ``target`` even on a dry run. The dispatch then posts to that
+        very window, so the id the receipt records is the one the
+        events were bound to.
         """
-        screen: tuple[float, float] | None = None
+        resolved: tuple[str, int, tuple[float, float], _RoutedWindow] | None = None
 
         def prepare(host: _Host, pid: int) -> dict[str, JSONValue]:
-            nonlocal screen
-            host._validate_button(button)
+            nonlocal resolved
+            normalized_button = host._validate_button(button)
+            normalized_clicks = host._validate_clicks(clicks)
             screen = host._screen_point(x, y, coordinate_space, pid=pid)
             window = host._target_window(pid, screen)
+            resolved = (normalized_button, normalized_clicks, screen, window)
             return {
                 "point": {"x": screen[0], "y": screen[1]},
                 "window_id": window.window_id,
             }
 
         def dispatch(host: _Host, pid: int) -> None:
-            assert screen is not None
-            host.click(
-                *screen, app=pid, button=button, clicks=clicks, coordinate_space="screen"
+            assert resolved is not None
+            normalized_button, normalized_clicks, screen, window = resolved
+            host._post_click(
+                pid, screen, window, button=normalized_button, clicks=normalized_clicks
             )
 
         return self._input_verb(
@@ -2160,11 +2203,14 @@ class Operations:
         to ``mac.type``.
 
         The receipt never carries ``text`` itself, only its
-        `_value_summary`, the same rule `set` applies to a value.
+        `_value_summary`, the same rule `set` applies to a value. The
+        text is bounded and checked (`_validate_type_text`) before the
+        ``once`` token is reserved.
         """
 
         def prepare(host: _Host, pid: int) -> None:
             del host, pid
+            _validate_type_text(text)
 
         def dispatch(host: _Host, pid: int) -> None:
             host.type(text, app=pid)
@@ -2308,7 +2354,7 @@ class Operations:
                 if action == "in_flight":
                     return self._finish(self._in_flight_receipt(builder, target=target))
 
-            before = host._focus_sample(pid)
+            before = _sample_focus(host, pid)
             try:
                 dispatch(host, pid)
             except FocusChangedError as exc:
@@ -2343,29 +2389,34 @@ class Operations:
             return self._finish(receipt)
 
     def _focus_effect(
-        self, host: _Host, pid: int, before: Mapping[str, JSONValue]
+        self, host: _Host, pid: int, before: Mapping[str, JSONValue] | None
     ) -> dict[str, JSONValue]:
         """Read focus again after a raw input landed and report what moved.
 
-        The first reading right after dispatch usually already differs;
-        when it does not, one short wait and one more reading give the
-        app's run loop a chance to process the event before the receipt
-        calls the effect unobserved.
+        Polls every `_FOCUS_POLL_SECONDS` for up to `_FOCUS_POLLS` readings
+        and stops at the first that differs from ``before``, so the app's
+        run loop gets up to 100ms to process the event before the receipt
+        calls the effect unobserved. Either reading failing leaves
+        ``changed`` empty: no witness, not a witness of nothing.
         """
-        after = host._focus_sample(pid)
-        if after == before:
-            self._sleep(_FOCUS_RESAMPLE_SECONDS)
-            after = host._focus_sample(pid)
+        after = _sample_focus(host, pid)
+        if before is not None:
+            for _ in range(_FOCUS_POLLS):
+                if after is not None and after != before:
+                    break
+                self._sleep(_FOCUS_POLL_SECONDS)
+                after = _sample_focus(host, pid)
+        changed = [] if before is None or after is None else _changed_focus_fields(before, after)
         return {
-            "before": _redact_focus(before),
-            "after": _redact_focus(after),
-            "changed": _changed_focus_fields(before, after),
+            "before": None if before is None else _redact_focus(before),
+            "after": None if after is None else _redact_focus(after),
+            "changed": changed,
         }
 
     def recall(self, once: str) -> Receipt:
         """Look up the at-most-once ledger for ``once`` without
         dispatching anything: returns the finished receipt (replayed)
-        for a completed ``press``/``run``/``key``.
+        for a completed ``press``/``run``/``key``/``click``/``type``.
 
         Raises `OperationError`, carrying a failed, ``acted=UNKNOWN``
         receipt, if the token's reservation is still in progress or was

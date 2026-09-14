@@ -85,12 +85,15 @@ PY
   read the target back before and after and know for certain. `key`/
   `click`/`type` sample focus before and after — frontmost pid, focused
   window, and the focused element's role, value summary, selected range,
-  character count, position, and size — and report the fields that moved
-  under `observed.focus`: `changed` is `True` when focus moved or a
-  postcondition verified the effect, `None` when nothing observable moved,
-  which is how a key AppKit silently dropped shows up. `press`/`run` have
-  no readback of their own, so `changed` is `None` unless you pass a
-  `postcondition` that confirms the effect actually took hold.
+  character count, position, and size; a secure field gives its role and
+  subrole only — and report the fields that moved under `observed.focus`.
+  The after-reading repeats every 10ms for up to 100ms until it differs,
+  so an app's run loop gets time to process the event. `changed` is
+  `True` when focus moved or a postcondition verified the effect, `None`
+  when nothing observable moved, which is how a key AppKit silently
+  dropped shows up. `press`/`run` have no readback of their own, so
+  `changed` is `None` unless you pass a `postcondition` that confirms the
+  effect actually took hold.
 - A bad argument — an unknown role, a malformed postcondition, reusing a
   `once` token for a genuinely different request — raises `MacOSError`
   directly, before anything is dispatched: there is no receipt, because

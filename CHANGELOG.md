@@ -89,10 +89,13 @@ follows [Semantic Versioning](https://semver.org/).
   otherwise.
 - `mac.do.click(x, y, app=...)` and `mac.do.type(text, app=...)`: the
   receipted counterparts of `mac.click` and `mac.type`. `click` resolves
-  the screen point and the target `window_id` before anything is
-  reserved or posted, so a stale screenshot, a moved window, or a point
-  over none of the app's windows fails with `acted=no`; a `type` receipt
-  carries the text's length and hash, never the text.
+  the screen point, the target `window_id`, the button, and the click
+  count before anything is reserved or posted, so a stale screenshot, a
+  moved window, a point over none of the app's windows, or a fourth
+  click fails with `acted=no`, and the events go to the very window the
+  receipt names. A `type` receipt carries the text's length and hash,
+  never the text; text longer than 4096 characters or holding a lone
+  surrogate fails with `acted=no` before a `once` token is reserved.
 - `mac.do.key`, `click`, and `type` receipts report what the input did to
   focus. `observed.focus` holds a before/after sample of the frontmost
   pid, the focused window title, and the focused element (role, title,
@@ -101,9 +104,15 @@ follows [Semantic Versioning](https://semver.org/).
   not verified is `changed=True` when focus moved and `None` when nothing
   observable moved, so a key that AppKit silently dropped -- a menu
   shortcut sent to an inactive app -- no longer reads as a success. The
-  sample reads the focused element without enhanced accessibility, so an
-  app that keeps AX off stays that way, and a secure field's value is
-  never read. One sample costs about 0.2ms warm.
+  reading after dispatch is repeated every 10ms for up to 100ms until it
+  differs from the one before: the first reading missed 70 of 80 effects
+  that showed within 62ms. A reading the app's AX tree refuses leaves
+  the receipt without a witness, never without its dispatch or its
+  `once` token. The sample reads the focused element without enhanced
+  accessibility, so an app that keeps AX off stays that way; a secure
+  field reports its role and subrole only, so a password's value,
+  length, and selection are never requested. One sample costs about
+  0.4ms (p95 0.9ms over 50 readings of TextEdit).
 
 ## [0.5.0] - 2026-08-22
 

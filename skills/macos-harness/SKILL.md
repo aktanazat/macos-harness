@@ -65,8 +65,10 @@ receipt = mac.do.press(
 - `changed` is an observed fact, not a guess: `set`/`toggle` read the
   target back and know for certain. `key`/`click`/`type` sample focus
   before and after -- frontmost pid, focused window, focused element's
-  role, value summary, selected range, character count, position, size --
-  and report the fields that moved under `observed.focus`; `changed` is
+  role, value summary, selected range, character count, position, size;
+  a secure field gives role and subrole only -- and report the fields
+  that moved under `observed.focus`. The after-reading repeats every
+  10ms for up to 100ms until it differs from the before. `changed` is
   `True` when a postcondition verified the effect or focus moved, and
   `None` when nothing observable moved, which is how a key AppKit
   silently dropped shows up. `press`/`run` have no readback of their own,
@@ -177,10 +179,16 @@ repeated keys, clicks, deletion loops, or bulk input.
   manipulate focus to restore it.
 - `mac.click()` is raw PID-targeted input. It never guesses an AX action.
   Every click, drag, and scroll is routed to the app's frontmost on-screen
-  window under the point (the click result and `mac.do.click` target carry
-  its `window_id`); a point over none of the app's windows raises
-  `bad_request` before anything is posted, and `mac.scroll()` with no
-  `x`/`y` scrolls the center of the window in your last screenshot.
+  window under the point, skipping any same-app tooltip or helper surface
+  `windows()` would not list (the click result and `mac.do.click` target
+  carry its `window_id`); a point over none of the app's windows raises
+  `bad_request` before anything is posted, `clicks` is 1 to 3, and
+  `mac.scroll()` with no `x`/`y` scrolls the center of the window in your
+  last screenshot.
+- `mac.type()` into the frontmost app lands 128 characters in about 30ms
+  (runs of text per key event, no pause); into an inactive app it sends
+  one character every 10ms, so a long text there costs seconds.
+  `mac.do.type` takes at most 4096 characters.
 - The animated pointer is click-through and never moves the physical cursor. It
   draws the system arrow at the user's pointer size and fades after three idle
   seconds. `mac.see()` leaves it out of the image unless `show_pointer=True`.

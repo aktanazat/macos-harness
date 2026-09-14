@@ -98,7 +98,8 @@ class FakeHost:
         self.press_calls: list[dict[str, object]] = []
         self.press_results: deque[dict[str, object] | BaseException] = deque()
         self.press_hook: Callable[[], None] | None = None
-        self.focus_samples: deque[dict[str, object]] = deque()
+        # A `MacOSError` queued here is raised by that `_focus_sample` call.
+        self.focus_samples: deque[dict[str, object] | MacOSError] = deque()
         self.focus_sample: dict[str, object] = {
             "frontmost_pid": 41,
             "window": "Untitled",
@@ -139,6 +140,15 @@ class FakeHost:
             )
         return button.casefold()
 
+    def _validate_clicks(self, clicks: int) -> int:
+        if not 1 <= clicks <= 3:
+            raise MacOSError(
+                f"clicks must be a count from 1 to 3, not {clicks!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "clicks", "value": clicks, "limit": 3},
+            )
+        return clicks
+
     def _screen_point(
         self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
     ) -> tuple[float, float]:
@@ -161,7 +171,10 @@ class FakeHost:
         assert pid == 41
         self.focus_sample_calls += 1
         if self.focus_samples:
-            self.focus_sample = self.focus_samples.popleft()
+            sample = self.focus_samples.popleft()
+            if isinstance(sample, MacOSError):
+                raise sample
+            self.focus_sample = sample
         return copy.deepcopy(self.focus_sample)
 
     def _frontmost_app(self) -> dict[str, object]:
@@ -254,11 +267,20 @@ class FakeHost:
         if self.key_error is not None:
             raise self.key_error
 
-    def click(self, x: float, y: float, **kwargs: object) -> dict[str, object]:
-        self.click_calls.append({"x": x, "y": y, **kwargs})
+    def _post_click(
+        self,
+        pid: int,
+        point: tuple[float, float],
+        window: _Window,
+        *,
+        button: str,
+        clicks: int,
+    ) -> None:
+        self.click_calls.append(
+            {"pid": pid, "point": point, "window_id": window.window_id, "button": button, "clicks": clicks}
+        )
         if self.click_error is not None:
             raise self.click_error
-        return {"x": x, "y": y}
 
     def type(self, text: str, *, app: str | int | None = None) -> None:
         self.type_calls.append((text, app))
@@ -1472,30 +1494,76 @@ def test_key_reports_changed_when_the_focus_sample_moves() -> None:
     assert "olx" not in canonical_json(receipt.to_json())
 
 
-def test_input_verb_resamples_once_before_calling_focus_unchanged() -> None:
+def test_input_verb_polls_focus_until_the_effect_shows() -> None:
     slept: list[float] = []
     host, operations = _ops(sleep=slept.append)
     before = copy.deepcopy(host.focus_sample)
     landed = copy.deepcopy(before)
     landed["window"] = "Renamed"
-    host.focus_samples.extend([before, copy.deepcopy(before), landed])
+    # Dispatch reading, then three unchanged readings before the effect.
+    host.focus_samples.extend([before, *(copy.deepcopy(before) for _ in range(3)), landed])
 
     late = operations.key("return", app="Demo")
 
-    assert slept == [0.03]
-    assert host.focus_sample_calls == 3
+    assert slept == [0.01] * 3
+    assert host.focus_sample_calls == 5
     assert late.changed is True
     assert late.observed["focus"]["changed"] == ("window",)
 
-    host.focus_samples.extend([before, copy.deepcopy(before), copy.deepcopy(before)])
+
+def test_input_verb_gives_up_on_focus_after_its_polling_budget() -> None:
+    slept: list[float] = []
+    host, operations = _ops(sleep=slept.append)
+    before = copy.deepcopy(host.focus_sample)
+    host.focus_samples.extend([before, *(copy.deepcopy(before) for _ in range(20))])
+
     still = operations.key("cmd+s", app="Demo")
 
-    assert slept == [0.03, 0.03]
+    assert slept == [0.01] * 10
+    assert host.focus_sample_calls == 12
     assert still.changed is None
     assert still.observed["focus"]["changed"] == ()
 
 
-def test_click_resolves_the_point_before_dispatch_and_posts_in_screen_space() -> None:
+def test_input_verb_survives_a_failed_focus_reading() -> None:
+    """The focus witness must never fail -- or strand the token of -- the
+    input it observes: a failed reading leaves the receipt without a
+    witness, not without a dispatch."""
+    slept: list[float] = []
+    host, operations = _ops(sleep=slept.append)
+    host.focus_samples.append(MacOSError("bad geometry", code=ErrorCode.AX_ERROR))
+
+    receipt = operations.key("return", app="Demo", once="blind")
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.acted is Acted.YES
+    assert receipt.changed is None
+    focus = receipt.observed["focus"]
+    assert focus["before"] is None
+    assert focus["changed"] == ()
+    # The one reading after dispatch is still reported: it is a witness
+    # of the end state, just not of a change.
+    assert focus["after"]["window"] == "Untitled"
+    assert host.focus_sample_calls == 2
+    assert host.key_calls == [("return", 41)]
+    assert slept == []
+    assert operations.recall("blind").replayed is True
+
+    # A reading that fails mid-poll is skipped, and polling goes on.
+    before = copy.deepcopy(host.focus_sample)
+    landed = copy.deepcopy(before)
+    landed["window"] = "Renamed"
+    host.focus_samples.extend(
+        [before, MacOSError("bad geometry", code=ErrorCode.AX_ERROR), landed]
+    )
+    late = operations.key("return", app="Demo")
+
+    assert late.changed is True
+    assert late.observed["focus"]["changed"] == ("window",)
+    assert slept == [0.01]
+
+
+def test_click_resolves_the_point_before_dispatch_and_posts_to_that_window() -> None:
     host, operations = _ops()
 
     planned = operations.click(10, 20, app="Demo", dry_run=True)
@@ -1506,11 +1574,43 @@ def test_click_resolves_the_point_before_dispatch_and_posts_in_screen_space() ->
     assert planned.target["window_id"] == 7
     assert done.executor is Executor.INPUT
     assert done.acted is Acted.YES
+    assert done.target["window_id"] == 7
     assert host.click_calls == [
-        {"x": 110.0, "y": 220.0, "app": 41, "button": "Right", "clicks": 2, "coordinate_space": "screen"}
+        {"pid": 41, "point": (110.0, 220.0), "window_id": 7, "button": "right", "clicks": 2}
     ]
     assert host.screen_point_calls[-1] == {"x": 10, "y": 20, "coordinate_space": "screenshot", "pid": 41}
     assert host.target_window_calls[-1] == (41, (110.0, 220.0))
+
+
+def test_click_rejects_more_than_a_triple_click_before_reserving_the_token() -> None:
+    host, operations = _ops()
+
+    error = _failed(lambda: operations.click(10, 20, app="Demo", clicks=4, once="quad"))
+
+    assert error.code == ErrorCode.BAD_REQUEST
+    assert error.receipt.acted is Acted.NO
+    assert host.click_calls == []
+    assert host.focus_sample_calls == 0
+    with pytest.raises(MacOSError, match="Unknown once token"):
+        operations.recall("quad")
+
+
+def test_type_rejects_oversized_or_malformed_text_before_reserving_the_token() -> None:
+    host, operations = _ops()
+
+    too_long = _failed(lambda: operations.type("a" * 4097, app="Demo", once="long"))
+    malformed = _failed(lambda: operations.type("ab\udc80", app="Demo", once="lone"))
+
+    assert too_long.code == ErrorCode.BAD_REQUEST
+    assert too_long.receipt.error["details"] == {"parameter": "text", "length": 4097, "limit": 4096}
+    assert malformed.code == ErrorCode.BAD_REQUEST
+    assert malformed.receipt.error["details"]["parameter"] == "text"
+    assert host.type_calls == []
+    assert host.focus_sample_calls == 0
+    with pytest.raises(MacOSError, match="Unknown once token 'long'"):
+        operations.recall("long")
+    with pytest.raises(MacOSError, match="Unknown once token 'lone'"):
+        operations.recall("lone")
 
 
 def test_click_over_none_of_the_apps_windows_fails_before_anything_is_posted() -> None:
