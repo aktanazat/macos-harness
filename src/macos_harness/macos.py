@@ -897,19 +897,18 @@ class MacOS:
         except (TypeError, ValueError):
             return str(value)
 
-        type_specs = {
-            AS.kAXValueCGPointType: ("point", ("x", "y")),
-            AS.kAXValueCGSizeType: ("size", ("width", "height")),
-            AS.kAXValueCGRectType: ("rect", ("origin", "size")),
-            AS.kAXValueCFRangeType: ("range", ("location", "length")),
+        kinds = {
+            AS.kAXValueCGPointType: "point",
+            AS.kAXValueCGSizeType: "size",
+            AS.kAXValueCGRectType: "rect",
+            AS.kAXValueCFRangeType: "range",
         }
-        spec = type_specs.get(value_type)
-        if spec is None:
+        kind = kinds.get(value_type)
+        if kind is None:
             return str(value)
         ok, decoded = AS.AXValueGetValue(value, value_type, None)
         if not ok:
             return str(value)
-        kind, fields = spec
         if kind == "point":
             return {
                 "x": MacOS._finite_float(decoded.x, field="x"),
@@ -927,7 +926,10 @@ class MacOS:
                 "width": MacOS._finite_float(decoded.size.width, field="width"),
                 "height": MacOS._finite_float(decoded.size.height, field="height"),
             }
-        return {field: int(getattr(decoded, field)) for field in fields}
+        # A decoded ``CFRange`` arrives as a plain ``(location, length)``
+        # tuple, not a struct wrapper with named fields.
+        location, length = decoded
+        return {"location": int(location), "length": int(length)}
 
     def _snapshot_tree(
         self,
@@ -2122,7 +2124,7 @@ class MacOS:
 
     # --- windows and screenshots ----------------------------------------
 
-    def windows(self, app: str | None = None) -> list[dict[str, Any]]:
+    def windows(self, app: str | int | None = None) -> list[dict[str, Any]]:
         _, info = self._resolve_app(app)
         values = AS.CGWindowListCopyWindowInfo(
             AS.kCGWindowListOptionAll, AS.kCGNullWindowID
@@ -2221,7 +2223,7 @@ class MacOS:
     ) -> dict[str, Any]:
         self._ensure_screen_recording()
         _, info = self._resolve_app(app)
-        windows = self.windows(str(info["pid"]))
+        windows = self.windows(int(info["pid"]))
         if not windows:
             raise MacOSError(
                 f"No capturable windows found for {app or self._last_app}",

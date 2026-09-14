@@ -658,6 +658,10 @@ def test_ax_wait_gone_requires_two_empty_polls(monkeypatch) -> None:
 
     mac.ax.wait_gone("Not Now", app="Chrome", timeout=1.0)
 
+    # The second consecutive empty poll is the fifth response; a wait that
+    # returned on the first empty poll would leave three unread.
+    assert list(responses) == []
+
 
 def test_ax_wait_gone_handles_exit_and_timeout(monkeypatch) -> None:
     mac = MacOS()
@@ -1344,6 +1348,15 @@ def test_jsonable_converts_a_finite_ax_rect_unchanged() -> None:
     )
 
     assert MacOS._jsonable(rect) == {"x": 1.0, "y": 2.0, "width": 3.0, "height": 4.0}
+
+
+def test_jsonable_converts_an_ax_range_to_location_and_length() -> None:
+    selected = macos_module.AS.AXValueCreate(
+        macos_module.AS.kAXValueCFRangeType,
+        macos_module.AS.CFRange(4, 3),
+    )
+
+    assert MacOS._jsonable(selected) == {"location": 4, "length": 3}
 
 
 def _fail_if_called(*_args: object, **_kwargs: object) -> None:
