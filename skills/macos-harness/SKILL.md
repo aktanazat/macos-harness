@@ -171,11 +171,19 @@ repeated keys, clicks, deletion loops, or bulk input.
 - A background target becoming frontmost raises `FocusChangedError`; never
   manipulate focus to restore it.
 - `mac.click()` is raw PID-targeted input. It never guesses an AX action.
+  Every click, drag, and scroll is routed to the app's frontmost on-screen
+  window under the point (the click result carries its `window_id`); a
+  point over none of the app's windows raises `bad_request` before
+  anything is posted, and `mac.scroll()` with no `x`/`y` scrolls the
+  center of the window in your last screenshot.
 - The animated pointer is click-through and never moves the physical cursor. It
   draws the system arrow at the user's pointer size and fades after three idle
   seconds. `mac.see()` leaves it out of the image unless `show_pointer=True`.
 - `mac.move()` moves only that pointer; it cannot produce native hover.
-- Inactive apps may reject raw clicks. After one verified failure, switch mode.
+- An inactive app takes scrolls, plain keys, and typed text, but AppKit
+  drops a menu shortcut (`cmd+a`) sent to it, and passes a first click only
+  to a view that accepts first mouse -- text views do not. `mac.activate(app)`
+  first is the cure.
 - Never launch a closed app or use a custom URL scheme when focus is forbidden.
 - `mac.ax.query_all/wait/press/wait_gone` never bypass Touch ID, passkeys,
   CAPTCHA, account recovery, or other checks that need the real user present;

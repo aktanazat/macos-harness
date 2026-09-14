@@ -7,6 +7,7 @@ renders a specific window (see ``capture.py``).
 
 from __future__ import annotations
 
+import ctypes
 import json
 import math
 import os
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 
 try:
     import ApplicationServices as AS
+    import objc
     from AppKit import (
         NSApplicationActivateIgnoringOtherApps,
         NSRunningApplication,
@@ -48,12 +50,43 @@ try:
     )
 except ImportError as exc:  # pragma: no cover - exercised on non-macOS hosts
     AS = None  # type: ignore[assignment]
+    objc = None  # type: ignore[assignment]
     NSApplicationActivateIgnoringOtherApps = 0
     NSRunningApplication = None  # type: ignore[assignment]
     NSWorkspace = None  # type: ignore[assignment]
     _IMPORT_ERROR: ImportError | None = exc
 else:
     _IMPORT_ERROR = None
+
+
+class _CGPoint(ctypes.Structure):
+    _fields_ = (("x", ctypes.c_double), ("y", ctypes.c_double))
+
+
+# A mouse or scroll event posted with ``CGEventPostToPid`` skips the window
+# server's hit test, so AppKit has to learn the destination window from the
+# event itself: the window number in this private ``CGEventField`` plus the
+# window-local point written by the private ``CGEventSetWindowLocation``.
+# Without both, AppKit finds no window under the event and drops it, and
+# the caret in TextEdit never moves (measured 2026-09-13; the field is the
+# one ``NSEvent.mouseEventWithType:...windowNumber:`` fills, and the
+# recipe is the one https://github.com/Lakr233/bgclick-rev-skill recovered).
+_CG_EVENT_WINDOW_NUMBER = 51
+_CORE_GRAPHICS = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+
+
+def _load_window_location_setter() -> Any:
+    """Resolve ``CGEventSetWindowLocation``; ``None`` on a macOS that dropped it."""
+    try:
+        setter = ctypes.CDLL(_CORE_GRAPHICS).CGEventSetWindowLocation
+    except (OSError, AttributeError):
+        return None
+    setter.argtypes = (ctypes.c_void_p, _CGPoint)
+    setter.restype = None
+    return setter
+
+
+_set_window_location = _load_window_location_setter() if AS else None
 
 
 _AX_SUCCESS = 0
@@ -2410,6 +2443,62 @@ class MacOS:
             )
         AS.CGEventPostToPid(pid, event)
 
+    @staticmethod
+    def _target_window(pid: int, point: tuple[float, float]) -> dict[str, Any]:
+        """Find the frontmost on-screen window of ``pid`` under ``point``.
+
+        Returns ``{"window_id", "origin"}``; ``origin`` is the window's
+        top-left screen point, which ``_route_to_window`` needs to express
+        each event in window coordinates. Other apps' windows over the
+        point do not matter: input posted to a pid only ever reaches that
+        pid, so the covered window is still the one the event lands in.
+        """
+        if _set_window_location is None:
+            raise MacOSError(
+                "This macOS build lacks CGEventSetWindowLocation, so posted "
+                "mouse input cannot be routed to a window",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"symbol": "CGEventSetWindowLocation"},
+            )
+        x, y = point
+        values = AS.CGWindowListCopyWindowInfo(
+            AS.kCGWindowListOptionOnScreenOnly, AS.kCGNullWindowID
+        )
+        for value in values or ():
+            if int(value.get(AS.kCGWindowOwnerPID, -1)) != pid:
+                continue
+            bounds = value.get(AS.kCGWindowBounds) or {}
+            left = float(bounds.get("X", 0))
+            top = float(bounds.get("Y", 0))
+            if (
+                left <= x < left + float(bounds.get("Width", 0))
+                and top <= y < top + float(bounds.get("Height", 0))
+            ):
+                return {
+                    "window_id": int(value[AS.kCGWindowNumber]),
+                    "origin": (left, top),
+                }
+        raise MacOSError(
+            f"No on-screen window of pid {pid} contains screen point "
+            f"({x:.0f}, {y:.0f}); pointer input there cannot land",
+            code=ErrorCode.BAD_REQUEST,
+            details={"pid": pid, "point": {"x": x, "y": y}},
+        )
+
+    @staticmethod
+    def _route_to_window(
+        event: Any, window: dict[str, Any], point: tuple[float, float]
+    ) -> Any:
+        """Bind a mouse or scroll ``event`` at screen ``point`` to ``window``."""
+        AS.CGEventSetIntegerValueField(
+            event, _CG_EVENT_WINDOW_NUMBER, window["window_id"]
+        )
+        left, top = window["origin"]
+        _set_window_location(
+            objc.pyobjc_id(event), _CGPoint(point[0] - left, point[1] - top)
+        )
+        return event
+
     def _screen_point(
         self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
     ) -> tuple[float, float]:
@@ -2628,19 +2717,8 @@ class MacOS:
             "elapsed_ms": round((time.monotonic() - started) * 1000),
         }
 
-    def click(
-        self,
-        x: float,
-        y: float,
-        *,
-        app: str | None = None,
-        button: str = "left",
-        clicks: int = 1,
-        coordinate_space: str = "screenshot",
-    ) -> dict[str, Any]:
-        """Send one raw coordinate click to an app PID; never guess an AX action."""
-        self._ensure_accessibility()
-        self._ensure_post_events()
+    @staticmethod
+    def _validate_button(button: str) -> str:
         button = button.casefold()
         if button not in _BUTTONS:
             raise MacOSError(
@@ -2648,6 +2726,29 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "button", "value": button},
             )
+        return button
+
+    def click(
+        self,
+        x: float,
+        y: float,
+        *,
+        app: str | int | None = None,
+        button: str = "left",
+        clicks: int = 1,
+        coordinate_space: str = "screenshot",
+    ) -> dict[str, Any]:
+        """Send one raw coordinate click to an app PID; never guess an AX action.
+
+        The result carries ``window_id``: the window of ``app`` the click
+        was routed to. The click still reaches that window when another
+        app is frontmost, but AppKit passes a plain first click on an
+        inactive app's view only where that view accepts first mouse;
+        elsewhere it is dropped, and ``activate`` first is the cure.
+        """
+        self._ensure_accessibility()
+        self._ensure_post_events()
+        button = self._validate_button(button)
         pid = self._pid(app)
         if pid is None:
             raise MacOSError(
@@ -2656,29 +2757,30 @@ class MacOS:
                 details={"parameter": "app"},
             )
         point = self._screen_point(x, y, coordinate_space, pid=pid)
+        window = self._target_window(pid, point)
         focus_before = self._frontmost_app()
         self._pointer_position = point
         self._overlay.move(*point)
         down_type, up_type, _ = _MOUSE_EVENTS[button]
         for click_count in range(1, max(1, int(clicks)) + 1):
-            down = AS.CGEventCreateMouseEvent(
-                self._event_source, down_type, point, _BUTTONS[button]
-            )
-            up = AS.CGEventCreateMouseEvent(
-                self._event_source, up_type, point, _BUTTONS[button]
-            )
-            AS.CGEventSetIntegerValueField(
-                down, AS.kCGMouseEventClickState, click_count
-            )
-            AS.CGEventSetIntegerValueField(up, AS.kCGMouseEventClickState, click_count)
-            self._post(down, pid)
-            time.sleep(0.03)
-            self._post(up, pid)
-            time.sleep(0.03)
+            for event_type in (down_type, up_type):
+                event = self._route_to_window(
+                    AS.CGEventCreateMouseEvent(
+                        self._event_source, event_type, point, _BUTTONS[button]
+                    ),
+                    window,
+                    point,
+                )
+                AS.CGEventSetIntegerValueField(
+                    event, AS.kCGMouseEventClickState, click_count
+                )
+                self._post(event, pid)
+                time.sleep(0.03)
             self._guard_focus(focus_before, pid, "click")
         self._overlay.click()
         pointer = self._pointer_info(pid=pid)
         assert pointer is not None
+        pointer["window_id"] = window["window_id"]
         return pointer
 
     def drag(
@@ -2696,13 +2798,7 @@ class MacOS:
     ) -> None:
         self._ensure_accessibility()
         self._ensure_post_events()
-        button = button.casefold()
-        if button not in _BUTTONS:
-            raise MacOSError(
-                f"Unknown mouse button {button!r}",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "button", "value": button},
-            )
+        button = self._validate_button(button)
         pid = self._pid(app)
         if pid is None:
             raise MacOSError(
@@ -2712,37 +2808,40 @@ class MacOS:
             )
         start = self._screen_point(from_x, from_y, coordinate_space, pid=pid)
         end = self._screen_point(to_x, to_y, coordinate_space, pid=pid)
+        # AppKit keeps a drag on the window that took the mouse-down, so
+        # every event is routed there even once the point leaves it.
+        window = self._target_window(pid, start)
         focus_before = self._frontmost_app()
         self._pointer_position = start
         self._overlay.move(*start, duration=0)
         self._overlay.move(*end, duration=duration)
         down_type, up_type, drag_type = _MOUSE_EVENTS[button]
-        self._post(
-            AS.CGEventCreateMouseEvent(
-                self._event_source, down_type, start, _BUTTONS[button]
-            ),
-            pid,
-        )
-        self._pointer_position = end
-        for index in range(1, max(1, steps) + 1):
-            ratio = index / max(1, steps)
-            point = (
-                start[0] + (end[0] - start[0]) * ratio,
-                start[1] + (end[1] - start[1]) * ratio,
-            )
+
+        def post(event_type: int, point: tuple[float, float]) -> None:
             self._post(
-                AS.CGEventCreateMouseEvent(
-                    self._event_source, drag_type, point, _BUTTONS[button]
+                self._route_to_window(
+                    AS.CGEventCreateMouseEvent(
+                        self._event_source, event_type, point, _BUTTONS[button]
+                    ),
+                    window,
+                    point,
                 ),
                 pid,
             )
+
+        post(down_type, start)
+        self._pointer_position = end
+        for index in range(1, max(1, steps) + 1):
+            ratio = index / max(1, steps)
+            post(
+                drag_type,
+                (
+                    start[0] + (end[0] - start[0]) * ratio,
+                    start[1] + (end[1] - start[1]) * ratio,
+                ),
+            )
             time.sleep(max(0.0, duration) / max(1, steps))
-        self._post(
-            AS.CGEventCreateMouseEvent(
-                self._event_source, up_type, end, _BUTTONS[button]
-            ),
-            pid,
-        )
+        post(up_type, end)
         self._guard_focus(focus_before, pid, "drag")
 
     def scroll(
@@ -2756,6 +2855,12 @@ class MacOS:
         y: float | None = None,
         coordinate_space: str = "screenshot",
     ) -> None:
+        """Scroll ``app`` at ``x``/``y``; with no point, at the center of the
+        window the last screenshot of ``app`` shows.
+
+        A scroll event only lands in the window it is routed to, so the
+        point decides which window scrolls; there is no app-wide scroll.
+        """
         self._ensure_accessibility()
         self._ensure_post_events()
         units = {
@@ -2783,11 +2888,22 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "app"},
             )
-        point: tuple[float, float] | None = None
-        if x is not None and y is not None:
-            point = self._screen_point(x, y, coordinate_space, pid=pid)
-            self._pointer_position = point
-            self._overlay.move(*point)
+        if x is None or y is None:
+            shot = self._last_screenshot
+            if shot is None or int(shot["pid"]) != pid:
+                raise MacOSError(
+                    "Scroll needs x/y, or a prior screenshot of this app to "
+                    "scroll at the center of",
+                    code=ErrorCode.BAD_REQUEST,
+                    details={"parameter": "x/y"},
+                )
+            bounds = shot["bounds"]
+            x, y = bounds["width"] / 2, bounds["height"] / 2
+            coordinate_space = "window"
+        point = self._screen_point(x, y, coordinate_space, pid=pid)
+        window = self._target_window(pid, point)
+        self._pointer_position = point
+        self._overlay.move(*point)
 
         focus_before = self._frontmost_app()
 
@@ -2802,13 +2918,12 @@ class MacOS:
             event = AS.CGEventCreateScrollWheelEvent(
                 self._event_source, scroll_unit, 2, int(step_y), int(step_x)
             )
-            if point:
-                AS.CGEventSetLocation(event, point)
-            self._post(event, pid)
+            AS.CGEventSetLocation(event, point)
+            self._post(self._route_to_window(event, window, point), pid)
             time.sleep(0.01)
             self._guard_focus(focus_before, pid, "scroll")
 
-    def type(self, text: str, *, app: str | None = None) -> None:
+    def type(self, text: str, *, app: str | int | None = None) -> None:
         self._ensure_accessibility()
         self._ensure_post_events()
         pid = self._pid(app)

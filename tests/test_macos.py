@@ -24,6 +24,25 @@ from macos_harness.macos import (
 )
 
 
+def _on_screen_windows(monkeypatch, *windows: tuple[int, int, float, float, float, float]) -> None:
+    """Fake the window server's front-to-back on-screen list.
+
+    Each entry is ``(pid, window_id, x, y, width, height)``, frontmost first.
+    """
+    described = [
+        {
+            "kCGWindowOwnerPID": pid,
+            "kCGWindowNumber": window_id,
+            "kCGWindowBounds": {"X": x, "Y": y, "Width": width, "Height": height},
+            "kCGWindowIsOnscreen": True,
+        }
+        for pid, window_id, x, y, width, height in windows
+    ]
+    monkeypatch.setattr(
+        macos_module.AS, "CGWindowListCopyWindowInfo", lambda options, relative: described
+    )
+
+
 def test_render_tree() -> None:
     text = MacOS._render_tree(
         [
@@ -731,6 +750,7 @@ def test_background_click_posts_to_pid_without_warp_or_activate(monkeypatch) -> 
     monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_post", lambda event, pid: posted.append(pid))
+    _on_screen_windows(monkeypatch, (42, 7, 0, 0, 800, 600))
     monkeypatch.setattr(
         macos_module.AS,
         "CGWarpMouseCursorPosition",
@@ -745,6 +765,109 @@ def test_background_click_posts_to_pid_without_warp_or_activate(monkeypatch) -> 
     )
 
     assert posted == [42, 42]
+
+
+def _routed(monkeypatch, mac: MacOS) -> list[tuple[int, int, tuple[float, float]]]:
+    """Capture ``(pid, window_id, window-local point)`` for every posted event."""
+    routed: list[tuple[int, int, tuple[float, float]]] = []
+    locals_by_event: dict[int, tuple[float, float]] = {}
+    monkeypatch.setattr(
+        macos_module,
+        "_set_window_location",
+        lambda event, point: locals_by_event.__setitem__(event, (point.x, point.y)),
+    )
+
+    def post(event, pid):
+        window_id = macos_module.AS.CGEventGetIntegerValueField(
+            event, macos_module._CG_EVENT_WINDOW_NUMBER
+        )
+        routed.append((pid, window_id, locals_by_event[macos_module.objc.pyobjc_id(event)]))
+
+    monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
+    monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
+    monkeypatch.setattr(mac, "_pid", lambda app: 42)
+    monkeypatch.setattr(mac, "_post", post)
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+    return routed
+
+
+def test_click_routes_to_the_apps_frontmost_window_under_the_point(monkeypatch) -> None:
+    """AppKit hit-tests a posted click against the window number and
+    window-local point carried by the event, so both name the app's own
+    frontmost window under the point, even with another app's window on
+    top of it."""
+    mac = MacOS()
+    routed = _routed(monkeypatch, mac)
+    _on_screen_windows(
+        monkeypatch,
+        (99, 1, 0, 0, 2000, 2000),  # another app covers everything
+        (42, 8, 300, 100, 200, 200),  # the app's sheet, over its document
+        (42, 7, 100, 50, 800, 600),
+    )
+
+    result = mac.click(310, 120, app="Demo", coordinate_space="screen")
+
+    assert routed == [(42, 8, (10.0, 20.0)), (42, 8, (10.0, 20.0))]
+    assert result["window_id"] == 8
+
+
+def test_click_outside_every_window_of_the_app_posts_nothing(monkeypatch) -> None:
+    mac = MacOS()
+    routed = _routed(monkeypatch, mac)
+    _on_screen_windows(monkeypatch, (42, 7, 100, 50, 800, 600))
+
+    with pytest.raises(MacOSError) as excinfo:
+        mac.click(10, 20, app="Demo", coordinate_space="screen")
+
+    assert excinfo.value.code == ErrorCode.BAD_REQUEST.value
+    assert routed == []
+
+
+def test_drag_keeps_every_event_on_the_window_that_took_the_mouse_down(monkeypatch) -> None:
+    mac = MacOS()
+    routed = _routed(monkeypatch, mac)
+    _on_screen_windows(monkeypatch, (42, 7, 100, 50, 200, 200), (42, 8, 300, 50, 200, 200))
+
+    mac.drag(110, 60, 310, 60, app="Demo", coordinate_space="screen", steps=2)
+
+    assert routed == [
+        (42, 7, (10.0, 10.0)),
+        (42, 7, (110.0, 10.0)),
+        (42, 7, (210.0, 10.0)),
+        (42, 7, (210.0, 10.0)),
+    ]
+
+
+def test_scroll_without_a_point_targets_the_screenshot_window_center(monkeypatch) -> None:
+    mac = MacOS()
+    routed = _routed(monkeypatch, mac)
+    _on_screen_windows(monkeypatch, (42, 7, 100, 50, 800, 600))
+    mac._last_screenshot = {
+        "pid": 42,
+        "window_id": 7,
+        "bounds": {"x": 100.0, "y": 50.0, "width": 800.0, "height": 600.0},
+        "width": 800,
+        "height": 600,
+        "scale_x": 1.0,
+        "scale_y": 1.0,
+    }
+    monkeypatch.setattr(mac, "_require_window_unchanged", lambda shot: None)
+
+    mac.scroll(-3, app="Demo", unit="line")
+
+    assert routed == [(42, 7, (400.0, 300.0))]
+
+
+def test_scroll_without_a_point_or_a_screenshot_of_the_app_is_refused(monkeypatch) -> None:
+    mac = MacOS()
+    routed = _routed(monkeypatch, mac)
+    mac._last_screenshot = {"pid": 11, "bounds": {"x": 0.0, "y": 0.0, "width": 8.0, "height": 6.0}}
+
+    with pytest.raises(MacOSError) as excinfo:
+        mac.scroll(-3, app="Demo")
+
+    assert excinfo.value.code == ErrorCode.BAD_REQUEST.value
+    assert routed == []
 
 
 @pytest.mark.parametrize(
@@ -915,6 +1038,8 @@ def test_background_click_uses_private_event_source(monkeypatch) -> None:
     monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_post", lambda event, pid: None)
+    monkeypatch.setattr(mac, "_route_to_window", lambda event, window, point: event)
+    _on_screen_windows(monkeypatch, (42, 7, 0, 0, 800, 600))
     monkeypatch.setattr(
         macos_module.AS,
         "CGEventCreateMouseEvent",
@@ -943,6 +1068,7 @@ def test_coordinate_click_never_guesses_an_ax_action(monkeypatch) -> None:
         lambda pid: pytest.fail("raw click must not inspect AX"),
     )
     monkeypatch.setattr(mac, "_post", lambda event, pid: posted.append(pid))
+    _on_screen_windows(monkeypatch, (42, 7, 0, 0, 800, 600))
 
     mac.click(10, 20, app="Slack", coordinate_space="screen")
 
@@ -969,10 +1095,11 @@ def test_click_screen_space_omits_image_coordinates_from_a_different_app(
     monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 222)  # app B
     monkeypatch.setattr(mac, "_post", lambda event, pid: None)
+    _on_screen_windows(monkeypatch, (222, 9, 0, 0, 800, 600))
 
     pointer = mac.click(10, 20, app="B", coordinate_space="screen")
 
-    assert pointer == {"screen": {"x": 10.0, "y": 20.0}}
+    assert pointer == {"screen": {"x": 10.0, "y": 20.0}, "window_id": 9}
     assert "image" not in pointer
     assert "inside" not in pointer
 
@@ -1568,6 +1695,7 @@ def test_click_accepts_a_screenshot_from_the_same_app(monkeypatch) -> None:
         "scale_y": 1.0,
     }
     monkeypatch.setattr(mac, "_require_window_unchanged", lambda shot: None)
+    _on_screen_windows(monkeypatch, (42, 7, 100, 200, 400, 300))
 
     mac.click(10, 20, app="SameApp")
 

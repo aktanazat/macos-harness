@@ -45,6 +45,21 @@ follows [Semantic Versioning](https://semver.org/).
   caller can pick the pid. Nothing is picked on its behalf.
 - `mac.ax.get(handle, "AXSelectedTextRange")` returns
   `{"location", "length"}`; it raised `AttributeError` before.
+- Posted clicks, drags, and scrolls now land. `CGEventPostToPid` skips
+  the window server's hit test, so AppKit found no window under the
+  event and dropped it: a raw `mac.click` never moved TextEdit's caret,
+  and a raw `mac.scroll` never scrolled, active app or not. Each mouse
+  and scroll event now carries the app's frontmost on-screen window
+  under the point and the point in that window's coordinates, the two
+  fields AppKit hit-tests, and `click` returns the `window_id` it
+  routed to. A point over none of the app's windows raises
+  `bad_request` before anything is posted. A drag stays on the window
+  that took its mouse-down. `scroll` with no `x`/`y` scrolls at the
+  center of the window in the last screenshot of that app instead of
+  posting an event with no target; without such a screenshot it raises
+  `bad_request`. The routing uses the private `CGEventSetWindowLocation`
+  symbol; a macOS build without it raises `unsupported_op` instead of
+  posting an event that cannot land.
 
 ### Added
 
