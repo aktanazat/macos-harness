@@ -113,6 +113,15 @@ follows [Semantic Versioning](https://semver.org/).
   field reports its role and subrole only, so a password's value,
   length, and selection are never requested. One sample costs about
   0.4ms (p95 0.9ms over 50 readings of TextEdit).
+- `equals(...)`, a third postcondition beside `present`/`gone`: one AX
+  match resolved the way `present` resolves it, its `attribute` (default
+  `AXValue`) read back every `interval`, satisfied once the reading equals
+  `value` under the same canonical comparison `set` uses to judge
+  convergence. `key`, `click`, and `type` gain a way to verify what a
+  field holds or where a selection landed, not just that focus moved. A
+  receipt carries the expected and observed values as length/SHA-256
+  summaries; a timeout reports both under `error.details`. `value` must
+  be JSON-safe and `attribute` nonempty, checked at construction.
 
 ## [0.5.0] - 2026-08-22
 

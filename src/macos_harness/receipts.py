@@ -12,9 +12,9 @@ argument shape, a fork-boundary violation, an invalidly-shaped deadline,
 or a ``once`` token already recorded for a different request -- raises
 a plain ``MacOSError`` instead, with no receipt to carry: nothing was
 ever attempted, so there is nothing yet to report. A ``Postcondition``
-(``Present`` or ``Gone``) lets a caller ask ``mac.do`` to confirm the
-*effect* of a mutation, not just that the underlying call returned
-without raising. ``OperationError`` is what a failed, receipted
+(``Present``, ``Gone``, or ``Equals``) lets a caller ask ``mac.do`` to
+confirm the *effect* of a mutation, not just that the underlying call
+returned without raising. ``OperationError`` is what a failed, receipted
 operation raises; it always carries the one ``Receipt`` describing that
 failure, so a caller never has to choose between "catch the exception"
 and "get the structured detail" -- both come from the same place.
@@ -40,6 +40,7 @@ from .errors import ErrorCode, MacOSError
 
 __all__ = [
     "Acted",
+    "Equals",
     "ErrorPayload",
     "Executor",
     "Gone",
@@ -51,6 +52,7 @@ __all__ = [
     "Receipt",
     "canonical_json",
     "canonicalize",
+    "equals",
     "gone",
     "present",
     "request_fingerprint",
@@ -377,9 +379,50 @@ class Gone(_PostconditionBase):
         self._validate(allow_zero_timeout=False)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Equals(_PostconditionBase):
+    """A postcondition satisfied once exactly one AX match's ``attribute``
+    reads back equal to ``value``.
+
+    The match is resolved with `MacOS.ax.wait`'s one-match,
+    fail-closed-on-ambiguity semantics and its ``attribute`` read with
+    `MacOS.get`, every `interval`, until the reading equals ``value``
+    (compared canonically, the way `set` judges convergence) or the
+    deadline passes. Scope inheritance and deadline behavior are as
+    for `Present`; a zero `timeout` means one look. ``value`` is frozen
+    with `canonicalize` at construction, so it must be JSON-safe, and a
+    receipt only ever carries its length and hash, never the value.
+    The comparison itself uses the real value, so ``Equals`` tells a
+    receipt whether a field holds the requested text, whether a
+    selection sits where a click should have put it, or whether a
+    control reads the requested state -- without a separate readback.
+    """
+
+    value: JSONValue
+    attribute: str = "AXValue"
+
+    def __post_init__(self) -> None:
+        self._validate(allow_zero_timeout=True)
+        if not isinstance(self.attribute, str) or not self.attribute:
+            raise MacOSError(
+                f"Equals attribute must be a nonempty str, not {self.attribute!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "attribute"},
+            )
+        try:
+            frozen = canonicalize(self.value)
+        except (TypeError, ValueError) as exc:
+            raise MacOSError(
+                f"Equals value is not JSON-safe: {exc}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "value"},
+            ) from exc
+        object.__setattr__(self, "value", frozen)
+
+
 #: What a caller hands `Operations` to confirm a mutation's effect, not
 #: just that the underlying call returned without raising.
-Postcondition: TypeAlias = Present | Gone
+Postcondition: TypeAlias = Present | Gone | Equals
 
 
 def present(
@@ -429,6 +472,41 @@ def gone(
     """Build a `Gone` postcondition; mirrors `MacOS.ax.wait_gone`'s call shape."""
     return Gone(
         text=text,
+        role=role,
+        search_key=search_key,
+        app=app,
+        apps=apps,
+        all_apps=all_apps,
+        visible_only=visible_only,
+        direction=direction,
+        immediate_descendants_only=immediate_descendants_only,
+        timeout=timeout,
+        interval=interval,
+    )
+
+
+def equals(
+    text: str | None = None,
+    *,
+    value: JSONValue,
+    attribute: str = "AXValue",
+    role: str | None = None,
+    search_key: str | None = None,
+    app: str | int | None = None,
+    apps: str | int | Iterable[str | int] | None = None,
+    all_apps: bool = False,
+    visible_only: bool = True,
+    direction: str = "next",
+    immediate_descendants_only: bool = False,
+    timeout: float | None = None,
+    interval: float = 0.1,
+) -> Equals:
+    """Build an `Equals` postcondition; `present`'s call shape plus the
+    expected ``value`` and the ``attribute`` to read it from."""
+    return Equals(
+        text=text,
+        value=value,
+        attribute=attribute,
         role=role,
         search_key=search_key,
         app=app,

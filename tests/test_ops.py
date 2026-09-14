@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import gc
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from macos_harness.receipts import (
     Outcome,
     canonical_json,
     canonicalize,
+    equals,
     gone,
     present,
 )
@@ -469,6 +471,24 @@ def _delayed_clock(
     return _monotonic
 
 
+class _SleepClock:
+    """A monotonic clock that only advances inside ``sleep``: every read
+    between two sleeps returns the same instant, so a polling loop's
+    deadline arithmetic depends on the sleeps it asked for and never on
+    how many times it happened to read the clock."""
+
+    def __init__(self, start: float = 100.0) -> None:
+        self.now = start
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 def test_operations_weak_host_matches_other_child_surfaces() -> None:
     host, operations = _ops()
     del host
@@ -808,6 +828,78 @@ def test_press_changed_is_none_without_a_verified_postcondition_true_once_verifi
         lambda: operations.press(app="Demo", text="Save", postcondition=gone("Save", role="button"))
     )
     assert failed_verify.receipt.changed is None
+
+
+def test_press_equals_polls_the_attribute_until_it_reads_the_expected_value() -> None:
+    sleeps: list[float] = []
+    host, operations = _ops(sleep=sleeps.append)
+    host.get_results.extend([[], ["Inbox"], ["Inbox", "Sent"]])
+
+    receipt = operations.press(
+        app="Demo",
+        text="Save",
+        postcondition=equals(
+            "Mailboxes",
+            search_key="AXTableSearchKey",
+            value=["Inbox", "Sent"],
+            attribute="AXSelectedRows",
+            interval=0.02,
+        ),
+    )
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.verified is True
+    assert receipt.changed is True
+    assert sleeps == [0.02, 0.02]
+    assert host.wait_calls[-1]["app"] == "Demo"
+    assert host.wait_calls[-1]["search_key"] == "AXTableSearchKey"
+    assert receipt.request["postcondition"]["attribute"] == "AXSelectedRows"
+    assert receipt.observed["attribute"] == "AXSelectedRows"
+    assert receipt.observed["value"] == _value_summary(["Inbox", "Sent"])
+
+
+def test_press_equals_fails_at_the_deadline_with_summaries_and_never_the_value() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.get_results.extend(["hunter2"] * 4)
+    host.value = "hello"
+
+    error = _failed(
+        lambda: operations.press(
+            app="Demo",
+            text="Save",
+            postcondition=equals(
+                "Name", role="textfield", value="hello", timeout=0.3, interval=0.125
+            ),
+        )
+    )
+
+    assert error.receipt.acted is Acted.YES
+    assert error.receipt.verified is False
+    assert error.receipt.changed is None
+    assert error.receipt.error["code"] == ErrorCode.TIMEOUT.value
+    assert error.receipt.error["details"]["attribute"] == "AXValue"
+    assert error.receipt.error["details"]["expected"] == _value_summary("hello")
+    assert error.receipt.error["details"]["observed"] == _value_summary("hunter2")
+    assert clock.sleeps == pytest.approx([0.125, 0.125, 0.05])
+    assert error.receipt.duration_s == pytest.approx(0.3)
+    assert "hunter2" not in json.dumps(error.receipt.to_json())
+
+
+def test_once_token_distinguishes_equals_postconditions_by_expected_value() -> None:
+    host, operations = _ops()
+    host.value = "a"
+    operations.key(
+        "return", app="Demo", once="same", postcondition=equals("Name", role="textfield", value="a")
+    )
+
+    with pytest.raises(MacOSError) as caught:
+        operations.key(
+            "return", app="Demo", once="same", postcondition=equals("Name", role="textfield", value="b")
+        )
+
+    assert caught.value.code == ErrorCode.BAD_REQUEST
+    assert len(host.key_calls) == 1
 
 
 def test_press_changed_is_none_for_ambiguous_or_focus_changed_dispatch_failures() -> None:

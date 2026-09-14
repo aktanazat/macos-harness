@@ -16,6 +16,7 @@ import pytest
 from macos_harness.errors import MacOSError
 from macos_harness.receipts import (
     Acted,
+    Equals,
     ErrorPayload,
     Executor,
     Gone,
@@ -26,6 +27,7 @@ from macos_harness.receipts import (
     Receipt,
     canonical_json,
     canonicalize,
+    equals,
     gone,
     present,
     request_fingerprint,
@@ -142,6 +144,36 @@ def test_present_and_gone_helpers_freeze_app_scope() -> None:
     assert present("x", apps=None).apps is None
 
 
+def test_equals_factory_freezes_the_expected_value() -> None:
+    postcondition = equals("Name", role="textfield", value={"location": 3, "length": 0})
+
+    assert isinstance(postcondition, Equals)
+    assert postcondition.attribute == "AXValue"
+    assert isinstance(postcondition.value, MappingProxyType)
+    assert postcondition.value == {"location": 3, "length": 0}
+    assert postcondition == Equals(
+        text="Name", role="textfield", value={"location": 3, "length": 0}
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "parameter"),
+    [
+        ({"value": object()}, "value"),
+        ({"value": float("nan")}, "value"),
+        ({"value": "x", "attribute": ""}, "attribute"),
+    ],
+)
+def test_equals_rejects_an_unsafe_value_or_an_empty_attribute(
+    kwargs: dict[str, object], parameter: str
+) -> None:
+    with pytest.raises(MacOSError) as excinfo:
+        Equals(**kwargs)
+
+    assert excinfo.value.code == "bad_request"
+    assert excinfo.value.details["parameter"] == parameter
+
+
 @pytest.mark.parametrize("postcondition_class", [Present, Gone])
 def test_postcondition_rejects_more_than_one_scope_selector(
     postcondition_class: type[Present | Gone],
@@ -161,9 +193,9 @@ def test_postcondition_rejects_more_than_one_scope_selector(
 def test_postcondition_accepts_a_single_scope_selector(
     postcondition_class: type[Present | Gone],
 ) -> None:
-    postcondition_class(app="Notes")
-    postcondition_class(all_apps=True)
-    postcondition_class(apps=["Notes"])
+    assert postcondition_class(app="Notes").app == "Notes"
+    assert postcondition_class(all_apps=True).all_apps is True
+    assert postcondition_class(apps=["Notes"]).apps == ("Notes",)
 
 
 @pytest.mark.parametrize("postcondition_class", [Present, Gone])
@@ -179,8 +211,8 @@ def test_postcondition_rejects_bad_direction(
 def test_postcondition_accepts_direction_case_insensitively(
     postcondition_class: type[Present | Gone],
 ) -> None:
-    postcondition_class(direction="Next")
-    postcondition_class(direction="PREVIOUS")
+    assert postcondition_class(direction="Next").direction == "Next"
+    assert postcondition_class(direction="PREVIOUS").direction == "PREVIOUS"
 
 
 @pytest.mark.parametrize("postcondition_class", [Present, Gone])

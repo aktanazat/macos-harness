@@ -106,6 +106,14 @@ PY
   must set `app=`, `all_apps=True`, or `apps=` explicitly. `press`/`set`/
   `toggle` accept an `interval` for their own AX resolution polling;
   `run` and `key` poll for nothing of their own, so neither takes one.
+- `equals(..., value=, attribute="AXValue")` verifies a value, not just a
+  presence: it resolves one match the way `present` does, reads
+  `attribute` back every `interval`, and is satisfied once the reading
+  equals `value` (compared canonically, the way `set` judges
+  convergence). Pair it with `key`, `click`, or `type` to confirm a field
+  holds the requested text or a selection landed where it should. A
+  receipt carries the expected and observed values as length/SHA-256
+  summaries, never the values themselves.
 - `timeout` is one cooperative budget across resolution, dispatch, and
   verification. The harness does not start a mutation after the budget
   expires and it terminates a timed-out script process group. A synchronous

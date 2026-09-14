@@ -29,9 +29,9 @@ Every verb shares:
     already in progress cannot be preempted safely and may return later.
   - `dry_run=True`: validate/resolve/compile, but never dispatch a mutating
     call and never touch the `once` ledger.
-  - An optional `Postcondition` (`Present`/`Gone`) confirming the mutation's
-    real effect, not just that the underlying call returned without
-    raising; unscoped, it inherits the operation's own scope.
+  - An optional `Postcondition` (`Present`/`Gone`/`Equals`) confirming the
+    mutation's real effect, not just that the underlying call returned
+    without raising; unscoped, it inherits the operation's own scope.
   - `press`/`run`/`key`/`click`/`type` additionally accept a nonempty `once` token for
     at-most-once dispatch (`_Ledger`); `set`/`toggle` are convergent
     (read, act only if needed, read back) and so are already safe to call
@@ -79,6 +79,7 @@ from typing import IO, Literal, Protocol
 from .errors import ErrorCode, FocusChangedError, MacOSError
 from .receipts import (
     Acted,
+    Equals,
     ErrorPayload,
     Executor,
     JSONValue,
@@ -2508,7 +2509,7 @@ class Operations:
             return
         if not isinstance(postcondition, Postcondition):
             raise MacOSError(
-                f"postcondition must be a Present or Gone, not {type(postcondition).__name__}",
+                f"postcondition must be a Present, Gone, or Equals, not {type(postcondition).__name__}",
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "postcondition"},
             )
@@ -2539,9 +2540,8 @@ class Operations:
     def _postcondition_payload(self, postcondition: Postcondition | None) -> JSONValue:
         if postcondition is None:
             return None
-        kind = "present" if isinstance(postcondition, Present) else "gone"
-        return {
-            "kind": kind,
+        payload: dict[str, JSONValue] = {
+            "kind": type(postcondition).__name__.lower(),
             "text": postcondition.text,
             "role": postcondition.role,
             "search_key": postcondition.search_key,
@@ -2552,6 +2552,10 @@ class Operations:
             "timeout": postcondition.timeout,
             "interval": postcondition.interval,
         }
+        if isinstance(postcondition, Equals):
+            payload["attribute"] = postcondition.attribute
+            payload["value"] = _value_summary(postcondition.value)
+        return payload
 
     # --- AX target resolution ------------------------------------------------
 
@@ -2663,9 +2667,20 @@ class Operations:
                     interval=postcondition.interval,
                 )
                 return _Verification(ok=True, observed=self._match_summary_payload(match), error=None)
+            if isinstance(postcondition, Equals):
+                return self._verify_equals(
+                    host,
+                    postcondition,
+                    effective_timeout,
+                    search_key=search_key,
+                    app=scope_app,
+                    all_apps=scope_all_apps,
+                    apps=scope_apps,
+                )
             # `postcondition` is a `Gone`: `_validate_postcondition` has
-            # already guaranteed it is a `Present` or `Gone` before this
-            # method is ever reached, so this is the only case left.
+            # already guaranteed it is a `Present`, `Gone`, or `Equals`
+            # before this method is ever reached, so this is the only
+            # case left.
             if effective_timeout <= 0:
                 # `Gone` needs two *consecutive* empty polls to confirm
                 # absence (see its own docstring); a zero-or-negative
@@ -2697,6 +2712,72 @@ class Operations:
             return _Verification(ok=True, observed=None, error=None)
         except MacOSError as exc:
             return _Verification(ok=False, observed=None, error=exc.to_json())
+
+    def _verify_equals(
+        self,
+        host: _Host,
+        postcondition: Equals,
+        timeout: float,
+        *,
+        search_key: str,
+        app: str | int | None,
+        all_apps: bool,
+        apps: str | int | Iterable[str | int] | None,
+    ) -> _Verification:
+        """Resolve the one match and read its attribute every
+        ``postcondition.interval`` until the reading equals the expected
+        value or ``timeout`` runs out.
+
+        Each poll resolves the match again rather than holding the first
+        element: an app that rebuilds a control after the action would
+        otherwise leave a dead reference, and the one-match rule already
+        refuses to certify a look-alike. A read the app refuses raises
+        out to the caller's ``except`` -- the same bounded failure a
+        `Present` search gets -- rather than polling an error that will
+        not heal.
+        """
+        attribute = postcondition.attribute
+        deadline = self._monotonic() + timeout
+        while True:
+            match = host.ax_wait(
+                app=app,
+                all_apps=all_apps,
+                apps=apps,
+                search_key=search_key,
+                text=postcondition.text,
+                visible_only=postcondition.visible_only,
+                direction=postcondition.direction,
+                immediate_descendants_only=postcondition.immediate_descendants_only,
+                timeout=max(0.0, deadline - self._monotonic()),
+                interval=postcondition.interval,
+            )
+            observed = host.get(int(match["element_index"]), attribute)
+            if canonicalize(observed) == postcondition.value:
+                return _Verification(
+                    ok=True,
+                    observed={
+                        **self._match_summary_payload(match),
+                        "attribute": attribute,
+                        "value": _value_summary(observed),
+                    },
+                    error=None,
+                )
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                return _Verification(
+                    ok=False,
+                    observed=None,
+                    error={
+                        "code": ErrorCode.TIMEOUT.value,
+                        "message": f"{attribute} did not equal the expected value before the deadline",
+                        "details": {
+                            "attribute": attribute,
+                            "expected": _value_summary(postcondition.value),
+                            "observed": _value_summary(observed),
+                        },
+                    },
+                )
+            self._sleep(min(postcondition.interval, remaining))
 
     @staticmethod
     def _match_summary_payload(match: Mapping[str, JSONValue]) -> JSONValue:

@@ -43,11 +43,14 @@ success -- `outcome` (`planned`/`done`/`already`/`failed`), `acted`
 verified the effect -- instead of a bare value you have to trust blindly:
 
 ```python
-from macos_harness.receipts import gone
+from macos_harness.receipts import equals, gone
 
 not_now = dict(text="Not Now", role="button", all_apps=True)
 receipt = mac.do.press(
     **not_now, postcondition=gone(**not_now), once="dismiss-not-now",
+)
+receipt = mac.do.type(
+    "hello", app="TextEdit", postcondition=equals(role="text area", value="hello"),
 )
 ```
 
@@ -73,6 +76,13 @@ receipt = mac.do.press(
   `None` when nothing observable moved, which is how a key AppKit
   silently dropped shows up. `press`/`run` have no readback of their own,
   so `changed` is `None` unless a `postcondition` confirms the effect.
+- `equals(..., value=, attribute="AXValue")` is the postcondition that
+  reads the target back for you: one match resolved like `present`, its
+  `attribute` read every `interval`, verified once the reading equals
+  `value` (canonically, the way `set` judges convergence). Use it after
+  `key`/`click`/`type` to confirm the text a field holds or where a
+  selection landed. The receipt keeps length/SHA-256 summaries of the
+  expected and observed values, never the values.
 - Pass a nonempty `once` keyword on `press`/`run`/`key`/`click`/`type` before
   an action you cannot safely repeat, with the *same* request every time you reuse a
   token. Its ledger lives only in the memory of the one live `MacOS`

@@ -15,6 +15,7 @@ from .handoff import HandoffReason, HumanHandoff
 from .macos import MacOS
 from .receipts import (
     Acted,
+    Equals,
     ErrorPayload,
     Executor,
     Gone,
@@ -26,6 +27,7 @@ from .receipts import (
     Receipt,
     canonical_json,
     canonicalize,
+    equals,
     gone,
     present,
     request_fingerprint,
@@ -79,6 +81,7 @@ __all__ = [
     "CredentialError",
     "CredentialManifest",
     "CredentialReceipt",
+    "Equals",
     "ErrorCode",
     "ErrorPayload",
     "Executor",
@@ -97,6 +100,7 @@ __all__ = [
     "__version__",
     "canonical_json",
     "canonicalize",
+    "equals",
     "gone",
     "present",
     "request_fingerprint",
