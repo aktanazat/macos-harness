@@ -683,7 +683,28 @@ class NativeClient:
         return match
 
     def get(self, handle: _NativeHandle, attribute: str) -> Any:
-        return self.get_attributes(handle, (attribute,))[attribute]
+        """Read one raw AX attribute with the agent's required-value op.
+
+        The counterpart of the local ``MacOS.get`` branch, not of
+        ``get_attributes``: a read the app refuses -- cannot-complete,
+        invalid element, no value, unsupported attribute -- is the agent's
+        error response and raises here, never a ``None`` that a caller
+        deciding whether to toggle could mistake for ``False``. A
+        successful explicit ``null`` is still a value. An older agent
+        that predates the op refuses it as ``unsupported_op``; nothing
+        here downgrades to the best-effort batch read.
+        """
+        wire_handle = self._resolve_handle(handle)
+        result = self._request(
+            "ax_element_get_value", {"handle": wire_handle, "attribute": attribute}
+        )
+        if "value" not in result:
+            raise NativeProtocolError(
+                f"Malformed ax_element_get_value result: {result!r}",
+                code=ErrorCode.AX_ERROR,
+                details={"op": "ax_element_get_value"},
+            )
+        return result["value"]
 
     def get_attributes(
         self, handle: _NativeHandle, attributes: Iterable[str]

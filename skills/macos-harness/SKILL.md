@@ -404,4 +404,9 @@ sample behind `key`/`click`/`type` receipts, the pointer overlay,
 AppleScript, full app snapshots — always stays local. A native
 `element_index` is interned into the same handle registry a local query
 would use, so it behaves exactly like one: stale or reset indices still
-raise instead of aliasing a different element.
+raise instead of aliasing a different element. `ax.get` is one checked
+read on either backend -- a read the app refuses raises (`timeout` when it
+did not answer, `ax.error` otherwise), so `set`/`toggle`/`equals` never
+judge a state from a value that was never read -- while
+`ax.get_attributes` is a bulk sample where an unreadable attribute is
+`None`.

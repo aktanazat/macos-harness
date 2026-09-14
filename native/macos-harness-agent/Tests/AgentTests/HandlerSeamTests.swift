@@ -66,6 +66,10 @@ final class HandlerSeamTests: XCTestCase {
         .object(["handle": .number(1), "attribute": .string("value"), "value": .string("x")])
       ),
       (14, "ax_element_perform", .object(["handle": .number(1), "action": .string("AXPress")])),
+      (
+        15, "ax_element_get_value",
+        .object(["handle": .number(1), "attribute": .string("AXValue")])
+      ),
     ]
     for (id, op, params) in axOps {
       let response = handlers.handle(WireRequest(v: 1, id: id, op: op, params: params))
@@ -242,6 +246,16 @@ final class HandlerSeamTests: XCTestCase {
       WireRequest(
         v: 1, id: 1, op: "ax_element_get",
         params: .object(["handle": .number(1), "attributes": .array(tooMany)])))
+    XCTAssertEqual(response.error?.code, "bad_request")
+  }
+
+  func testElementGetValueRequiresAnAttributeName() {
+    // Decoded before the executor is reached, so this is deterministic on a trusted Mac too:
+    // a single read with no attribute is a malformed request, not a read of some default.
+    let handlers = AgentHandlers(trustCheck: { true })
+    let response = handlers.handle(
+      WireRequest(
+        v: 1, id: 1, op: "ax_element_get_value", params: .object(["handle": .number(1)])))
     XCTAssertEqual(response.error?.code, "bad_request")
   }
 

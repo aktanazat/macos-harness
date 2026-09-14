@@ -612,7 +612,12 @@ backend. An `element_index` returned by a native query is not a raw
 agent-side number — the client interns it into the same monotonic element
 registry local queries use, so `ax.get`/`ax.set`/`ax.perform` accept it
 exactly like a Python-minted index, and a stale index still raises instead of
-silently aliasing a different element.
+silently aliasing a different element. The two reads keep the contracts the
+Python backend gives them: `ax.get` is one checked read, so a read the app
+refuses raises (`timeout` when it did not answer, `ax.error` otherwise) and
+`set`/`toggle`/`equals` never judge a state from a value that was never
+read; `ax.get_attributes` is a bulk sample where an unreadable attribute is
+`None`.
 
 ## How it works
 

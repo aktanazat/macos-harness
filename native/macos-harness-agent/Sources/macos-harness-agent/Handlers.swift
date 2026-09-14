@@ -84,6 +84,9 @@ final class AgentHandlers {
     case "ax_element_get":
       try requireTrust()
       return try handleElementGet(params: request.params)
+    case "ax_element_get_value":
+      try requireTrust()
+      return try handleElementGetValue(params: request.params)
     case "ax_element_set":
       try requireTrust()
       return try handleElementSet(params: request.params)
@@ -228,6 +231,17 @@ final class AgentHandlers {
     let attributes = try Self.boundedAttributes(params, default: [])
     let values = try executor.get(handle: handle, attributes: attributes, registry: registry)
     return .object(["attributes": .object(values)])
+  }
+
+  /// The required-value counterpart of `handleElementGet`: one attribute, and a read the app
+  /// refuses is an error response rather than a `null` slot. `MacOS.get` in `macos.py` reads
+  /// a native handle through this, where `set`/`toggle` and value postconditions decide on
+  /// the result.
+  private func handleElementGetValue(params: JSONValue) throws -> JSONValue {
+    let handle = try Self.requiredInt(params, "handle")
+    let attribute = try Self.requiredAttributeName(params, "attribute")
+    let value = try executor.getValue(handle: handle, attribute: attribute, registry: registry)
+    return .object(["value": value])
   }
 
   private func handleElementSet(params: JSONValue) throws -> JSONValue {

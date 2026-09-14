@@ -157,6 +157,20 @@ follows [Semantic Versioning](https://semver.org/).
   runs only after `AXPress` returns, the order `mac.do.press(apps=...)`,
   `toggle`, and the native agent already used: a failed action keeps its
   error and the receipt says `acted=unknown`.
+- On the native backend, `mac.ax.get` read one attribute through the
+  agent's best-effort batch op, which answers `null` for a read the app
+  refuses -- it did not answer in time, the element is gone, the
+  attribute is unsupported. So `mac.do.toggle` read a refused `AXValue`
+  as "off" and pressed a control it could not see, `set` judged
+  convergence against nothing, and `equals(value=None)` verified a
+  postcondition the app never answered. The agent now has a single
+  required-value read, `ax_element_get_value`, that returns the error the
+  Python backend already raised: `timeout` when the app did not answer
+  (`ax_error` -25204), `ax.error` otherwise, with a successful explicit
+  `null` still a value. An agent binary that predates the op refuses it
+  as `unsupported_op`; nothing downgrades to the batch read.
+  `mac.ax.get_attributes` is unchanged: a bulk sample where an unreadable
+  attribute is `None`.
 
 ## [0.5.0] - 2026-08-22
 

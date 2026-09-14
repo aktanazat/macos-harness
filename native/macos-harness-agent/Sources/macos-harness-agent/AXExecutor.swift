@@ -93,6 +93,21 @@ final class AXExecutor {
     }
   }
 
+  /// Reads exactly one attribute and never invents a value for it. Where `get` mirrors the
+  /// best-effort bulk reader and fills a refused slot with `.null`, this is the counterpart of
+  /// the local `MacOS.get` branch in `macos.py`: any status other than `.success` -- including
+  /// "no value" and "attribute unsupported" -- throws through `axAgentError` with the raw code,
+  /// so a Python caller deciding whether to toggle, or whether a value matches, sees the refused
+  /// read instead of a `null` it could mistake for `false`.
+  func getValue(handle: Int, attribute: String, registry: ElementRegistry) throws -> JSONValue {
+    try Self.queue.sync {
+      try Self.requireTrust()
+      let element = try Self.resolveElement(handle, registry: registry)
+      return try Self.requiredValue(
+        element, attribute, handle: handle, copy: Self.copyAttributeStatus)
+    }
+  }
+
   func set(handle: Int, attribute: String, value: JSONValue, registry: ElementRegistry) throws {
     try Self.queue.sync {
       try performSet(handle: handle, attribute: attribute, value: value, registry: registry)
@@ -537,10 +552,37 @@ final class AXExecutor {
     return result
   }
 
-  private static func copyAttribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
+  /// One `AXUIElementCopyAttributeValue` call: the status AX reported and whatever value it
+  /// produced. `requiredValue` takes this as a parameter so `AgentTests` can hand it a refused
+  /// status without a live target or a trust grant; production always passes
+  /// `copyAttributeStatus`.
+  typealias AttributeCopy = (AXUIElement, String) -> (AXError, AnyObject?)
+
+  private static func copyAttributeStatus(_ element: AXUIElement, _ name: String) -> (
+    AXError, AnyObject?
+  ) {
     var value: CFTypeRef?
     let error = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+    return (error, value)
+  }
+
+  private static func copyAttribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
+    let (error, value) = copyAttributeStatus(element, name)
     return error == .success ? value : nil
+  }
+
+  /// The strict single read behind `getValue`: `.success` converts the value exactly like every
+  /// other reader (a genuine `null` stays `.null`, `false` and `0` stay values); every other
+  /// status is thrown through `axAgentError`, so `.cannotComplete` reads as `timeout` and the
+  /// rest as `ax.error`, each carrying the raw `AXError` code.
+  static func requiredValue(
+    _ element: AXUIElement, _ attribute: String, handle: Int, copy: AttributeCopy
+  ) throws -> JSONValue {
+    let (status, value) = copy(element, attribute)
+    guard status == .success else {
+      throw axAgentError("Read \(attribute) from element \(handle)", status)
+    }
+    return value.map(jsonable) ?? .null
   }
 
   private static func actionNames(_ element: AXUIElement) -> [String] {

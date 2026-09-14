@@ -77,7 +77,8 @@ struct WireResponse: Codable, Error {
 /// Recognized wire codes: `permission.accessibility`, `app.not_found`,
 /// `app.ambiguous`, `focus.changed`, `ax.error`, `element.unknown`,
 /// `timeout`, `bad_request`, `unsupported_op`. `axError` carries the raw
-/// `AXError` integer for `ax.error`; every other code leaves it `nil`.
+/// `AXError` integer for `ax.error` and for a `timeout` mapped from
+/// `kAXErrorCannotComplete`; every other code leaves it `nil`.
 struct AgentError: Error {
   let code: String
   let message: String

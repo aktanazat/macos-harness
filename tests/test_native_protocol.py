@@ -25,6 +25,7 @@ from macos_harness.macos import (
     AccessibilityPermissionError,
     ApplicationNotFoundError,
     FocusChangedError,
+    MacOS,
     MacOSError,
 )
 from macos_harness.native import (
@@ -35,6 +36,7 @@ from macos_harness.native import (
     NativeProtocolError,
     _NativeHandle,
 )
+from macos_harness.receipts import Acted, OperationError, Outcome, equals
 
 #: Sentinel script entries.
 CLOSE = object()  # drop the connection without responding
@@ -176,7 +178,7 @@ def test_handshake_rejects_protocol_major_mismatch() -> None:
 def test_error_codes_map_to_expected_exception(
     code: str, expected: type[MacOSError]
 ) -> None:
-    ax_error = -25200 if code == "ax.error" else None
+    ax_error = {"ax.error": -25200, "timeout": -25204}.get(code)
     agent = _FakeAgent(
         [_ok(1, _ping_result()), _err(2, code, f"boom: {code}", ax_error=ax_error)]
     )
@@ -487,7 +489,7 @@ def test_full_operation_surface_round_trips() -> None:
     responses = [
         _ok(1, _ping_result()),  # connect handshake
         _ok(2, {"matches": [match]}),  # query
-        _ok(3, {"attributes": {"AXValue": "hello"}}),  # get
+        _ok(3, {"value": "hello"}),  # get
         _ok(
             4, {"attributes": {"AXValue": "hello", "AXTitle": "Not Now"}}
         ),  # get_attributes
@@ -522,8 +524,8 @@ def test_full_operation_surface_round_trips() -> None:
         assert query_request["params"] == {"text": "Not Now", "reset_elements": True}
 
         get_request = json.loads(agent.received[2])
-        assert get_request["op"] == "ax_element_get"
-        assert get_request["params"] == {"handle": 11, "attributes": ["AXValue"]}
+        assert get_request["op"] == "ax_element_get_value"
+        assert get_request["params"] == {"handle": 11, "attribute": "AXValue"}
 
         get_attrs_request = json.loads(agent.received[3])
         assert get_attrs_request["op"] == "ax_element_get"
@@ -547,6 +549,184 @@ def test_full_operation_surface_round_trips() -> None:
         press_request = json.loads(agent.received[6])
         assert press_request["op"] == "ax_press"
         assert press_request["params"] == {"text": "Not Now"}
+    finally:
+        agent.close()
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {},
+        # The best-effort batch shape, where a refused slot is a `null`:
+        # the one answer a required read must never accept as a value.
+        {"attributes": {"AXValue": None}},
+    ],
+    ids=["empty", "batch-shape"],
+)
+def test_single_read_result_without_a_value_key_is_a_protocol_error(
+    result: dict[str, object],
+) -> None:
+    agent = _FakeAgent([_ok(1, _ping_result()), _ok(2, result)])
+    try:
+        client = _client(agent)
+        client.connect()
+        handle = _NativeHandle(client, 11, client.generation)
+        with pytest.raises(NativeProtocolError, match="ax_element_get_value"):
+            client.get(handle, "AXValue")
+    finally:
+        agent.close()
+
+
+def test_single_read_explicit_null_is_a_value() -> None:
+    agent = _FakeAgent([_ok(1, _ping_result()), _ok(2, {"value": None})])
+    try:
+        client = _client(agent)
+        client.connect()
+        handle = _NativeHandle(client, 11, client.generation)
+        assert client.get(handle, "AXValue") is None
+    finally:
+        agent.close()
+
+
+def test_single_read_against_an_older_agent_is_refused_not_downgraded() -> None:
+    """An agent binary that predates ``ax_element_get_value`` answers
+    ``unsupported_op``; the client surfaces that verbatim rather than
+    retrying through the lossy batch op it could have used instead."""
+    agent = _FakeAgent(
+        [
+            _ok(1, _ping_result()),
+            _err(2, "unsupported_op", 'Unsupported operation "ax_element_get_value"'),
+        ]
+    )
+    try:
+        client = _client(agent)
+        client.connect()
+        handle = _NativeHandle(client, 11, client.generation)
+        with pytest.raises(MacOSError, match="Unsupported operation") as exc_info:
+            client.get(handle, "AXValue")
+        assert exc_info.value.code == "unsupported_op"
+        agent.join(timeout=2.0)
+        assert [json.loads(line)["op"] for line in agent.received] == [
+            "ping",
+            "ax_element_get_value",
+        ]
+    finally:
+        agent.close()
+
+
+# --- consumer consequences: a refused single read reaches mac.do ----------
+
+
+def _native_mac(
+    monkeypatch: pytest.MonkeyPatch, agent: _FakeAgent
+) -> tuple[MacOS, int]:
+    """A real ``MacOS`` whose one interned element is a live native handle
+    over ``agent``'s socket, with app resolution, target discovery, and the
+    focus guard pinned so the only thing between ``mac.do`` and the wire is
+    the production read path under test."""
+    client = _client(agent)
+    client.connect()
+    mac = MacOS(backend="native")
+    index = mac._remember_element(_NativeHandle(client, 11, client.generation))
+    app_info = {"pid": 41, "name": "Demo", "bundle_id": "com.example.demo"}
+    match = {
+        "element_index": index,
+        "role": "AXCheckBox",
+        "title": "Enabled",
+        "description": None,
+        "identifier": None,
+        "actions": ["AXPress"],
+        "app": app_info,
+    }
+    monkeypatch.setattr(mac, "_resolve_app", lambda query: (object(), dict(app_info)))
+    monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
+    monkeypatch.setattr(mac, "ax_wait", lambda **kwargs: dict(match))
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: dict(app_info))
+    monkeypatch.setattr(mac, "_guard_focus", lambda before, target_pid, operation: None)
+    return mac, index
+
+
+def test_toggle_never_presses_a_control_whose_state_it_could_not_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrong-direction bug: a refused ``AXValue`` read once arrived as
+    ``None``, read as "currently off", and ``toggle(False)`` reported
+    ``already`` (or ``toggle(True)`` pressed an already-on control off)."""
+    agent = _FakeAgent(
+        [
+            _ok(1, _ping_result()),
+            _err(2, "timeout", "Read AXValue from element 11 failed", ax_error=-25204),
+        ]
+    )
+    try:
+        mac, _ = _native_mac(monkeypatch, agent)
+        with pytest.raises(OperationError) as caught:
+            mac.do.toggle(False, app="Demo", text="Enabled")
+        receipt = caught.value.receipt
+        assert receipt.outcome is Outcome.FAILED
+        assert receipt.acted is Acted.NO
+        assert receipt.changed is False
+        assert receipt.verified is False
+        assert receipt.error is not None
+        assert receipt.error["code"] == "timeout"
+        assert receipt.error["details"]["ax_error"] == -25204
+        agent.join(timeout=2.0)
+        assert [json.loads(line)["op"] for line in agent.received] == [
+            "ping",
+            "ax_element_get_value",
+        ]
+    finally:
+        agent.close()
+
+
+def test_press_with_a_null_expectation_fails_on_a_refused_read_and_replays_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``equals(value=None)`` once verified against the ``None`` a refused
+    read produced. The press still happened, so the receipt keeps
+    ``acted=yes`` with ``verified=False``, and recalling the token returns
+    that failure without pressing again."""
+    agent = _FakeAgent(
+        [
+            _ok(1, _ping_result()),
+            _err(2, "timeout", "Read AXValue from element 11 failed", ax_error=-25204),
+        ]
+    )
+    try:
+        mac, index = _native_mac(monkeypatch, agent)
+        presses: list[object] = []
+        pressed = {
+            "element_index": index,
+            "role": "AXButton",
+            "title": "Save",
+            "actions": ["AXPress"],
+            "app": {"pid": 41, "name": "Demo", "bundle_id": "com.example.demo"},
+        }
+        monkeypatch.setattr(
+            mac, "ax_press", lambda **kwargs: presses.append(kwargs) or dict(pressed)
+        )
+        with pytest.raises(OperationError) as caught:
+            mac.do.press(
+                app="Demo",
+                text="Save",
+                once="null-witness",
+                postcondition=equals("Enabled", value=None),
+            )
+        receipt = caught.value.receipt
+        assert receipt.outcome is Outcome.FAILED
+        assert receipt.acted is Acted.YES
+        assert receipt.verified is False
+        assert receipt.changed is None
+        assert receipt.error is not None
+        assert receipt.error["code"] == "timeout"
+        assert len(presses) == 1
+
+        with pytest.raises(OperationError) as replayed:
+            mac.do.recall("null-witness")
+        assert replayed.value.receipt.replayed is True
+        assert replayed.value.receipt.outcome is Outcome.FAILED
+        assert replayed.value.receipt.verified is False
+        assert len(presses) == 1
     finally:
         agent.close()
 
