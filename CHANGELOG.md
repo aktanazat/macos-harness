@@ -7,6 +7,14 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `mac.do.set` and `mac.do.toggle` wait for their readback. Both used to
+  read the attribute once after the mutation and fail with `acted=yes`
+  when that first reading still showed the old state, which is what an
+  app that applies a set or a press on its next run-loop turn looks like.
+  They now re-read every `interval` until the requested state shows or
+  the shared deadline runs out, with the same summary-only receipt, and
+  the mutation is never repeated: a stable mismatch still fails with the
+  last reading, and a refused read is still an error, not a retry.
 - `mac.see()` and `capture_screenshot()` render one window through
   ScreenCaptureKit at the requested output size instead of running
   `screencapture` and shrinking a full Retina PNG with Pillow. A 1280px

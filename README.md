@@ -82,11 +82,14 @@ PY
   postcondition verified the effect, duration_s, and — on failure — a
   structured error. `receipt.to_json()` is ready for `json.dumps`.
 - `changed` is only ever an observed fact, never a guess. `set`/`toggle`
-  read the target back before and after and know for certain. `key`/
-  `click`/`type` sample focus before and after — frontmost pid, focused
-  window, and the focused element's role, value summary, selected range,
-  character count, position, and size; a secure field gives its role and
-  subrole only — and report the fields that moved under `observed.focus`.
+  read the target back before and after and know for certain; a readback
+  that lags behind the mutation is re-read every `interval` until it
+  shows the requested state or the deadline runs out, and the mutation
+  itself is never repeated. `key`/`click`/`type` sample focus before and
+  after — frontmost pid, focused window, and the focused element's role,
+  value summary, selected range, character count, position, and size; a
+  secure field gives its role and subrole only — and report the fields
+  that moved under `observed.focus`.
   The after-reading repeats every 10ms for up to 100ms until it differs,
   so an app's run loop gets time to process the event. `changed` is
   `True` when focus moved or a postcondition verified the effect, `None`
@@ -104,8 +107,9 @@ PY
   postcondition inherits the operation's own `app`/`apps`/`all_apps` scope
   — except for `run`, which has no scope of its own, so its postcondition
   must set `app=`, `all_apps=True`, or `apps=` explicitly. `press`/`set`/
-  `toggle` accept an `interval` for their own AX resolution polling;
-  `run` and `key` poll for nothing of their own, so neither takes one.
+  `toggle` accept an `interval` for their own AX polling — resolution,
+  and for `set`/`toggle` the readback after the mutation; `run` and `key`
+  poll for nothing of their own, so neither takes one.
 - `equals(..., value=, attribute="AXValue")` verifies a value, not just a
   presence: it resolves one match the way `present` does, reads
   `attribute` back every `interval`, and is satisfied once the reading

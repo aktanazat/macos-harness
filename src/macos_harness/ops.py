@@ -1545,10 +1545,14 @@ class Operations:
         dry_run: bool = False,
     ) -> Receipt:
         """Converge one AX attribute to ``value``: read, ``ALREADY`` if it
-        already matches, otherwise set and read back to confirm.
+        already matches, otherwise set once and read back every
+        ``interval`` until the value shows or the deadline runs out.
 
-        Naturally idempotent -- calling this twice with the same arguments
-        is always safe -- so, unlike ``press``/``run``/``key``, it takes no
+        The mutation is never repeated: a readback that lags behind a
+        synchronous set is given the remaining budget to catch up, and a
+        value that never appears fails with the last reading. Naturally
+        idempotent -- calling this twice with the same arguments is
+        always safe -- so, unlike ``press``/``run``/``key``, it takes no
         ``once``.
         """
         self._check_owner()
@@ -1673,7 +1677,12 @@ class Operations:
                 )
 
             try:
-                after = host.get(element_index, attribute)
+                after, converged = self._read_until(
+                    deadline,
+                    interval,
+                    lambda: host.get(element_index, attribute),
+                    lambda reading: canonicalize(reading) == canonical_value,
+                )
             except MacOSError as exc:
                 return self._finish(
                     builder.build(
@@ -1681,9 +1690,8 @@ class Operations:
                         target=target, observed=_value_summary(before), error=exc.to_json(),
                     )
                 )
-            canonical_after = canonicalize(after)
-            changed = canonical_after != canonical_before
-            if canonical_after != canonical_value:
+            changed = canonicalize(after) != canonical_before
+            if not converged:
                 error: ErrorPayload = {
                     "code": ErrorCode.AX_ERROR.value,
                     "message": f"{attribute} did not converge to the requested value after set",
@@ -1735,10 +1743,12 @@ class Operations:
     ) -> Receipt:
         """Converge one AX target to a boolean ``desired`` state: read
         ``attribute``, do nothing if it already matches, otherwise press
-        the target once and read back to confirm.
+        the target once and read back every ``interval`` until the state
+        shows or the deadline runs out.
 
         For controls -- checkboxes, switches, menu items -- that only
-        expose a press action, not a freely settable attribute. Naturally
+        expose a press action, not a freely settable attribute. The press
+        is never repeated, whatever the readback shows. Naturally
         idempotent, like ``set``; takes no ``once``.
         """
         self._check_owner()
@@ -1899,7 +1909,12 @@ class Operations:
                 )
 
             try:
-                after = bool(host.get(element_index, attribute))
+                after, converged = self._read_until(
+                    deadline,
+                    interval,
+                    lambda: bool(host.get(element_index, attribute)),
+                    lambda reading: reading == desired,
+                )
             except MacOSError as exc:
                 return self._finish(
                     builder.build(
@@ -1908,7 +1923,7 @@ class Operations:
                     )
                 )
             changed = after != before
-            if after != desired:
+            if not converged:
                 error = {
                     "code": ErrorCode.AX_ERROR.value,
                     "message": f"{attribute} did not converge to the requested state after AXPress",

@@ -1032,15 +1032,37 @@ def test_set_post_dispatch_read_failure_returns_failed_receipt() -> None:
     assert host.set_calls == 1
 
 
-def test_set_reports_failed_convergence() -> None:
-    host, operations = _ops()
-    host.get_results.extend(("old", "other"))
+def test_set_waits_for_a_lagging_readback_without_setting_twice() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.get_results.extend(("old", "old", "old", "new"))
 
-    error = _failed(lambda: operations.set("new", app="Demo", text="Field"))
+    receipt = operations.set("new", app="Demo", text="Field", interval=0.05)
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.acted is Acted.YES
+    assert receipt.changed is True
+    assert receipt.observed == _value_summary("new")
+    assert host.set_calls == 1
+    assert clock.sleeps == [0.05, 0.05]
+
+
+def test_set_reports_failed_convergence_at_the_deadline() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.get_results.extend(["old"] + ["other"] * 4)
+
+    error = _failed(
+        lambda: operations.set("new", app="Demo", text="Field", timeout=0.3, interval=0.125)
+    )
 
     assert error.receipt.acted is Acted.YES
+    assert error.receipt.error["code"] == ErrorCode.AX_ERROR.value
     assert error.receipt.observed == _value_summary("other")
     assert error.receipt.changed is True
+    assert error.receipt.duration_s == pytest.approx(0.3)
+    assert host.set_calls == 1
+    assert not host.get_results
 
 
 def test_toggle_is_convergent_and_presses_only_when_needed() -> None:
@@ -1124,11 +1146,16 @@ def test_set_receipt_never_contains_the_raw_secret_value() -> None:
 
 
 def test_set_convergence_failure_error_never_contains_the_raw_secret_value() -> None:
-    host, operations = _ops()
-    host.get_results.extend(("old", "still-old"))
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.get_results.extend(["old"] + ["still-old"] * 4)
     secret = "super-secret-password"
 
-    error = _failed(lambda: operations.set(secret, app="Demo", text="Password"))
+    error = _failed(
+        lambda: operations.set(
+            secret, app="Demo", text="Password", timeout=0.3, interval=0.125
+        )
+    )
 
     blob = repr(error.receipt.to_json()) + repr(error.to_json())
     assert secret not in blob
@@ -1137,15 +1164,38 @@ def test_set_convergence_failure_error_never_contains_the_raw_secret_value() -> 
     assert error.receipt.error["details"]["observed"] == _value_summary("still-old")
 
 
-def test_toggle_receipt_uses_value_summaries_not_raw_booleans() -> None:
-    host, operations = _ops()
-    host.get_results.extend((False, False))
+def test_toggle_waits_for_a_lagging_readback_without_pressing_twice() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.get_results.extend((False, False, True))
 
-    error = _failed(lambda: operations.toggle(True, app="Demo", text="Enabled"))
+    receipt = operations.toggle(True, app="Demo", text="Enabled", interval=0.05)
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.changed is True
+    assert receipt.observed == _value_summary(True)
+    assert host.action_calls == 1
+    assert clock.sleeps == [0.05]
+
+
+def test_toggle_receipt_uses_value_summaries_not_raw_booleans() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.get_results.extend([False] * 5)
+
+    error = _failed(
+        lambda: operations.toggle(
+            True, app="Demo", text="Enabled", timeout=0.3, interval=0.125
+        )
+    )
 
     assert error.receipt.request["desired"] == _value_summary(True)
+    assert error.receipt.error["code"] == ErrorCode.AX_ERROR.value
     assert error.receipt.error["details"]["requested"] == _value_summary(True)
     assert error.receipt.error["details"]["observed"] == _value_summary(False)
+    assert error.receipt.changed is False
+    assert error.receipt.duration_s == pytest.approx(0.3)
+    assert host.action_calls == 1
 
 
 def test_run_dry_run_compiles_only_and_does_not_reserve() -> None:

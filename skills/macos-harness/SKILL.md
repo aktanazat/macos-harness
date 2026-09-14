@@ -66,7 +66,9 @@ receipt = mac.do.type(
   raises `MacOSError` directly, before anything is dispatched, with no
   receipt at all -- nothing was ever attempted.
 - `changed` is an observed fact, not a guess: `set`/`toggle` read the
-  target back and know for certain. `key`/`click`/`type` sample focus
+  target back and know for certain, re-reading every `interval` until the
+  requested state shows or the deadline runs out, without ever repeating
+  the mutation. `key`/`click`/`type` sample focus
   before and after -- frontmost pid, focused window, focused element's
   role, value summary, selected range, character count, position, size;
   a secure field gives role and subrole only -- and report the fields
@@ -93,7 +95,8 @@ receipt = mac.do.type(
 - Pass `dry_run=True` to validate and resolve (and, for `run`, compile)
   without ever dispatching, when you need to confirm a target exists before
   committing to the action. `press`/`set`/`toggle` take an `interval` for
-  their own AX polling; `run` and `key` do not poll, so neither takes one.
+  their own AX polling (resolution, and the readback after a `set` or a
+  press); `run` and `key` do not poll, so neither takes one.
 - `timeout` is a cooperative budget. No mutation starts after it expires,
   polling and script process groups are bounded by it, but a synchronous
   macOS AX/input call already in progress cannot be preempted safely.
