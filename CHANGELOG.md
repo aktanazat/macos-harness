@@ -112,23 +112,25 @@ follows [Semantic Versioning](https://semver.org/).
   not verified is `changed=True` when focus moved and `None` when nothing
   observable moved, so a key that AppKit silently dropped -- a menu
   shortcut sent to an inactive app -- comes back as a done receipt whose
-  effect is unconfirmed rather than one that claims it. Without a
-  postcondition the reading after dispatch is repeated every 10ms for up
-  to 100ms until it differs from the one before, never past the shared
-  deadline: the first reading missed 70 of 80 effects that showed within
-  62ms. With a postcondition the single after-reading is taken and the
-  postcondition is verified straight away, so the effect the caller
-  asked about never waits behind the focus witness. A reading the app's
-  AX tree refuses leaves the receipt without a witness, never without
-  its dispatch or its `once` token. The reading before dispatch counts
-  against the budget too: the deadline is checked again after it and
-  before the token is reserved, so an app whose AX tree answers slowly
-  costs the call its dispatch (`acted=no`, the token unspent), never a
-  late mutation. The sample reads the focused element without enhanced
-  accessibility, so an app that keeps AX off stays that way; a secure
-  field reports its role and subrole only, so a password's value,
-  length, and selection are never requested. One sample costs about
-  0.4ms (p95 0.9ms over 50 readings of TextEdit).
+  effect is unconfirmed rather than one that claims it. The sample reads
+  the focused element without enhanced accessibility, so an app that
+  keeps AX off stays that way; a secure field reports its role and
+  subrole only, so a password's value, length, and selection are never
+  requested. One sample costs about 0.4ms (p95 0.9ms over 50 readings
+  of TextEdit).
+- The focus witness waits for the effect, but never past the deadline.
+  Without a postcondition the reading after dispatch is repeated every
+  10ms for up to 100ms until it differs from the one before: the first
+  reading missed 70 of 80 effects that showed within 62ms. With a
+  postcondition the single after-reading is taken and the postcondition
+  is verified straight away, so the effect the caller asked about never
+  waits behind the witness. A reading the app's AX tree refuses leaves
+  the receipt without a witness, never without its dispatch or its
+  `once` token.
+- The focus reading before dispatch counts against the budget: the
+  deadline is checked again after it and before the `once` token is
+  reserved, so an app whose AX tree answers slowly costs the call its
+  dispatch (`acted=no`, the token unspent), never a late mutation.
 - `equals(...)`, a third postcondition beside `present`/`gone`: one AX
   match resolved the way `present` resolves it, its `attribute` (default
   `AXValue`) read back every `interval`, satisfied once the reading equals

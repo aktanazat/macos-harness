@@ -2440,10 +2440,8 @@ class Operations:
             for _ in range(_FOCUS_POLLS):
                 if after is not None and after != before:
                     break
-                remaining = deadline.remaining()
-                if remaining <= 0:
+                if not self._sleep_within(deadline, _FOCUS_POLL_SECONDS):
                     break
-                self._sleep(min(_FOCUS_POLL_SECONDS, remaining))
                 after = _sample_focus(host, pid)
         changed = [] if before is None or after is None else _changed_focus_fields(before, after)
         return {
@@ -2832,10 +2830,17 @@ class Operations:
             reading = read()
             if converged(reading):
                 return reading, True
-            remaining = deadline.remaining()
-            if remaining <= 0:
+            if not self._sleep_within(deadline, interval):
                 return reading, False
-            self._sleep(min(interval, remaining))
+
+    def _sleep_within(self, deadline: _Deadline, interval: float) -> bool:
+        """Sleep ``interval`` clipped to what is left of ``deadline``;
+        `False`, without sleeping, once nothing is left."""
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            return False
+        self._sleep(min(interval, remaining))
+        return True
 
     @staticmethod
     def _match_summary_payload(match: Mapping[str, JSONValue]) -> JSONValue:

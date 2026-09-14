@@ -99,7 +99,8 @@ receipt = mac.do.type(
   committing to the action. `press`/`set`/`toggle` take an `interval` for
   their own AX polling (resolution, and for `set`/`toggle` the readback
   after the mutation); `key`/`click`/`type` watch focus on a fixed 10ms
-  cadence and `run` polls for nothing, so none of those takes one.
+  cadence and `run` polls for nothing, so none of those takes one; a
+  postcondition carries its own `interval`.
 - `timeout` is a cooperative budget. No mutation starts after it expires
   -- `key`/`click`/`type` check it again after their focus reading and
   before the `once` token is reserved -- polling and script process
