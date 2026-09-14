@@ -89,7 +89,12 @@ PY
   after — frontmost pid, focused window, and the focused element's role,
   value summary, selected range, character count, position, and size; a
   secure field gives its role and subrole only — and report the fields
-  that moved under `observed.focus`.
+  that moved under `observed.focus`. A reading the app refuses — it did
+  not answer, the element is gone — is no reading, not a sample with a
+  field missing: it shows as `None` under `observed.focus` and never
+  counts as focus having moved, while an attribute the app reports as
+  absent is an ordinary absence. Only a subrole the app actually
+  reported clears a field for its text to be read.
   Without a `postcondition` the after-reading repeats every 10ms for up
   to 100ms until it differs, never past the deadline, so an app's run
   loop gets time to process the event. With one, the single after-reading
@@ -600,8 +605,9 @@ Only a fixed, narrow set of calls ever cross the socket: `list_apps`, the
 bounded `ax.query`/`ax.query_all` search, `ax.press`, and the element
 primitives `ax.get`/`ax.get_attributes`, `ax.set`, and `ax.perform` once you
 already hold an `element_index`. Screenshots, keyboard and pointer input, the
-animated pointer overlay, AppleScript, full app-state snapshots, and any
-unrouted or parameterized AX call stay local to the Python process on every
+focus sample behind `key`/`click`/`type` receipts, the animated pointer
+overlay, AppleScript, full app-state snapshots, and any unrouted or
+parameterized AX call stay local to the Python process on every
 backend. An `element_index` returned by a native query is not a raw
 agent-side number — the client interns it into the same monotonic element
 registry local queries use, so `ax.get`/`ax.set`/`ax.perform` accept it

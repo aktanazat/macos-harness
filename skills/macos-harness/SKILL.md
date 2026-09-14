@@ -72,7 +72,12 @@ receipt = mac.do.type(
   before and after -- frontmost pid, focused window, focused element's
   role, value summary, selected range, character count, position, size;
   a secure field gives role and subrole only -- and report the fields
-  that moved under `observed.focus`. Without a `postcondition` the
+  that moved under `observed.focus`. A reading the app refuses -- it did
+  not answer, the element is gone -- is no reading, not a sample with a
+  field missing: it shows as `None` and never counts as focus having
+  moved; an attribute the app reports as absent is an ordinary absence,
+  and only a subrole the app actually reported clears a field for its
+  text to be read. Without a `postcondition` the
   after-reading repeats every 10ms for up to 100ms until it differs from
   the before, never past the deadline; with one, the postcondition is
   verified right after the single after-reading instead. `changed` is
@@ -394,8 +399,9 @@ calls instead of relaunching; construct a new `MacOS()` to use `native`/
 
 Only `list_apps`, `ax.query`/`ax.query_all`, `ax.press`, and the element
 primitives `ax.get`/`ax.get_attributes`/`ax.set`/`ax.perform` can route to
-the agent. Everything else — screenshots, keyboard/pointer input, the pointer
-overlay, AppleScript, full app snapshots — always stays local. A native
+the agent. Everything else — screenshots, keyboard/pointer input, the focus
+sample behind `key`/`click`/`type` receipts, the pointer overlay,
+AppleScript, full app snapshots — always stays local. A native
 `element_index` is interned into the same handle registry a local query
 would use, so it behaves exactly like one: stale or reset indices still
 raise instead of aliasing a different element.

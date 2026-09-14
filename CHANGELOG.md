@@ -114,19 +114,26 @@ follows [Semantic Versioning](https://semver.org/).
   shortcut sent to an inactive app -- comes back as a done receipt whose
   effect is unconfirmed rather than one that claims it. The sample reads
   the focused element without enhanced accessibility, so an app that
-  keeps AX off stays that way; a secure field reports its role and
-  subrole only, so a password's value, length, and selection are never
-  requested. One sample costs about 0.4ms (p95 0.9ms over 50 readings
-  of TextEdit).
+  keeps AX off stays that way. Every read in it is checked: one the app
+  refuses -- it did not answer, the element is gone -- fails the whole
+  reading rather than passing as a missing field the receipt would count
+  as a move, while an attribute AX reports as absent is an ordinary
+  absence. A secure field reports its role and subrole only, and only a
+  subrole the app actually reported clears a field for its details, so a
+  password's value, length, and selection are never requested. One sample
+  costs about 0.4ms (p95 0.9ms over 50 readings of TextEdit, measured
+  before the reads were checked; the checks add no round trip).
 - The focus witness waits for the effect, but never past the deadline.
   Without a postcondition the reading after dispatch is repeated every
   10ms for up to 100ms until it differs from the one before: the first
   reading missed 70 of 80 effects that showed within 62ms. With a
   postcondition the single after-reading is taken and the postcondition
   is verified straight away, so the effect the caller asked about never
-  waits behind the witness. A reading the app's AX tree refuses leaves
-  the receipt without a witness, never without its dispatch or its
-  `once` token.
+  waits behind the witness. A reading the app refuses, before or after,
+  leaves the receipt without a witness (`observed.focus.after` is `None`
+  when every after-reading was refused), never without its dispatch or
+  its `once` token, and the polling goes on to the deadline in case the
+  app answers again.
 - The focus reading before dispatch counts against the budget: the
   deadline is checked again after it and before the `once` token is
   reserved, so an app whose AX tree answers slowly costs the call its

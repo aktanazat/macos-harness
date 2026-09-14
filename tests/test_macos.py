@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Never
+from typing import NamedTuple, Never
 
 import pytest
 import Quartz
@@ -349,65 +349,160 @@ def test_application_element_enables_enhanced_ax(monkeypatch) -> None:
     assert writes == []
 
 
-def test_focus_sample_reads_the_focused_element_without_enhancing_ax(monkeypatch) -> None:
+class _Refused(NamedTuple):
+    """The AXError an app answers a read with, in place of a value."""
+
+    code: int
+
+
+def _focus_ax(
+    monkeypatch, mac: MacOS, data: dict[object, dict[str, object]], *, batch: bool
+) -> list[str]:
+    """Answer `_focus_sample`'s AX reads from ``data`` -- ``{element:
+    {attribute: value}}``, a missing attribute being AX's own "no value"
+    -- at the ApplicationServices boundary, so the real readers run. With
+    ``batch`` an element's batch read answers every slot at once, error
+    sentinels included; without it the batch call is unsupported and the
+    readers fall back to single reads. Returns the attribute names
+    requested, in order, appended to as the sample runs."""
+    AS = macos_module.AS
+    requested: list[str] = []
+
+    def answer(element, name):
+        value = data[element].get(name, _Refused(AS.kAXErrorNoValue))
+        return (value.code, None) if isinstance(value, _Refused) else (0, value)
+
+    def copy_attribute(element, name, _out):
+        requested.append(name)
+        return answer(element, name)
+
+    def copy_attributes(element, names, options, _out):
+        if not batch:
+            return AS.kAXErrorNotImplemented, None
+        requested.extend(names)
+        values = []
+        for name in names:
+            error, value = answer(element, name)
+            values.append(
+                value if error == 0 else AS.AXValueCreate(AS.kAXValueAXErrorType, error)
+            )
+        return 0, values
+
+    monkeypatch.setattr(AS, "AXUIElementCopyAttributeValue", copy_attribute)
+    monkeypatch.setattr(AS, "AXUIElementCopyMultipleAttributeValues", copy_attributes)
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "Demo", "pid": 42})
+    return requested
+
+
+@pytest.mark.parametrize("batch", [True, False], ids=["batch", "single-reads"])
+def test_focus_sample_reads_the_focused_element_without_enhancing_ax(monkeypatch, batch) -> None:
     mac = MacOS()
     root, window, field = object(), object(), object()
     roots: list[dict[str, object]] = []
-    requested: list[tuple[object, tuple[str, ...]]] = []
-    data = {
+    data: dict[object, dict[str, object]] = {
         root: {"AXFocusedWindow": window, "AXFocusedUIElement": field},
         window: {"AXTitle": "Login"},
-        field: {
-            "AXRole": "AXTextField",
-            "AXSubrole": "AXSecureTextField",
-            "AXValue": "hunter2",
-            "AXNumberOfCharacters": 7,
-        },
+        field: {"AXRole": "AXTextField", "AXValue": "hello", "AXNumberOfCharacters": 5},
     }
 
     def fake_root(pid, **kwargs):
         roots.append({"pid": pid, **kwargs})
         return root
 
-    def copy_attributes(element, attributes):
-        # Batch reads are for the focused element only: Safari's root
-        # answers a batch for AXFocusedWindow with a stale value.
-        assert element is field
-        requested.append((element, tuple(attributes)))
-        return {name: data[element].get(name) for name in attributes}
-
     monkeypatch.setattr(mac, "_application_element", fake_root)
-    monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "Demo", "pid": 42})
-    monkeypatch.setattr(mac, "_copy_attributes", copy_attributes)
-    monkeypatch.setattr(
-        mac, "_copy_attribute", lambda element, attribute: data[element].get(attribute)
-    )
+    requested = _focus_ax(monkeypatch, mac, data, batch=batch)
 
-    sample = mac._focus_sample(42)
-    assert roots == [{"pid": 42, "enhance": False}]
-    # A password field reports its identity only: its value, length and
-    # selection are never even requested from the app.
-    assert sample == {
+    # An ordinary field has no subrole to report, which is an absence,
+    # not a refusal: the sample goes on to read its details.
+    assert mac._focus_sample(42) == {
         "frontmost_pid": 42,
         "window": "Login",
-        "focused": {"role": "AXTextField", "subrole": "AXSecureTextField"},
+        "focused": {"role": "AXTextField", "value": "hello", "characters": 5},
     }
-    assert all(
-        not {"AXValue", "AXNumberOfCharacters", "AXSelectedTextRange"} & set(attributes)
-        for _, attributes in requested
-    )
+    assert roots == [{"pid": 42, "enhance": False}]
 
-    data[field] = {"AXRole": "AXTextField", "AXValue": "hello", "AXNumberOfCharacters": 5}
+    # A password field reports its identity only: its value, length and
+    # selection are never even requested from the app.
+    data[field] = {
+        "AXRole": "AXTextField",
+        "AXSubrole": "AXSecureTextField",
+        "AXTitle": "Password",
+        "AXValue": "hunter2",
+        "AXNumberOfCharacters": 7,
+    }
     requested.clear()
     assert mac._focus_sample(42)["focused"] == {
         "role": "AXTextField",
-        "value": "hello",
-        "characters": 5,
+        "subrole": "AXSecureTextField",
     }
-    assert any("AXValue" in attributes for _, attributes in requested)
+    assert not {"AXValue", "AXNumberOfCharacters", "AXSelectedTextRange"} & set(requested)
 
-    data[root] = {"AXFocusedWindow": None, "AXFocusedUIElement": None}
+    # Nothing focused is an absence too.
+    data[root] = {}
     assert mac._focus_sample(42) == {"frontmost_pid": 42, "window": None, "focused": None}
+
+
+@pytest.mark.parametrize("batch", [True, False], ids=["batch", "single-reads"])
+@pytest.mark.parametrize(
+    ("refused", "code"),
+    [
+        ("AXFocusedUIElement", -25204),  # kAXErrorCannotComplete: the app did not answer
+        ("AXTitle", -25202),  # kAXErrorInvalidUIElement: the window is gone
+        ("AXValue", -25211),  # kAXErrorAPIDisabled
+    ],
+)
+def test_focus_sample_raises_on_a_refused_read_instead_of_reporting_an_absence(
+    monkeypatch, batch, refused, code
+) -> None:
+    """A refused read is no observation at all -- the whole sample fails
+    -- never a sample in which the field happens to be missing, which a
+    receipt would count as focus having moved."""
+    mac = MacOS()
+    root, window, field = object(), object(), object()
+    data: dict[object, dict[str, object]] = {
+        root: {"AXFocusedWindow": window, "AXFocusedUIElement": field},
+        window: {"AXTitle": "Login"},
+        field: {"AXRole": "AXTextField", "AXValue": "hello", "AXNumberOfCharacters": 5},
+    }
+    for element in data.values():
+        if refused in element:
+            element[refused] = _Refused(code)
+    monkeypatch.setattr(mac, "_application_element", lambda pid, **kwargs: root)
+    _focus_ax(monkeypatch, mac, data, batch=batch)
+
+    with pytest.raises(MacOSError) as excinfo:
+        mac._focus_sample(42)
+    assert excinfo.value.code == ErrorCode.AX_ERROR
+    assert excinfo.value.details["ax_error"] == code
+    assert "hello" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("batch", [True, False], ids=["batch", "single-reads"])
+def test_focus_sample_requests_no_text_after_a_refused_secure_field_check(
+    monkeypatch, batch
+) -> None:
+    """Only a subrole the app actually reported can clear a field for its
+    value, selection and length to be read: a refused subrole read fails
+    the sample before any of them is requested."""
+    mac = MacOS()
+    root, window, field = object(), object(), object()
+    data: dict[object, dict[str, object]] = {
+        root: {"AXFocusedWindow": window, "AXFocusedUIElement": field},
+        window: {"AXTitle": "Login"},
+        field: {
+            "AXRole": "AXTextField",
+            "AXSubrole": _Refused(macos_module.AS.kAXErrorCannotComplete),
+            "AXValue": "hunter2",
+            "AXNumberOfCharacters": 7,
+        },
+    }
+    monkeypatch.setattr(mac, "_application_element", lambda pid, **kwargs: root)
+    requested = _focus_ax(monkeypatch, mac, data, batch=batch)
+
+    with pytest.raises(MacOSError):
+        mac._focus_sample(42)
+    assert "AXSubrole" in requested
+    assert not {"AXValue", "AXNumberOfCharacters", "AXSelectedTextRange"} & set(requested)
 
 
 def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:

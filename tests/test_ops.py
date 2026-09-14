@@ -1801,6 +1801,34 @@ def test_input_verb_survives_a_failed_focus_reading() -> None:
     assert slept == [0.01]
 
 
+def test_input_verb_polls_a_refused_focus_reading_to_the_deadline_and_reports_no_witness() -> None:
+    """An app whose AX tree stops answering after the input lands (the
+    focused element went away, the app is busy) gets the same polling
+    budget as a slow one, and the receipt then says so: no after-reading,
+    no change claimed, the dispatch and its token untouched."""
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    refused = MacOSError(
+        "Read AXFocusedUIElement failed with AXError -25204", code=ErrorCode.AX_ERROR
+    )
+    host.focus_samples.extend([copy.deepcopy(host.focus_sample), *(refused for _ in range(4))])
+
+    receipt = operations.key("return", app="Demo", timeout=0.025, once="deaf")
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.acted is Acted.YES
+    assert receipt.changed is None
+    assert receipt.verified is False
+    focus = receipt.observed["focus"]
+    assert focus["before"]["window"] == "Untitled"
+    assert focus["after"] is None
+    assert focus["changed"] == ()
+    assert clock.sleeps == pytest.approx([0.01, 0.01, 0.005])
+    assert host.focus_sample_calls == 5
+    assert operations.recall("deaf").replayed is True
+    assert host.key_calls == [("return", 41)]
+
+
 def test_click_resolves_the_point_before_dispatch_and_posts_to_that_window() -> None:
     host, operations = _ops()
 

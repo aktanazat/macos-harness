@@ -159,18 +159,20 @@ _AX_NODE_MAPPING = {
     "AXFrame": "frame",
 }
 # What `_focus_sample` reads from the focused element, and the receipt
-# name for each. Identity first: it decides whether the text attributes
-# may be read at all, so a secure field's value, length and selection
-# are never requested, not merely dropped.
+# name for each. Identity first, on its own: it decides whether the
+# details may be read at all, so a secure field's value, length and
+# selection are never requested, not merely dropped -- and an identity
+# read that failed raises (see `_copy_attributes`), so it authorizes
+# nothing either.
 _FOCUS_IDENTITY_ATTRIBUTES = {
     "AXRole": "role",
     "AXSubrole": "subrole",
+}
+_FOCUS_DETAIL_ATTRIBUTES = {
     "AXTitle": "title",
     "AXDescription": "description",
     "AXPosition": "position",
     "AXSize": "size",
-}
-_FOCUS_TEXT_ATTRIBUTES = {
     "AXValue": "value",
     "AXSelectedTextRange": "selected_range",
     "AXNumberOfCharacters": "characters",
@@ -423,6 +425,15 @@ def _ax_error(operation: str, error: int, **details: object) -> MacOSError:
         code=ErrorCode.AX_ERROR,
         details={"ax_error": int(error), "operation": operation, **details},
     )
+
+
+def _ax_absent(error: int) -> bool:
+    """Whether ``error`` is AX reporting that an attribute has nothing to
+    say -- the element has no such attribute, or it has no value right
+    now -- as opposed to a read that failed: the app did not answer, the
+    element is gone, the API is off. A lossy read treats both as absent;
+    a checked one (`MacOS._copy_attribute`) only the first."""
+    return error in (AS.kAXErrorNoValue, AS.kAXErrorAttributeUnsupported)
 
 
 _BACKENDS = ("python", "native", "auto")
@@ -961,15 +972,29 @@ class MacOS:
         return root
 
     @staticmethod
-    def _copy_attribute(element: Any, attribute: str) -> Any | None:
+    def _copy_attribute(element: Any, attribute: str, *, checked: bool = False) -> Any | None:
+        """One attribute, ``None`` when the element has nothing to report
+        for it. A read that failed outright is ``None`` too, unless
+        ``checked``, where it raises: a witness must not pass a refused
+        read off as an absence (see `_ax_absent`)."""
         error, value = AS.AXUIElementCopyAttributeValue(element, attribute, None)
-        return value if error == _AX_SUCCESS else None
+        if error == _AX_SUCCESS:
+            return value
+        if checked and not _ax_absent(error):
+            raise _ax_error(f"Read {attribute}", error)
+        return None
 
     @staticmethod
     def _copy_attributes(
-        element: Any, attributes: Iterable[str]
+        element: Any, attributes: Iterable[str], *, checked: bool = False
     ) -> dict[str, Any | None]:
-        """Read AX attributes in one application round trip when supported."""
+        """Read AX attributes in one application round trip when supported.
+
+        A batch the app or the binding would not answer falls back to
+        single reads. ``checked`` carries `_copy_attribute`'s contract
+        through both paths: a slot the batch answered with an AXError
+        other than an absence raises instead of reading as ``None``.
+        """
         names = tuple(dict.fromkeys(str(attribute) for attribute in attributes))
         if not names:
             return {}
@@ -980,19 +1005,33 @@ class MacOS:
         except (AttributeError, TypeError, ValueError):
             error, values = -1, None
         if error != _AX_SUCCESS or values is None or len(values) != len(names):
-            return {name: MacOS._copy_attribute(element, name) for name in names}
+            return {
+                name: MacOS._copy_attribute(element, name, checked=checked) for name in names
+            }
 
         result: dict[str, Any | None] = {}
         for name, value in zip(names, values, strict=True):
-            try:
-                value_type = AS.AXValueGetType(value)
-            except (TypeError, ValueError):
-                pass
-            else:
-                if value_type == AS.kAXValueAXErrorType:
-                    value = None
+            slot_error = MacOS._slot_error(value)
+            if slot_error is not None:
+                if checked and not _ax_absent(slot_error):
+                    raise _ax_error(f"Read {name}", slot_error)
+                value = None
             result[name] = value
         return result
+
+    @staticmethod
+    def _slot_error(value: Any) -> int | None:
+        """The AXError an ``AXUIElementCopyMultipleAttributeValues`` slot
+        carries in place of a value, ``None`` for a real value."""
+        try:
+            value_type = AS.AXValueGetType(value)
+        except (TypeError, ValueError):
+            return None
+        if value_type != AS.kAXValueAXErrorType:
+            return None
+        # The type was just checked, so the decode cannot fail.
+        _, code = AS.AXValueGetValue(value, AS.kAXValueAXErrorType, None)
+        return int(code)
 
     @staticmethod
     def _actions(element: Any) -> list[str]:
@@ -1013,28 +1052,36 @@ class MacOS:
         are read one at a time: Safari answers a batched read of the two
         with no element (10 of 10 tries) while single reads find it every
         time. Then the window's title, the focused element's identity,
-        and -- only when that identity is not a secure field -- its text
-        attributes, so a password's value, length and selection are never
+        and -- only when that identity is not a secure field -- its
+        details, so a password's value, length and selection are never
         requested. ``value`` is the raw attribute; a receipt summarizes
         it before storing.
+
+        Every read is checked: one the app refuses raises `MacOSError`
+        rather than reading as an absence, so a sample is either a whole
+        observation or no observation. A refused identity read therefore
+        never lets the details be requested, and a focused element that
+        stopped answering never counts as focus having moved.
         """
         root = self._application_element(pid, enhance=False)
-        window = self._copy_attribute(root, "AXFocusedWindow")
-        focused = self._copy_attribute(root, "AXFocusedUIElement")
+        window = self._copy_attribute(root, "AXFocusedWindow", checked=True)
+        focused = self._copy_attribute(root, "AXFocusedUIElement", checked=True)
         frontmost = self._frontmost_app()
         sample: dict[str, JSONValue] = {
             "frontmost_pid": None if frontmost is None else int(frontmost["pid"]),
             "window": None
             if window is None
-            else self._jsonable(self._copy_attribute(window, "AXTitle")),
+            else self._jsonable(self._copy_attribute(window, "AXTitle", checked=True)),
             "focused": None,
         }
         if focused is None:
             return sample
-        attributes = self._copy_attributes(focused, _FOCUS_IDENTITY_ATTRIBUTES)
+        attributes = self._copy_attributes(focused, _FOCUS_IDENTITY_ATTRIBUTES, checked=True)
         if attributes.get("AXSubrole") != _SECURE_SUBROLE:
-            attributes.update(self._copy_attributes(focused, _FOCUS_TEXT_ATTRIBUTES))
-        names = {**_FOCUS_IDENTITY_ATTRIBUTES, **_FOCUS_TEXT_ATTRIBUTES}
+            attributes.update(
+                self._copy_attributes(focused, _FOCUS_DETAIL_ATTRIBUTES, checked=True)
+            )
+        names = {**_FOCUS_IDENTITY_ATTRIBUTES, **_FOCUS_DETAIL_ATTRIBUTES}
         sample["focused"] = {
             names[name]: self._jsonable(value)
             for name, value in attributes.items()
