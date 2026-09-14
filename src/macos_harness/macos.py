@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 import weakref
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
@@ -325,6 +325,8 @@ _KEY_ONLY_CHARACTERS = frozenset("\n\r\t")
 # The most UTF-16 units one packed key event carries: 20 landed exactly
 # in every app measured, and larger payloads were not measured.
 _TYPE_CHUNK_UNITS = 20
+# macOS has no gesture past a triple click.
+_MAX_CLICKS = 3
 
 
 def _character_key(character: str) -> tuple[int, int]:
@@ -2327,6 +2329,21 @@ class MacOS:
 
     # --- windows and screenshots ----------------------------------------
 
+    @staticmethod
+    def _is_content_window(pid: int, value: Mapping[str, Any]) -> bool:
+        """Whether a `CGWindowListCopyWindowInfo` entry is one of ``pid``'s
+        windows in the everyday sense: on the normal layer and at least
+        40pt on a side. A menu bar extra, tooltip, or helper surface is
+        not, so `see` never captures one and posted input never routes
+        to one over the window it was aimed at.
+        """
+        if int(value.get(AS.kCGWindowOwnerPID, -1)) != pid:
+            return False
+        if int(value.get(AS.kCGWindowLayer, -1)) != 0:
+            return False
+        bounds = value.get(AS.kCGWindowBounds) or {}
+        return float(bounds.get("Width", 0)) >= 40 and float(bounds.get("Height", 0)) >= 40
+
     def windows(self, app: str | int | None = None) -> list[dict[str, Any]]:
         _, info = self._resolve_app(app)
         values = AS.CGWindowListCopyWindowInfo(
@@ -2334,15 +2351,11 @@ class MacOS:
         )
         windows: list[dict[str, Any]] = []
         for value in values or []:
-            if int(value.get(AS.kCGWindowOwnerPID, -1)) != info["pid"]:
-                continue
-            if int(value.get(AS.kCGWindowLayer, -1)) != 0:
+            if not self._is_content_window(int(info["pid"]), value):
                 continue
             bounds = value.get(AS.kCGWindowBounds) or {}
             width = float(bounds.get("Width", 0))
             height = float(bounds.get("Height", 0))
-            if width < 40 or height < 40:
-                continue
             windows.append(
                 {
                     "window_id": int(value[AS.kCGWindowNumber]),
@@ -2557,15 +2570,17 @@ class MacOS:
             )
         AS.CGEventPostToPid(pid, event)
 
-    @staticmethod
-    def _target_window(pid: int, point: tuple[float, float]) -> _TargetWindow:
+    @classmethod
+    def _target_window(cls, pid: int, point: tuple[float, float]) -> _TargetWindow:
         """Find the frontmost on-screen window of ``pid`` under ``point``.
 
-        ``origin`` is the window's top-left screen point, which
-        ``_route_to_window`` needs to express each event in window
-        coordinates. Other apps' windows over the point do not matter:
-        input posted to a pid only ever reaches that pid, so the covered
-        window is still the one the event lands in.
+        Only a window `windows` would list counts, so input routes to a
+        window `see` can capture and never to a same-app tooltip or
+        helper surface over it. ``origin`` is the window's top-left
+        screen point, which ``_route_to_window`` needs to express each
+        event in window coordinates. Other apps' windows over the point
+        do not matter: input posted to a pid only ever reaches that pid,
+        so the covered window is still the one the event lands in.
         """
         if _set_window_location is None:
             raise MacOSError(
@@ -2579,7 +2594,7 @@ class MacOS:
             AS.kCGWindowListOptionOnScreenOnly, AS.kCGNullWindowID
         )
         for value in values or ():
-            if int(value.get(AS.kCGWindowOwnerPID, -1)) != pid:
+            if not cls._is_content_window(pid, value):
                 continue
             bounds = value.get(AS.kCGWindowBounds) or {}
             left = float(bounds.get("X", 0))
@@ -2836,6 +2851,19 @@ class MacOS:
             )
         return button
 
+    @staticmethod
+    def _validate_clicks(clicks: int) -> int:
+        """``clicks`` as a count from 1 to `_MAX_CLICKS`: macOS has no
+        gesture past a triple click, and every extra one is two more
+        posted events and a 60ms wait."""
+        if isinstance(clicks, bool) or not isinstance(clicks, int) or not 1 <= clicks <= _MAX_CLICKS:
+            raise MacOSError(
+                f"clicks must be a count from 1 to {_MAX_CLICKS}, not {clicks!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "clicks", "value": clicks, "limit": _MAX_CLICKS},
+            )
+        return clicks
+
     def click(
         self,
         x: float,
@@ -2857,6 +2885,7 @@ class MacOS:
         self._ensure_accessibility()
         self._ensure_post_events()
         button = self._validate_button(button)
+        clicks = self._validate_clicks(clicks)
         pid = self._pid(app)
         if pid is None:
             raise MacOSError(
@@ -2866,27 +2895,58 @@ class MacOS:
             )
         point = self._screen_point(x, y, coordinate_space, pid=pid)
         window = self._target_window(pid, point)
-        focus_before = self._frontmost_app()
-        self._pointer_position = point
-        self._overlay.move(*point)
-        down_type, up_type, _ = _MOUSE_EVENTS[button]
-        for click_count in range(1, max(1, int(clicks)) + 1):
-            for event_type in (down_type, up_type):
-                event = AS.CGEventCreateMouseEvent(
-                    self._event_source, event_type, point, _BUTTONS[button]
-                )
-                self._route_to_window(event, window, point)
-                AS.CGEventSetIntegerValueField(
-                    event, AS.kCGMouseEventClickState, click_count
-                )
-                self._post(event, pid)
-                time.sleep(0.03)
-            self._guard_focus(focus_before, pid, "click")
-        self._overlay.click()
+        self._post_click(pid, point, window, button=button, clicks=clicks)
         pointer = self._pointer_info(pid=pid)
         assert pointer is not None
         pointer["window_id"] = window.window_id
         return pointer
+
+    def _post_click(
+        self,
+        pid: int,
+        point: tuple[float, float],
+        window: _TargetWindow,
+        *,
+        button: str,
+        clicks: int,
+    ) -> None:
+        """Post ``clicks`` presses of ``button`` at screen ``point``, each
+        routed to ``window``. ``click`` resolves those three for a raw
+        call; ``mac.do.click`` resolves them itself, before it reserves
+        anything, and hands them over so the window it reports is the
+        one the events carry."""
+        focus_before = self._frontmost_app()
+        self._pointer_position = point
+        self._overlay.move(*point)
+        down_type, up_type, _ = _MOUSE_EVENTS[button]
+        for click_count in range(1, clicks + 1):
+            for event_type in (down_type, up_type):
+                self._post_mouse(
+                    pid, window, button, event_type, point, click_state=click_count
+                )
+                time.sleep(0.03)
+            self._guard_focus(focus_before, pid, "click")
+        self._overlay.click()
+
+    def _post_mouse(
+        self,
+        pid: int,
+        window: _TargetWindow,
+        button: str,
+        event_type: int,
+        point: tuple[float, float],
+        *,
+        click_state: int | None = None,
+    ) -> None:
+        """Create one ``button`` mouse event of ``event_type`` at screen
+        ``point``, bind it to ``window``, and post it to ``pid``."""
+        event = AS.CGEventCreateMouseEvent(
+            self._event_source, event_type, point, _BUTTONS[button]
+        )
+        self._route_to_window(event, window, point)
+        if click_state is not None:
+            AS.CGEventSetIntegerValueField(event, AS.kCGMouseEventClickState, click_state)
+        self._post(event, pid)
 
     def drag(
         self,
@@ -2895,7 +2955,7 @@ class MacOS:
         to_x: float,
         to_y: float,
         *,
-        app: str | None = None,
+        app: str | int | None = None,
         button: str = "left",
         coordinate_space: str = "screenshot",
         duration: float = 0.25,
@@ -2923,11 +2983,7 @@ class MacOS:
         down_type, up_type, drag_type = _MOUSE_EVENTS[button]
 
         def post(event_type: int, point: tuple[float, float]) -> None:
-            event = AS.CGEventCreateMouseEvent(
-                self._event_source, event_type, point, _BUTTONS[button]
-            )
-            self._route_to_window(event, window, point)
-            self._post(event, pid)
+            self._post_mouse(pid, window, button, event_type, point)
 
         post(down_type, start)
         self._pointer_position = end
@@ -2949,7 +3005,7 @@ class MacOS:
         delta_y: int,
         delta_x: int = 0,
         *,
-        app: str | None = None,
+        app: str | int | None = None,
         unit: str = "pixel",
         x: float | None = None,
         y: float | None = None,

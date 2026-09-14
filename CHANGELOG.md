@@ -52,14 +52,17 @@ follows [Semantic Versioning](https://semver.org/).
   and scroll event now carries the app's frontmost on-screen window
   under the point and the point in that window's coordinates, the two
   fields AppKit hit-tests, and `click` returns the `window_id` it
-  routed to. A point over none of the app's windows raises
-  `bad_request` before anything is posted. A drag stays on the window
-  that took its mouse-down. `scroll` with no `x`/`y` scrolls at the
-  center of the window in the last screenshot of that app instead of
-  posting an event with no target; without such a screenshot it raises
-  `bad_request`. The routing uses the private `CGEventSetWindowLocation`
-  symbol; a macOS build without it raises `unsupported_op` instead of
-  posting an event that cannot land.
+  routed to. Only a window `windows()` would list counts -- on the
+  normal layer and at least 40pt on a side -- so a same-app tooltip or
+  helper surface over the point does not take the event. A point over
+  none of the app's windows raises `bad_request` before anything is
+  posted. A drag stays on the window that took its mouse-down. `scroll`
+  with no `x`/`y` scrolls at the center of the window in the last
+  screenshot of that app instead of posting an event with no target;
+  without such a screenshot it raises `bad_request`. The routing uses
+  the private `CGEventSetWindowLocation` symbol; a macOS build without
+  it raises `unsupported_op` instead of posting an event that cannot
+  land.
 - `mac.type` into the frontmost app sends text in runs of up to 20
   UTF-16 units per key event with no pause between events: 128
   characters land in about 30ms instead of 1.6s, exact in TextEdit,
@@ -68,6 +71,10 @@ follows [Semantic Versioning](https://semver.org/).
   background Chrome drops every event carrying more than one unit.
   Newline, carriage return, and tab always travel alone as Return and
   Tab key events.
+- `clicks` is a count from 1 to 3 (macOS has no gesture past a triple
+  click); `mac.click` and `mac.do.click` reject anything else with
+  `bad_request` before posting. `drag` and `scroll` accept a pid for
+  `app`, as `click` and `type` already did.
 
 ### Added
 

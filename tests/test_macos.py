@@ -24,10 +24,11 @@ from macos_harness.macos import (
 )
 
 
-def _on_screen_windows(monkeypatch, *windows: tuple[int, int, float, float, float, float]) -> None:
+def _on_screen_windows(monkeypatch, *windows: tuple[int | float, ...]) -> None:
     """Fake the window server's front-to-back on-screen list.
 
-    Each entry is ``(pid, window_id, x, y, width, height)``, frontmost first.
+    Each entry is ``(pid, window_id, x, y, width, height)``, frontmost
+    first, on the normal window layer unless a seventh item names one.
     """
     described = [
         {
@@ -35,8 +36,9 @@ def _on_screen_windows(monkeypatch, *windows: tuple[int, int, float, float, floa
             "kCGWindowNumber": window_id,
             "kCGWindowBounds": {"X": x, "Y": y, "Width": width, "Height": height},
             "kCGWindowIsOnscreen": True,
+            "kCGWindowLayer": layer[0] if layer else 0,
         }
-        for pid, window_id, x, y, width, height in windows
+        for pid, window_id, x, y, width, height, *layer in windows
     ]
     monkeypatch.setattr(
         macos_module.AS, "CGWindowListCopyWindowInfo", lambda options, relative: described
@@ -870,6 +872,51 @@ def test_click_routes_to_the_apps_frontmost_window_under_the_point(monkeypatch) 
 
     assert routed == [(42, 8, (10.0, 20.0)), (42, 8, (10.0, 20.0))]
     assert result["window_id"] == 8
+
+
+def test_click_skips_the_apps_own_overlay_over_the_window(monkeypatch) -> None:
+    """A same-app surface above the normal layer (a tooltip, a menu bar
+    extra's popover) is not a window `see` would list, so input routes
+    past it to the window underneath."""
+    mac = MacOS()
+    routed = _routed(monkeypatch, mac)
+    _on_screen_windows(
+        monkeypatch,
+        (42, 9, 300, 100, 200, 200, 25),  # the app's own overlay, layer 25
+        (42, 7, 100, 50, 800, 600),
+    )
+
+    result = mac.click(310, 120, app="Demo", coordinate_space="screen")
+
+    assert routed == [(42, 7, (210.0, 70.0)), (42, 7, (210.0, 70.0))]
+    assert result["window_id"] == 7
+
+
+def test_click_fails_before_posting_when_window_routing_is_unavailable(monkeypatch) -> None:
+    mac = MacOS()
+    routed = _routed(monkeypatch, mac)
+    _on_screen_windows(monkeypatch, (42, 7, 100, 50, 800, 600))
+    monkeypatch.setattr(macos_module, "_set_window_location", None)
+
+    with pytest.raises(MacOSError) as excinfo:
+        mac.click(310, 120, app="Demo", coordinate_space="screen")
+
+    assert excinfo.value.code == ErrorCode.UNSUPPORTED_OP.value
+    assert routed == []
+
+
+@pytest.mark.parametrize("clicks", [0, 4, True])
+def test_click_rejects_a_count_outside_one_to_three_before_posting(monkeypatch, clicks) -> None:
+    mac = MacOS()
+    routed = _routed(monkeypatch, mac)
+    _on_screen_windows(monkeypatch, (42, 7, 100, 50, 800, 600))
+
+    with pytest.raises(MacOSError) as excinfo:
+        mac.click(310, 120, app="Demo", coordinate_space="screen", clicks=clicks)
+
+    assert excinfo.value.code == ErrorCode.BAD_REQUEST.value
+    assert excinfo.value.details == {"parameter": "clicks", "value": clicks, "limit": 3}
+    assert routed == []
 
 
 def test_click_outside_every_window_of_the_app_posts_nothing(monkeypatch) -> None:
