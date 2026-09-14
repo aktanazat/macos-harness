@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
@@ -159,20 +159,23 @@ _AX_NODE_MAPPING = {
     "AXFrame": "frame",
 }
 # What `_focus_sample` reads from the focused element, and the receipt
-# name for each: enough to notice a typed character, a moved caret, a
-# changed selection, or focus landing on another control, in one round
-# trip.
-_FOCUS_SAMPLE_ATTRIBUTES = {
+# name for each. Identity first: it decides whether the text attributes
+# may be read at all, so a secure field's value, length and selection
+# are never requested, not merely dropped.
+_FOCUS_IDENTITY_ATTRIBUTES = {
     "AXRole": "role",
     "AXSubrole": "subrole",
     "AXTitle": "title",
     "AXDescription": "description",
-    "AXValue": "value",
-    "AXSelectedTextRange": "selected_range",
-    "AXNumberOfCharacters": "characters",
     "AXPosition": "position",
     "AXSize": "size",
 }
+_FOCUS_TEXT_ATTRIBUTES = {
+    "AXValue": "value",
+    "AXSelectedTextRange": "selected_range",
+    "AXNumberOfCharacters": "characters",
+}
+_SECURE_SUBROLE = "AXSecureTextField"
 _SETTABLE_CANDIDATES = ("AXValue", "AXFocused", "AXSelected")
 _ACTION_ALIASES = {
     "press": "AXPress",
@@ -314,6 +317,52 @@ _KEYCODES = {
 _SHIFTED_CHARACTERS = dict(
     zip('~!@#$%^&*()_+{}|:"<>?', "`1234567890-=[]\\;',./", strict=True)
 )
+# Characters `type` sends by key name rather than by character: a space
+# so the keycode is right, and the three that must always arrive as a
+# key press, never inside a packed run of text.
+_KEY_NAMES = {" ": "space", "\n": "return", "\r": "return", "\t": "tab"}
+_KEY_ONLY_CHARACTERS = frozenset("\n\r\t")
+# The most UTF-16 units one packed key event carries: 20 landed exactly
+# in every app measured, and larger payloads were not measured.
+_TYPE_CHUNK_UNITS = 20
+
+
+def _character_key(character: str) -> tuple[int, int]:
+    """The keycode and modifier flags one typed ``character`` rides on."""
+    base = _SHIFTED_CHARACTERS.get(character, _KEY_NAMES.get(character, character.casefold()))
+    flags = (
+        AS.kCGEventFlagMaskShift
+        if character.isupper() or character in _SHIFTED_CHARACTERS
+        else 0
+    )
+    return _KEYCODES.get(base, 0), flags
+
+
+def _typing_chunks(text: str, *, packed: bool) -> Iterator[str]:
+    """The strings each key event of `MacOS.type` carries, in order.
+
+    A `_KEY_ONLY_CHARACTERS` member always travels alone; unpacked, so
+    does every other character. Packed, the rest group into runs of at
+    most `_TYPE_CHUNK_UNITS` UTF-16 units, split only between code
+    points so a surrogate pair never straddles two events.
+    """
+    run: list[str] = []
+    units = 0
+    for character in text:
+        if not packed or character in _KEY_ONLY_CHARACTERS:
+            if run:
+                yield "".join(run)
+                run, units = [], 0
+            yield character
+            continue
+        width = 2 if ord(character) > 0xFFFF else 1
+        if units + width > _TYPE_CHUNK_UNITS:
+            yield "".join(run)
+            run, units = [], 0
+        run.append(character)
+        units += width
+    if run:
+        yield "".join(run)
 
 
 def _parse_key(key: str) -> tuple[int, tuple[tuple[int, int], ...]]:
@@ -956,17 +1005,21 @@ class MacOS:
     def _focus_sample(self, pid: int) -> dict[str, JSONValue]:
         """What has keyboard focus in ``pid`` right now, in one cheap reading.
 
-        Two AX round trips (the app root, then the focused element) and
-        no ``AXEnhancedUserInterface`` toggle, so it costs well under a
-        millisecond and is safe to take before and after every posted
-        input. A secure field's ``value`` is never read. ``value`` is
-        the raw attribute; a receipt summarizes it before storing.
+        Up to five AX calls and no ``AXEnhancedUserInterface`` toggle, so
+        it costs about a millisecond and is safe to take before and after
+        every posted input. The root's focused window and focused element
+        are read one at a time: Safari answers a batched read of the two
+        with no element (10 of 10 tries) while single reads find it every
+        time. Then the window's title, the focused element's identity,
+        and -- only when that identity is not a secure field -- its text
+        attributes, so a password's value, length and selection are never
+        requested. ``value`` is the raw attribute; a receipt summarizes
+        it before storing.
         """
         root = self._application_element(pid, enhance=False)
-        raw = self._copy_attributes(root, ("AXFocusedWindow", "AXFocusedUIElement"))
+        window = self._copy_attribute(root, "AXFocusedWindow")
+        focused = self._copy_attribute(root, "AXFocusedUIElement")
         frontmost = self._frontmost_app()
-        window = raw.get("AXFocusedWindow")
-        focused = raw.get("AXFocusedUIElement")
         sample: dict[str, JSONValue] = {
             "frontmost_pid": None if frontmost is None else int(frontmost["pid"]),
             "window": None
@@ -976,11 +1029,12 @@ class MacOS:
         }
         if focused is None:
             return sample
-        attributes = self._copy_attributes(focused, _FOCUS_SAMPLE_ATTRIBUTES)
-        if attributes.get("AXSubrole") == "AXSecureTextField":
-            attributes["AXValue"] = None
+        attributes = self._copy_attributes(focused, _FOCUS_IDENTITY_ATTRIBUTES)
+        if attributes.get("AXSubrole") != _SECURE_SUBROLE:
+            attributes.update(self._copy_attributes(focused, _FOCUS_TEXT_ATTRIBUTES))
+        names = {**_FOCUS_IDENTITY_ATTRIBUTES, **_FOCUS_TEXT_ATTRIBUTES}
         sample["focused"] = {
-            _FOCUS_SAMPLE_ATTRIBUTES[name]: self._jsonable(value)
+            names[name]: self._jsonable(value)
             for name, value in attributes.items()
             if value is not None
         }
@@ -2971,6 +3025,19 @@ class MacOS:
             self._guard_focus(focus_before, pid, "scroll")
 
     def type(self, text: str, *, app: str | int | None = None) -> None:
+        """Type ``text`` into ``app`` as keyboard events.
+
+        When ``app`` is frontmost the text goes in packed: each key event
+        carries a run of up to `_TYPE_CHUNK_UNITS` UTF-16 units, split
+        only between code points, with no pause between events. 128
+        characters land in about 30ms that way instead of 1.6s, exact in
+        TextEdit, Notes, Safari and Chrome (280 of 280 trials). An
+        inactive app gets one event pair per character with a 10ms
+        pause, because a background Chrome drops every event carrying
+        more than one unit. Newline, carriage return and tab always
+        travel alone as Return and Tab key events, so the app sees the
+        key rather than a pasted character.
+        """
         self._ensure_accessibility()
         self._ensure_post_events()
         pid = self._pid(app)
@@ -2981,28 +3048,26 @@ class MacOS:
                 details={"parameter": "app"},
             )
         focus_before = self._frontmost_app()
-        aliases = {" ": "space", "\n": "return", "\r": "return", "\t": "tab"}
-        for character in text:
-            base = _SHIFTED_CHARACTERS.get(
-                character, aliases.get(character, character.casefold())
-            )
-            flags = (
-                AS.kCGEventFlagMaskShift
-                if character.isupper() or character in _SHIFTED_CHARACTERS
-                else 0
-            )
-            keycode = _KEYCODES.get(base, 0)
+        packed = focus_before is not None and int(focus_before["pid"]) == pid
+        for chunk in _typing_chunks(text, packed=packed):
+            if packed and chunk not in _KEY_ONLY_CHARACTERS:
+                keycode, flags = 0, 0
+            else:
+                keycode, flags = _character_key(chunk)
             down = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, True)
             up = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, False)
-            length = len(character.encode("utf-16-le")) // 2
-            AS.CGEventKeyboardSetUnicodeString(down, length, character)
-            AS.CGEventKeyboardSetUnicodeString(up, length, character)
+            length = len(chunk.encode("utf-16-le")) // 2
+            AS.CGEventKeyboardSetUnicodeString(down, length, chunk)
+            AS.CGEventKeyboardSetUnicodeString(up, length, chunk)
             AS.CGEventSetFlags(down, flags)
             AS.CGEventSetFlags(up, flags)
             self._post(down, pid)
             self._post(up, pid)
-            time.sleep(0.01)
-            self._guard_focus(focus_before, pid, "typing")
+            if not packed:
+                # A frontmost app took focus already, so the guard that
+                # stops when the target steals it has nothing to catch.
+                time.sleep(0.01)
+                self._guard_focus(focus_before, pid, "typing")
 
     @staticmethod
     def _validate_key(key: str) -> None:

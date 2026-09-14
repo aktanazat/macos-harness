@@ -351,8 +351,10 @@ def test_focus_sample_reads_the_focused_element_without_enhancing_ax(monkeypatch
     mac = MacOS()
     root, window, field = object(), object(), object()
     roots: list[dict[str, object]] = []
+    requested: list[tuple[object, tuple[str, ...]]] = []
     data = {
         root: {"AXFocusedWindow": window, "AXFocusedUIElement": field},
+        window: {"AXTitle": "Login"},
         field: {
             "AXRole": "AXTextField",
             "AXSubrole": "AXSecureTextField",
@@ -365,31 +367,42 @@ def test_focus_sample_reads_the_focused_element_without_enhancing_ax(monkeypatch
         roots.append({"pid": pid, **kwargs})
         return root
 
+    def copy_attributes(element, attributes):
+        # Batch reads are for the focused element only: Safari's root
+        # answers a batch for AXFocusedWindow with a stale value.
+        assert element is field
+        requested.append((element, tuple(attributes)))
+        return {name: data[element].get(name) for name in attributes}
+
     monkeypatch.setattr(mac, "_application_element", fake_root)
     monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "Demo", "pid": 42})
+    monkeypatch.setattr(mac, "_copy_attributes", copy_attributes)
     monkeypatch.setattr(
-        mac,
-        "_copy_attributes",
-        lambda element, attributes: {name: data[element].get(name) for name in attributes},
-    )
-    monkeypatch.setattr(
-        mac,
-        "_copy_attribute",
-        lambda element, attribute: "Login" if (element, attribute) == (window, "AXTitle") else None,
+        mac, "_copy_attribute", lambda element, attribute: data[element].get(attribute)
     )
 
     sample = mac._focus_sample(42)
-
     assert roots == [{"pid": 42, "enhance": False}]
+    # A password field reports its identity only: its value, length and
+    # selection are never even requested from the app.
     assert sample == {
         "frontmost_pid": 42,
         "window": "Login",
-        "focused": {
-            "role": "AXTextField",
-            "subrole": "AXSecureTextField",
-            "characters": 7,
-        },
+        "focused": {"role": "AXTextField", "subrole": "AXSecureTextField"},
     }
+    assert all(
+        not {"AXValue", "AXNumberOfCharacters", "AXSelectedTextRange"} & set(attributes)
+        for _, attributes in requested
+    )
+
+    data[field] = {"AXRole": "AXTextField", "AXValue": "hello", "AXNumberOfCharacters": 5}
+    requested.clear()
+    assert mac._focus_sample(42)["focused"] == {
+        "role": "AXTextField",
+        "value": "hello",
+        "characters": 5,
+    }
+    assert any("AXValue" in attributes for _, attributes in requested)
 
     data[root] = {"AXFocusedWindow": None, "AXFocusedUIElement": None}
     assert mac._focus_sample(42) == {"frontmost_pid": 42, "window": None, "focused": None}
@@ -971,14 +984,16 @@ def test_input_without_target_is_refused(monkeypatch) -> None:
         mac.click(10, 20, coordinate_space="screen")
 
 
-def test_type_posts_one_physical_event_pair_per_character(monkeypatch) -> None:
-    mac = MacOS()
-    posted = []
+def _typing_fakes(monkeypatch, mac: MacOS, *, frontmost_pid: int) -> tuple[list, list[float]]:
+    """Fake the keyboard event calls; return the posted events and sleeps."""
+    posted: list = []
+    sleeps: list[float] = []
     monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
     monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "Front", "pid": frontmost_pid})
     monkeypatch.setattr(mac, "_post", lambda event, pid: posted.append((event, pid)))
-    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(macos_module.time, "sleep", sleeps.append)
     monkeypatch.setattr(
         macos_module.AS,
         "CGEventCreateKeyboardEvent",
@@ -994,6 +1009,12 @@ def test_type_posts_one_physical_event_pair_per_character(monkeypatch) -> None:
         "CGEventSetFlags",
         lambda event, flags: event.update(flags=flags),
     )
+    return posted, sleeps
+
+
+def test_type_into_an_inactive_app_posts_one_event_pair_per_character(monkeypatch) -> None:
+    mac = MacOS()
+    posted, sleeps = _typing_fakes(monkeypatch, mac, frontmost_pid=7)
 
     mac.type("aB !🙂", app="Spotify")
 
@@ -1005,6 +1026,25 @@ def test_type_posts_one_physical_event_pair_per_character(monkeypatch) -> None:
     assert downs[1]["flags"] == macos_module.AS.kCGEventFlagMaskShift
     assert downs[3]["flags"] == macos_module.AS.kCGEventFlagMaskShift
     assert all(pid == 42 for _, pid in posted)
+    assert sleeps == [0.01] * 5
+
+
+def test_type_into_the_frontmost_app_packs_runs_of_text_per_event(monkeypatch) -> None:
+    """A frontmost app takes text in runs of up to 20 UTF-16 units per
+    key event with no pause, split only between code points; a newline
+    still travels alone as the Return key."""
+    mac = MacOS()
+    posted, sleeps = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+
+    mac.type("a" * 19 + "😀" + "b\n" + "c", app="Spotify")
+
+    downs = [event for (event, pid) in posted if event["down"]]
+    assert [event["text"] for event in downs] == ["a" * 19, "😀b", "\n", "c"]
+    assert [event["length"] for event in downs] == [19, 3, 1, 1]
+    assert [event["keycode"] for event in downs] == [0, 0, 36, 0]
+    assert [event["flags"] for event in downs] == [0, 0, 0, 0]
+    assert [pid for _, pid in posted] == [42] * 8
+    assert sleeps == []
 
 
 def test_key_posts_real_modifier_transitions(monkeypatch) -> None:

@@ -60,6 +60,14 @@ follows [Semantic Versioning](https://semver.org/).
   `bad_request`. The routing uses the private `CGEventSetWindowLocation`
   symbol; a macOS build without it raises `unsupported_op` instead of
   posting an event that cannot land.
+- `mac.type` into the frontmost app sends text in runs of up to 20
+  UTF-16 units per key event with no pause between events: 128
+  characters land in about 30ms instead of 1.6s, exact in TextEdit,
+  Notes, Safari, and Chrome (280 of 280 trials). An inactive app still
+  gets one event pair per character with a 10ms pause, because a
+  background Chrome drops every event carrying more than one unit.
+  Newline, carriage return, and tab always travel alone as Return and
+  Tab key events.
 
 ### Added
 
