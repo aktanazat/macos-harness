@@ -51,11 +51,11 @@ receipt = mac.do.press(
 )
 ```
 
-- `press`, `set`, `toggle`, `run`, and `key` mutate; `recall(once)` looks up
-  a past receipt by its token without dispatching anything. `set`/`toggle`
-  are convergent -- they check first and report `outcome="already"` instead
-  of re-mutating a target already in the requested state, so neither takes
-  a `once` token.
+- `press`, `set`, `toggle`, `run`, `key`, `click`, and `type` mutate;
+  `recall(once)` looks up a past receipt by its token without dispatching
+  anything. `set`/`toggle` are convergent -- they check first and report
+  `outcome="already"` instead of re-mutating a target already in the
+  requested state, so neither takes a `once` token.
 - A call either returns a `Receipt`, or raises `OperationError` -- catch it
   and read `exc.receipt` for the same structured detail a success would
   have had (`.outcome`, `.acted`, `.error["code"]`). A bad argument (an
@@ -63,11 +63,16 @@ receipt = mac.do.press(
   raises `MacOSError` directly, before anything is dispatched, with no
   receipt at all -- nothing was ever attempted.
 - `changed` is an observed fact, not a guess: `set`/`toggle` read the
-  target back and know for certain; `press`/`run`/`key` have no readback
-  of their own, so `changed` is `None` unless a `postcondition` confirms
-  the effect.
-- Pass a nonempty `once` keyword on `press`/`run`/`key` before an action you
-  cannot safely repeat, with the *same* request every time you reuse a
+  target back and know for certain. `key`/`click`/`type` sample focus
+  before and after -- frontmost pid, focused window, focused element's
+  role, value summary, selected range, character count, position, size --
+  and report the fields that moved under `observed.focus`; `changed` is
+  `True` when a postcondition verified the effect or focus moved, and
+  `None` when nothing observable moved, which is how a key AppKit
+  silently dropped shows up. `press`/`run` have no readback of their own,
+  so `changed` is `None` unless a `postcondition` confirms the effect.
+- Pass a nonempty `once` keyword on `press`/`run`/`key`/`click`/`type` before
+  an action you cannot safely repeat, with the *same* request every time you reuse a
   token. Its ledger lives only in the memory of the one live `MacOS`
   instance that dispatched it -- gone on a crash, a fresh `MacOS()`, or a
   new process -- and never written to disk. A retried call with the same
@@ -172,18 +177,18 @@ repeated keys, clicks, deletion loops, or bulk input.
   manipulate focus to restore it.
 - `mac.click()` is raw PID-targeted input. It never guesses an AX action.
   Every click, drag, and scroll is routed to the app's frontmost on-screen
-  window under the point (the click result carries its `window_id`); a
-  point over none of the app's windows raises `bad_request` before
-  anything is posted, and `mac.scroll()` with no `x`/`y` scrolls the
-  center of the window in your last screenshot.
+  window under the point (the click result and `mac.do.click` target carry
+  its `window_id`); a point over none of the app's windows raises
+  `bad_request` before anything is posted, and `mac.scroll()` with no
+  `x`/`y` scrolls the center of the window in your last screenshot.
 - The animated pointer is click-through and never moves the physical cursor. It
   draws the system arrow at the user's pointer size and fades after three idle
   seconds. `mac.see()` leaves it out of the image unless `show_pointer=True`.
 - `mac.move()` moves only that pointer; it cannot produce native hover.
 - An inactive app takes scrolls, plain keys, and typed text, but AppKit
   drops a menu shortcut (`cmd+a`) sent to it, and passes a first click only
-  to a view that accepts first mouse -- text views do not. `mac.activate(app)`
-  first is the cure.
+  to a view that accepts first mouse -- text views do not. The receipt says
+  `changed=None` when that happens; `mac.activate(app)` first is the cure.
 - Never launch a closed app or use a custom URL scheme when focus is forbidden.
 - `mac.ax.query_all/wait/press/wait_gone` never bypass Touch ID, passkeys,
   CAPTCHA, account recovery, or other checks that need the real user present;

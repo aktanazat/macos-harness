@@ -150,6 +150,21 @@ _AX_NODE_MAPPING = {
     "AXSize": "size",
     "AXFrame": "frame",
 }
+# What `_focus_sample` reads from the focused element, and the receipt
+# name for each: enough to notice a typed character, a moved caret, a
+# changed selection, or focus landing on another control, in one round
+# trip.
+_FOCUS_SAMPLE_ATTRIBUTES = {
+    "AXRole": "role",
+    "AXSubrole": "subrole",
+    "AXTitle": "title",
+    "AXDescription": "description",
+    "AXValue": "value",
+    "AXSelectedTextRange": "selected_range",
+    "AXNumberOfCharacters": "characters",
+    "AXPosition": "position",
+    "AXSize": "size",
+}
 _SETTABLE_CANDIDATES = ("AXValue", "AXFocused", "AXSelected")
 _ACTION_ALIASES = {
     "press": "AXPress",
@@ -930,6 +945,39 @@ class MacOS:
         error, value = AS.AXUIElementIsAttributeSettable(element, attribute, None)
         return bool(value) if error == _AX_SUCCESS else False
 
+    def _focus_sample(self, pid: int) -> dict[str, Any]:
+        """What has keyboard focus in ``pid`` right now, in one cheap reading.
+
+        Two AX round trips (the app root, then the focused element) and
+        no ``AXEnhancedUserInterface`` toggle, so it costs well under a
+        millisecond and is safe to take before and after every posted
+        input. A secure field's ``value`` is never read. ``value`` is
+        the raw attribute; a receipt summarizes it before storing.
+        """
+        root = self._application_element(pid, enhance=False)
+        raw = self._copy_attributes(root, ("AXFocusedWindow", "AXFocusedUIElement"))
+        frontmost = self._frontmost_app()
+        window = raw.get("AXFocusedWindow")
+        focused = raw.get("AXFocusedUIElement")
+        sample: dict[str, Any] = {
+            "frontmost_pid": None if frontmost is None else int(frontmost["pid"]),
+            "window": None
+            if window is None
+            else self._jsonable(self._copy_attribute(window, "AXTitle")),
+            "focused": None,
+        }
+        if focused is None:
+            return sample
+        attributes = self._copy_attributes(focused, _FOCUS_SAMPLE_ATTRIBUTES)
+        if attributes.get("AXSubrole") == "AXSecureTextField":
+            attributes["AXValue"] = None
+        sample["focused"] = {
+            _FOCUS_SAMPLE_ATTRIBUTES[name]: self._jsonable(value)
+            for name, value in attributes.items()
+            if value is not None
+        }
+        return sample
+
     @staticmethod
     def _is_ax_element(value: Any) -> bool:
         try:
@@ -966,8 +1014,12 @@ class MacOS:
 
     @staticmethod
     def _jsonable(value: Any) -> Any:
-        if value is None or isinstance(value, (str, int, bool)):
+        if value is None or isinstance(value, (int, bool)):
             return value
+        if isinstance(value, str):
+            # An AX string arrives as `pyobjc_unicode`; a receipt's value
+            # summary names the type, so hand back the plain `str`.
+            return str(value)
         if isinstance(value, float):
             return MacOS._finite_float(value)
         if isinstance(value, bytes):

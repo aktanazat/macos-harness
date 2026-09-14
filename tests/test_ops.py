@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import gc
 import hashlib
 import os
@@ -92,6 +93,21 @@ class FakeHost:
         self.press_calls: list[dict[str, object]] = []
         self.press_results: deque[dict[str, object] | BaseException] = deque()
         self.press_hook: Callable[[], None] | None = None
+        self.focus_samples: deque[dict[str, object]] = deque()
+        self.focus_sample: dict[str, object] = {
+            "frontmost_pid": 41,
+            "window": "Untitled",
+            "focused": {"role": "AXTextArea", "value": "old", "selected_range": {"location": 3, "length": 0}},
+        }
+        self.focus_sample_calls = 0
+        self.click_calls: list[dict[str, object]] = []
+        self.click_error: BaseException | None = None
+        self.type_calls: list[tuple[str, str | int | None]] = []
+        self.type_error: BaseException | None = None
+        self.screen_point_error: MacOSError | None = None
+        self.screen_point_calls: list[dict[str, object]] = []
+        self.target_window_error: MacOSError | None = None
+        self.target_window_calls: list[tuple[int, tuple[float, float]]] = []
 
     def _resolve_app(self, query: str | int | None) -> tuple[object, dict[str, object]]:
         if query is None:
@@ -108,6 +124,40 @@ class FakeHost:
         self.validated_keys.append(key)
         if self.validation_error is not None:
             raise self.validation_error
+
+    def _validate_button(self, button: str) -> str:
+        if button.casefold() not in {"left", "right", "middle"}:
+            raise MacOSError(
+                f"Unknown mouse button {button!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "button", "value": button},
+            )
+        return button.casefold()
+
+    def _screen_point(
+        self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
+    ) -> tuple[float, float]:
+        self.screen_point_calls.append(
+            {"x": x, "y": y, "coordinate_space": coordinate_space, "pid": pid}
+        )
+        if self.screen_point_error is not None:
+            raise self.screen_point_error
+        if coordinate_space == "screen":
+            return float(x), float(y)
+        return float(x) + 100.0, float(y) + 200.0
+
+    def _target_window(self, pid: int, point: tuple[float, float]) -> dict[str, object]:
+        self.target_window_calls.append((pid, point))
+        if self.target_window_error is not None:
+            raise self.target_window_error
+        return {"window_id": 7, "origin": (100.0, 200.0)}
+
+    def _focus_sample(self, pid: int) -> dict[str, object]:
+        assert pid == 41
+        self.focus_sample_calls += 1
+        if self.focus_samples:
+            self.focus_sample = self.focus_samples.popleft()
+        return copy.deepcopy(self.focus_sample)
 
     def _frontmost_app(self) -> dict[str, object]:
         return dict(self.app_info)
@@ -198,6 +248,17 @@ class FakeHost:
             self.key_hook()
         if self.key_error is not None:
             raise self.key_error
+
+    def click(self, x: float, y: float, **kwargs: object) -> dict[str, object]:
+        self.click_calls.append({"x": x, "y": y, **kwargs})
+        if self.click_error is not None:
+            raise self.click_error
+        return {"x": x, "y": y}
+
+    def type(self, text: str, *, app: str | int | None = None) -> None:
+        self.type_calls.append((text, app))
+        if self.type_error is not None:
+            raise self.type_error
 
 
 def _exit_script(returncode: int = 0, *, stdout: bytes = b"", stderr: bytes = b"") -> str:
@@ -328,16 +389,15 @@ def _ops(
     *,
     spawn: PopenFactory | None = None,
     monotonic: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> tuple[FakeHost, Operations]:
     host = FakeHost()
-    if spawn is None and monotonic is None:
-        return host, Operations(host)
-    if spawn is None:
-        assert monotonic is not None
-        return host, Operations(host, _monotonic=monotonic)
-    if monotonic is None:
-        return host, Operations(host, _spawn=spawn)
-    return host, Operations(host, _spawn=spawn, _monotonic=monotonic)
+    kwargs: dict[str, object] = {"_sleep": sleep if sleep is not None else lambda _seconds: None}
+    if spawn is not None:
+        kwargs["_spawn"] = spawn
+    if monotonic is not None:
+        kwargs["_monotonic"] = monotonic
+    return host, Operations(host, **kwargs)
 
 
 def _failed(call: Callable[[], object]) -> OperationError:
@@ -1385,6 +1445,133 @@ def test_key_changed_is_true_once_a_postcondition_verifies() -> None:
 
     assert receipt.outcome is Outcome.DONE
     assert receipt.changed is True
+
+
+def test_key_reports_changed_when_the_focus_sample_moves() -> None:
+    host, operations = _ops()
+    before = copy.deepcopy(host.focus_sample)
+    after = copy.deepcopy(before)
+    after["focused"]["value"] = "olx"
+    after["focused"]["selected_range"] = {"location": 4, "length": 0}
+    host.focus_samples.extend([before, after])
+
+    receipt = operations.key("x", app="Demo")
+
+    assert receipt.changed is True
+    assert receipt.verified is False
+    focus = receipt.observed["focus"]
+    assert focus["changed"] == ("focused.selected_range", "focused.value")
+    assert focus["before"]["focused"]["value"] == _value_summary("old")
+    assert focus["after"]["focused"]["value"] == _value_summary("olx")
+    assert receipt.observed["postcondition"] is None
+    assert "olx" not in canonical_json(receipt.to_json())
+
+
+def test_input_verb_resamples_once_before_calling_focus_unchanged() -> None:
+    slept: list[float] = []
+    host, operations = _ops(sleep=slept.append)
+    before = copy.deepcopy(host.focus_sample)
+    landed = copy.deepcopy(before)
+    landed["window"] = "Renamed"
+    host.focus_samples.extend([before, copy.deepcopy(before), landed])
+
+    late = operations.key("return", app="Demo")
+
+    assert slept == [0.03]
+    assert host.focus_sample_calls == 3
+    assert late.changed is True
+    assert late.observed["focus"]["changed"] == ("window",)
+
+    host.focus_samples.extend([before, copy.deepcopy(before), copy.deepcopy(before)])
+    still = operations.key("cmd+s", app="Demo")
+
+    assert slept == [0.03, 0.03]
+    assert still.changed is None
+    assert still.observed["focus"]["changed"] == ()
+
+
+def test_click_resolves_the_point_before_dispatch_and_posts_in_screen_space() -> None:
+    host, operations = _ops()
+
+    planned = operations.click(10, 20, app="Demo", dry_run=True)
+    done = operations.click(10, 20, app="Demo", button="Right", clicks=2)
+
+    assert planned.outcome is Outcome.PLANNED
+    assert planned.target["point"] == {"x": 110.0, "y": 220.0}
+    assert planned.target["window_id"] == 7
+    assert done.executor is Executor.INPUT
+    assert done.acted is Acted.YES
+    assert host.click_calls == [
+        {"x": 110.0, "y": 220.0, "app": 41, "button": "Right", "clicks": 2, "coordinate_space": "screen"}
+    ]
+    assert host.screen_point_calls[-1] == {"x": 10, "y": 20, "coordinate_space": "screenshot", "pid": 41}
+    assert host.target_window_calls[-1] == (41, (110.0, 220.0))
+
+
+def test_click_over_none_of_the_apps_windows_fails_before_anything_is_posted() -> None:
+    host, operations = _ops()
+    host.target_window_error = MacOSError("no window there", code=ErrorCode.BAD_REQUEST)
+
+    error = _failed(lambda: operations.click(10, 20, app="Demo"))
+
+    assert error.code == ErrorCode.BAD_REQUEST
+    assert error.receipt.acted is Acted.NO
+    assert "point" not in error.receipt.target
+    assert host.click_calls == []
+    assert host.focus_sample_calls == 0
+
+
+def test_click_with_a_stale_screenshot_fails_before_anything_is_posted() -> None:
+    host, operations = _ops()
+    host.screen_point_error = MacOSError("window moved", code=ErrorCode.WINDOW_CHANGED)
+
+    error = _failed(lambda: operations.click(10, 20, app="Demo"))
+
+    assert error.code == ErrorCode.WINDOW_CHANGED
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.changed is False
+    assert host.click_calls == []
+    assert host.focus_sample_calls == 0
+
+
+def test_click_rejects_an_unknown_button_without_resolving_a_point() -> None:
+    host, operations = _ops()
+
+    error = _failed(lambda: operations.click(10, 20, app="Demo", button="sideways"))
+
+    assert error.code == ErrorCode.BAD_REQUEST
+    assert error.receipt.acted is Acted.NO
+    assert host.screen_point_calls == []
+    assert host.click_calls == []
+
+
+def test_type_receipt_never_carries_the_text() -> None:
+    host, operations = _ops()
+    before = copy.deepcopy(host.focus_sample)
+    after = copy.deepcopy(before)
+    after["focused"]["value"] = "oldhunter2"
+    host.focus_samples.extend([before, after])
+
+    receipt = operations.type("hunter2", app="Demo", once="secret")
+    replay = operations.type("hunter2", app="Demo", once="secret")
+
+    assert host.type_calls == [("hunter2", 41)]
+    assert receipt.request["text"] == _value_summary("hunter2")
+    assert receipt.changed is True
+    assert replay.replayed is True
+    assert "hunter2" not in canonical_json(receipt.to_json())
+    assert "hunter2" not in canonical_json(replay.to_json())
+
+
+def test_type_failure_after_dispatch_is_acted_unknown() -> None:
+    host, operations = _ops()
+    host.type_error = MacOSError("post failed", code=ErrorCode.AX_ERROR)
+
+    error = _failed(lambda: operations.type("abc", app="Demo"))
+
+    assert error.receipt.acted is Acted.UNKNOWN
+    assert error.receipt.changed is None
+    assert host.focus_sample_calls == 1
 
 
 def test_once_collision_rejects_different_request_without_dispatch() -> None:

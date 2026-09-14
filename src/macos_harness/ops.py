@@ -265,17 +265,58 @@ def _deadline_exhausted_error(reason: str, message: str) -> ErrorPayload:
 
 
 def _changed_after_dispatch(postcondition: Postcondition | None, verified: _Verification) -> bool | None:
-    """Whether a dispatched ``press``/``run``/``key`` effect is confirmed
-    changed: `True` only once a postcondition has actually verified it,
-    `None` otherwise.
+    """Whether a dispatched ``press``/``run`` effect is confirmed changed:
+    `True` only once a postcondition has actually verified it, `None`
+    otherwise.
 
-    ``press``/``key`` have no attribute value to read back before and
+    ``press``/``run`` have no attribute value to read back before and
     after the way `set`/`toggle` do, so a bare dispatch with no
     postcondition -- or one that failed to verify -- can never claim a
     confirmed `True`/`False`; only an explicit, *passed* postcondition
-    check ever earns that confidence.
+    check ever earns that confidence. The raw-input verbs add one more
+    witness on top, the focus sample -- see `_changed_focus_fields`.
     """
     return True if postcondition is not None and verified.ok else None
+
+
+# How long a raw-input verb waits before its one resample when the focus
+# sample right after dispatch still equals the one before it: long enough
+# for a posted key to land in the app's run loop, short enough to be free.
+_FOCUS_RESAMPLE_SECONDS = 0.03
+
+
+def _changed_focus_fields(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> list[str]:
+    """The names of the `MacOS._focus_sample` fields that differ between
+    ``before`` and ``after``, ``focused.<field>`` for the focused element's
+    own attributes, in a stable order.
+
+    A non-empty list is a confirmed change: the app's own focus state
+    moved between the two readings. An empty one proves nothing -- a
+    ``cmd+s`` saves without touching focus -- so it never becomes
+    ``changed=False``.
+    """
+    changed = [name for name in ("frontmost_pid", "window") if before.get(name) != after.get(name)]
+    focused_before = before.get("focused")
+    focused_after = after.get("focused")
+    if isinstance(focused_before, Mapping) and isinstance(focused_after, Mapping):
+        changed.extend(
+            f"focused.{name}"
+            for name in sorted(focused_before.keys() | focused_after.keys())
+            if focused_before.get(name) != focused_after.get(name)
+        )
+    elif focused_before != focused_after:
+        changed.append("focused")
+    return changed
+
+
+def _redact_focus(sample: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+    """A `MacOS._focus_sample` reading fit for a `Receipt`: the focused
+    element's ``value`` reduced to its `_value_summary`, everything else
+    as read. The raw reading is only ever compared, never stored."""
+    focused = sample.get("focused")
+    if not isinstance(focused, Mapping) or "value" not in focused:
+        return dict(sample)
+    return {**sample, "focused": {**focused, "value": _value_summary(focused["value"])}}
 
 
 def _atomic_press_acted(exc: MacOSError) -> Acted:
@@ -1017,6 +1058,25 @@ class _Host(Protocol):
     def set(self, element_index: int, value: object, attribute: str = "AXValue") -> None: ...
     def perform_action(self, element_index: int, action: str = "AXPress") -> None: ...
     def key(self, key: str, *, app: str | int | None = None) -> None: ...
+    def click(
+        self,
+        x: float,
+        y: float,
+        *,
+        app: str | int | None = None,
+        button: str = "left",
+        clicks: int = 1,
+        coordinate_space: str = "screenshot",
+    ) -> dict[str, JSONValue]: ...
+    def type(self, text: str, *, app: str | int | None = None) -> None: ...
+    def _validate_button(self, button: str) -> str: ...
+    def _focus_sample(self, pid: int) -> dict[str, JSONValue]: ...
+    def _screen_point(
+        self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
+    ) -> tuple[float, float]: ...
+    def _target_window(
+        self, pid: int, point: tuple[float, float]
+    ) -> dict[str, JSONValue]: ...
 
 
 # --- receipt construction ---------------------------------------------
@@ -1091,6 +1151,7 @@ class Operations:
         *,
         _spawn: _Spawner = subprocess.Popen,
         _monotonic: Callable[[], float] = time.monotonic,
+        _sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         # A weak reference, exactly like `Accessibility` in controls.py:
         # `MacOS.__init__` does `self.do = Operations(self)`, so a strong
@@ -1100,6 +1161,7 @@ class Operations:
         self._host_ref = weakref.ref(host)
         self._ledger = _Ledger()
         self._monotonic = _monotonic
+        self._sleep = _sleep
         self._spawn = _spawn
         self._creator_pid = os.getpid()
         # Reentrant so a helper called while this thread already holds
@@ -2023,6 +2085,97 @@ class Operations:
             dispatch=dispatch,
         )
 
+    def click(
+        self,
+        x: float,
+        y: float,
+        *,
+        app: str | int,
+        button: str = "left",
+        clicks: int = 1,
+        coordinate_space: str = "screenshot",
+        timeout: float = 5.0,
+        postcondition: Postcondition | None = None,
+        once: str | None = None,
+        dry_run: bool = False,
+    ) -> Receipt:
+        """Post one coordinate click to exactly ``app`` -- the ``mac.do``
+        counterpart to ``mac.click``.
+
+        The point and the window of ``app`` under it resolve before
+        anything is reserved or posted, so a stale screenshot, a moved
+        window, or a point over none of the app's windows fails with
+        ``acted=NO``, and the resolved screen point and ``window_id``
+        show up in ``target`` even on a dry run.
+        """
+        screen: tuple[float, float] | None = None
+
+        def prepare(host: _Host, pid: int) -> dict[str, JSONValue]:
+            nonlocal screen
+            host._validate_button(button)
+            screen = host._screen_point(x, y, coordinate_space, pid=pid)
+            window = host._target_window(pid, screen)
+            return {
+                "point": {"x": screen[0], "y": screen[1]},
+                "window_id": window["window_id"],
+            }
+
+        def dispatch(host: _Host, pid: int) -> None:
+            assert screen is not None
+            host.click(
+                *screen, app=pid, button=button, clicks=clicks, coordinate_space="screen"
+            )
+
+        return self._input_verb(
+            op="click",
+            app=app,
+            request={
+                "x": x, "y": y, "button": button, "clicks": clicks,
+                "coordinate_space": coordinate_space,
+            },
+            timeout=timeout,
+            postcondition=postcondition,
+            once=once,
+            dry_run=dry_run,
+            prepare=prepare,
+            dispatch=dispatch,
+        )
+
+    def type(
+        self,
+        text: str,
+        *,
+        app: str | int,
+        timeout: float = 5.0,
+        postcondition: Postcondition | None = None,
+        once: str | None = None,
+        dry_run: bool = False,
+    ) -> Receipt:
+        """Type ``text`` into exactly ``app`` -- the ``mac.do`` counterpart
+        to ``mac.type``.
+
+        The receipt never carries ``text`` itself, only its
+        `_value_summary`, the same rule `set` applies to a value.
+        """
+
+        def prepare(host: _Host, pid: int) -> None:
+            del host, pid
+
+        def dispatch(host: _Host, pid: int) -> None:
+            host.type(text, app=pid)
+
+        return self._input_verb(
+            op="type",
+            app=app,
+            request={"text": _value_summary(text)},
+            timeout=timeout,
+            postcondition=postcondition,
+            once=once,
+            dry_run=dry_run,
+            prepare=prepare,
+            dispatch=dispatch,
+        )
+
     def _input_verb(
         self,
         *,
@@ -2150,6 +2303,7 @@ class Operations:
                 if action == "in_flight":
                     return self._finish(self._in_flight_receipt(builder, target=target))
 
+            before = host._focus_sample(pid)
             try:
                 dispatch(host, pid)
             except FocusChangedError as exc:
@@ -2163,21 +2317,45 @@ class Operations:
                     target=target, error=exc.to_json(),
                 )
             else:
+                focus = self._focus_effect(host, pid, before)
                 verified = self._verify_postcondition(
                     host, postcondition, deadline, app=app, all_apps=False, apps=None
                 )
                 outcome = Outcome.DONE if verified.ok else Outcome.FAILED
+                changed = _changed_after_dispatch(postcondition, verified)
+                if changed is None and focus["changed"]:
+                    changed = True
                 receipt = builder.build(
-                    outcome=outcome, acted=Acted.YES,
-                    changed=_changed_after_dispatch(postcondition, verified),
+                    outcome=outcome, acted=Acted.YES, changed=changed,
                     verified=postcondition is not None and verified.ok,
-                    target=target, observed=verified.observed,
+                    target=target,
+                    observed={"focus": focus, "postcondition": verified.observed},
                     error=None if verified.ok else verified.error,
                 )
 
             if once is not None:
                 self._ledger.finalize(once, receipt)
             return self._finish(receipt)
+
+    def _focus_effect(
+        self, host: _Host, pid: int, before: Mapping[str, JSONValue]
+    ) -> dict[str, JSONValue]:
+        """Read focus again after a raw input landed and report what moved.
+
+        The first reading right after dispatch usually already differs;
+        when it does not, one short wait and one more reading give the
+        app's run loop a chance to process the event before the receipt
+        calls the effect unobserved.
+        """
+        after = host._focus_sample(pid)
+        if after == before:
+            self._sleep(_FOCUS_RESAMPLE_SECONDS)
+            after = host._focus_sample(pid)
+        return {
+            "before": _redact_focus(before),
+            "after": _redact_focus(after),
+            "changed": _changed_focus_fields(before, after),
+        }
 
     def recall(self, once: str) -> Receipt:
         """Look up the at-most-once ledger for ``once`` without

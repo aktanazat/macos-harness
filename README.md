@@ -67,10 +67,11 @@ except OperationError as exc:
 PY
 ```
 
-- `press`, `set`, `toggle`, `run`, and `key` mutate; `recall(once)` looks up
-  a past receipt by its token, without dispatching anything. `set`/`toggle`
-  are convergent: they read the current state first and report
-  `outcome="already"` instead of touching anything already correct.
+- `press`, `set`, `toggle`, `run`, `key`, `click`, and `type` mutate;
+  `recall(once)` looks up a past receipt by its token, without dispatching
+  anything. `set`/`toggle` are convergent: they read the current state
+  first and report `outcome="already"` instead of touching anything
+  already correct.
 - Every call returns an immutable, JSON-safe `Receipt` on success, or
   raises `OperationError` on failure — `exc.receipt` is the exact same
   `Receipt` a success would have had, so you never have to choose between
@@ -81,9 +82,15 @@ PY
   postcondition verified the effect, duration_s, and — on failure — a
   structured error. `receipt.to_json()` is ready for `json.dumps`.
 - `changed` is only ever an observed fact, never a guess. `set`/`toggle`
-  read the target back before and after and know for certain; `press`/
-  `run`/`key` have no readback of their own, so `changed` is `None` unless
-  you pass a `postcondition` that confirms the effect actually took hold.
+  read the target back before and after and know for certain. `key`/
+  `click`/`type` sample focus before and after — frontmost pid, focused
+  window, and the focused element's role, value summary, selected range,
+  character count, position, and size — and report the fields that moved
+  under `observed.focus`: `changed` is `True` when focus moved or a
+  postcondition verified the effect, `None` when nothing observable moved,
+  which is how a key AppKit silently dropped shows up. `press`/`run` have
+  no readback of their own, so `changed` is `None` unless you pass a
+  `postcondition` that confirms the effect actually took hold.
 - A bad argument — an unknown role, a malformed postcondition, reusing a
   `once` token for a genuinely different request — raises `MacOSError`
   directly, before anything is dispatched: there is no receipt, because

@@ -347,6 +347,54 @@ def test_application_element_enables_enhanced_ax(monkeypatch) -> None:
     assert writes == []
 
 
+def test_focus_sample_reads_the_focused_element_without_enhancing_ax(monkeypatch) -> None:
+    mac = MacOS()
+    root, window, field = object(), object(), object()
+    roots: list[dict[str, object]] = []
+    data = {
+        root: {"AXFocusedWindow": window, "AXFocusedUIElement": field},
+        field: {
+            "AXRole": "AXTextField",
+            "AXSubrole": "AXSecureTextField",
+            "AXValue": "hunter2",
+            "AXNumberOfCharacters": 7,
+        },
+    }
+
+    def fake_root(pid, **kwargs):
+        roots.append({"pid": pid, **kwargs})
+        return root
+
+    monkeypatch.setattr(mac, "_application_element", fake_root)
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "Demo", "pid": 42})
+    monkeypatch.setattr(
+        mac,
+        "_copy_attributes",
+        lambda element, attributes: {name: data[element].get(name) for name in attributes},
+    )
+    monkeypatch.setattr(
+        mac,
+        "_copy_attribute",
+        lambda element, attribute: "Login" if (element, attribute) == (window, "AXTitle") else None,
+    )
+
+    sample = mac._focus_sample(42)
+
+    assert roots == [{"pid": 42, "enhance": False}]
+    assert sample == {
+        "frontmost_pid": 42,
+        "window": "Login",
+        "focused": {
+            "role": "AXTextField",
+            "subrole": "AXSecureTextField",
+            "characters": 7,
+        },
+    }
+
+    data[root] = {"AXFocusedWindow": None, "AXFocusedUIElement": None}
+    assert mac._focus_sample(42) == {"frontmost_pid": 42, "window": None, "focused": None}
+
+
 def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
     mac = MacOS()
     root, button, group, match, too_deep = (object() for _ in range(5))

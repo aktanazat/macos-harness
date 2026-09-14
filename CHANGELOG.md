@@ -72,6 +72,23 @@ follows [Semantic Versioning](https://semver.org/).
 - `mac.wait_for_window(app, timeout=2.0)`: `windows(app)` once it is
   non-empty, polled every 50ms; `MacOSError` with code `timeout`
   otherwise.
+- `mac.do.click(x, y, app=...)` and `mac.do.type(text, app=...)`: the
+  receipted counterparts of `mac.click` and `mac.type`. `click` resolves
+  the screen point and the target `window_id` before anything is
+  reserved or posted, so a stale screenshot, a moved window, or a point
+  over none of the app's windows fails with `acted=no`; a `type` receipt
+  carries the text's length and hash, never the text.
+- `mac.do.key`, `click`, and `type` receipts report what the input did to
+  focus. `observed.focus` holds a before/after sample of the frontmost
+  pid, the focused window title, and the focused element (role, title,
+  value summary, selected range, character count, position, size), and
+  `changed` lists which of those moved. A verb whose postcondition is
+  not verified is `changed=True` when focus moved and `None` when nothing
+  observable moved, so a key that AppKit silently dropped -- a menu
+  shortcut sent to an inactive app -- no longer reads as a success. The
+  sample reads the focused element without enhanced accessibility, so an
+  app that keeps AX off stays that way, and a secure field's value is
+  never read. One sample costs about 0.2ms warm.
 
 ## [0.5.0] - 2026-08-22
 
