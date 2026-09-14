@@ -2325,11 +2325,12 @@ class MacOS:
                 details={"parameter": "app"},
             )
 
+        # Guard only after `AXPress` has returned: an action that raised
+        # keeps its own error, so `FocusChangedError` from here always means
+        # the press landed (`ops._atomic_press_acted` relies on that).
         before = self._frontmost_app()
-        try:
-            self.perform_action(int(match["element_index"]), "AXPress")
-        finally:
-            self._guard_focus(before, target_pid, "AX press")
+        self.perform_action(int(match["element_index"]), "AXPress")
+        self._guard_focus(before, target_pid, "AX press")
         return match
 
     def set(self, element_index: int, value: Any, attribute: str = "AXValue") -> None:

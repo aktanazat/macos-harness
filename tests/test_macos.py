@@ -842,6 +842,42 @@ def test_ax_press_reports_target_activation(monkeypatch) -> None:
         mac.ax.press(app="Chrome", text="Not Now")
 
 
+def test_ax_press_keeps_a_failed_action_error_when_the_target_activates(monkeypatch) -> None:
+    """The focus guard runs only after `AXPress` returned: an action that
+    raised keeps its own error even when the target came frontmost
+    meanwhile, since `FocusChangedError` is what `press()` reads as
+    proof that the press landed. The guard's after-reading is never
+    taken, so the second frontmost state stays unread."""
+    mac = MacOS()
+    frontmost = iter(
+        [
+            {"name": "Ghostty", "pid": 1},
+            {"name": "Chrome", "pid": 42},
+        ]
+    )
+
+    def failing_action(element_index, action):
+        raise MacOSError("AXPress failed with AXError -25204", code=ErrorCode.AX_ERROR)
+
+    monkeypatch.setattr(
+        mac,
+        "ax_wait",
+        lambda **kwargs: {
+            "element_index": 4,
+            "role": "AXButton",
+            "app": {"name": "Chrome", "pid": 42},
+        },
+    )
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: next(frontmost))
+    monkeypatch.setattr(mac, "perform_action", failing_action)
+
+    with pytest.raises(MacOSError, match="AXPress failed") as raised:
+        mac.ax.press(app="Chrome", text="Not Now")
+
+    assert raised.value.code == ErrorCode.AX_ERROR
+    assert next(frontmost) == {"name": "Chrome", "pid": 42}
+
+
 def test_ax_wait_gone_requires_two_empty_polls(monkeypatch) -> None:
     mac = MacOS()
     responses = iter(

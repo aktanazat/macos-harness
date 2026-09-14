@@ -148,6 +148,16 @@ follows [Semantic Versioning](https://semver.org/).
   summaries; a timeout reports both under `error.details`. `value` must
   be JSON-safe and `attribute` nonempty, checked at construction.
 
+### Fixed
+
+- `mac.ax.press` ran its focus guard in a `finally`, so an `AXPress` that
+  raised while the target came frontmost was reported as `focus.changed`
+  instead of its own error, and a receipted `mac.do.press(app=...)` then
+  read that code as proof the press landed (`acted=yes`). The guard now
+  runs only after `AXPress` returns, the order `mac.do.press(apps=...)`,
+  `toggle`, and the native agent already used: a failed action keeps its
+  error and the receipt says `acted=unknown`.
+
 ## [0.5.0] - 2026-08-22
 
 ### Added
