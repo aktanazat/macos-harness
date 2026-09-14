@@ -356,15 +356,23 @@ class _Refused(NamedTuple):
 
 
 def _focus_ax(
-    monkeypatch, mac: MacOS, data: dict[object, dict[str, object]], *, batch: bool
+    monkeypatch,
+    mac: MacOS,
+    data: dict[object, dict[str, object]],
+    *,
+    batch: bool,
+    focused: object,
 ) -> list[str]:
     """Answer `_focus_sample`'s AX reads from ``data`` -- ``{element:
     {attribute: value}}``, a missing attribute being AX's own "no value"
     -- at the ApplicationServices boundary, so the real readers run. With
     ``batch`` an element's batch read answers every slot at once, error
     sentinels included; without it the batch call is unsupported and the
-    readers fall back to single reads. Returns the attribute names
-    requested, in order, appended to as the sample runs."""
+    readers fall back to single reads. Only ``focused`` may be read in a
+    batch: Safari answers a batched root read with no element while
+    single reads find it, so the sample must never batch anything else.
+    Returns the attribute names requested, in order, appended to as the
+    sample runs."""
     AS = macos_module.AS
     requested: list[str] = []
 
@@ -379,6 +387,7 @@ def _focus_ax(
     def copy_attributes(element, names, options, _out):
         if not batch:
             return AS.kAXErrorNotImplemented, None
+        assert element is focused, "only the focused element is read in a batch"
         requested.extend(names)
         values = []
         for name in names:
@@ -410,7 +419,7 @@ def test_focus_sample_reads_the_focused_element_without_enhancing_ax(monkeypatch
         return root
 
     monkeypatch.setattr(mac, "_application_element", fake_root)
-    requested = _focus_ax(monkeypatch, mac, data, batch=batch)
+    requested = _focus_ax(monkeypatch, mac, data, batch=batch, focused=field)
 
     # An ordinary field has no subrole to report, which is an absence,
     # not a refusal: the sample goes on to read its details.
@@ -468,7 +477,7 @@ def test_focus_sample_raises_on_a_refused_read_instead_of_reporting_an_absence(
         if refused in element:
             element[refused] = _Refused(code)
     monkeypatch.setattr(mac, "_application_element", lambda pid, **kwargs: root)
-    _focus_ax(monkeypatch, mac, data, batch=batch)
+    _focus_ax(monkeypatch, mac, data, batch=batch, focused=field)
 
     with pytest.raises(MacOSError) as excinfo:
         mac._focus_sample(42)
@@ -497,7 +506,7 @@ def test_focus_sample_requests_no_text_after_a_refused_secure_field_check(
         },
     }
     monkeypatch.setattr(mac, "_application_element", lambda pid, **kwargs: root)
-    requested = _focus_ax(monkeypatch, mac, data, batch=batch)
+    requested = _focus_ax(monkeypatch, mac, data, batch=batch, focused=field)
 
     with pytest.raises(MacOSError):
         mac._focus_sample(42)

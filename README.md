@@ -94,7 +94,7 @@ PY
   field missing: it shows as `None` under `observed.focus` and never
   counts as focus having moved, while an attribute the app reports as
   absent is an ordinary absence. Only a subrole the app actually
-  reported clears a field for its text to be read.
+  reported clears a field for its details to be read.
   Without a `postcondition` the after-reading repeats every 10ms for up
   to 100ms until it differs, never past the deadline, so an app's run
   loop gets time to process the event. With one, the single after-reading

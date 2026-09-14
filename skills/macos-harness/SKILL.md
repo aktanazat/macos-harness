@@ -77,8 +77,8 @@ receipt = mac.do.type(
   field missing: it shows as `None` and never counts as focus having
   moved; an attribute the app reports as absent is an ordinary absence,
   and only a subrole the app actually reported clears a field for its
-  text to be read. Without a `postcondition` the
-  after-reading repeats every 10ms for up to 100ms until it differs from
+  details to be read. Without a `postcondition` the after-reading
+  repeats every 10ms for up to 100ms until it differs from
   the before, never past the deadline; with one, the postcondition is
   verified right after the single after-reading instead. `changed` is
   `True` when a postcondition verified the effect or focus moved, and
