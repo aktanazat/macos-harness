@@ -136,6 +136,37 @@ you need: identity-only lookups, reads, or an action `mac.do` does not
 model. Raw primitives are unchanged and fully supported, just without a
 receipt or an idempotency guarantee.
 
+## Inspect failures before more input
+
+Keep the failed `OperationError.receipt`. Its `process` evidence belongs to the
+original completion; replay does not refresh it. Preserve `acted=unknown` when
+input is uncertain. Process exit evidence does not replace an existing action
+error, and a verified expected disappearance can still succeed.
+
+Use `mac.status(app_or_receipt)` for process and on-disk build metadata without a
+UI read. Use `mac.inspect(app_or_receipt)` when current controls, focus, windows,
+or blocking sheets are needed. Inspect `process`, `coverage`, and `blocked` before
+interpreting the result. Partial traversal cannot establish that no sheet exists.
+A failed receipt adds current same-role controls under `nearby`.
+
+Inspection excludes values and screenshots by default and does not enable
+accessibility features. Request `include_values=True` or `screenshot=True` only
+when the task permits that data. Secure fields and failed identity reads still
+exclude content attributes. Titles and labels can contain private text.
+`mac.diff_windows(before, after)` compares supplied snapshots without another
+observation. Snapshots do not freeze the app.
+
+Collect `mac.logs(receipt)` or `mac.crashes(receipt)` only when those records can
+answer the failure. An explicit time pair needs `app=pid`. Check collection
+status and truncation; delayed or absent records do not rule out a failure.
+`mac.sample(app_or_receipt, duration=1)` explicitly collects a bounded call graph,
+which does not prove a hang. Diagnostic text can contain private data.
+
+Pass collected results to `mac.explain(receipt, *evidence)`. It preserves the
+action receipt and makes no new observations or retries. A changed executable
+mtime is evidence of a potentially stale build, not the running build's version.
+The README's Diagnostics section documents collection limits and result fields.
+
 ## Use the small surface
 
 Think in six verbs: `see`, `key`, `type`, `click`, `ax`, `script`.

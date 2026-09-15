@@ -12,6 +12,7 @@ import errno
 import json
 import math
 import os
+import plistlib
 import re
 import subprocess
 import tempfile
@@ -33,7 +34,7 @@ from .errors import (
 from .handoff import HandoffReason, HumanHandoff
 from .ops import _Deadline, _utc_timestamp
 from .overlay import LivePointerOverlay
-from .receipts import JSONValue, validate_exact_selectors
+from .receipts import JSONValue, Receipt, validate_exact_selectors
 
 if TYPE_CHECKING:
     # Only for annotations -- `native.py` imports from this module at
@@ -752,6 +753,143 @@ class MacOS:
         """Return recent receipted operations without observing the desktop."""
         return [receipt.to_json() for receipt in self.do.history()]
 
+    def _diagnostic_identity(self, app: str | int | Receipt) -> _AppIdentity:
+        if not isinstance(app, Receipt):
+            return self._process_identity(app)
+        process, target = app.process, app.target
+        info = target.get("app") if isinstance(target, Mapping) else None
+        if not isinstance(process, Mapping) or not isinstance(info, Mapping):
+            raise MacOSError("Receipt has no bound app identity; select an app explicitly",
+                             code=ErrorCode.BAD_REQUEST)
+        pid, launched = process.get("pid"), process.get("launched_at")
+        if type(pid) is not int or type(launched) not in (int, float):
+            raise MacOSError("Receipt has no process launch identity", code=ErrorCode.BAD_REQUEST)
+        bundle, name, path = info.get("bundle_id"), info.get("name"), info.get("path")
+        return _AppIdentity(pid, bundle if isinstance(bundle, str) else None, launched,
+                            name if isinstance(name, str) else "", path if isinstance(path, str) else None)
+
+    def _status_identity(self, identity: _AppIdentity) -> dict[str, JSONValue]:
+        return {
+            "app": {"pid": identity.pid, "name": identity.name,
+                    "bundle_id": identity.bundle_id, "path": identity.path},
+            "process": self._observe_process(identity),
+            "build": self._build_status(identity), "observed_at": _utc_timestamp(time.time()),
+        }
+
+    def status(self, app: str | int | Receipt) -> dict[str, JSONValue]:
+        """Read app lifetime and on-disk build metadata without reading its UI."""
+        self.do._check_owner()
+        return self._status_identity(self._diagnostic_identity(app))
+
+    def inspect(
+        self, app: str | int | Receipt, *, max_depth: int = 12, max_nodes: int = 300,
+        include_values: bool = False, screenshot: bool = False,
+    ) -> dict[str, JSONValue]:
+        """Collect a bounded, non-enhancing snapshot; values and capture are opt-in."""
+        from .diagnostics import inspection_findings
+
+        self.do._check_owner()
+        if type(max_nodes) is not int or not 1 <= max_nodes <= 5000:
+            raise MacOSError("max_nodes must be between 1 and 5000", code=ErrorCode.BAD_REQUEST)
+        if type(max_depth) is not int or not 0 <= max_depth <= 25:
+            raise MacOSError("max_depth must be between 0 and 25", code=ErrorCode.BAD_REQUEST)
+        if not isinstance(include_values, bool) or not isinstance(screenshot, bool):
+            raise MacOSError("include_values and screenshot must be booleans", code=ErrorCode.BAD_REQUEST)
+        with self.do._dispatch_lock:
+            identity = self._diagnostic_identity(app)
+            status = self._status_identity(identity)
+            process = status["process"]
+            if isinstance(process, Mapping) and process.get("state") == "running":
+                try:
+                    state = self.get_app_state(
+                        identity.pid, max_depth=max_depth, max_nodes=max_nodes,
+                        include_values=include_values, screenshot=screenshot,
+                        include_actions=False, include_settable=False, enhance=False,
+                    )
+                except MacOSError as exc:
+                    state = {"error": exc.to_json()}
+                try:
+                    state["focus"] = self._focus_sample(identity.pid, include_values=include_values)
+                except MacOSError as exc:
+                    state["focus_error"] = exc.to_json()
+                state.update(status)
+                state["process"] = self._observe_process(identity)
+            else:
+                state = status
+            state["observed_at"] = _utc_timestamp(time.time())
+            state.update(inspection_findings(state, app if isinstance(app, Receipt) else None))
+            return state
+
+    def _diagnostic_pid(self, subject: Receipt | tuple[str, str], app: str | int | None) -> int:
+        from .diagnostics import receipt_pid
+
+        if isinstance(subject, Receipt):
+            if app is not None:
+                raise MacOSError("A receipt already supplies the target app", code=ErrorCode.BAD_REQUEST)
+            return receipt_pid(subject)
+        if isinstance(app, int) and not isinstance(app, bool) and app > 0:
+            return app
+        if isinstance(app, str):
+            return self._process_identity(app).pid
+        raise MacOSError("An explicit time interval needs an app or pid", code=ErrorCode.BAD_REQUEST)
+
+    def logs(
+        self, subject: Receipt | tuple[str, str], *, app: str | int | None = None,
+        subsystem: str | None = None, category: str | None = None, level: str = "info",
+        limit: int = 200, timeout: float = 5.0, max_bytes: int = 1024 * 1024,
+    ) -> dict[str, JSONValue]:
+        """Read bounded unified logs for an action or explicit UTC interval."""
+        from .diagnostics import collect_logs
+
+        self.do._check_owner()
+        return collect_logs(subject, self._diagnostic_pid(subject, app), subsystem=subsystem,
+                            category=category, level=level, limit=limit, timeout=timeout, max_bytes=max_bytes)
+
+    def crashes(
+        self, subject: Receipt | tuple[str, str], *, app: str | int | None = None,
+        limit: int = 3, max_files: int = 128,
+    ) -> dict[str, JSONValue]:
+        """Look up bounded modern crash reports; absence is only this lookup's result."""
+        from .diagnostics import collect_crashes
+
+        self.do._check_owner()
+        return collect_crashes(subject, self._diagnostic_pid(subject, app), limit=limit, max_files=max_files,
+                               directories=(Path.home() / "Library/Logs/DiagnosticReports",
+                                            Path("/Library/Logs/DiagnosticReports")))
+
+    def sample(
+        self, app: str | int | Receipt, *, duration: int = 1, timeout: float = 5.0,
+        max_bytes: int = 1024 * 1024,
+    ) -> dict[str, JSONValue]:
+        """Collect a bounded call graph explicitly, without diagnosing a hang from it."""
+        from .diagnostics import collect_sample
+
+        self.do._check_owner()
+        identity = self._diagnostic_identity(app)
+        process = self._observe_process(identity)
+        if process.get("state") != "running":
+            return {"kind": "sample", "status": "failed", "pid": identity.pid, "process": process,
+                    "error": MacOSError("The bound app is no longer available for sampling",
+                                        code=ErrorCode.APP_EXITED if process.get("state") == "exited"
+                                        else ErrorCode.UNSUPPORTED_OP).to_json()}
+        result = collect_sample(identity.pid, duration=duration, timeout=timeout, max_bytes=max_bytes)
+        result["process"] = self._observe_process(identity)
+        return result
+
+    @staticmethod
+    def explain(receipt: Receipt, *evidence: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        """Explain a receipt using only supplied evidence, without a fresh observation."""
+        from .diagnostics import explain
+
+        return explain(receipt, evidence)
+
+    @staticmethod
+    def diff_windows(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        """Compare supplied window snapshots without observing the desktop."""
+        from .diagnostics import diff_windows
+
+        return diff_windows(before, after)
+
     def _check_native_owner(self) -> None:
         """Fail closed before touching ``_native_lock`` from a forked child.
 
@@ -978,6 +1116,38 @@ class MacOS:
         return (current.pid, current.bundle_id, current.launched_at) == (
             expected.pid, expected.bundle_id, expected.launched_at
         )
+
+    @staticmethod
+    def _bundle_info(path: str | None) -> dict[str, object]:
+        if path is None:
+            return {}
+        try:
+            with (Path(path) / "Contents" / "Info.plist").open("rb") as source:
+                info = plistlib.load(source)
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            return {}
+        return info if isinstance(info, dict) else {}
+
+    def _build_status(self, identity: _AppIdentity) -> dict[str, JSONValue]:
+        info = self._bundle_info(identity.path)
+        version, build = info.get("CFBundleShortVersionString"), info.get("CFBundleVersion")
+        result: dict[str, JSONValue] = {
+            "on_disk_version": version if isinstance(version, str) else None,
+            "on_disk_build": build if isinstance(build, str) else None,
+            "executable_modified_at": None, "potentially_stale": None,
+        }
+        executable = info.get("CFBundleExecutable")
+        if (identity.path is None or not isinstance(executable, str)
+                or not executable or Path(executable).name != executable):
+            return result
+        try:
+            modified = (Path(identity.path) / "Contents" / "MacOS" / executable).stat().st_mtime
+        except OSError as exc:
+            result["error"] = str(exc)
+        else:
+            result["executable_modified_at"] = _utc_timestamp(modified)
+            result["potentially_stale"] = modified > identity.launched_at
+        return result
 
     @classmethod
     def _frontmost_app(cls) -> dict[str, Any] | None:

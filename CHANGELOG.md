@@ -12,6 +12,15 @@ follows [Semantic Versioning](https://semver.org/).
   fails with `app.exited` after an observed exit when the effect was unverified.
   A verified expected disappearance can succeed. Replayed receipts retain their
   original process evidence.
+- `mac.status` reports process and on-disk build metadata, including command-line
+  PIDs. `mac.inspect` composes bounded snapshots, focus, blocking-dialog evidence,
+  and current same-role controls after a failed search. Values and screenshots
+  are opt-in; secure fields and failed identity reads exclude content attributes.
+  `mac.diff_windows` compares supplied observations without reading the desktop.
+- `mac.logs`, `mac.crashes`, and `mac.sample` collect bounded diagnostic evidence
+  on request. Collection failures and partial results remain explicit.
+  `mac.explain` correlates supplied evidence without changing the receipt,
+  collecting more data, or retrying input.
 - Presses keep their original deadline through agent setup, searches, retry
   delays, and focus readings on both backends. A known pre-dispatch timeout
   reports `acted=no` and releases its once-token reservation. Other timeouts

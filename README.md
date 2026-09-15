@@ -189,6 +189,74 @@ Path("action-history.json").write_text(
 )
 ```
 
+### Diagnostics
+
+Use `mac.status(app)` to read process identity and on-disk build metadata without
+reading the UI. An app selector or an app-bound receipt is accepted. A numeric
+PID can also identify a command-line process. `process.state` is `running`,
+`exited`, or `unknown`, relative to the bound PID and launch time.
+`build.potentially_stale` compares the executable's modification time with the
+process start. It does not identify the build loaded into the running process.
+
+App-bound receipts retain process evidence from completion. Replays keep the
+original evidence.
+
+If input returned successfully but its effect was not verified, an observed exit
+fails with `app.exited`. An exit that satisfies a verified postcondition can
+succeed. An existing action error and its `acted` classification stay intact.
+Missing process metadata does not turn a successful action into a failure.
+
+For a failed app-scoped operation, retain `OperationError.receipt` and inspect it:
+
+```python
+state = mac.inspect(receipt)
+print(state["process"], state["blocked"], state.get("nearby"))
+
+logs = mac.logs(receipt, timeout=3)
+crashes = mac.crashes(receipt)
+print(mac.explain(receipt, state, logs, crashes))
+```
+
+`inspect` composes the existing snapshot exporter with focus and process evidence.
+It reads at most 300 nodes to depth 12 by default, without enabling accessibility
+features. `coverage` reports node, depth, and read limits. `blocked` describes
+observed sheets or modal windows; it is `None` when an incomplete tree cannot
+establish their absence. A failed receipt adds up to eight current controls
+matching the requested role, including disabled controls.
+
+Values and screenshots require separate `include_values=True` and
+`screenshot=True` opt-ins. Secure fields and failed identity reads exclude value,
+selection, and character-count reads even when values are requested. Titles and
+labels can still contain private text. Snapshots are not atomic; the app can
+change between reads. `mac.diff_windows(before, after)` compares supplied
+snapshots for opened, closed, and changed windows without another observation.
+
+Logs and crash lookups accept a receipt or a `(start, end)` pair of timezone-aware
+ISO-8601 strings with `app=pid`. Receipt intervals include 250 ms on each side.
+Logs default to 200 rows, 1 MiB, and a five-second deadline. `subsystem`, `category`,
+and `level` narrow the query. Collection rounds outward to whole seconds, then
+filters events to the requested interval. Read `status`, `coverage`, and
+`truncated`; successful collection does not prove that delayed log events have
+arrived.
+
+Crash lookup reads bounded modern `.ips` reports from the user and system
+DiagnosticReports directories. It matches PID and capture time, plus launch time
+when available. Optional termination fields and empty stacks are retained;
+returned stacks contain at most ten frames. `not_found_at_lookup` is not proof
+that the app did not crash. File and byte limits can leave the lookup partial.
+
+`mac.sample(app_or_receipt, duration=1)` explicitly collects a call graph with a
+10 ms sampling interval. Duration is limited to one through five seconds. A
+sample alone does not establish that an app is hung. Log and sample subprocesses
+have time and output bounds and are reaped before returning. Their text can
+contain private data; these diagnostics do not save it automatically.
+
+`mac.explain(receipt, *evidence)` uses only supplied evidence. It checks available
+process and time correlation, keeps the original receipt, and reports observed
+conditions separately from collection failures. It does not retry an action or
+collect more evidence. When input may have happened, inspect the target before
+sending it again.
+
 When no `mac.do` verb fits, drop to the six raw primitives below — an escape
 hatch, not a deprecated path: unchanged, fully supported, just without a
 receipt or an idempotency token.
