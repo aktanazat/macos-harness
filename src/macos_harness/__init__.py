@@ -12,7 +12,7 @@ from .errors import (
     MacOSError,
 )
 from .handoff import HandoffReason, HumanHandoff
-from .macos import MacOS
+from .macos import MacOS, SearchMatches
 from .receipts import (
     Acted,
     Equals,
@@ -32,6 +32,7 @@ from .receipts import (
     present,
     request_fingerprint,
 )
+from .routes import RouteResult
 
 if TYPE_CHECKING:
     from .credentials import (
@@ -97,6 +98,8 @@ __all__ = [
     "Postcondition",
     "Present",
     "Receipt",
+    "RouteResult",
+    "SearchMatches",
     "__version__",
     "canonical_json",
     "canonicalize",

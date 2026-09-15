@@ -20,8 +20,11 @@ from macos_harness.macos import (
     FocusChangedError,
     MacOS,
     MacOSError,
+    SearchMatches,
     _split_scroll_delta,
 )
+from macos_harness.ops import Operations
+from macos_harness.receipts import Acted, Postcondition, equals, gone, present
 
 
 def _on_screen_windows(monkeypatch, *windows: tuple[int | float, ...]) -> None:
@@ -43,6 +46,12 @@ def _on_screen_windows(monkeypatch, *windows: tuple[int | float, ...]) -> None:
     monkeypatch.setattr(
         macos_module.AS, "CGWindowListCopyWindowInfo", lambda options, relative: described
     )
+
+
+def _found(*matches: dict[str, object], complete: bool = True) -> SearchMatches:
+    """A search answer for a fake ``ax_search``: ``matches`` from a search
+    that saw every candidate unless ``complete`` says it was cut short."""
+    return SearchMatches(matches, complete=complete, visited=len(matches))
 
 
 def test_render_tree() -> None:
@@ -78,27 +87,6 @@ def test_common_navigation_keys_are_supported() -> None:
         119,
         121,
     }
-
-
-def test_agent_surface_is_flat_and_explicit() -> None:
-    mac = MacOS()
-
-    for verb in ("see", "key", "type", "click", "script", "handoff"):
-        assert callable(getattr(mac, verb))
-    for verb in (
-        "at",
-        "query",
-        "query_all",
-        "wait",
-        "wait_gone",
-        "press",
-        "get",
-        "set",
-        "perform",
-    ):
-        assert callable(getattr(mac.ax, verb))
-    assert not hasattr(mac, "mouse")
-    assert not hasattr(mac, "keyboard")
 
 
 class _FakeDate:
@@ -514,16 +502,10 @@ def test_focus_sample_requests_no_text_after_a_refused_secure_field_check(
     assert not {"AXValue", "AXNumberOfCharacters", "AXSelectedTextRange"} & set(requested)
 
 
-def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
-    mac = MacOS()
-    root, button, group, match, too_deep = (object() for _ in range(5))
-    children = {root: [button, group], group: [match, too_deep]}
-    data = {
-        button: {"AXRole": "AXButton", "AXTitle": "Save"},
-        group: {"AXRole": "AXGroup"},
-        match: {"AXRole": "AXStaticText", "AXValue": "Alessia playlist"},
-        too_deep: {"AXRole": "AXStaticText", "AXValue": "Alessia too deep"},
-    }
+def _bounded_tree(monkeypatch, mac: MacOS, root: object, children: dict, data: dict) -> None:
+    """Serve a fake AX tree through the bounded-walk fallback: the app's
+    own search predicate is unsupported, so every query walks ``children``
+    from ``root`` and reads each element's attributes from ``data``."""
     monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_application_element", lambda pid, **kwargs: root)
@@ -544,7 +526,9 @@ def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
             "AXChildren": children.get(element),
             "AXWindows": None,
         }
-        return {attribute: values.get(attribute) for attribute in attributes}
+        return macos_module._AttributeValues(
+            (attribute, values.get(attribute)) for attribute in attributes
+        )
 
     monkeypatch.setattr(mac, "_copy_attributes", fake_attributes)
     monkeypatch.setattr(mac, "_actions", lambda element: [])
@@ -556,6 +540,19 @@ def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
             None,
         ),
     )
+
+
+def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
+    mac = MacOS()
+    root, button, group, match, too_deep = (object() for _ in range(5))
+    children = {root: [button, group], group: [match, too_deep]}
+    data = {
+        button: {"AXRole": "AXButton", "AXTitle": "Save"},
+        group: {"AXRole": "AXGroup"},
+        match: {"AXRole": "AXStaticText", "AXValue": "Alessia playlist"},
+        too_deep: {"AXRole": "AXStaticText", "AXValue": "Alessia too deep"},
+    }
+    _bounded_tree(monkeypatch, mac, root, children, data)
 
     results = mac.ax.query(
         app="Spotify",
@@ -572,6 +569,242 @@ def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
             "value": "Alessia playlist",
         }
     ]
+    # max_nodes stopped the walk one node short, so the fifth element was
+    # never examined and this list may not be every match.
+    assert results.complete is False
+    assert results.visited == 4
+
+
+@pytest.mark.parametrize(
+    "condition",
+    (
+        present(app="Demo", title="Save", timeout=1),
+        equals(value=False, app="Demo", title="Save", timeout=1),
+        gone(app="Demo", title="Absent", timeout=1),
+    ),
+)
+def test_expect_never_enables_app_accessibility_features(monkeypatch, condition: Postcondition) -> None:
+    mac = MacOS()
+    root, save = object(), object()
+    data = {
+        root: {"AXRole": "AXApplication", "AXEnhancedUserInterface": False},
+        save: {"AXRole": "AXButton", "AXTitle": "Save", "AXValue": False},
+    }
+    info = {"pid": 42, "name": "Demo", "bundle_id": None, "path": None}
+    identity = macos_module._AppIdentity(42, None, 1000.0, "Demo", None)
+    monkeypatch.setattr(mac, "_resolve_app", lambda app: (None, info))
+    monkeypatch.setattr(mac, "_identity_from_info", lambda app_info: identity)
+    monkeypatch.setattr(mac, "_process_identity", lambda app: identity)
+    _bounded_tree(monkeypatch, mac, root, {root: [save]}, data)
+    monkeypatch.setattr(mac, "_application_element", MacOS._application_element)
+    monkeypatch.setattr(macos_module.AS, "AXUIElementCreateApplication", lambda pid: root)
+    monkeypatch.setattr(
+        macos_module.AS,
+        "AXUIElementCopyAttributeValue",
+        lambda element, attribute, out: (0, data[element].get(attribute)),
+    )
+
+    def set_attribute(element, attribute, value):
+        data[element][attribute] = value
+        return 0
+
+    monkeypatch.setattr(macos_module.AS, "AXUIElementSetAttributeValue", set_attribute)
+    clock = iter(range(100))
+
+    def monotonic():
+        return next(clock) * 0.01
+
+    monkeypatch.setattr(macos_module.time, "monotonic", monotonic)
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+    mac.do = Operations(mac, _monotonic=monotonic)
+
+    receipt = mac.do.expect(condition)
+
+    assert data[root]["AXEnhancedUserInterface"] is False
+    assert receipt.verified is True
+    assert receipt.acted is Acted.NO
+    assert receipt.changed is None
+
+
+def test_unsupported_fallback_predicate_never_matches_unrelated_controls(monkeypatch) -> None:
+    mac = MacOS()
+    root, save = object(), object()
+    data = {save: {"AXRole": "AXButton", "AXTitle": "Save"}}
+    _bounded_tree(monkeypatch, mac, root, {root: [save]}, data)
+
+    with pytest.raises(MacOSError, match="AXHeadingSearchKey") as caught:
+        mac.ax.query(
+            app="Pages", search_key="AXHeadingSearchKey", include_actions=False
+        )
+
+    assert caught.value.code == ErrorCode.UNSUPPORTED_OP
+
+
+def test_exact_title_rejects_substring_and_case_twins(monkeypatch) -> None:
+    """Substring ``text`` is how an agent finds things; an exact ``title``
+    is how it proves it found the right one. "Save" must not resolve to
+    "Save As…" or "save", and the walk must say it saw every node."""
+    mac = MacOS()
+    root, save, save_as, lower = (object() for _ in range(4))
+    children = {root: [save_as, lower, save]}
+    data = {
+        save: {"AXRole": "AXButton", "AXTitle": "Save"},
+        save_as: {"AXRole": "AXButton", "AXTitle": "Save As…"},
+        lower: {"AXRole": "AXStaticText", "AXTitle": "save"},
+    }
+    _bounded_tree(monkeypatch, mac, root, children, data)
+
+    loose = mac.ax.query(app="Pages", text="save", include_actions=False)
+    exact = mac.ax.query(app="Pages", title="Save", include_actions=False)
+
+    assert [match["title"] for match in loose] == ["Save As…", "save", "Save"]
+    assert [match["title"] for match in exact] == ["Save"]
+    assert exact.complete is True
+    assert exact.visited == 4
+
+
+def test_exact_identifier_twins_are_ambiguous_not_first_match(monkeypatch) -> None:
+    """Two elements with the same identifier is exactly the situation an
+    exact selector exists to expose; ``wait`` must refuse rather than
+    act on whichever the walk reached first."""
+    mac = MacOS()
+    root, first, second = (object() for _ in range(3))
+    children = {root: [first, second]}
+    data = {
+        first: {"AXRole": "AXButton", "AXIdentifier": "_NS:9", "AXTitle": "OK"},
+        second: {"AXRole": "AXButton", "AXIdentifier": "_NS:9", "AXTitle": "Cancel"},
+    }
+    _bounded_tree(monkeypatch, mac, root, children, data)
+
+    with pytest.raises(MacOSError, match="found 2 matches") as exc_info:
+        mac.ax.wait(app="Pages", identifier="_NS:9", timeout=0)
+
+    assert exc_info.value.code == ErrorCode.BAD_REQUEST
+    assert exc_info.value.details["count"] == 2
+
+
+def test_strict_wait_never_trusts_one_match_from_a_cut_search(monkeypatch) -> None:
+    """One match from a walk ``max_nodes`` stopped early may have a twin
+    in the part the walk never reached. A substring wait keeps its
+    first-match contract; an exact wait keeps polling and times out with
+    the bound that stopped the search."""
+    mac = MacOS()
+    match = {"element_index": 4, "role": "AXButton", "title": "Save"}
+    monkeypatch.setattr(mac, "ax_search", lambda **kwargs: _found(match, complete=False))
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+
+    assert mac.ax.wait(app="Pages", text="Save", timeout=0) == match
+
+    with pytest.raises(MacOSError, match="before a complete search") as exc_info:
+        mac.ax.wait(app="Pages", title="Save", timeout=0, max_nodes=300)
+
+    assert exc_info.value.code == ErrorCode.TIMEOUT
+    assert exc_info.value.details == {
+        "timeout": 0,
+        "complete": False,
+        "visited": 1,
+        "max_nodes": 300,
+    }
+
+
+def test_strict_wait_rejects_a_branch_that_refused_its_children(monkeypatch) -> None:
+    mac = MacOS()
+    root, save, blocked = (object() for _ in range(3))
+    data = {
+        root: {
+            "AXRole": "AXApplication",
+            "AXChildren": [save, blocked],
+        },
+        save: {
+            "AXRole": "AXButton",
+            "AXTitle": "Save",
+        },
+        blocked: {
+            "AXRole": "AXGroup",
+            "AXChildren": _Refused(macos_module.AS.kAXErrorCannotComplete),
+        },
+    }
+    copy_attributes = mac._copy_attributes
+    _bounded_tree(monkeypatch, mac, root, {root: [save, blocked]}, data)
+    monkeypatch.setattr(mac, "_copy_attributes", copy_attributes)
+    _focus_ax(monkeypatch, mac, data, batch=False, focused=root)
+
+    with pytest.raises(MacOSError, match="complete search") as caught:
+        mac.ax.wait(app="Pages", title="Save", timeout=0)
+
+    assert caught.value.code == ErrorCode.TIMEOUT
+    assert caught.value.details["complete"] is False
+
+
+def test_repeated_child_at_the_node_budget_is_still_complete(monkeypatch) -> None:
+    mac = MacOS()
+    root, save = object(), object()
+    data = {save: {"AXRole": "AXButton", "AXTitle": "Save"}}
+    _bounded_tree(monkeypatch, mac, root, {root: [save, save]}, data)
+
+    matches = mac.ax.query(
+        app="Pages", title="Save", max_nodes=2, include_actions=False
+    )
+
+    assert [match["title"] for match in matches] == ["Save"]
+    assert matches.complete is True
+
+
+def test_wait_gone_never_certifies_absence_from_a_cut_search(monkeypatch) -> None:
+    """An empty result from a walk that stopped at ``max_nodes`` says
+    nothing about the unseen part, so it must not count toward the two
+    empty polls that confirm the match is gone."""
+    mac = MacOS()
+    monkeypatch.setattr(mac, "ax_search", lambda **kwargs: _found(complete=False))
+    clock = iter(range(100))
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: next(clock) * 0.01)
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(MacOSError, match="two consecutive empty polls") as exc_info:
+        mac.ax.wait_gone("Not Now", app="Chrome", timeout=0.025, max_nodes=300)
+
+    assert exc_info.value.code == ErrorCode.TIMEOUT
+    assert exc_info.value.details == {
+        "timeout": 0.025,
+        "consecutive_empty_polls": 0,
+        "complete": False,
+        "visited": 0,
+        "max_nodes": 300,
+    }
+
+
+@pytest.mark.parametrize("field", ["title", "identifier", "description"])
+def test_exact_selectors_reject_empty_strings(monkeypatch, field: str) -> None:
+    """An empty exact selector can never equal an attribute a search
+    keeps, so it is a bad request, not a silent never-match -- decided
+    before the app is even resolved."""
+    mac = MacOS()
+    monkeypatch.setattr(mac, "_pid", _fail_if_called)
+    monkeypatch.setattr(mac, "_acquire_native", _fail_if_called)
+
+    with pytest.raises(MacOSError, match=f"{field} must be a non-empty str") as exc_info:
+        mac.ax.query(app="Pages", **{field: ""})
+
+    assert exc_info.value.code == ErrorCode.BAD_REQUEST
+    assert exc_info.value.details["parameter"] == field
+
+
+def test_exact_selector_alone_scopes_a_cross_app_search(monkeypatch) -> None:
+    """A cross-app search needs something to look for; an exact selector
+    is that something even without substring ``text``."""
+    mac = MacOS()
+    arguments = {}
+
+    def fake_search_all(**kwargs):
+        arguments.update(kwargs)
+        return _found()
+
+    monkeypatch.setattr(mac, "ax_search_all", fake_search_all)
+
+    mac.ax.query_all(identifier="_NS:9", apps="Pages")
+
+    assert arguments["text"] is None
+    assert arguments["identifier"] == "_NS:9"
 
 
 def test_safe_ax_fallback_does_not_read_values(monkeypatch) -> None:
@@ -589,7 +822,9 @@ def test_safe_ax_fallback_does_not_read_values(monkeypatch) -> None:
             root: {"AXRole": "AXApplication", "AXChildren": [button]},
             button: {"AXRole": "AXButton", "AXTitle": "Use Password"},
         }[element]
-        return {attribute: values.get(attribute) for attribute in attributes}
+        return macos_module._AttributeValues(
+            (attribute, values.get(attribute)) for attribute in attributes
+        )
 
     monkeypatch.setattr(mac, "_copy_attributes", fake_attributes)
     monkeypatch.setattr(mac, "_actions", lambda element: [])
@@ -619,21 +854,21 @@ def test_snapshot_tree_can_preserve_earlier_element_handles(monkeypatch) -> None
     monkeypatch.setattr(
         mac,
         "_copy_attributes",
-        lambda element, attributes: {
-            attribute: ("AXApplication" if attribute == "AXRole" else None)
+        lambda element, attributes: macos_module._AttributeValues(
+            (attribute, "AXApplication" if attribute == "AXRole" else None)
             for attribute in attributes
-        },
+        ),
     )
     monkeypatch.setattr(mac, "_actions", lambda element: [])
 
-    mac._snapshot_tree(
+    first_snapshot = mac._snapshot_tree(
         first,
         max_depth=1,
         max_nodes=2,
         include_menu_bar=False,
         attributes=("AXRole",),
     )
-    mac._snapshot_tree(
+    second_snapshot = mac._snapshot_tree(
         second,
         max_depth=1,
         max_nodes=2,
@@ -642,6 +877,8 @@ def test_snapshot_tree_can_preserve_earlier_element_handles(monkeypatch) -> None
         reset_elements=False,
     )
 
+    assert [node["element_index"] for node in first_snapshot.nodes] == [0]
+    assert [node["element_index"] for node in second_snapshot.nodes] == [1]
     assert mac._element(0) is first
     assert mac._element(1) is second
 
@@ -693,7 +930,7 @@ def test_ax_query_all_scans_every_app_without_mutating_targets(monkeypatch) -> N
         if app_pid == 2:
             raise MacOSError("inaccessible")
         index = mac._remember_element(elements[app_pid])
-        return [{"element_index": index, "role": "AXButton"}]
+        return _found({"element_index": index, "role": "AXButton"})
 
     monkeypatch.setattr(mac, "ax_search", fake_search)
 
@@ -717,13 +954,38 @@ def test_ax_query_all_scans_every_app_without_mutating_targets(monkeypatch) -> N
         mac.ax.query_all("Not Now", apps=[])
 
 
+@pytest.mark.parametrize("method", ["wait", "wait_gone"])
+def test_cross_app_wait_cannot_certify_a_search_that_skipped_an_app(monkeypatch, method) -> None:
+    mac = MacOS()
+    apps = [{"name": "Readable", "pid": 1}, {"name": "Unreadable", "pid": 2}]
+    answer = _found({"element_index": 7, "role": "AXButton", "title": "Save"}) if method == "wait" else _found()
+    monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
+    monkeypatch.setattr(mac, "list_apps", lambda: apps)
+
+    def search(*, app_pid, **kwargs):
+        if app_pid == 2:
+            raise MacOSError("Unreadable app", code=ErrorCode.AX_ERROR)
+        return answer
+
+    monkeypatch.setattr(mac, "ax_search", search)
+    clock = iter(range(100))
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: next(clock) * 0.1)
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(MacOSError, match="timed out") as failure:
+        getattr(mac.ax, method)(all_apps=True, title="Save", timeout=0.3)
+
+    assert failure.value.code == ErrorCode.TIMEOUT
+    assert failure.value.details["complete"] is False
+
+
 def test_ax_role_aliases_and_app_selectors_fail_closed(monkeypatch) -> None:
     mac = MacOS()
     arguments = {}
 
     def fake_search_all(**kwargs):
         arguments.update(kwargs)
-        return []
+        return _found()
 
     monkeypatch.setattr(mac, "ax_search_all", fake_search_all)
 
@@ -758,7 +1020,7 @@ def test_ax_app_resolution_deduplicates_pids(monkeypatch) -> None:
 
 def test_ax_wait_retries_until_one_match(monkeypatch) -> None:
     mac = MacOS()
-    responses = iter([[], [{"element_index": 7, "role": "AXButton"}]])
+    responses = iter([_found(), _found({"element_index": 7, "role": "AXButton"})])
     monkeypatch.setattr(mac, "ax_search", lambda **kwargs: next(responses))
     monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
 
@@ -772,15 +1034,15 @@ def test_ax_wait_fails_closed_on_ambiguity_and_timeout(monkeypatch) -> None:
     monkeypatch.setattr(
         mac,
         "ax_search_all",
-        lambda **kwargs: [
+        lambda **kwargs: _found(
             {"element_index": 1},
             {"element_index": 2},
-        ],
+        ),
     )
     with pytest.raises(MacOSError, match="found 2 matches"):
         mac.ax.wait(all_apps=True, text="Not Now")
 
-    monkeypatch.setattr(mac, "ax_search", lambda **kwargs: [])
+    monkeypatch.setattr(mac, "ax_search", lambda **kwargs: _found())
     with pytest.raises(MacOSError, match="timed out"):
         mac.ax.wait(app="Chrome", text="Missing", timeout=0)
 
@@ -891,11 +1153,11 @@ def test_ax_wait_gone_requires_two_empty_polls(monkeypatch) -> None:
     mac = MacOS()
     responses = iter(
         [
-            [{"element_index": 1}],
-            [],
-            [{"element_index": 2}],
-            [],
-            [],
+            _found({"element_index": 1}),
+            _found(),
+            _found({"element_index": 2}),
+            _found(),
+            _found(),
         ]
     )
     monkeypatch.setattr(mac, "ax_search", lambda **kwargs: next(responses))
@@ -920,7 +1182,7 @@ def test_ax_wait_gone_handles_exit_and_timeout(monkeypatch) -> None:
     monkeypatch.setattr(
         mac,
         "ax_search",
-        lambda **kwargs: [{"element_index": 1}],
+        lambda **kwargs: _found({"element_index": 1}),
     )
     with pytest.raises(MacOSError, match="AX wait timed out") as exc_info:
         mac.ax.wait_gone("Not Now", app="Chrome", timeout=0)
@@ -936,7 +1198,7 @@ def test_ax_wait_gone_timeout_after_one_empty_poll_reports_truthful_count(
     absence, so the message and details must reflect that exactly one
     empty poll -- not zero -- was observed."""
     mac = MacOS()
-    monkeypatch.setattr(mac, "ax_search", lambda **kwargs: [])
+    monkeypatch.setattr(mac, "ax_search", lambda **kwargs: _found())
 
     with pytest.raises(MacOSError, match="two consecutive empty polls") as exc_info:
         mac.ax.wait_gone("Not Now", app="Chrome", timeout=0)
@@ -1772,17 +2034,17 @@ def test_ax_wait_ambiguous_and_timeout_carry_machine_readable_codes(monkeypatch)
     monkeypatch.setattr(
         mac,
         "ax_search_all",
-        lambda **kwargs: [
+        lambda **kwargs: _found(
             {"element_index": 1, "role": "AXButton"},
             {"element_index": 2, "role": "AXButton"},
-        ],
+        ),
     )
     with pytest.raises(MacOSError, match="found 2 matches") as ambiguous:
         mac.ax.wait(all_apps=True, text="Not Now")
     assert ambiguous.value.code == ErrorCode.BAD_REQUEST
     assert ambiguous.value.details["count"] == 2
 
-    monkeypatch.setattr(mac, "ax_search", lambda **kwargs: [])
+    monkeypatch.setattr(mac, "ax_search", lambda **kwargs: _found())
     with pytest.raises(MacOSError, match="timed out") as timed_out:
         mac.ax.wait(app="Chrome", text="Missing", timeout=0)
     assert timed_out.value.code == ErrorCode.TIMEOUT
@@ -2051,8 +2313,14 @@ def test_get_app_state_never_invalidates_a_still_valid_screenshot(monkeypatch) -
     monkeypatch.setattr(
         mac, "_resolve_app", lambda app: (object(), {"name": "Chrome", "pid": 42})
     )
-    monkeypatch.setattr(mac, "_application_element", lambda pid: object())
-    monkeypatch.setattr(mac, "_snapshot_tree", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mac, "_application_element", lambda pid, *, enhance=True: object())
+    monkeypatch.setattr(
+        mac,
+        "_snapshot_tree",
+        lambda *args, **kwargs: macos_module._TreeSnapshot(
+            [], node_cut=False, depth_cut=False, read_cut=False
+        ),
+    )
     monkeypatch.setattr(mac, "windows", lambda app: [])
     existing_screenshot = {"pid": 42, "path": "/tmp/x.png"}
     mac._last_screenshot = existing_screenshot

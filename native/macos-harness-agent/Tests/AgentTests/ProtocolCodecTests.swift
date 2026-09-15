@@ -94,6 +94,30 @@ final class ProtocolCodecTests: XCTestCase {
     XCTAssertEqual(decoded.id, 12)
   }
 
+  func testErrorDetailsSurviveEncodeDecodeAndAreOmittedWhenAbsent() throws {
+    // `details` is how a press failure says which bound stopped the search; the client merges
+    // it into its own error details, so the keys and value types must cross the wire intact.
+    let withDetails = WireError(
+      code: "element.unknown", message: "found 0",
+      details: ["complete": .bool(false), "visited": .number(500)])
+    let data = try JSONEncoder().encode(WireResponse(id: 13, ok: false, result: nil, error: withDetails))
+    let object = try JSONDecoder().decode([String: JSONValue].self, from: data)
+    let wireError = try XCTUnwrap(object["error"]?.objectValue)
+    let details = try XCTUnwrap(wireError["details"]?.objectValue)
+    XCTAssertEqual(details["complete"], .bool(false))
+    XCTAssertEqual(details["visited"], .number(500))
+
+    let decoded = try JSONDecoder().decode(WireResponse.self, from: data)
+    XCTAssertEqual(decoded.error?.details?["complete"], .bool(false))
+    XCTAssertEqual(decoded.error?.details?["visited"], .number(500))
+
+    let without = WireError(code: "bad_request", message: "no")
+    let bare = try JSONEncoder().encode(WireResponse(id: 14, ok: false, result: nil, error: without))
+    let bareObject = try JSONDecoder().decode([String: JSONValue].self, from: bare)
+    let bareError = try XCTUnwrap(bareObject["error"]?.objectValue)
+    XCTAssertNil(bareError["details"], "an absent details object must not encode as null")
+  }
+
   func testWireRequestRoundTripsThroughEncodeDecode() throws {
     let request = WireRequest(v: 1, id: 44, op: "list_apps", params: .object([:]))
     let data = try JSONEncoder().encode(request)

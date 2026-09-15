@@ -55,8 +55,8 @@ receipt = mac.do.type(
 ```
 
 - `press`, `set`, `toggle`, `run`, `key`, `click`, and `type` mutate;
-  `recall(once)` looks up a past receipt by its token without dispatching
-  anything. `set`/`toggle` are convergent -- they check first and report
+  `expect(condition)` observes a condition, and `recall(once)` looks up a past
+  receipt without dispatching anything. `set`/`toggle` check first and report
   `outcome="already"` instead of re-mutating a target already in the
   requested state, so neither takes a `once` token.
 - A call either returns a `Receipt`, or raises `OperationError` -- catch it
@@ -92,6 +92,18 @@ receipt = mac.do.type(
   `key`/`click`/`type` to confirm the text a field holds or where a
   selection landed. The receipt keeps length/SHA-256 summaries of the
   expected and observed values, never the values.
+- Use `mac.do.expect(condition)` for read-only checks with `present`, `gone`,
+  or `equals`. Give the condition an
+  explicit scope. Its timeout defaults to five seconds and its interval controls
+  polling. It leaves accessibility features unchanged and skips focus sampling.
+  A successful receipt has `acted="no"`, `verified=True`, and `changed=None`;
+  failure raises `OperationError` with the verification error.
+- Use `mac.timeline()` for the latest 256 non-replayed receipts in completion
+  order, including failures and tokenless calls. It returns JSON-safe data
+  without observing the desktop or saving a file. Raw primitives are outside
+  this history. Replays preserve the original `started_at`/`finished_at` UTC
+  timestamps; elapsed time and deadlines remain monotonic. Export with
+  `json.dumps` and `Path.write_text` when a file is needed.
 - Pass a nonempty `once` keyword on `press`/`run`/`key`/`click`/`type` before
   an action you cannot safely repeat, with the *same* request every time you reuse a
   token. Its ledger lives only in the memory of the one live `MacOS`
@@ -106,11 +118,15 @@ receipt = mac.do.type(
   after the mutation); `key`/`click`/`type` watch focus on a fixed 10ms
   cadence and `run` polls for nothing, so none of those takes one; a
   postcondition carries its own `interval`.
-- `timeout` is a cooperative budget. No mutation starts after it expires
-  -- `key`/`click`/`type` check it again after their focus reading and
-  before the `once` token is reserved -- polling and script process
-  groups are bounded by it, but a synchronous macOS AX/input call already
-  in progress cannot be preempted safely.
+- `timeout` is a cooperative budget. An expired budget stops the next
+  mutating call. Presses share it across agent startup, searches, retry
+  delays, and the frontmost-app reading. A press stopped with
+  `deadline_exhausted_before_dispatch` reports `acted="no"` and leaves its
+  `once` token available. Other timeouts can mean the action happened;
+  keep the token and inspect the receipt before deciding what to do.
+  A synchronous macOS AX/input call already in progress cannot be preempted
+  safely. Raw `mac.ax.press(timeout=0)` makes one attempt without retry;
+  `mac.do.press(timeout=0)` does not dispatch.
 - `run` receipts keep source, arguments, and output as length/SHA-256
   metadata by default. Pass `capture_output=True` only when you need bounded
   stdout/stderr text and accept that it can contain sensitive data.
@@ -119,6 +135,66 @@ Drop to the matching raw primitive only when no `mac.do` verb covers what
 you need: identity-only lookups, reads, or an action `mac.do` does not
 model. Raw primitives are unchanged and fully supported, just without a
 receipt or an idempotency guarantee.
+
+## Repeat saved navigation
+
+Use `mac.route.run(name, app=exact_bundle_id, timeout=30)` for a previously
+recorded navigation sequence. Inspect `status`, `at`, `error`, `check`, and
+`steps_run`. A diverged run retains the failing receipt, including whether it
+acted. Stop and inspect the current state before another run; every call has a
+fresh run id and may repeat input. There is no retry, resume, rollback, or
+implicit activation.
+
+Record through `with mac.route.record(name, app=exact_bundle_id, entry=entry,
+goal=goal) as rec:`. Call `rec.press`, `rec.set`, `rec.toggle`, or `rec.key` only.
+Unrelated Python and calls outside the handle are not recorded. Keep the handle
+on its with-block thread. A failed step prevents saving, even when caught; the
+previous file remains intact.
+
+Use a role plus one exact identifier, title, or description for every target
+and condition. Press/key steps require a postcondition. Set/toggle steps retain
+their convergence checks. Set and equals values must be boolean or numeric.
+Keep secrets out of selectors and keys, which are saved verbatim. Supply both
+an entry condition and a terminal goal. Definitions allow at most 64 steps.
+
+`dry_run=True` validates the whole definition without input or accessibility
+feature changes. It checks the current goal, or the entry and first target;
+later controls need not exist yet. A refused or incomplete check stops the run.
+Replay stays on one app process and shares one cooperative deadline.
+`mac.route.list(app=exact_bundle_id)` reads saved definitions without observing
+the app. Reported app versions come from the on-disk bundle; a difference alone
+does not reject a run.
+
+## Inspect failures before more input
+
+Keep the failed `OperationError.receipt`. Its `process` evidence belongs to the
+original completion; replay does not refresh it. Preserve `acted=unknown` when
+input is uncertain. Process exit evidence does not replace an existing action
+error, and a verified expected disappearance can still succeed.
+
+Use `mac.status(app_or_receipt)` for process and on-disk build metadata without a
+UI read. Use `mac.inspect(app_or_receipt)` when current controls, focus, windows,
+or blocking sheets are needed. Inspect `process`, `coverage`, and `blocked` before
+interpreting the result. Partial traversal cannot establish that no sheet exists.
+A failed receipt adds current same-role controls under `nearby`.
+
+Inspection excludes values and screenshots by default and does not enable
+accessibility features. Request `include_values=True` or `screenshot=True` only
+when the task permits that data. Secure fields and failed identity reads still
+exclude content attributes. Titles and labels can contain private text.
+`mac.diff_windows(before, after)` compares supplied snapshots without another
+observation. Snapshots do not freeze the app.
+
+Collect `mac.logs(receipt)` or `mac.crashes(receipt)` only when those records can
+answer the failure. An explicit time pair needs `app=pid`. Check collection
+status and truncation; delayed or absent records do not rule out a failure.
+`mac.sample(app_or_receipt, duration=1)` explicitly collects a bounded call graph,
+which does not prove a hang. Diagnostic text can contain private data.
+
+Pass collected results to `mac.explain(receipt, *evidence)`. It preserves the
+action receipt and makes no new observations or retries. A changed executable
+mtime is evidence of a potentially stale build, not the running build's version.
+The README's Diagnostics section documents collection limits and result fields.
 
 ## Use the small surface
 
@@ -152,6 +228,13 @@ the first positional argument. Use `role=` for common targets: `any`, `button`,
 `radio button`, `static text`, `table`, `text area`, and `text field`. An
 unknown role raises `MacOSError`. Do not pass both `role` and `search_key`.
 
+Use `title=`, `identifier=`, or `description=` for whole-attribute, case-sensitive
+matching. All supplied fields must match. `text` remains a substring filter.
+Query results are lists with `complete` and `visited` metadata. Exact waits and
+presses require a complete search before accepting a single match. If a limit,
+failed read, or skipped process leaves it incomplete, narrow the scope or inspect
+the reported bound. The ordinary tree fallback rejects unsupported search keys.
+
 Use `apps=` to limit a cross-process search. Pass one app name, bundle ID,
 path, or PID, or pass an iterable of selectors. Duplicate PIDs are removed.
 `apps="Safari"` is one selector, not an iterable of characters. An empty
@@ -162,12 +245,12 @@ one positive global `limit`, times out each process, and returns owner metadata.
 A broad search skips inaccessible processes. A scoped search reports target
 failures. Element handles remain valid until the next AX snapshot or search.
 
-Cross-process calls require non-empty search text. Default attributes exclude
-`AXValue`; reading a value requires a separate `ax.get` or explicit attributes.
+Cross-process calls require non-empty text or an exact selector. Default
+attributes exclude `AXValue`; read it with `ax.get` or explicit attributes.
 
 `wait` accepts exactly one scope: `app`, `all_apps=True`, or `apps`. Zero
 matches keep polling. Multiple matches fail closed and report owner, role, and
-title details. `wait_gone` requires two consecutive empty polls; a named app
+title details. `wait_gone` requires two consecutive complete, empty searches; a named app
 that exits counts as gone. `press` waits for one match, requires `AXPress`, and
 returns the match. It never requests activation. If the target makes itself
 frontmost, `press` raises `FocusChangedError`; it cannot undo that focus change.

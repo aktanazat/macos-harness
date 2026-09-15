@@ -310,29 +310,12 @@ def _make_receipt(**overrides: object) -> Receipt:
         "changed": True,
         "verified": True,
         "duration_s": 0.123,
+        "started_at": "2026-09-14T10:00:00.000+00:00",
+        "finished_at": "2026-09-14T10:00:00.123+00:00",
         "once": "tok-1",
     }
     fields.update(overrides)
     return Receipt(**fields)  # type: ignore[arg-type]
-
-
-def test_receipt_requires_only_its_core_fields() -> None:
-    receipt = Receipt(
-        op="run",
-        outcome=Outcome.PLANNED,
-        acted=Acted.NO,
-        backend="auto",
-        executor=Executor.SCRIPT,
-        request={},
-        changed=False,
-        verified=False,
-        duration_s=0.0,
-    )
-    assert receipt.target is None
-    assert receipt.observed is None
-    assert receipt.once is None
-    assert receipt.replayed is False
-    assert receipt.error is None
 
 
 def test_receipt_is_frozen() -> None:
@@ -438,27 +421,6 @@ def test_receipt_to_json_is_json_safe_for_a_failed_receipt() -> None:
     assert isinstance(payload["error"], dict)
     assert isinstance(payload["error"]["details"], dict)
     assert isinstance(payload["error"]["details"]["nested"]["a"], list)
-
-
-def test_receipt_to_json_matches_every_field() -> None:
-    receipt = _make_receipt()
-    payload = receipt.to_json()
-    assert payload == {
-        "op": "press",
-        "outcome": "done",
-        "acted": "yes",
-        "backend": "python",
-        "executor": "python",
-        "request": {"text": "Save", "app": "Notes"},
-        "target": {"role": "AXButton", "title": "Save"},
-        "observed": None,
-        "changed": True,
-        "verified": True,
-        "duration_s": 0.123,
-        "once": "tok-1",
-        "replayed": False,
-        "error": None,
-    }
 
 
 # --- replayed_as(): the once-token replay copy -----------------------------

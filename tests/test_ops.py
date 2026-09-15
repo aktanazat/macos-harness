@@ -18,13 +18,20 @@ from typing import ClassVar, NamedTuple
 
 import pytest
 
-from macos_harness.errors import ErrorCode, FocusChangedError, MacOSError
+from macos_harness.errors import (
+    ApplicationNotFoundError,
+    ErrorCode,
+    FocusChangedError,
+    MacOSError,
+)
+from macos_harness.macos import MacOS, _AppIdentity
 from macos_harness.ops import Operations
 from macos_harness.receipts import (
     Acted,
     Executor,
     OperationError,
     Outcome,
+    Receipt,
     canonical_json,
     canonicalize,
     equals,
@@ -60,7 +67,11 @@ class _Window(NamedTuple):
 class FakeHost:
     def __init__(self) -> None:
         self._backend = "python"
+        self._native_client: object | None = None
         self.ax = FakeAX()
+        self.identity = _AppIdentity(41, "com.example.demo", 1000.0, "Demo", None)
+        self.process_running = True
+        self.process_error: MacOSError | None = None
         self.app_info: dict[str, object] = {
             "pid": 41,
             "name": "Demo",
@@ -103,6 +114,7 @@ class FakeHost:
         # A `MacOSError` queued here is raised by that `_focus_sample` call.
         self.focus_samples: deque[dict[str, object] | MacOSError] = deque()
         self.focus_hook: Callable[[], None] | None = None
+        self.frontmost_hook: Callable[[], None] | None = None
         self.focus_sample: dict[str, object] = {
             "frontmost_pid": 41,
             "window": "Untitled",
@@ -122,6 +134,22 @@ class FakeHost:
         if query is None:
             raise MacOSError("missing app", code=ErrorCode.BAD_REQUEST)
         return object(), dict(self.app_info)
+
+    def _process_identity(self, query: str | int) -> _AppIdentity:
+        if self.process_error is not None:
+            raise self.process_error
+        if not self.process_running:
+            raise ApplicationNotFoundError("App exited")
+        return self.identity
+
+    def _identity_from_info(self, info: dict[str, object]) -> _AppIdentity:
+        return self._process_identity(info["pid"])
+
+    def exit(self) -> None:
+        self.process_running = False
+
+    _same_process = MacOS._same_process
+    _observe_process = MacOS._observe_process
 
     def _ensure_accessibility(self) -> None:
         self.ensure_accessibility_calls += 1
@@ -183,6 +211,8 @@ class FakeHost:
         return copy.deepcopy(self.focus_sample)
 
     def _frontmost_app(self) -> dict[str, object]:
+        if self.frontmost_hook is not None:
+            self.frontmost_hook()
         return dict(self.app_info)
 
     def _guard_focus(
@@ -208,9 +238,11 @@ class FakeHost:
         self.wait_calls.append(dict(kwargs))
         if self.wait_hook is not None:
             self.wait_hook()
-        if (kwargs.get("all_apps") or kwargs.get("apps") is not None) and kwargs.get("text") is None:
+        cross_app = kwargs.get("all_apps") or kwargs.get("apps") is not None
+        exact = any(kwargs.get(name) for name in ("title", "identifier", "description"))
+        if cross_app and kwargs.get("text") is None and not exact:
             raise MacOSError(
-                "Cross-app search requires text",
+                "Cross-app AX search requires non-empty text or an exact selector",
                 code=ErrorCode.BAD_REQUEST,
             )
         if self.wait_results:
@@ -422,6 +454,7 @@ def _ops(
     spawn: PopenFactory | None = None,
     monotonic: Callable[[], float] | None = None,
     sleep: Callable[[float], None] | None = None,
+    wall_clock: Callable[[], float] | None = None,
 ) -> tuple[FakeHost, Operations]:
     host = FakeHost()
     kwargs: dict[str, object] = {"_sleep": sleep if sleep is not None else lambda _seconds: None}
@@ -429,6 +462,8 @@ def _ops(
         kwargs["_spawn"] = spawn
     if monotonic is not None:
         kwargs["_monotonic"] = monotonic
+    if wall_clock is not None:
+        kwargs["_wall_clock"] = wall_clock
     return host, Operations(host, **kwargs)
 
 
@@ -658,24 +693,6 @@ def test_press_replay_does_not_resolve_again() -> None:
     assert len(host.press_calls) == 1
 
 
-def test_press_uses_one_deadline_and_verifies_present() -> None:
-    clock = iter((100.0, 101.0, 102.0, 103.0, 104.0))
-    host, operations = _ops(monotonic=lambda: next(clock))
-
-    receipt = operations.press(
-        app="Demo",
-        text="Save",
-        timeout=5.0,
-        postcondition=present("Saved", role="button"),
-    )
-
-    assert host.press_calls[0]["timeout"] == pytest.approx(3.0)
-    assert host.wait_calls[0]["timeout"] == pytest.approx(2.0)
-    assert host.wait_calls[0]["app"] == "Demo"
-    assert receipt.duration_s == pytest.approx(4.0)
-    assert receipt.verified is True
-
-
 def test_press_verifies_gone_with_inherited_scope() -> None:
     host, operations = _ops()
 
@@ -689,6 +706,71 @@ def test_press_verifies_gone_with_inherited_scope() -> None:
     assert receipt.verified is True
     assert host.gone_calls[0]["app"] == "Demo"
     assert host.gone_calls[0]["search_key"] == "AXButtonSearchKey"
+
+
+def test_press_exact_selectors_reach_the_dispatch_the_receipt_and_the_postcondition() -> None:
+    """An exact selector is part of what was asked, so it must reach the
+    press, be recorded in the receipt (a replay with a different exact
+    selector is a different request), and reach the wait that verifies
+    the postcondition."""
+    host, operations = _ops()
+
+    receipt = operations.press(
+        app="Demo",
+        text="Save",
+        title="Save",
+        identifier="_NS:9",
+        postcondition=present(identifier="_NS:10", description="Saved"),
+    )
+
+    assert receipt.outcome is Outcome.DONE
+    assert host.press_calls[0]["title"] == "Save"
+    assert host.press_calls[0]["identifier"] == "_NS:9"
+    assert host.press_calls[0]["description"] is None
+    assert receipt.request["title"] == "Save"
+    assert receipt.request["identifier"] == "_NS:9"
+    assert receipt.request["description"] is None
+    assert receipt.request["postcondition"]["text"] is None
+    assert receipt.request["postcondition"]["identifier"] == "_NS:10"
+    assert receipt.request["postcondition"]["description"] == "Saved"
+    assert host.wait_calls[0]["identifier"] == "_NS:10"
+    assert host.wait_calls[0]["description"] == "Saved"
+    assert host.wait_calls[0]["text"] is None
+
+
+def test_press_gone_postcondition_with_only_an_exact_selector_is_verified() -> None:
+    host, operations = _ops()
+
+    receipt = operations.press(
+        app="Demo",
+        text="Save",
+        postcondition=gone(title="Save", role="button"),
+    )
+
+    assert receipt.verified is True
+    assert host.gone_calls[0]["title"] == "Save"
+    assert host.gone_calls[0]["text"] is None
+
+
+@pytest.mark.parametrize("field", ["title", "identifier", "description"])
+def test_press_rejects_an_empty_exact_selector_before_dispatch(field: str) -> None:
+    host, operations = _ops()
+
+    with pytest.raises(MacOSError, match=f"{field} must be a non-empty str") as exc_info:
+        operations.press(app="Demo", text="Save", **{field: ""})
+
+    assert exc_info.value.code == ErrorCode.BAD_REQUEST
+    assert host.press_calls == []
+
+
+def test_press_exact_selector_alone_satisfies_a_cross_app_search() -> None:
+    host, operations = _ops()
+
+    receipt = operations.press(all_apps=True, identifier="_NS:9")
+
+    assert receipt.outcome is Outcome.DONE
+    assert host.wait_calls[0]["text"] is None
+    assert host.wait_calls[0]["identifier"] == "_NS:9"
 
 
 def test_press_focus_failure_is_finalized_and_never_redispatched() -> None:
@@ -795,7 +877,9 @@ def test_press_deadline_exhausted_before_dispatch_fails_without_acting_or_burnin
 
 
 def test_press_gone_postcondition_deadline_exhausted_fails_without_polling() -> None:
-    host, operations = _ops(monotonic=_delayed_clock(3))
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.press_hook = lambda: clock.sleep(5.0)
 
     error = _failed(
         lambda: operations.press(
@@ -993,15 +1077,36 @@ def test_press_atomic_classifies_pre_dispatch_codes_as_acted_no(code: ErrorCode)
     assert error.receipt.error["code"] == code.value
 
 
+def test_known_predispatch_press_timeout_keeps_the_once_token_available() -> None:
+    host, operations = _ops()
+    host.press_results.append(MacOSError(
+        "deadline exhausted before dispatch", code=ErrorCode.TIMEOUT,
+        details={"reason": "deadline_exhausted_before_dispatch"},
+    ))
+
+    error = _failed(lambda: operations.press(app="Demo", title="Save", once="late"))
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.changed is False
+
+    receipt = operations.press(app="Demo", title="Save", once="late")
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.replayed is False
+
+
 @pytest.mark.parametrize("code", [ErrorCode.AX_ERROR, ErrorCode.TIMEOUT])
 def test_press_atomic_classifies_other_codes_as_acted_unknown(code: ErrorCode) -> None:
     host, operations = _ops()
     host.press_results.append(MacOSError("ambiguous outcome", code=code))
 
-    error = _failed(lambda: operations.press(app="Demo", text="Save"))
+    error = _failed(lambda: operations.press(app="Demo", text="Save", once="uncertain"))
 
     assert error.receipt.acted is Acted.UNKNOWN
     assert error.receipt.changed is None
+    replay = _failed(lambda: operations.press(app="Demo", text="Save", once="uncertain"))
+    assert replay.receipt.replayed is True
+    assert replay.receipt.acted is Acted.UNKNOWN
+    assert len(host.press_calls) == 1
 
 
 def test_set_is_convergent_and_reads_back_changed_value() -> None:
@@ -1132,6 +1237,42 @@ def test_toggle_deadline_exhausted_before_dispatch_fails_without_acting() -> Non
     assert error.receipt.error["code"] == ErrorCode.TIMEOUT.value
     assert error.receipt.error["details"]["reason"] == "deadline_exhausted_before_dispatch"
     assert host.action_calls == 0
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda operations: operations.press(
+            all_apps=True, identifier="save", once="late-focus", timeout=0.05
+        ),
+        lambda operations: operations.toggle(
+            True, app="Demo", identifier="save", timeout=0.05
+        ),
+    ],
+    ids=["press", "toggle"],
+)
+def test_slow_frontmost_read_cannot_authorize_a_late_action(
+    invoke: Callable[[Operations], Receipt],
+) -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.frontmost_hook = lambda: clock.sleep(0.06)
+    host.toggle_on_press = True
+
+    error = _failed(lambda: invoke(operations))
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.changed is False
+    assert error.code == ErrorCode.TIMEOUT
+    assert error.receipt.error["details"]["reason"] == "deadline_exhausted_before_dispatch"
+    assert host.value is False
+    assert host.action_calls == 0
+
+    host.frontmost_hook = None
+    completed = invoke(operations)
+    assert completed.outcome is Outcome.DONE
+    assert completed.replayed is False
+    assert host.value is True
+    assert host.action_calls == 1
 
 
 def test_set_receipt_never_contains_the_raw_secret_value() -> None:
@@ -2234,3 +2375,129 @@ def test_key_dispatch_failure_is_ambiguous_not_confirmed() -> None:
 
     assert error.receipt.acted is Acted.UNKNOWN
     assert len(host.key_calls) == 1
+
+
+def test_receipt_times_cover_the_action_and_survive_replay() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(
+        monotonic=clock.monotonic, sleep=clock.sleep, wall_clock=clock.monotonic
+    )
+    host.press_hook = lambda: clock.sleep(0.25)
+
+    original = operations.press(app="Demo", identifier="save", once="stamp")
+    clock.sleep(60.0)
+    repeated = operations.press(app="Demo", identifier="save", once="stamp")
+    recalled = operations.recall("stamp")
+
+    assert original.started_at == "1970-01-01T00:01:40.000+00:00"
+    assert original.finished_at == "1970-01-01T00:01:40.250+00:00"
+    assert original.duration_s == 0.25
+    assert repeated.to_json() == {**original.to_json(), "replayed": True}
+    assert recalled.to_json() == repeated.to_json()
+    assert operations.history() == (original,)
+
+
+def test_expect_timestamps_include_observation_time() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(
+        monotonic=clock.monotonic, sleep=clock.sleep, wall_clock=clock.monotonic
+    )
+    host.wait_hook = lambda: clock.sleep(0.5)
+
+    receipt = operations.expect(present(app="Demo", identifier="save"))
+
+    assert receipt.started_at == "1970-01-01T00:01:40.000+00:00"
+    assert receipt.finished_at == "1970-01-01T00:01:40.500+00:00"
+    assert receipt.duration_s == 0.5
+
+
+def test_history_keeps_failures_in_completion_order_when_wall_time_moves_back() -> None:
+    wall = _SleepClock()
+    host, operations = _ops(wall_clock=wall.monotonic)
+    completed = operations.set(True, app="Demo", identifier="save")
+    wall.now = 50.0
+    host.set_error = MacOSError("read-only control", code=ErrorCode.AX_ERROR)
+
+    failed = _failed(lambda: operations.set(False, app="Demo", identifier="save"))
+
+    assert failed.code == ErrorCode.AX_ERROR
+    assert failed.receipt.finished_at < completed.finished_at
+    assert operations.history() == (completed, failed.receipt)
+
+
+def test_history_eviction_does_not_release_a_once_token() -> None:
+    host, operations = _ops()
+
+    def toggle() -> None:
+        host.value = not bool(host.value)
+
+    host.press_hook = toggle
+    original = operations.press(app="Demo", identifier="save", once="retained")
+    for _ in range(256):
+        operations.expect(present(app="Demo", identifier="save"))
+
+    recent = operations.history()
+    replay = operations.press(app="Demo", identifier="save", once="retained")
+
+    assert len(recent) == 256
+    assert all(receipt.op == "expect" for receipt in recent)
+    assert replay.to_json() == {**original.to_json(), "replayed": True}
+    assert host.value is True
+    assert operations.history() == recent
+
+
+def test_exit_evidence_preserves_a_failed_press_and_its_original_identity() -> None:
+    host, operations = _ops()
+    failure = MacOSError("App stopped answering", code=ErrorCode.AX_ERROR)
+    host.press_results.append(failure)
+    host.press_hook = host.exit
+
+    failed = _failed(lambda: operations.press(app="Demo", identifier="save", once="exit"))
+
+    assert failed.receipt.error == failure.to_json()
+    assert failed.receipt.acted is Acted.UNKNOWN
+    assert failed.receipt.target["app"]["pid"] == 41
+    assert failed.receipt.process == {"pid": 41, "launched_at": 1000.0, "state": "exited"}
+    host.process_running = True
+    host.identity = host.identity._replace(launched_at=2000.0)
+    recalled = _failed(lambda: operations.recall("exit"))
+    assert recalled.receipt.process == failed.receipt.process
+
+
+def test_unconfirmed_exit_is_a_failure_without_reclassifying_the_input() -> None:
+    host, operations = _ops()
+    host.key_hook = host.exit
+
+    failed = _failed(lambda: operations.key("return", app="Demo"))
+
+    assert failed.code == ErrorCode.APP_EXITED
+    assert failed.receipt.acted is Acted.YES
+    assert failed.receipt.verified is False
+    assert failed.receipt.process["state"] == "exited"
+
+
+def test_expected_disappearance_succeeds_even_when_the_app_exits() -> None:
+    host, operations = _ops()
+    host.key_hook = host.exit
+
+    receipt = operations.key("cmd+q", app="Demo", postcondition=gone(role="button", identifier="save"))
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.verified is True
+    assert receipt.process["state"] == "exited"
+
+
+def test_failed_lifetime_observation_does_not_fail_a_successful_action() -> None:
+    host, operations = _ops()
+
+    def lose_metadata() -> None:
+        host.process_error = MacOSError("No metadata", code=ErrorCode.UNSUPPORTED_OP)
+
+    host.key_hook = lose_metadata
+
+    receipt = operations.key("return", app="Demo")
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.acted is Acted.YES
+    assert receipt.process["state"] == "unknown"
+    assert receipt.process["error"]["code"] == ErrorCode.UNSUPPORTED_OP

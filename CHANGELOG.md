@@ -7,6 +7,44 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- App-bound receipts retain process lifetime evidence without replacing the
+  original action error or input classification. Otherwise-successful input
+  fails with `app.exited` after an observed exit when the effect was unverified.
+  A verified expected disappearance can succeed. Replayed receipts retain their
+  original process evidence.
+- `mac.status` reports process and on-disk build metadata, including command-line
+  PIDs. `mac.inspect` composes bounded snapshots, focus, blocking-dialog evidence,
+  and current same-role controls after a failed search. Values and screenshots
+  are opt-in; secure fields and failed identity reads exclude content attributes.
+  `mac.diff_windows` compares supplied observations without reading the desktop.
+- `mac.logs`, `mac.crashes`, and `mac.sample` collect bounded diagnostic evidence
+  on request. Collection failures and partial results remain explicit.
+  `mac.explain` correlates supplied evidence without changing the receipt,
+  collecting more data, or retrying input.
+- `mac.route` records explicit press/set/toggle/key calls and saves a validated
+  navigation definition with entry and terminal conditions. Replay stays on one
+  app process, shares one deadline, and stops at the first divergence while
+  retaining the failing receipt. Dry runs observe only current conditions and
+  targets. Failed recordings preserve the previous file; no route retries,
+  resume, rollback, or implicit activation are added.
+- Presses keep their original deadline through agent setup, searches, retry
+  delays, and focus readings on both backends. A known pre-dispatch timeout
+  reports `acted=no` and releases its once-token reservation. Other timeouts
+  retain the token because the action may have happened. Raw zero-timeout
+  presses still make one attempt.
+- Receipts include original ISO-8601 UTC start and completion timestamps.
+  `mac.timeline()` returns the latest 256 non-replayed receipts, including
+  failures and calls without once tokens, without collecting new observations.
+  History eviction leaves the at-most-once token ledger intact.
+- AX searches accept exact `title`, `identifier`, and `description` selectors
+  alongside substring `text`. Results expose `complete` and `visited`; strict
+  waits and presses refuse an unproved unique match, and disappearance requires
+  two complete empty searches. Failed reads and traversal limits leave a search
+  incomplete. Unsupported fallback predicates now raise instead of broadening
+  the search. The native wire protocol is version 2.
+- `mac.do.expect` checks an explicitly scoped `present`, `gone`, or `equals`
+  condition through the existing verifier and returns a read-only receipt. It
+  does not enable accessibility features, sample focus, or reserve a once token.
 - `mac.do.set` and `mac.do.toggle` wait for their readback. Both used to
   read the attribute once after the mutation and fail with `acted=yes`
   when that first reading still showed the old state, which is what an
