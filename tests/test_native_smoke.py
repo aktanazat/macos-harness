@@ -18,6 +18,8 @@ from macos_harness.macos import (
     MacOS,
     MacOSError,
 )
+from macos_harness.native import NativeQueryResult
+from macos_harness.receipts import JSONValue
 
 
 class _FakeNativeClient:
@@ -45,6 +47,9 @@ class _FakeNativeClient:
             {"role": "AXButton", "title": "Not Now"}
         ]
         self.press_result: dict[str, Any] = {"role": "AXButton", "title": "Not Now"}
+        # Whether the fake's answer stands for every match in scope; a test
+        # that models a search cut short by ``max_nodes`` flips this.
+        self.query_complete = True
         # Queue of exceptions `press()` raises (in order) before falling through
         # to `press_result`; empty by default, so every existing test that never
         # sets this keeps seeing a single unconditional success.
@@ -59,9 +64,10 @@ class _FakeNativeClient:
         self.calls.append(("list_apps", None))
         return [dict(app) for app in self.apps]
 
-    def query(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+    def query(self, params: dict[str, JSONValue]) -> NativeQueryResult:
         self.calls.append(("query", params))
-        return [{**match, "handle": self._mint()} for match in self.query_result]
+        matches = [{**match, "handle": self._mint()} for match in self.query_result]
+        return NativeQueryResult(matches, self.query_complete, len(matches))
 
     def press(self, params: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(("press", params))
@@ -378,7 +384,9 @@ def test_acquire_native_closes_a_session_orphaned_by_baseexception_during_storag
 def test_macos_close_is_idempotent_and_safe_when_never_launched() -> None:
     mac = MacOS(backend="python")
     mac.close()
-    mac.close()  # idempotent, no error
+    mac.close()
+    assert mac._native_client is None
+    assert mac._native_session_box[0] is None
 
 
 def test_macos_close_tears_down_the_launched_session(monkeypatch) -> None:
@@ -729,14 +737,19 @@ def test_auto_backend_falls_back_to_python_when_native_client_is_none(
     monkeypatch.setattr(
         mac,
         "_snapshot_tree",
-        lambda *args, **kwargs: [
-            {"element_index": 0, "depth": 0, "role": "AXApplication"}
-        ],
+        lambda *args, **kwargs: macos_module._TreeSnapshot(
+            [{"element_index": 0, "depth": 0, "role": "AXApplication"}],
+            node_cut=False,
+            depth_cut=False,
+            read_cut=False,
+        ),
     )
 
     matches = mac.ax_search(app="Finder", text="whatever")
 
     assert matches == []
+    assert matches.complete is True
+    assert matches.visited == 1
     assert client.calls == []
 
 
@@ -745,7 +758,7 @@ def test_auto_backend_never_falls_back_after_a_request_is_dispatched(
 ) -> None:
     client = _FakeNativeClient()
 
-    def _boom(params: dict[str, Any]) -> list[dict[str, Any]]:
+    def _boom(params: dict[str, JSONValue]) -> NativeQueryResult:
         raise MacOSError("agent-side failure")
 
     client.query = _boom  # type: ignore[method-assign]
@@ -1065,6 +1078,67 @@ def test_native_press_gives_up_with_a_timeout_code_once_the_deadline_passes(
     assert [call[0] for call in client.calls] == ["press"]  # timeout=0 still tries once
 
 
+def test_native_strict_press_timeout_reports_which_bound_stopped_the_search(
+    monkeypatch,
+) -> None:
+    """An exact press the agent could not prove unique -- one match from a
+    search its node budget cut short -- is ``element.unknown`` with the
+    agent's ``complete``/``visited`` beside it. The timeout keeps those so
+    the caller knows to raise ``max_nodes`` rather than wait longer."""
+    client = _FakeNativeClient()
+    client.press_errors = [
+        MacOSError(
+            "AX press found one match for pid 55 but the search stopped "
+            "before confirming it is unique",
+            code=ErrorCode.ELEMENT_UNKNOWN,
+            details={"complete": False, "visited": 300},
+        ),
+    ]
+    mac = MacOS(backend="native")
+    monkeypatch.setattr(mac, "_acquire_native", lambda: client)
+    monkeypatch.setattr(mac, "_pid", lambda app: 55)
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(MacOSError, match="timed out") as exc_info:
+        mac.ax_press(app="Chrome", title="Save", timeout=0, max_nodes=300)
+
+    assert exc_info.value.code == ErrorCode.TIMEOUT
+    assert exc_info.value.details == {
+        "timeout": 0,
+        "pid": 55,
+        "max_nodes": 300,
+        "complete": False,
+        "visited": 300,
+        "reason": "deadline_exhausted_before_dispatch",
+    }
+    (_, params), = client.calls
+    assert params["title"] == "Save"
+    assert params["identifier"] is None
+    assert params["description"] is None
+
+
+def test_native_query_carries_exact_selectors_and_completeness(monkeypatch) -> None:
+    """The agent does the exact matching, so the selectors must reach it
+    on the wire, and its verdict on completeness must reach the caller."""
+    client = _FakeNativeClient()
+    client.query_result = [{"role": "AXButton", "title": "Save", "identifier": "_NS:9"}]
+    client.query_complete = False
+    mac = MacOS(backend="native")
+    monkeypatch.setattr(mac, "_acquire_native", lambda: client)
+    monkeypatch.setattr(mac, "_pid", lambda app: 55)
+
+    matches = mac.ax.query(app="Pages", identifier="_NS:9", description="Save it")
+
+    (_, params), = client.calls
+    assert params["text"] is None
+    assert params["title"] is None
+    assert params["identifier"] == "_NS:9"
+    assert params["description"] == "Save it"
+    assert [match["identifier"] for match in matches] == ["_NS:9"]
+    assert matches.complete is False
+    assert matches.visited == 1
+
+
 def test_native_press_never_retries_after_a_possibly_applied_failure(monkeypatch) -> None:
     """Any native press failure other than a pre-dispatch
     ``element.unknown`` -- here ``focus.changed``, reported only after
@@ -1170,3 +1244,88 @@ def test_ax_press_validates_timeout_and_interval_before_backend_dispatch(
         mac.ax_press(app="Chrome", text="Not Now", interval=0)
     assert exc_info.value.code == ErrorCode.BAD_REQUEST
     assert exc_info.value.details["parameter"] == "interval"
+
+
+def test_native_press_does_not_restart_its_budget_after_acquiring_the_agent(monkeypatch) -> None:
+    client = _FakeNativeClient()
+    now = 10.0
+
+    def acquire():
+        nonlocal now
+        now += 0.06
+        return client
+
+    mac = MacOS(backend="native")
+    monkeypatch.setattr(mac, "_pid", lambda app: 55)
+    monkeypatch.setattr(mac, "_acquire_native", acquire)
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: now)
+
+    with pytest.raises(MacOSError, match="deadline") as error:
+        mac.ax_press(app=55, title="Save", timeout=0.05)
+
+    assert error.value.code == ErrorCode.TIMEOUT
+    assert error.value.details["reason"] == "deadline_exhausted_before_dispatch"
+    assert client.calls == []
+
+
+def test_native_press_does_not_retry_after_sleep_exhausts_the_budget(monkeypatch) -> None:
+    client = _FakeNativeClient()
+    client.press_errors = [
+        MacOSError("no unique match", code=ErrorCode.ELEMENT_UNKNOWN,
+                   details={"complete": False, "visited": 20}),
+    ]
+    now = 10.0
+
+    def sleep(seconds):
+        nonlocal now
+        now += seconds + 0.01
+
+    mac = MacOS(backend="native")
+    monkeypatch.setattr(mac, "_pid", lambda app: 55)
+    monkeypatch.setattr(mac, "_acquire_native", lambda: client)
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(macos_module.time, "sleep", sleep)
+
+    with pytest.raises(MacOSError, match="deadline") as error:
+        mac.ax_press(app=55, title="Save", timeout=0.05, interval=0.1)
+
+    assert error.value.code == ErrorCode.TIMEOUT
+    assert error.value.details["reason"] == "deadline_exhausted_before_dispatch"
+    assert error.value.details["complete"] is False
+    assert error.value.details["visited"] == 20
+    assert [op for op, params in client.calls] == ["press"]
+
+
+@pytest.mark.parametrize("slow_read", ["search", "frontmost"])
+def test_local_press_cannot_act_after_observation_spends_the_budget(monkeypatch, slow_read) -> None:
+    now = 10.0
+    pressed = False
+
+    def wait(**kwargs):
+        nonlocal now
+        if slow_read == "search":
+            now += 0.06
+        return {"element_index": 7, "app": {"pid": 55}}
+
+    def frontmost():
+        nonlocal now
+        if slow_read == "frontmost":
+            now += 0.06
+        return {"pid": 99}
+
+    def perform(element_index, action):
+        nonlocal pressed
+        pressed = True
+
+    mac = MacOS(backend="python")
+    monkeypatch.setattr(mac, "ax_wait", wait)
+    monkeypatch.setattr(mac, "_frontmost_app", frontmost)
+    monkeypatch.setattr(mac, "perform_action", perform)
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: now)
+
+    with pytest.raises(MacOSError, match="deadline") as error:
+        mac.ax_press(app=55, title="Save", timeout=0.05)
+
+    assert error.value.code == ErrorCode.TIMEOUT
+    assert error.value.details["reason"] == "deadline_exhausted_before_dispatch"
+    assert pressed is False

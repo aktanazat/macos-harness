@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 
 /// Resolves and presses exactly one AX target on behalf of the `ax_press` wire operation.
@@ -16,32 +17,52 @@ import Foundation
 enum PressCoordinator {
 
   struct Dependencies {
-    /// Finds the candidate elements to press. Expected to already be scoped to the target
-    /// process and bounded to an effective limit of two.
-    let search: () throws -> [ElementDescriptor]
+    /// Finds the candidate elements to press, with whether the search saw every candidate.
+    /// Expected to already be scoped to the target process and bounded to an effective limit
+    /// of two.
+    let search: () throws -> AXExecutor.QueryResult
     /// Samples the current frontmost application's pid, or `nil` if none.
     let frontmostPID: () -> pid_t?
     /// Performs the actual `AXPress` action on the resolved element.
     let performPress: (ElementDescriptor) throws -> Void
   }
 
-  /// Throws `element.unknown` when the search finds no match at all, `bad_request` when it
-  /// finds more than one (ambiguous — the caller's `search_key`/`text` must narrow further),
-  /// or `unsupported_op` when the single match it does settle on does not expose `AXPress` --
-  /// in all three cases before `performPress` is ever invoked, so a caller retrying only
-  /// `element.unknown` (see `MacOS._native_press` in `macos.py`) never wastes its deadline
-  /// retrying an ambiguous or non-pressable target that another search will never resolve
-  /// any differently. Once the press is attempted, any error `performPress` throws propagates
-  /// unchanged: a failed press is never reported as a success. A successful press that made a
-  /// background target frontmost throws a `focus.changed` `AgentError` despite the press
-  /// itself already having happened.
-  static func run(targetPID: pid_t, _ deps: Dependencies) throws -> ElementDescriptor {
-    let matches = try deps.search()
+  /// Throws `element.unknown` when the search finds no match at all -- or, when `strict`,
+  /// finds one match from a search that stopped before it could rule out a second --
+  /// `bad_request` when it finds more than one (ambiguous — the caller's `search_key`/`text`
+  /// must narrow further), or `unsupported_op` when the single match it does settle on does
+  /// not expose `AXPress` -- in all three cases before `performPress` is ever invoked, so a
+  /// caller retrying only `element.unknown` (see `MacOS._native_press` in `macos.py`) never
+  /// wastes its deadline retrying an ambiguous or non-pressable target that another search
+  /// will never resolve any differently. `strict` is how an exact selector presses: its
+  /// uniqueness is only proven by a complete search, so `element.unknown` there carries
+  /// `complete`/`visited` in `details` to say which bound stopped it. Once the press is
+  /// attempted, any error `performPress` throws propagates unchanged: a failed press is never
+  /// reported as a success. A successful press that made a background target frontmost
+  /// throws a `focus.changed` `AgentError` despite the press itself already having happened.
+  static func run(
+    targetPID: pid_t, strict: Bool, deadline: Double?, _ deps: Dependencies,
+    monotonic: () -> Double = { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 }
+  ) throws -> ElementDescriptor {
+    func checkDeadline() throws {
+      if let deadline, monotonic() >= deadline {
+        throw AgentError(
+          code: "timeout", message: "AX press deadline exhausted before dispatch",
+          details: ["reason": .string("deadline_exhausted_before_dispatch")])
+      }
+    }
+    try checkDeadline()
+    let result = try deps.search()
+    let matches = result.matches
+    let details: [String: JSONValue] = [
+      "complete": .bool(result.complete), "visited": .number(Double(result.visited)),
+    ]
     guard !matches.isEmpty else {
       throw AgentError(
         code: "element.unknown",
         message:
-          "AX press expected exactly one match for pid \(targetPID), found 0"
+          "AX press expected exactly one match for pid \(targetPID), found 0",
+        details: details
       )
     }
     guard matches.count == 1 else {
@@ -50,6 +71,15 @@ enum PressCoordinator {
         message:
           "AX press expected exactly one match for pid \(targetPID), found "
           + "\(matches.count) (ambiguous); narrow search_key/text to a unique target"
+      )
+    }
+    if strict, !result.complete {
+      throw AgentError(
+        code: "element.unknown",
+        message:
+          "AX press found one match for pid \(targetPID) but the search stopped "
+          + "before confirming it is unique; raise max_nodes or narrow the search",
+        details: details
       )
     }
     let match = matches[0]
@@ -62,6 +92,7 @@ enum PressCoordinator {
     }
 
     let wasFrontmost = deps.frontmostPID() == targetPID
+    try checkDeadline()
     try deps.performPress(match)
     let isFrontmost = deps.frontmostPID() == targetPID
 

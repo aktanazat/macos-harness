@@ -68,7 +68,8 @@ PY
 ```
 
 - `press`, `set`, `toggle`, `run`, `key`, `click`, and `type` mutate;
-  `recall(once)` looks up a past receipt by its token, without dispatching
+  `expect(condition)` observes a condition, and `recall(once)` looks up a
+  past receipt by its token, without dispatching
   anything. `set`/`toggle` are convergent: they read the current state
   first and report `outcome="already"` instead of touching anything
   already correct.
@@ -128,14 +129,17 @@ PY
   receipt carries the expected and observed values as length/SHA-256
   summaries, never the values themselves.
 - `timeout` is one cooperative budget across resolution, dispatch, and
-  verification. The harness does not start a mutation after the budget
-  expires — `key`/`click`/`type` check it again after their focus reading,
-  before the `once` token is reserved, so a slow app's AX tree costs the
-  call its dispatch, not its token — and it terminates a timed-out script
-  process group. A synchronous macOS Accessibility or input call that is
-  already in progress cannot be preempted safely and can return after the
-  budget.
-- `press`, `run`, and `key` accept a nonempty `once` keyword for
+  verification. Presses keep that budget through agent startup, searches,
+  retry delays, and the frontmost-app reading. An expired budget stops the
+  next mutating call. A synchronous macOS Accessibility or input call
+  already in progress cannot be preempted safely and can return later.
+  Timed-out script process groups are terminated.
+  A press stopped with `deadline_exhausted_before_dispatch` reports
+  `acted="no"` and leaves its `once` token available for another attempt.
+  Other timeouts can mean the action happened and retain their token.
+  Raw `mac.ax.press(timeout=0)` makes one attempt without retry;
+  `mac.do.press(timeout=0)` does not dispatch.
+- `press`, `run`, `key`, `click`, and `type` accept a nonempty `once` keyword for
   at-most-once dispatch. The ledger lives only in the memory of the one
   live `MacOS` instance that dispatched the call — a crash, a fresh
   `MacOS()`, or a new process all start with an empty ledger — and it
@@ -151,6 +155,39 @@ PY
   metadata instead of raw values. Pass `capture_output=True` only when you
   need bounded stdout/stderr text and accept that it can contain sensitive
   data.
+
+Use `mac.do.expect(condition)` to wait without a mutation. Pass an explicit
+`app`, `apps`, or `all_apps=True` on `present`, `gone`, or `equals`. The
+condition's `timeout` defaults to five seconds; its `interval` controls polling.
+This uses the same verifier as postconditions, without enabling accessibility
+features, sampling focus, or reserving a `once` token. Success reports
+`outcome="done"`, `acted="no"`, `verified=True`, and `changed=None`.
+A failed check raises `OperationError` with the original verification error.
+
+```python
+from macos_harness import equals
+
+mac.do.expect(equals(app="Demo", identifier="sync-status", value="Saved"))
+```
+
+`mac.timeline()` returns the latest 256 non-replayed receipts in completion
+order, including tokenless calls and failures. It does not observe the desktop
+or write files. `mac.do.history()` returns the same history as immutable
+`Receipt` objects. Raw primitives are not recorded.
+
+Receipts carry `started_at` and `finished_at` as ISO-8601 UTC timestamps with
+millisecond precision. `duration_s` uses a monotonic clock. Replays keep the
+original times and add no history entry. Evicting an old history entry does
+not release its once token. Export the JSON view explicitly when needed:
+
+```python
+import json
+from pathlib import Path
+
+Path("action-history.json").write_text(
+    json.dumps(mac.timeline(), indent=2), encoding="utf-8"
+)
+```
 
 When no `mac.do` verb fits, drop to the six raw primitives below — an escape
 hatch, not a deprecated path: unchanged, fully supported, just without a
@@ -195,6 +232,16 @@ targets: `any`, `button`, `checkbox`, `combo box`, `image`, `link`, `list`,
 `text field`. An unknown role raises `MacOSError`. Do not pass both `role` and
 `search_key`.
 
+`title=`, `identifier=`, and `description=` compare the whole attribute,
+including case. Every supplied exact selector must match; `text` remains a
+substring filter. Exact filtering happens before the result limit. The ordinary
+tree fallback rejects unsupported search keys instead of treating them as `any`.
+
+Query results remain lists and expose `complete` and `visited`. A result or
+traversal limit, failed attribute read, or skipped process can leave the search
+incomplete. `visited` counts returned candidates for optimized searches and
+visited nodes for tree walks. A complete result does not freeze the app's state.
+
 Use `apps=` to limit a cross-process search. Pass one app selector or an
 iterable of selectors. Each selector can be an app name, bundle ID, path, or
 PID. Duplicate PIDs are removed.
@@ -210,16 +257,17 @@ owner metadata (`name`, `bundle_id`, `pid`, `path`) to every match. A broad
 search skips inaccessible processes. A scoped `apps` search reports a target
 failure. Element handles remain valid until the next AX snapshot or search.
 
-Cross-process calls require non-empty search text. Default result attributes
-exclude `AXValue`. Reading a value remains a separate, explicit `ax.get` call
-or custom `attributes` choice.
+Cross-process calls require non-empty search text or an exact selector. Default
+result attributes exclude `AXValue`. Reading a value remains a separate, explicit
+`ax.get` call or custom `attributes` choice.
 
 `wait` polls one `app`, every app with `all_apps=True`, or the target set in
 `apps`. Pass exactly one scope. Zero matches keep polling until `timeout`.
-Multiple matches fail closed with owner, role, and title details.
+Multiple matches fail closed with owner, role, and title details. With an exact
+selector, a single match is accepted only from a complete search.
 
-`wait_gone` requires two consecutive empty polls. A named app that exits counts
-as gone. `press` waits for one match, requires `AXPress`, performs it, and
+`wait_gone` requires two consecutive complete, empty searches. A named app that
+exits counts as gone. `press` waits for one match, requires `AXPress`, performs it, and
 returns the match. The harness never activates an app on its own;
 `mac.activate(app)` is the one explicit request and reports whether macOS
 honored it. If the target makes itself frontmost, `press` detects that change
@@ -617,7 +665,12 @@ Python backend gives them: `ax.get` is one checked read, so a read the app
 refuses raises (`timeout` when it did not answer, `ax.error` otherwise) and
 `set`/`toggle`/`equals` never judge a state from a value that was never
 read; `ax.get_attributes` is a bulk sample where an unreadable attribute is
-`None`.
+`None`. Query results include completeness metadata. The client and agent use
+protocol version 2; an older configured agent is rejected at the handshake
+and must be rebuilt or replaced. Each `ax_press` request includes
+`action_deadline`, a macOS monotonic timestamp in seconds, or JSON `null`
+for the raw zero-timeout single attempt. The agent checks the deadline before
+searching and again after reading the frontmost app.
 
 ## How it works
 

@@ -142,6 +142,7 @@ final class AgentHandlers {
     let appPid = try Self.requiredPID(params, "app_pid")
     let searchKey = Self.string(params, "search_key") ?? "AXAnyTypeSearchKey"
     let text = try Self.boundedText(params)
+    let exact = try Self.boundedExactSelector(params)
     let visibleOnly = Self.bool(params, "visible_only", default: false)
     let direction = Self.string(params, "direction") ?? "next"
     let immediateDescendantsOnly = Self.bool(params, "immediate_descendants_only", default: false)
@@ -159,10 +160,11 @@ final class AgentHandlers {
       registry.reset()
     }
 
-    let matches = try executor.query(
+    let result = try executor.query(
       pid: appPid,
       searchKey: searchKey,
       text: text,
+      exact: exact,
       visibleOnly: visibleOnly,
       limit: limit,
       direction: direction,
@@ -173,24 +175,39 @@ final class AgentHandlers {
       messagingTimeout: messagingTimeout,
       enhance: enhance,
       registry: registry)
-    return .object(["matches": .array(matches.map { $0.wireValue })])
+    return .object([
+      "matches": .array(result.matches.map { $0.wireValue }),
+      "complete": .bool(result.complete),
+      "visited": .number(Double(result.visited)),
+    ])
   }
 
   /// Builds the `PressCoordinator` seam around `AXExecutor` and delegates to it. Ignores
   /// whatever `limit`/`include_actions`/`reset_elements` the wire params might claim: a
   /// single-shot press always resets the registry first and always searches with an effective
   /// limit of two, matching `MacOS._native_press` in `macos.py` — the agent enforces this
-  /// itself rather than trusting a client to have sent the right values.
+  /// itself rather than trusting a client to have sent the right values. An exact selector
+  /// makes the press strict: one match counts only from a complete search.
   private func handlePress(params: JSONValue) throws -> JSONValue {
     let targetPID = try Self.requiredPID(params, "app_pid")
     let searchKey = Self.string(params, "search_key") ?? "AXAnyTypeSearchKey"
     let text = try Self.boundedText(params)
+    let exact = try Self.boundedExactSelector(params)
     let visibleOnly = Self.bool(params, "visible_only", default: true)
     let direction = Self.string(params, "direction") ?? "next"
     let immediateDescendantsOnly = Self.bool(params, "immediate_descendants_only", default: false)
     let attributes = try Self.boundedAttributes(params, default: Self.defaultSafeAttributes)
     let maxNodes = try Self.boundedMaxNodes(params, default: 500)
     let messagingTimeout = try Self.boundedMessagingTimeout(params)
+    let deadline: Double?
+    switch params["action_deadline"] {
+    case .null?: deadline = nil
+    case .number(let value)? where value.isFinite && value >= 0: deadline = value
+    default:
+      throw AgentError(
+        code: "bad_request",
+        message: "\"action_deadline\" must be null or a finite non-negative monotonic timestamp")
+    }
     let enhance = Self.bool(params, "enhance", default: true)
 
     registry.reset()
@@ -204,6 +221,7 @@ final class AgentHandlers {
           pid: targetPID,
           searchKey: searchKey,
           text: text,
+          exact: exact,
           visibleOnly: visibleOnly,
           limit: 2,
           direction: direction,
@@ -220,7 +238,8 @@ final class AgentHandlers {
         try executor.perform(handle: match.handle, action: "AXPress", registry: registry)
       })
 
-    let match = try PressCoordinator.run(targetPID: targetPID, deps)
+    let match = try PressCoordinator.run(
+      targetPID: targetPID, strict: exact.isActive, deadline: deadline, deps)
     return .object(["match": match.wireValue])
   }
 
@@ -408,6 +427,28 @@ final class AgentHandlers {
         code: "bad_request", message: "\"text\" must not exceed \(textByteCeiling) UTF-8 bytes")
     }
     return text
+  }
+
+  /// `title`/`identifier`/`description`: each absent (or `null`) means that exact selector
+  /// is unset; present must be a non-empty string no longer than `textByteCeiling` UTF-8
+  /// bytes, matching `validate_exact_selectors` in `receipts.py` -- an empty string could
+  /// never equal an attribute a search keeps, so it is a bad request rather than a silent
+  /// never-match.
+  private static func boundedExactSelector(_ params: JSONValue) throws -> AXExecutor.ExactSelector {
+    func field(_ key: String) throws -> String? {
+      guard isPresent(params, key) else { return nil }
+      guard let value = params[key]?.stringValue, !value.isEmpty else {
+        throw AgentError(code: "bad_request", message: "\"\(key)\" must be a non-empty string")
+      }
+      guard value.utf8.count <= textByteCeiling else {
+        throw AgentError(
+          code: "bad_request", message: "\"\(key)\" must not exceed \(textByteCeiling) UTF-8 bytes")
+      }
+      return value
+    }
+    return AXExecutor.ExactSelector(
+      title: try field("title"), identifier: try field("identifier"),
+      description: try field("description"))
   }
 
   /// `messaging_timeout`: absent (or `null`) leaves the per-element messaging timeout at its

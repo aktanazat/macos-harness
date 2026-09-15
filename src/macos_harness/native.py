@@ -9,9 +9,9 @@ supervising the agent process (see ``agent.py`` for that) and it never
 imports ``agent.py``, so ``agent.py`` can import *this* module for its own
 readiness probes without creating an import cycle.
 
-Wire envelope (protocol v1)::
+Wire envelope (protocol v2)::
 
-    request:  {"v": 1, "id": <int>, "op": <str>, "params": {...}}
+    request:  {"v": 2, "id": <int>, "op": <str>, "params": {...}}
     success:  {"id": <int>, "ok": true, "result": {...}}
     error:    {"id": <int>, "ok": false,
                "error": {"code": <str>, "message": <str>, "ax_error": <int?>}}
@@ -33,7 +33,7 @@ import socket
 import threading
 import weakref
 from collections.abc import Callable, Iterable
-from typing import Any, Self
+from typing import Any, NamedTuple, Self
 
 from .errors import (
     AccessibilityPermissionError,
@@ -42,10 +42,12 @@ from .errors import (
     FocusChangedError,
     MacOSError,
 )
+from .receipts import JSONValue
 
 #: Major protocol version this client speaks. The agent's ``ping`` result
-#: must echo the same value or the handshake fails closed.
-PROTOCOL_VERSION = 1
+#: must echo the same value or the handshake fails closed. Version 2 added
+#: exact selectors and search completeness to ``ax_query``/``ax_press``.
+PROTOCOL_VERSION = 2
 
 #: Hard cap on a single NDJSON line -- content plus its terminating
 #: newline -- matching the agent's own line cap. Enforced while *reading*
@@ -138,7 +140,8 @@ def _error_from_payload(response: dict[str, Any]) -> MacOSError:
     code = str(error.get("code") or "ax.error")
     message = str(error.get("message") or code)
     ax_error = error.get("ax_error")
-    details: dict[str, object] = {}
+    wire_details = error.get("details")
+    details: dict[str, object] = dict(wire_details) if isinstance(wire_details, dict) else {}
     if isinstance(ax_error, int):
         message = f"{message} (AXError {ax_error})"
         details["ax_error"] = ax_error
@@ -148,6 +151,16 @@ def _error_from_payload(response: dict[str, Any]) -> MacOSError:
     # any future code this client does not know about yet -- rather than
     # coercing to a closed enum and losing forward compatibility.
     return exc_type(message, code=code, details=details)
+
+
+class NativeQueryResult(NamedTuple):
+    """One ``ax_query`` answer: the match descriptors (``handle`` intact),
+    whether they are every match in scope, and how many candidates the
+    agent examined to find them."""
+
+    matches: list[dict[str, JSONValue]]
+    complete: bool
+    visited: int
 
 
 class _NativeHandle:
@@ -654,12 +667,19 @@ class NativeClient:
             key=lambda item: (str(item.get("name", "")).casefold(), item.get("pid", 0)),
         )
 
-    def query(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        """Run ``ax_query`` and return its match descriptors, ``handle`` intact."""
+    def query(self, params: dict[str, JSONValue]) -> NativeQueryResult:
+        """Run ``ax_query`` and return its matches with their completeness."""
         resets = bool(params.get("reset_elements", True))
         result = self._request("ax_query", params)
         matches = result.get("matches")
-        if not isinstance(matches, list):
+        complete = result.get("complete")
+        visited = result.get("visited")
+        if (
+            not isinstance(matches, list)
+            or not isinstance(complete, bool)
+            or isinstance(visited, bool)
+            or not isinstance(visited, int)
+        ):
             raise NativeProtocolError(
                 f"Malformed ax_query result: {result!r}",
                 code=ErrorCode.AX_ERROR,
@@ -667,7 +687,7 @@ class NativeClient:
             )
         if resets:
             self._generation += 1
-        return matches
+        return NativeQueryResult(matches, complete, visited)
 
     def press(self, params: dict[str, Any]) -> dict[str, Any]:
         """Run ``ax_press`` and return the single match it acted on."""

@@ -59,10 +59,69 @@ final class AXExecutor {
 
   // MARK: - AX query
 
+  /// One search's matches plus whether they are all of them, matching `SearchMatches` in
+  /// `macos.py`: `complete` is true when no limit or failed read left part of the scope
+  /// unexamined. `visited` counts returned candidates for optimized searches and visited
+  /// nodes for tree walks.
+  struct QueryResult: Equatable {
+    let matches: [ElementDescriptor]
+    let complete: Bool
+    let visited: Int
+  }
+
+  struct AttributeValues {
+    var values: [String: AnyObject] = [:]
+    var complete = true
+
+    mutating func record(_ name: String, status: AXError, value: AnyObject?) {
+      switch status {
+      case .success:
+        if let value { values[name] = value }
+      case .noValue, .attributeUnsupported:
+        break
+      default:
+        complete = false
+      }
+    }
+  }
+
+  /// The exact-equality half of a search, matching `_ExactSelector` in `macos.py`: each set
+  /// field must equal the element's wire field of the same name character for character.
+  /// Substring `text` narrows the candidates; this decides them.
+  struct ExactSelector: Equatable {
+    let title: String?
+    let identifier: String?
+    let description: String?
+
+    static let none = ExactSelector(title: nil, identifier: nil, description: nil)
+
+    var isActive: Bool { title != nil || identifier != nil || description != nil }
+
+    /// The AX attributes a candidate must be read for before `matches` can judge it.
+    var attributeNames: [String] {
+      var names: [String] = []
+      if title != nil { names.append("AXTitle") }
+      if identifier != nil { names.append("AXIdentifier") }
+      if description != nil { names.append("AXDescription") }
+      return names
+    }
+
+    /// Whether `fields` -- wire-keyed, as `mappedFields` builds them -- carries every set
+    /// selector's value exactly.
+    func matches(_ fields: [String: JSONValue]) -> Bool {
+      for (name, expected) in [("title", title), ("identifier", identifier), ("description", description)] {
+        guard let expected else { continue }
+        guard case .string(let actual)? = fields[name], actual == expected else { return false }
+      }
+      return true
+    }
+  }
+
   func query(
     pid: pid_t,
     searchKey: String,
     text: String?,
+    exact: ExactSelector,
     visibleOnly: Bool,
     limit: Int,
     direction: String,
@@ -73,11 +132,11 @@ final class AXExecutor {
     messagingTimeout: Double?,
     enhance: Bool,
     registry: ElementRegistry
-  ) throws -> [ElementDescriptor] {
+  ) throws -> QueryResult {
     try Self.queue.sync {
       try performQuery(
-        pid: pid, searchKey: searchKey, text: text, visibleOnly: visibleOnly, limit: limit,
-        direction: direction, immediateDescendantsOnly: immediateDescendantsOnly,
+        pid: pid, searchKey: searchKey, text: text, exact: exact, visibleOnly: visibleOnly,
+        limit: limit, direction: direction, immediateDescendantsOnly: immediateDescendantsOnly,
         attributes: attributes, includeActions: includeActions, maxNodes: maxNodes,
         messagingTimeout: messagingTimeout, enhance: enhance, registry: registry)
     }
@@ -208,12 +267,15 @@ final class AXExecutor {
   /// `AXUIElementsForSearchPredicate` parameterized attribute; only on
   /// `kAXErrorParameterizedAttributeUnsupported` does it fall back to a bounded ordinary
   /// traversal. Direction is validated before the root is created (Python validates it after)
-  /// so a bad request never touches the target application's AX state.
+  /// so a bad request never touches the target application's AX state. With an exact selector
+  /// the app's search only narrows: every candidate the `maxNodes` bound allows is requested,
+  /// judged here, and `limit` applied after judging.
   private func performQuery(
-    pid: pid_t, searchKey: String, text: String?, visibleOnly: Bool, limit: Int, direction: String,
-    immediateDescendantsOnly: Bool, attributes: [String], includeActions: Bool, maxNodes: Int,
-    messagingTimeout: Double?, enhance: Bool, registry: ElementRegistry
-  ) throws -> [ElementDescriptor] {
+    pid: pid_t, searchKey: String, text: String?, exact: ExactSelector, visibleOnly: Bool,
+    limit: Int, direction: String, immediateDescendantsOnly: Bool, attributes: [String],
+    includeActions: Bool, maxNodes: Int, messagingTimeout: Double?, enhance: Bool,
+    registry: ElementRegistry
+  ) throws -> QueryResult {
     try Self.requireTrust()
 
     let axDirection: String
@@ -224,14 +286,19 @@ final class AXExecutor {
       throw AgentError(
         code: "bad_request", message: "AX search direction must be 'next' or 'previous'")
     }
+    if exact.isActive, maxNodes <= 0 {
+      throw AgentError(
+        code: "bad_request", message: "AX search max_nodes must be positive with an exact selector")
+    }
 
     let root = try Self.applicationElement(
       pid: pid, messagingTimeout: messagingTimeout, enhance: enhance)
 
+    let requestedLimit = exact.isActive ? maxNodes : limit
     var predicate: [String: Any] = [
       "AXSearchKey": searchKey,
       "AXVisibleOnly": visibleOnly,
-      "AXResultsLimit": limit,
+      "AXResultsLimit": requestedLimit,
       "AXDirection": axDirection,
       "AXImmediateDescendantsOnly": immediateDescendantsOnly,
     ]
@@ -245,8 +312,8 @@ final class AXExecutor {
 
     if error == .parameterizedAttributeUnsupported {
       return try Self.boundedSearch(
-        root: root, searchKey: searchKey, text: text, visibleOnly: visibleOnly, limit: limit,
-        direction: direction, immediateDescendantsOnly: immediateDescendantsOnly,
+        root: root, searchKey: searchKey, text: text, exact: exact, visibleOnly: visibleOnly,
+        limit: limit, direction: direction, immediateDescendantsOnly: immediateDescendantsOnly,
         attributes: attributes, includeActions: includeActions, maxNodes: maxNodes,
         registry: registry)
     }
@@ -254,66 +321,99 @@ final class AXExecutor {
       throw Self.axAgentError("AXUIElementsForSearchPredicate", error)
     }
 
-    guard let values = resultRef as? [AnyObject] else { return [] }
+    let candidates = (resultRef as? [AnyObject] ?? []).filter(Self.isAXUIElement)
+    let described = Self.dedup(attributes + exact.attributeNames)
     var matches: [ElementDescriptor] = []
-    matches.reserveCapacity(values.count)
-    for value in values {
-      guard Self.isAXUIElement(value) else { continue }
+    var readComplete = true
+    for value in candidates {
       let element = value as! AXUIElement
+      if exact.isActive {
+        let reading = Self.copyAttributes(element, exact.attributeNames)
+        readComplete = readComplete && reading.complete
+        let fields = Self.mappedFields(from: reading.values)
+        guard exact.matches(fields) else { continue }
+      }
       let handle = registry.register(element)
       matches.append(
         Self.describeElement(
-          element, handle: handle, attributes: attributes, includeActions: includeActions))
+          element, handle: handle, attributes: described, includeActions: includeActions))
     }
-    return matches
+    let cut = limit >= 0 && matches.count > limit
+    if cut {
+      matches.removeLast(matches.count - limit)
+    }
+    // The app returns at most `requestedLimit` candidates and says nothing more, so a full
+    // page may hide more; a short page is all there was.
+    let complete = (requestedLimit < 0 || candidates.count < requestedLimit) && !cut && readComplete
+    return QueryResult(matches: matches, complete: complete, visited: candidates.count)
   }
 
   /// One node visited while walking a small ordinary AX tree in `boundedSearch`, matching what
-  /// `_snapshot_tree` records per node in `macos.py`. `matchText` holds the already-stringified
-  /// values of the wire fields `_bounded_ax_search` substring-matches against; `element` is
-  /// retained so a surviving match can be re-described from scratch exactly like
-  /// `_describe_element` does, rather than reusing the (traversal-attribute-reduced) snapshot.
+  /// `_snapshot_tree` records per node in `macos.py`. `fields` holds the wire-keyed mapped
+  /// attributes the traversal read, from which the substring match text and the exact-selector
+  /// judgement are both derived; `element` is retained so a surviving match can be re-described
+  /// from scratch exactly like `_describe_element` does, rather than reusing the
+  /// (traversal-attribute-reduced) snapshot.
   private struct TraversalNode {
     let handle: Int
     let element: AXUIElement
     let role: String?
-    let hidden: Bool
-    let matchText: [String]
+    let fields: [String: JSONValue]
+
+    var hidden: Bool { fields["hidden"]?.boolValue ?? false }
+    var matchText: [String] { matchFieldOrder.compactMap { fields[$0].map(pythonLikeString) } }
+  }
+
+  /// The visited nodes and gaps: `nodeCut` or `depthCut` for traversal bounds, `readCut`
+  /// for a refused attribute read. Each can leave candidate matches unexamined.
+  private struct TreeSnapshot {
+    var nodes: [TraversalNode]
+    var nodeCut: Bool
+    var depthCut: Bool
+    var readCut: Bool
   }
 
   /// Searches a small ordinary AX tree when the optimized parameterized predicate is
   /// unsupported, matching `_bounded_ax_search` in `macos.py` one for one: `max_nodes` must be
   /// positive (there is no tree to walk otherwise), a non-positive effective limit yields no
-  /// results rather than an error, the root itself is never a candidate, and `previous` walks
-  /// the flattened traversal in reverse.
+  /// results (and no certainty) rather than an error, the root itself is never a candidate,
+  /// and `previous` walks the flattened traversal in reverse. The result is complete only when
+  /// the walk saw the whole tree and the limit did not stop it before a further match.
   private static func boundedSearch(
-    root: AXUIElement, searchKey: String, text: String?, visibleOnly: Bool, limit: Int,
-    direction: String,
-    immediateDescendantsOnly: Bool, attributes: [String], includeActions: Bool, maxNodes: Int,
-    registry: ElementRegistry
-  ) throws -> [ElementDescriptor] {
+    root: AXUIElement, searchKey: String, text: String?, exact: ExactSelector, visibleOnly: Bool,
+    limit: Int, direction: String, immediateDescendantsOnly: Bool, attributes: [String],
+    includeActions: Bool, maxNodes: Int, registry: ElementRegistry
+  ) throws -> QueryResult {
     guard maxNodes > 0 else {
       throw AgentError(code: "bad_request", message: "AX fallback max_nodes must be positive")
     }
-    let resultLimit = limit < 0 ? maxNodes : limit
-    guard resultLimit > 0 else { return [] }
-
     let role = searchRoles[searchKey]
-    let needle = text?.lowercased()
+    guard role != nil || searchKey == "AXAnyTypeSearchKey" else {
+      throw AgentError(
+        code: "unsupported_op", message: "AX fallback does not support \(searchKey)",
+        details: ["search_key": .string(searchKey)])
+    }
+    let resultLimit = limit < 0 ? maxNodes : limit
+    guard resultLimit > 0 else { return QueryResult(matches: [], complete: false, visited: 0) }
 
-    var traversalAttributes = dedup(attributes)
+    let needle = text?.lowercased()
+    let described = dedup(attributes + exact.attributeNames)
+
+    var traversalAttributes = dedup(described)
     if !traversalAttributes.contains("AXHidden") {
       traversalAttributes.append("AXHidden")
     }
 
-    var nodes = try snapshotTree(
+    let snapshot = try snapshotTree(
       root: root,
       maxDepth: immediateDescendantsOnly ? 1 : 25,
       maxNodes: maxNodes,
       includeMenuBar: true,
       attributes: traversalAttributes,
       registry: registry)
-    guard !nodes.isEmpty else { return [] }
+    var nodes = snapshot.nodes
+    let visited = nodes.count
+    guard !nodes.isEmpty else { return QueryResult(matches: [], complete: false, visited: 0) }
     nodes.removeFirst()  // the root itself is never a fallback match candidate
 
     if direction.lowercased() == "previous" {
@@ -321,19 +421,29 @@ final class AXExecutor {
     }
 
     var matches: [ElementDescriptor] = []
+    var cut = false
     for node in nodes {
       guard role == nil || node.role == role else { continue }
       guard !visibleOnly || !node.hidden else { continue }
       if let needle {
         guard node.matchText.contains(where: { $0.lowercased().contains(needle) }) else { continue }
       }
+      guard exact.matches(node.fields) else { continue }
+      if matches.count >= resultLimit {
+        cut = true
+        break
+      }
       matches.append(
         describeElement(
-          node.element, handle: node.handle, attributes: attributes, includeActions: includeActions)
+          node.element, handle: node.handle, attributes: described, includeActions: includeActions)
       )
-      if matches.count >= resultLimit { break }
     }
-    return matches
+    // A depth cut only matters when the walk was meant to go deep: an immediate-descendants
+    // search stops at depth 1 by design.
+    let complete =
+      !cut && !snapshot.nodeCut && !snapshot.readCut
+      && (immediateDescendantsOnly || !snapshot.depthCut)
+    return QueryResult(matches: matches, complete: complete, visited: visited)
   }
 
   /// Depth-first, cycle-guarded walk mirroring `_snapshot_tree` in `macos.py`: bounded by
@@ -344,34 +454,41 @@ final class AXExecutor {
   /// `_remember_element` runs unconditionally inside `_snapshot_tree`'s own `visit`.
   /// `AXChildren`/`AXWindows` are fetched only to steer this traversal; they are never mapped
   /// attributes, so `mappedFields`/`extraFields` never surface them on the resulting nodes.
+  /// Reports which bound, if any, refused a node, so the caller can tell a finished walk from
+  /// one that stopped short.
   private static func snapshotTree(
     root: AXUIElement, maxDepth: Int, maxNodes: Int, includeMenuBar: Bool, attributes: [String],
     registry: ElementRegistry
-  ) throws -> [TraversalNode] {
+  ) throws -> TreeSnapshot {
     var requestedNames = dedup(attributes)
     for name in ["AXRole", "AXChildren", "AXWindows"] where !requestedNames.contains(name) {
       requestedNames.append(name)
     }
 
-    var nodes: [TraversalNode] = []
-    var seenHashes = Set<UInt>()
+    var snapshot = TreeSnapshot(nodes: [], nodeCut: false, depthCut: false, readCut: false)
+    var seen = Set<AXUIElement>()
 
     func visit(_ element: AXUIElement, depth: Int) throws {
-      guard depth <= maxDepth, nodes.count < maxNodes else { return }
-      let identity = CFHash(element)
-      guard seenHashes.insert(identity).inserted else { return }
+      guard !seen.contains(element) else { return }
+      guard depth <= maxDepth else {
+        snapshot.depthCut = true
+        return
+      }
+      guard snapshot.nodes.count < maxNodes else {
+        snapshot.nodeCut = true
+        return
+      }
+      seen.insert(element)
 
-      let raw = copyAttributes(element, requestedNames)
+      let reading = copyAttributes(element, requestedNames)
+      snapshot.readCut = snapshot.readCut || !reading.complete
+      let raw = reading.values
       let role = raw["AXRole"].map(jsonable)?.stringValue
       if role == "AXMenuBar" && !includeMenuBar { return }
 
       let handle = registry.register(element)
-      let fields = mappedFields(from: raw)
-      let hidden = fields["hidden"]?.boolValue ?? false
-      let matchText = matchFieldOrder.compactMap { fields[$0].map(pythonLikeString) }
-      nodes.append(
-        TraversalNode(
-          handle: handle, element: element, role: role, hidden: hidden, matchText: matchText))
+      snapshot.nodes.append(
+        TraversalNode(handle: handle, element: element, role: role, fields: mappedFields(from: raw)))
 
       let childrenToVisit: [AnyObject]?
       if let children = raw["AXChildren"] as? [AnyObject], !children.isEmpty {
@@ -391,7 +508,7 @@ final class AXExecutor {
     }
 
     try visit(root, depth: 0)
-    return nodes
+    return snapshot
   }
 
   /// Sets up the application-root AX element exactly like `_application_element` in
@@ -437,7 +554,7 @@ final class AXExecutor {
     for name in dedup(attributes) where name != "AXRole" {
       requestedNames.append(name)
     }
-    let raw = copyAttributes(element, requestedNames)
+    let raw = copyAttributes(element, requestedNames).values
     let role = raw["AXRole"].map(jsonable)?.stringValue
     let fields = mappedFields(from: raw)
     let extra = extraFields(from: raw)
@@ -459,7 +576,7 @@ final class AXExecutor {
     let element = try Self.resolveElement(handle, registry: registry)
     let names = Self.dedup(attributes)
     guard !names.isEmpty else { return [:] }
-    let raw = Self.copyAttributes(element, names)
+    let raw = Self.copyAttributes(element, names).values
     var result: [String: JSONValue] = [:]
     for name in names {
       result[name] = raw[name].map(Self.jsonable) ?? .null
@@ -520,34 +637,28 @@ final class AXExecutor {
 
   // MARK: - Attribute reading (must only run on `queue`)
 
-  /// Reads `names` from `element` in as few round trips as possible, matching
-  /// `_copy_attributes` in `macos.py`: tries the batch API first and falls back to one
-  /// `AXUIElementCopyAttributeValue` call per name if the batch call itself fails outright. A
-  /// name AX reports as unavailable — including a batched slot that decodes as the
-  /// `kAXValueAXErrorType` per-item error sentinel — is simply absent from the result; callers
-  /// that must represent every requested name (`performGet`) fill the gaps with `.null`
-  /// themselves.
-  private static func copyAttributes(_ element: AXUIElement, _ names: [String]) -> [String:
-    AnyObject]
-  {
-    guard !names.isEmpty else { return [:] }
+  /// Reads every requested attribute, retaining whether any read failed. Missing or unsupported
+  /// attributes are known absences; other AX errors leave search completeness unproved.
+  private static func copyAttributes(
+    _ element: AXUIElement, _ names: [String]
+  ) -> AttributeValues {
+    var result = AttributeValues()
+    guard !names.isEmpty else { return result }
 
     var valuesRef: CFArray?
     let batchError = AXUIElementCopyMultipleAttributeValues(
       element, names as CFArray, [], &valuesRef)
     if batchError == .success, let values = valuesRef as? [AnyObject], values.count == names.count {
-      var result: [String: AnyObject] = [:]
-      for (name, value) in zip(names, values) where !isErrorSentinel(value) {
-        result[name] = value
+      for (name, value) in zip(names, values) {
+        let status = slotError(value) ?? .success
+        result.record(name, status: status, value: status == .success ? value : nil)
       }
       return result
     }
 
-    var result: [String: AnyObject] = [:]
     for name in names {
-      if let value = copyAttribute(element, name) {
-        result[name] = value
-      }
+      let (status, value) = copyAttributeStatus(element, name)
+      result.record(name, status: status, value: value)
     }
     return result
   }
@@ -566,10 +677,6 @@ final class AXExecutor {
     return (error, value)
   }
 
-  private static func copyAttribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
-    let (error, value) = copyAttributeStatus(element, name)
-    return error == .success ? value : nil
-  }
 
   /// The strict single read behind `getValue`: `.success` converts the value exactly like every
   /// other reader (a genuine `null` stays `.null`, `false` and `0` stay values); every other
@@ -735,9 +842,13 @@ final class AXExecutor {
     return (value as! AXValue)
   }
 
-  private static func isErrorSentinel(_ value: AnyObject) -> Bool {
-    guard let axValue = axValueCast(value) else { return false }
-    return AXValueGetType(axValue) == .axError
+  private static func slotError(_ value: AnyObject) -> AXError? {
+    guard let axValue = axValueCast(value), AXValueGetType(axValue) == .axError else {
+      return nil
+    }
+    var error = AXError.failure
+    _ = AXValueGetValue(axValue, .axError, &error)
+    return error
   }
 
   private static func isAXUIElement(_ value: AnyObject) -> Bool {

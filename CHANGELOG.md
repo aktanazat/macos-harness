@@ -7,6 +7,29 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- App-bound receipts retain process lifetime evidence without replacing the
+  original action error or input classification. Otherwise-successful input
+  fails with `app.exited` after an observed exit when the effect was unverified.
+  A verified expected disappearance can succeed. Replayed receipts retain their
+  original process evidence.
+- Presses keep their original deadline through agent setup, searches, retry
+  delays, and focus readings on both backends. A known pre-dispatch timeout
+  reports `acted=no` and releases its once-token reservation. Other timeouts
+  retain the token because the action may have happened. Raw zero-timeout
+  presses still make one attempt.
+- Receipts include original ISO-8601 UTC start and completion timestamps.
+  `mac.timeline()` returns the latest 256 non-replayed receipts, including
+  failures and calls without once tokens, without collecting new observations.
+  History eviction leaves the at-most-once token ledger intact.
+- AX searches accept exact `title`, `identifier`, and `description` selectors
+  alongside substring `text`. Results expose `complete` and `visited`; strict
+  waits and presses refuse an unproved unique match, and disappearance requires
+  two complete empty searches. Failed reads and traversal limits leave a search
+  incomplete. Unsupported fallback predicates now raise instead of broadening
+  the search. The native wire protocol is version 2.
+- `mac.do.expect` checks an explicitly scoped `present`, `gone`, or `equals`
+  condition through the existing verifier and returns a read-only receipt. It
+  does not enable accessibility features, sample focus, or reserve a once token.
 - `mac.do.set` and `mac.do.toggle` wait for their readback. Both used to
   read the attribute once after the mutation and fail with `acted=yes`
   when that first reading still showed the old state, which is what an
