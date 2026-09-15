@@ -32,6 +32,7 @@ from .receipts import (
     present,
     request_fingerprint,
 )
+from .routes import RouteResult
 
 if TYPE_CHECKING:
     from .credentials import (
@@ -97,6 +98,7 @@ __all__ = [
     "Postcondition",
     "Present",
     "Receipt",
+    "RouteResult",
     "SearchMatches",
     "__version__",
     "canonical_json",

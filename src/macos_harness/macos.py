@@ -724,11 +724,13 @@ class MacOS:
 
         from .controls import Accessibility
         from .ops import Operations
+        from .routes import Routes
 
         self._pointer_position: tuple[float, float] | None = None
         self._overlay = LivePointerOverlay()
         self.ax = Accessibility(self)
         self.do = Operations(self)
+        self.route = Routes(self)
         self._backend = _resolve_backend(backend)
         self._native_client: NativeClient | None = None
         self._native_error: Exception | None = None
@@ -1127,6 +1129,14 @@ class MacOS:
         except (OSError, plistlib.InvalidFileException, ValueError):
             return {}
         return info if isinstance(info, dict) else {}
+
+    @classmethod
+    def _bundle_version(cls, path: str | None) -> tuple[str | None, str | None]:
+        info = cls._bundle_info(path)
+        version = info.get("CFBundleShortVersionString")
+        build = info.get("CFBundleVersion")
+        return (version if isinstance(version, str) else None,
+                build if isinstance(build, str) else None)
 
     def _build_status(self, identity: _AppIdentity) -> dict[str, JSONValue]:
         info = self._bundle_info(identity.path)

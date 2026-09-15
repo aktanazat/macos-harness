@@ -136,6 +136,35 @@ you need: identity-only lookups, reads, or an action `mac.do` does not
 model. Raw primitives are unchanged and fully supported, just without a
 receipt or an idempotency guarantee.
 
+## Repeat saved navigation
+
+Use `mac.route.run(name, app=exact_bundle_id, timeout=30)` for a previously
+recorded navigation sequence. Inspect `status`, `at`, `error`, `check`, and
+`steps_run`. A diverged run retains the failing receipt, including whether it
+acted. Stop and inspect the current state before another run; every call has a
+fresh run id and may repeat input. There is no retry, resume, rollback, or
+implicit activation.
+
+Record through `with mac.route.record(name, app=exact_bundle_id, entry=entry,
+goal=goal) as rec:`. Call `rec.press`, `rec.set`, `rec.toggle`, or `rec.key` only.
+Unrelated Python and calls outside the handle are not recorded. Keep the handle
+on its with-block thread. A failed step prevents saving, even when caught; the
+previous file remains intact.
+
+Use a role plus one exact identifier, title, or description for every target
+and condition. Press/key steps require a postcondition. Set/toggle steps retain
+their convergence checks. Set and equals values must be boolean or numeric.
+Keep secrets out of selectors and keys, which are saved verbatim. Supply both
+an entry condition and a terminal goal. Definitions allow at most 64 steps.
+
+`dry_run=True` validates the whole definition without input or accessibility
+feature changes. It checks the current goal, or the entry and first target;
+later controls need not exist yet. A refused or incomplete check stops the run.
+Replay stays on one app process and shares one cooperative deadline.
+`mac.route.list(app=exact_bundle_id)` reads saved definitions without observing
+the app. Reported app versions come from the on-disk bundle; a difference alone
+does not reject a run.
+
 ## Inspect failures before more input
 
 Keep the failed `OperationError.receipt`. Its `process` evidence belongs to the

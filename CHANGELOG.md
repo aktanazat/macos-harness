@@ -21,6 +21,12 @@ follows [Semantic Versioning](https://semver.org/).
   on request. Collection failures and partial results remain explicit.
   `mac.explain` correlates supplied evidence without changing the receipt,
   collecting more data, or retrying input.
+- `mac.route` records explicit press/set/toggle/key calls and saves a validated
+  navigation definition with entry and terminal conditions. Replay stays on one
+  app process, shares one deadline, and stops at the first divergence while
+  retaining the failing receipt. Dry runs observe only current conditions and
+  targets. Failed recordings preserve the previous file; no route retries,
+  resume, rollback, or implicit activation are added.
 - Presses keep their original deadline through agent setup, searches, retry
   delays, and focus readings on both backends. A known pre-dispatch timeout
   reports `acted=no` and releases its once-token reservation. Other timeouts

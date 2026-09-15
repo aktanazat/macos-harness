@@ -189,6 +189,68 @@ Path("action-history.json").write_text(
 )
 ```
 
+### Saved navigation
+
+Use `mac.route` to record a navigation sequence and replay it later through
+`mac.do`. Record only calls made through the yielded handle. Unrelated Python,
+raw input, and other `mac.do` calls are outside the recording.
+
+The following example assumes your app exposes these identifiers:
+
+```python
+from macos_harness import present
+
+app = "com.example.demo"
+entry = present(role="button", identifier="open-settings")
+goal = present(role="checkbox", identifier="enable-sync")
+with mac.route.record("open-settings", app=app, entry=entry, goal=goal) as rec:
+    rec.press(role="button", identifier="open-settings", postcondition=goal)
+
+# On a later visit to the starting screen:
+plan = mac.route.run("open-settings", app=app, dry_run=True)
+result = mac.route.run("open-settings", app=app, timeout=10)
+print(result.status, result.at, result.to_json())
+print(mac.route.list(app=app))
+```
+
+A route requires an exact bundle identifier, an entry condition, and a terminal
+goal. Every target and condition needs a role plus exactly one exact title,
+identifier, or description. There is no substring or alternate-field fallback.
+The supported steps are `press`, `set`, `toggle`, and `key`. Presses and keys
+require an explicit postcondition; set and toggle retain their value-convergence
+checks. Only boolean and numeric set/equals values are recordable. Selectors and
+key combinations are stored verbatim, so keep secrets out of them.
+
+Recording checks the entry before yielding and the goal before saving. A failed
+step prevents saving even if its exception is caught. The previous file stays
+intact. Keep the handle on the thread that entered the block; it closes when the
+block exits. A definition has at most 64 steps and a 1 MiB file limit.
+
+Replay validates the whole definition before input. It returns `already` if the
+goal holds, otherwise checks the entry and runs each step once. A refused or
+incomplete goal read stops the run. One app process and one cooperative timeout
+cover the sequence. A process exit or replacement stops further steps. The
+existing operations own target resolution, dispatch, and verification.
+
+Results have status `done`, `already`, `planned`, `diverged`, or `invalid`.
+`steps_run` retains the failing step's receipt, including whether it acted.
+`check` retains the latest condition check, and `at` names a failed stage.
+Dry runs validate the whole file but observe only the goal, or the entry and
+first target. Later targets may not exist until earlier steps run. A dry run
+does not enable accessibility features or dispatch input.
+
+Each `run` gets fresh once tokens for presses and keys. Calling it again starts
+a new run; it does not recover a lost response or resume an interrupted run.
+Inspect the result and current state before deciding to run again. Routes do
+not retry, roll back, or activate an app.
+
+Definitions are private JSON files under
+`~/Library/Application Support/macos-harness/routes/<bundle>/<name>.json`, or
+under `MACOS_HARNESS_HOME` when set. Writes replace the file atomically. Listing
+reads definitions without observing the app. Results report recorded and current
+on-disk bundle versions; a version difference alone does not reject a run.
+Run receipts remain in session history and are not saved beside the definition.
+
 ### Diagnostics
 
 Use `mac.status(app)` to read process identity and on-disk build metadata without
