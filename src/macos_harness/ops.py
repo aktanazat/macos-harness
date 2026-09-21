@@ -1,10 +1,10 @@
-"""``mac.do``: the recommended, receipted mutation surface for macOS Harness.
+"""``mac.do``: the recommended, receipted operation surface for macOS Harness.
 
 The raw six primitives (``mac.click``/``mac.key``/``mac.type``/``mac.ax.*``/
 ``mac.script``/...) stay exactly as they are: thin, direct, and trusting --
 they do what they are told and raise on the spot if that fails.
 ``Operations`` (``mac.do``) is a layer on top of a subset of them for
-mutations specifically. Once a call's arguments pass preflight and it
+mutations and explicit observations. Once a call's arguments pass preflight and it
 actually begins resolving or dispatching something, it always ends in --
 or raises with -- a `Receipt` describing what was asked, what actually
 happened, and how thoroughly that was confirmed, instead of a bare
@@ -15,14 +15,14 @@ different request -- raises a plain `MacOSError` instead, with no
 receipt: nothing was ever attempted (see `OperationError`).
 
 ``mac.do`` is deliberately small: `press`, `set`, `toggle`, `run`, `key`,
-`click`, `type`, and `recall`. It is not a workflow engine, a selector language of its own,
+`click`, `type`, `expect`, and `recall`. It is not a workflow engine, a selector language of its own,
 or an app-adapter framework -- it reuses `MacOS.ax`'s role/search-key
 vocabulary and `MacOS`'s own AX scope rules verbatim (see `_require_scope`
 and `Accessibility._search_key`) rather than inventing a second one, and it
-never does more per call than "resolve one target, act once, optionally
-confirm the effect."
+never adds another matcher. ``expect`` checks a condition; mutation calls resolve
+one target, act once, and optionally confirm the effect.
 
-Every verb shares:
+Every mutating verb shares:
   - One monotonic, cooperative budget (`_Deadline`) across resolution,
     dispatch, and postcondition checks. It prevents a new mutation after
     expiry and bounds polling/scripts; a synchronous macOS AX/input call
@@ -71,18 +71,22 @@ import tempfile
 import threading
 import time
 import weakref
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Literal, Protocol, TypeVar
+from typing import IO, TYPE_CHECKING, Literal, Protocol, TypeVar
 
-from .errors import ErrorCode, FocusChangedError, MacOSError
+from .errors import ApplicationNotFoundError, ErrorCode, FocusChangedError, MacOSError
 from .receipts import (
     Acted,
     Equals,
     ErrorPayload,
     Executor,
+    Gone,
     JSONValue,
+    Observation,
     OperationError,
     Outcome,
     Postcondition,
@@ -91,7 +95,11 @@ from .receipts import (
     canonical_json,
     canonicalize,
     request_fingerprint,
+    validate_exact_selectors,
 )
+
+if TYPE_CHECKING:
+    from .macos import _AppIdentity
 
 __all__ = ["Operations"]
 
@@ -248,6 +256,18 @@ class _Deadline:
         self._start = now
         self._deadline = now + timeout
 
+    @property
+    def expires_at(self) -> float:
+        return self._deadline
+
+    def check_dispatch(self, details: dict[str, JSONValue] | None = None) -> None:
+        if self.exhausted():
+            raise MacOSError(
+                "Operation timed out: deadline exhausted before dispatch",
+                code=ErrorCode.TIMEOUT,
+                details={**(details or {}), "reason": "deadline_exhausted_before_dispatch"},
+            )
+
     def remaining(self) -> float:
         return max(0.0, self._deadline - self._monotonic())
 
@@ -351,11 +371,13 @@ def _atomic_press_acted(exc: MacOSError) -> Acted:
     press happened; ``element.unknown``/``bad_request``/
     ``unsupported_op`` are exactly as certain in the other direction --
     no match, an ambiguous one, or one without the action at all.
-    Everything else has an unknown relationship to dispatch, the same
-    conservative bucket a resolved dispatch failure already falls into.
+    A timeout explicitly marked as before dispatch also means no action.
+    Other timeouts remain unknown because dispatch may already have happened.
     """
     if exc.code == ErrorCode.FOCUS_CHANGED.value:
         return Acted.YES
+    if exc.code == ErrorCode.TIMEOUT.value and exc.details.get("reason") == "deadline_exhausted_before_dispatch":
+        return Acted.NO
     if exc.code in {ErrorCode.ELEMENT_UNKNOWN.value, ErrorCode.BAD_REQUEST.value, ErrorCode.UNSUPPORTED_OP.value}:
         return Acted.NO
     return Acted.UNKNOWN
@@ -363,14 +385,67 @@ def _atomic_press_acted(exc: MacOSError) -> Acted:
 
 @dataclass(frozen=True, slots=True)
 class _Verification:
-    """The result of checking one optional `Postcondition`."""
+    """The result of checking one optional `Postcondition`.
 
-    ok: bool
+    ``state`` is the whole result: `Observation.MET` is the only
+    verified outcome, and the other two record *why* the check did not
+    verify in the one place that still knows -- the code that called the
+    search and caught its error. ``ok`` is derived so the two can never
+    drift apart.
+    """
+
+    state: Observation
     observed: JSONValue
     error: ErrorPayload | None
+    reason: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.state is Observation.MET
 
 
-def _perform_guarded(host: _Host, element_index: int, action: str, target_pid: int, operation: str) -> None:
+def _observation_of(postcondition: Postcondition, exc: MacOSError) -> tuple[Observation, str]:
+    """Classify one failed `Postcondition` check as `Observation.UNMET`
+    or `Observation.UNOBSERVABLE`, with the reason that decided it.
+
+    This is the one place that reads a search's failure payload for
+    meaning, and it sits next to the code that raised it. A caller that
+    re-derives the same distinction from ``error.details`` downstream
+    gets it wrong: a `Gone` check that timed out holding one complete
+    empty poll looks exactly like a plain timeout, yet it saw the match
+    *absent* -- it simply never got the second poll that confirms it.
+    """
+    details = exc.details
+    if exc.code != ErrorCode.TIMEOUT.value:
+        ambiguous = exc.code == ErrorCode.BAD_REQUEST.value and "count" in details
+        return Observation.UNOBSERVABLE, "ambiguous_match" if ambiguous else "observation_refused"
+    if "reason" in details:
+        # `_deadline_exhausted_error`: no window to look in at all.
+        return Observation.UNOBSERVABLE, "deadline_exhausted"
+    if details.get("complete") is False:
+        return Observation.UNOBSERVABLE, "incomplete_search"
+    if isinstance(postcondition, Gone):
+        polls = details.get("consecutive_empty_polls")
+        if not isinstance(polls, int):
+            return Observation.UNOBSERVABLE, "observation_refused"
+        # A complete empty poll already saw the match gone; only `Gone`'s
+        # two-poll confirmation rule is missing, so absence is unconfirmed
+        # rather than contradicted.
+        return (Observation.UNOBSERVABLE, "absence_unconfirmed") if polls else (
+            Observation.UNMET, "still_present"
+        )
+    if "expected" in details:
+        return Observation.UNMET, "value_differs"
+    if "timeout" in details:
+        # A complete search that ran out of time without a match.
+        return Observation.UNMET, "searched_and_absent"
+    return Observation.UNOBSERVABLE, "observation_refused"
+
+
+def _perform_guarded(
+    host: _Host, element_index: int, action: str, target_pid: int, operation: str,
+    before: dict[str, JSONValue] | None,
+) -> None:
     """Perform ``action`` on ``element_index``, then check focus.
 
     The focus guard only ever runs *after* ``action`` has returned
@@ -380,7 +455,6 @@ def _perform_guarded(host: _Host, element_index: int, action: str, target_pid: i
     always propagates as-is, never replaced by whatever the guard would
     have raised for an action that never actually happened.
     """
-    before = host._frontmost_app()
     host.perform_action(element_index, action)
     host._guard_focus(before, target_pid, operation)
 
@@ -948,16 +1022,18 @@ class _Ledger:
     fresh, empty `_Ledger` every time, so a token is only ever
     "at-most-once" against the one instance it was used on -- a second,
     independent `Operations` (even for the same `MacOS`, even in the
-    same process) never sees another instance's reservations. Nothing
-    here is ever written to disk, shared across a process boundary, or
-    evicted; there is no persistence or crash-recovery guarantee of any
-    kind. A restart, a crash, or the owning `Operations` simply being
-    garbage-collected drops every entry with it.
+    same process) never sees another instance's reservations. Token
+    records are never evicted. A known pre-dispatch press timeout releases
+    its unused reservation. The latest 256 non-replayed completions share
+    their receipt objects; history eviction never frees a token.
+    Neither collection is written to disk or shared across a process
+    boundary. A restart or collection of the owning instance loses both.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._entries: dict[str, _LedgerEntry] = {}
+        self._completed: deque[Receipt] = deque(maxlen=256)
 
     @staticmethod
     def _classify(
@@ -1007,6 +1083,10 @@ class _Ledger:
             fingerprint = entry.fingerprint if entry is not None else request_fingerprint(receipt.request)
             self._entries[token] = _LedgerEntry(op=receipt.op, fingerprint=fingerprint, receipt=receipt)
 
+    def release(self, token: str) -> None:
+        with self._lock:
+            del self._entries[token]
+
     def peek(self, token: str) -> tuple[Literal["unknown", "in_flight", "done"], str | None, Receipt | None]:
         with self._lock:
             entry = self._entries.get(token)
@@ -1015,6 +1095,15 @@ class _Ledger:
             if entry.receipt is None:
                 return "in_flight", entry.op, None
             return "done", entry.op, entry.receipt
+
+    def remember(self, receipt: Receipt) -> None:
+        if not receipt.replayed:
+            with self._lock:
+                self._completed.append(receipt)
+
+    def history(self) -> tuple[Receipt, ...]:
+        with self._lock:
+            return tuple(self._completed)
 
 
 # --- the host surface `Operations` depends on -----------------------------
@@ -1043,10 +1132,15 @@ class _Host(Protocol):
     _backend: str
     ax: _AXSurface
 
+    @property
+    def _native_client(self) -> object | None: ...
+
     def _resolve_app(
         self,
         query: str | int | None,
     ) -> tuple[object, dict[str, JSONValue]]: ...
+    def _identity_from_info(self, info: Mapping[str, JSONValue]) -> _AppIdentity: ...
+    def _observe_process(self, expected: _AppIdentity) -> dict[str, JSONValue]: ...
     def _ensure_accessibility(self) -> None: ...
     def _ensure_post_events(self) -> None: ...
     def _validate_key(self, key: str) -> None: ...
@@ -1067,11 +1161,15 @@ class _Host(Protocol):
         apps: str | int | Iterable[str | int] | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         include_actions: bool = False,
         max_nodes: int = 500,
+        enhance: bool = True,
         timeout: float = 5.0,
         interval: float = 0.1,
     ) -> dict[str, JSONValue]: ...
@@ -1083,9 +1181,13 @@ class _Host(Protocol):
         apps: str | int | Iterable[str | int] | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
+        enhance: bool = True,
         timeout: float = 5.0,
         interval: float = 0.1,
     ) -> None: ...
@@ -1097,12 +1199,16 @@ class _Host(Protocol):
         apps: str | int | Iterable[str | int] | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         max_nodes: int = 500,
         timeout: float = 5.0,
         interval: float = 0.1,
+        _deadline: _Deadline | None = None,
     ) -> dict[str, JSONValue]: ...
     def get(self, element_index: int, attribute: str = "AXValue") -> object: ...
     def set(self, element_index: int, value: object, attribute: str = "AXValue") -> None: ...
@@ -1130,16 +1236,19 @@ class _Host(Protocol):
 # --- receipt construction ---------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
+def _utc_timestamp(seconds: float) -> str:
+    return datetime.fromtimestamp(seconds, UTC).isoformat(timespec="milliseconds")
+
+
+@dataclass(slots=True)
 class _ReceiptBuilder:
     """Bundles what every `Receipt` a single verb call constructs shares
     -- `op`, `backend`, `executor`, `request`, `once`, and that call's
     own shared `_Deadline` -- so each call site spells out only what
     varies between one outcome and the next.
 
-    `executor` starts as `_default_executor(host)`'s best guess for a
-    receipt that never reaches resolution; `dataclasses.replace(builder,
-    executor=...)` swaps in the real one once a verb resolves a target.
+    `executor` starts as `_default_executor(host)`'s best guess and is
+    updated when resolution identifies the backend that did the work.
     """
 
     op: str
@@ -1148,6 +1257,22 @@ class _ReceiptBuilder:
     request: Mapping[str, JSONValue]
     once: str | None
     deadline: _Deadline
+    wall_clock: Callable[[], float]
+    host: _Host
+    started_at: str = dataclasses.field(init=False)
+    identity: _AppIdentity | None = None
+    app_info: Mapping[str, JSONValue] | None = None
+    process: JSONValue = None
+
+    def bind_app(self, info: Mapping[str, JSONValue]) -> None:
+        self.app_info = info
+        try:
+            self.identity = self.host._identity_from_info(info)
+        except MacOSError as exc:
+            self.process = {"pid": info.get("pid"), "state": "unknown", "error": exc.to_json()}
+
+    def __post_init__(self) -> None:
+        self.started_at = _utc_timestamp(self.wall_clock())
 
     def build(
         self,
@@ -1161,6 +1286,14 @@ class _ReceiptBuilder:
         error: ErrorPayload | None = None,
         duration_s: float | None = None,
     ) -> Receipt:
+        process = self.process if self.identity is None else self.host._observe_process(self.identity)
+        if (isinstance(process, Mapping) and process.get("state") == "exited"
+                and outcome is Outcome.DONE and acted is Acted.YES and not verified):
+            outcome = Outcome.FAILED
+            error = MacOSError("The target app exited before its effect was confirmed",
+                               code=ErrorCode.APP_EXITED).to_json()
+        if target is None and self.app_info is not None:
+            target = {"app": self.app_info}
         return Receipt(
             op=self.op,
             outcome=outcome,
@@ -1173,6 +1306,9 @@ class _ReceiptBuilder:
             changed=changed,
             verified=verified,
             duration_s=self.deadline.elapsed() if duration_s is None else duration_s,
+            process=process,
+            started_at=self.started_at,
+            finished_at=_utc_timestamp(self.wall_clock()),
             once=self.once,
             error=error,
         )
@@ -1182,7 +1318,7 @@ class _ReceiptBuilder:
 
 
 class Operations:
-    """``mac.do``: press, set, toggle, run, key, click, type, recall -- receipted.
+    """``mac.do``: receipted mutations, read-only assertions, and token recall.
 
     Once a call's arguments pass preflight and it actually begins
     resolving or dispatching something, it returns -- or raises with --
@@ -1200,6 +1336,7 @@ class Operations:
         _spawn: _Spawner = subprocess.Popen,
         _monotonic: Callable[[], float] = time.monotonic,
         _sleep: Callable[[float], None] = time.sleep,
+        _wall_clock: Callable[[], float] = time.time,
     ) -> None:
         # A weak reference, exactly like `Accessibility` in controls.py:
         # `MacOS.__init__` does `self.do = Operations(self)`, so a strong
@@ -1210,6 +1347,7 @@ class Operations:
         self._ledger = _Ledger()
         self._monotonic = _monotonic
         self._sleep = _sleep
+        self._wall_clock = _wall_clock
         self._spawn = _spawn
         self._creator_pid = os.getpid()
         # Reentrant so a helper called while this thread already holds
@@ -1256,7 +1394,97 @@ class Operations:
                 details={"creator_pid": self._creator_pid, "pid": pid},
             )
 
-    # --- the six verbs ---------------------------------------------------
+    def history(self) -> tuple[Receipt, ...]:
+        """Return the latest 256 non-replayed receipts in completion order."""
+        self._check_owner()
+        return self._ledger.history()
+
+    def expect(self, condition: Postcondition) -> Receipt:
+        """Observe an explicitly scoped condition without changing the app.
+
+        Uses the same verifier as mutation postconditions. The condition's
+        timeout defaults to five seconds; its interval controls polling.
+        Accessibility enhancements and focus sampling are disabled.
+
+        A condition that does not hold still raises `OperationError`, and
+        that error's receipt says which kind of "no" it was: ``observed``
+        carries ``{"state", "reason"}``, where ``state`` is
+        `Observation.UNMET` when the check completed and the app really
+        is in another state, and `Observation.UNOBSERVABLE` when it
+        established nothing -- a truncated walk, more than one match, a
+        refused read, or a deadline too short for `Gone`'s two
+        confirming polls. Only ``UNMET`` licenses a caller to act as
+        though the app disagreed; ``UNOBSERVABLE`` means look again. A
+        verified check keeps ``observed`` as the match summary.
+        """
+        self._check_owner()
+        host = self._host
+        if condition is None:
+            raise MacOSError(
+                "expect requires a Present, Gone, or Equals condition",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "condition"},
+            )
+        self._validate_postcondition(host, condition)
+        self._validate_postcondition_inheritance(condition, has_scope=False)
+        timeout = 5.0 if condition.timeout is None else condition.timeout
+        deadline = _Deadline(timeout, self._monotonic)
+        request = {"op": "expect", "condition": self._postcondition_payload(condition)}
+        builder = _ReceiptBuilder(
+            op="expect",
+            host=host,
+            backend=host._backend,
+            executor=self._default_executor(host),
+            request=request,
+            once=None,
+            deadline=deadline,
+            wall_clock=self._wall_clock,
+        )
+        with self._dispatch_lock:
+            verification: _Verification | None = None
+            try:
+                app = condition.app
+                if app is None and isinstance(condition.apps, (str, int)):
+                    app = condition.apps
+                elif app is None and isinstance(condition.apps, tuple) and len(condition.apps) == 1:
+                    app = condition.apps[0]
+                if app is not None:
+                    try:
+                        _, info = host._resolve_app(app)
+                    except ApplicationNotFoundError:
+                        if not isinstance(condition, Gone):
+                            raise
+                        if deadline.remaining() > 0:
+                            verification = _Verification(
+                                state=Observation.MET, observed=None, error=None
+                            )
+                    else:
+                        builder.bind_app(info)
+                        condition = dataclasses.replace(condition, app=info["pid"], apps=None)
+                if verification is None:
+                    verification = self._verify_postcondition(
+                        host, condition, deadline, app=None, all_apps=False, apps=None, enhance=False
+                    )
+            except MacOSError as exc:
+                state, reason = _observation_of(condition, exc)
+                verification = _Verification(
+                    state=state, observed=None, error=exc.to_json(), reason=reason
+                )
+            builder.executor = self._default_executor(host)
+            receipt = builder.build(
+                outcome=Outcome.DONE if verification.ok else Outcome.FAILED,
+                acted=Acted.NO,
+                changed=None,
+                verified=verification.ok,
+                observed=verification.observed if verification.ok else {
+                    "state": verification.state.value,
+                    "reason": verification.reason,
+                },
+                error=verification.error,
+            )
+            return self._finish(receipt)
+
+    # --- mutation verbs -------------------------------------------------
 
     def press(
         self,
@@ -1267,6 +1495,9 @@ class Operations:
         role: str | None = None,
         search_key: str | None = None,
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
@@ -1296,6 +1527,7 @@ class Operations:
         self._require_scope(app=app, all_apps=all_apps, apps=apps)
         apps = self._freeze_apps(apps)
         _validate_apps_selector(apps)
+        validate_exact_selectors(title=title, identifier=identifier, description=description)
         self._validate_postcondition(host, postcondition)
         self._validate_postcondition_inheritance(postcondition, has_scope=True)
         resolved_key = host.ax._search_key(search_key, role)
@@ -1308,6 +1540,9 @@ class Operations:
             "scope": self._scope_payload(app, all_apps, apps),
             "search_key": resolved_key,
             "text": text,
+            "title": title,
+            "identifier": identifier,
+            "description": description,
             "visible_only": visible_only,
             "direction": direction,
             "immediate_descendants_only": immediate_descendants_only,
@@ -1319,11 +1554,13 @@ class Operations:
         fingerprint = request_fingerprint(request) if once is not None else None
         builder = _ReceiptBuilder(
             op="press",
+            host=host,
             backend=backend,
             executor=self._default_executor(host),
             request=request,
             once=once,
             deadline=deadline,
+            wall_clock=self._wall_clock,
         )
         if once is not None and not dry_run:
             # Nonblocking on purpose: a concurrent duplicate of this same
@@ -1354,6 +1591,15 @@ class Operations:
                         )
                     )
 
+                try:
+                    _, app_info = host._resolve_app(app)
+                    builder.bind_app(app_info)
+                except MacOSError as exc:
+                    return self._finish(builder.build(
+                        outcome=Outcome.FAILED, acted=Acted.NO, changed=False,
+                        verified=False, error=exc.to_json(),
+                    ))
+
                 if once is not None:
                     assert fingerprint is not None
                     action = self._ledger.reserve(once, "press", fingerprint)
@@ -1364,15 +1610,19 @@ class Operations:
 
                 try:
                     match = host.ax_press(
-                        app=app,
+                        app=app_info["pid"],
                         search_key=resolved_key,
                         text=text,
+                        title=title,
+                        identifier=identifier,
+                        description=description,
                         visible_only=visible_only,
                         direction=direction,
                         immediate_descendants_only=immediate_descendants_only,
                         max_nodes=max_nodes,
-                        timeout=deadline.remaining(),
+                        timeout=timeout,
                         interval=interval,
+                        _deadline=deadline,
                     )
                 except MacOSError as exc:
                     acted = _atomic_press_acted(exc)
@@ -1383,14 +1633,15 @@ class Operations:
                         verified=False,
                         error=exc.to_json(),
                     )
+                    if once is not None and acted is Acted.NO and exc.code == ErrorCode.TIMEOUT.value:
+                        self._ledger.release(once)
+                        return self._finish(receipt)
                 else:
                     element_index = int(match["element_index"])
                     owner = match.get("app")
                     app_info = owner if isinstance(owner, dict) else host._resolve_app(app)[1]
                     target = self._match_target(match, app_info)
-                    builder = dataclasses.replace(
-                        builder, executor=self._executor_of(host, element_index)
-                    )
+                    builder.executor = self._executor_of(host, element_index)
                     verified = self._verify_postcondition(
                         host, postcondition, deadline, app=app, all_apps=all_apps, apps=apps
                     )
@@ -1416,11 +1667,15 @@ class Operations:
             try:
                 match, element_index, app_info, target = self._resolve_target(
                     host,
+                    builder,
                     app=app,
                     all_apps=all_apps,
                     apps=apps,
                     search_key=resolved_key,
                     text=text,
+                    title=title,
+                    identifier=identifier,
+                    description=description,
                     visible_only=visible_only,
                     direction=direction,
                     immediate_descendants_only=immediate_descendants_only,
@@ -1437,7 +1692,7 @@ class Operations:
                     )
                 )
 
-            builder = dataclasses.replace(builder, executor=self._executor_of(host, element_index))
+            builder.executor = self._executor_of(host, element_index)
 
             if dry_run:
                 return self._finish(
@@ -1478,6 +1733,7 @@ class Operations:
                     )
                 )
 
+            frontmost_before = None if deadline.exhausted() else host._frontmost_app()
             if deadline.exhausted():
                 return self._finish(
                     builder.build(
@@ -1499,7 +1755,9 @@ class Operations:
                     return self._finish(self._in_flight_receipt(builder, target=target))
 
             try:
-                _perform_guarded(host, element_index, "AXPress", target_pid, "mac.do.press")
+                _perform_guarded(
+                    host, element_index, "AXPress", target_pid, "mac.do.press", frontmost_before
+                )
             except FocusChangedError as exc:
                 receipt = builder.build(
                     outcome=Outcome.FAILED, acted=Acted.YES, changed=None, verified=False,
@@ -1537,6 +1795,9 @@ class Operations:
         role: str | None = None,
         search_key: str | None = None,
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         attribute: str = "AXValue",
         visible_only: bool = True,
         direction: str = "next",
@@ -1564,6 +1825,7 @@ class Operations:
         self._require_scope(app=app, all_apps=all_apps, apps=apps)
         apps = self._freeze_apps(apps)
         _validate_apps_selector(apps)
+        validate_exact_selectors(title=title, identifier=identifier, description=description)
         self._validate_postcondition(host, postcondition)
         self._validate_postcondition_inheritance(postcondition, has_scope=True)
         resolved_key = host.ax._search_key(search_key, role)
@@ -1575,6 +1837,9 @@ class Operations:
             "scope": self._scope_payload(app, all_apps, apps),
             "search_key": resolved_key,
             "text": text,
+            "title": title,
+            "identifier": identifier,
+            "description": description,
             "attribute": attribute,
             "value": _value_summary(canonical_value),
             "visible_only": visible_only,
@@ -1587,11 +1852,13 @@ class Operations:
         }
         builder = _ReceiptBuilder(
             op="set",
+            host=host,
             backend=backend,
             executor=self._default_executor(host),
             request=request,
             once=None,
             deadline=deadline,
+            wall_clock=self._wall_clock,
         )
 
         # Resolve -> precheck -> dispatch -> verify, serialized against
@@ -1601,11 +1868,15 @@ class Operations:
             try:
                 _match, element_index, _app_info, target = self._resolve_target(
                     host,
+                    builder,
                     app=app,
                     all_apps=all_apps,
                     apps=apps,
                     search_key=resolved_key,
                     text=text,
+                    title=title,
+                    identifier=identifier,
+                    description=description,
                     visible_only=visible_only,
                     direction=direction,
                     immediate_descendants_only=immediate_descendants_only,
@@ -1622,7 +1893,7 @@ class Operations:
                     )
                 )
 
-            builder = dataclasses.replace(builder, executor=self._executor_of(host, element_index))
+            builder.executor = self._executor_of(host, element_index)
 
             if dry_run:
                 return self._finish(
@@ -1734,6 +2005,9 @@ class Operations:
         role: str | None = None,
         search_key: str | None = None,
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         attribute: str = "AXValue",
         visible_only: bool = True,
         direction: str = "next",
@@ -1759,6 +2033,7 @@ class Operations:
         self._require_scope(app=app, all_apps=all_apps, apps=apps)
         apps = self._freeze_apps(apps)
         _validate_apps_selector(apps)
+        validate_exact_selectors(title=title, identifier=identifier, description=description)
         self._validate_postcondition(host, postcondition)
         self._validate_postcondition_inheritance(postcondition, has_scope=True)
         resolved_key = host.ax._search_key(search_key, role)
@@ -1770,6 +2045,9 @@ class Operations:
             "scope": self._scope_payload(app, all_apps, apps),
             "search_key": resolved_key,
             "text": text,
+            "title": title,
+            "identifier": identifier,
+            "description": description,
             "attribute": attribute,
             "desired": _value_summary(bool(desired)),
             "visible_only": visible_only,
@@ -1782,11 +2060,13 @@ class Operations:
         }
         builder = _ReceiptBuilder(
             op="toggle",
+            host=host,
             backend=backend,
             executor=self._default_executor(host),
             request=request,
             once=None,
             deadline=deadline,
+            wall_clock=self._wall_clock,
         )
 
         # Resolve -> precheck -> dispatch -> verify, serialized against
@@ -1796,11 +2076,15 @@ class Operations:
             try:
                 match, element_index, app_info, target = self._resolve_target(
                     host,
+                    builder,
                     app=app,
                     all_apps=all_apps,
                     apps=apps,
                     search_key=resolved_key,
                     text=text,
+                    title=title,
+                    identifier=identifier,
+                    description=description,
                     visible_only=visible_only,
                     direction=direction,
                     immediate_descendants_only=immediate_descendants_only,
@@ -1817,7 +2101,7 @@ class Operations:
                     )
                 )
 
-            builder = dataclasses.replace(builder, executor=self._executor_of(host, element_index))
+            builder.executor = self._executor_of(host, element_index)
 
             if dry_run:
                 return self._finish(
@@ -1882,6 +2166,7 @@ class Operations:
                     )
                 )
 
+            frontmost_before = None if deadline.exhausted() else host._frontmost_app()
             if deadline.exhausted():
                 return self._finish(
                     builder.build(
@@ -1895,7 +2180,9 @@ class Operations:
                 )
 
             try:
-                _perform_guarded(host, element_index, "AXPress", target_pid, "mac.do.toggle")
+                _perform_guarded(
+                    host, element_index, "AXPress", target_pid, "mac.do.toggle", frontmost_before
+                )
             except FocusChangedError as exc:
                 return self._finish(
                     builder.build(
@@ -2016,11 +2303,13 @@ class Operations:
         fingerprint = request_fingerprint(request) if once is not None else None
         builder = _ReceiptBuilder(
             op="run",
+            host=host,
             backend=backend,
             executor=Executor.SCRIPT,
             request=request,
             once=once,
             deadline=deadline,
+            wall_clock=self._wall_clock,
         )
         if once is not None and not dry_run:
             # Nonblocking on purpose: a concurrent duplicate of this same
@@ -2289,11 +2578,13 @@ class Operations:
         fingerprint = request_fingerprint(request) if once is not None else None
         builder = _ReceiptBuilder(
             op=op,
+            host=host,
             backend=backend,
             executor=Executor.INPUT,
             request=request,
             once=once,
             deadline=deadline,
+            wall_clock=self._wall_clock,
         )
         if once is not None and not dry_run:
             # Nonblocking on purpose -- see the matching comment in `press`.
@@ -2335,6 +2626,7 @@ class Operations:
                     )
                 )
 
+            builder.bind_app(info)
             try:
                 extras = prepare(host, pid)
             except MacOSError as exc:
@@ -2472,6 +2764,7 @@ class Operations:
             )
         if status == "in_flight":
             assert op is not None
+            lookup_at = _utc_timestamp(self._wall_clock())
             return self._finish(
                 Receipt(
                     op="recall",
@@ -2484,6 +2777,8 @@ class Operations:
                     verified=False,
                     duration_s=0.0,
                     once=token,
+                    started_at=lookup_at,
+                    finished_at=lookup_at,
                     error={
                         "code": ErrorCode.BAD_REQUEST.value,
                         "message": f"once token {token!r} (reserved for {op!r}) is still in "
@@ -2581,6 +2876,9 @@ class Operations:
             "text": postcondition.text,
             "role": postcondition.role,
             "search_key": postcondition.search_key,
+            "title": postcondition.title,
+            "identifier": postcondition.identifier,
+            "description": postcondition.description,
             "scope": self._scope_payload(postcondition.app, postcondition.all_apps, postcondition.apps),
             "visible_only": postcondition.visible_only,
             "direction": postcondition.direction,
@@ -2598,12 +2896,16 @@ class Operations:
     def _resolve_target(
         self,
         host: _Host,
+        builder: _ReceiptBuilder,
         *,
         app: str | int | None,
         all_apps: bool,
         apps: str | int | Iterable[str | int] | None,
         search_key: str,
         text: str | None,
+        title: str | None,
+        identifier: str | None,
+        description: str | None,
         visible_only: bool,
         direction: str,
         immediate_descendants_only: bool,
@@ -2618,12 +2920,19 @@ class Operations:
         permission, ...) -- always before any ledger reservation, so a
         resolution failure is always retry-free.
         """
+        if app is not None:
+            _, info = host._resolve_app(app)
+            builder.bind_app(info)
+            app = info["pid"]
         match = host.ax_wait(
             app=app,
             all_apps=all_apps,
             apps=apps,
             search_key=search_key,
             text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             direction=direction,
             immediate_descendants_only=immediate_descendants_only,
@@ -2638,6 +2947,8 @@ class Operations:
             app_info: Mapping[str, JSONValue] = owner
         else:
             _, app_info = host._resolve_app(app)
+        if builder.app_info is None:
+            builder.bind_app(app_info)
         target = self._match_target(match, app_info)
         return match, element_index, app_info, target
 
@@ -2661,11 +2972,11 @@ class Operations:
 
     @staticmethod
     def _default_executor(host: _Host) -> Executor:
-        """Best-effort executor for a receipt that never reached
-        resolution (a pre-dispatch failure) -- inferred from the
-        configured backend, since there is no resolved element to
-        introspect yet."""
-        return Executor.NATIVE if host._backend == "native" else Executor.PYTHON
+        """Use the resolved client for automatic backend selection."""
+        native = host._backend == "native" or (
+            host._backend == "auto" and host._native_client is not None
+        )
+        return Executor.NATIVE if native else Executor.PYTHON
 
     # --- postconditions --------------------------------------------------
 
@@ -2678,9 +2989,10 @@ class Operations:
         app: str | int | None,
         all_apps: bool,
         apps: str | int | Iterable[str | int] | None,
+        enhance: bool = True,
     ) -> _Verification:
         if postcondition is None:
-            return _Verification(ok=True, observed=None, error=None)
+            return _Verification(state=Observation.MET, observed=None, error=None)
         explicit = postcondition.app is not None or postcondition.all_apps or postcondition.apps is not None
         scope_app = postcondition.app if explicit else app
         scope_all_apps = postcondition.all_apps if explicit else all_apps
@@ -2696,13 +3008,19 @@ class Operations:
                     apps=scope_apps,
                     search_key=search_key,
                     text=postcondition.text,
+                    title=postcondition.title,
+                    identifier=postcondition.identifier,
+                    description=postcondition.description,
                     visible_only=postcondition.visible_only,
                     direction=postcondition.direction,
                     immediate_descendants_only=postcondition.immediate_descendants_only,
                     timeout=effective_timeout,
                     interval=postcondition.interval,
+                    enhance=enhance,
                 )
-                return _Verification(ok=True, observed=self._match_summary_payload(match), error=None)
+                return _Verification(
+                    state=Observation.MET, observed=self._match_summary_payload(match), error=None
+                )
             if isinstance(postcondition, Equals):
                 return self._verify_equals(
                     host,
@@ -2712,6 +3030,7 @@ class Operations:
                     app=scope_app,
                     all_apps=scope_all_apps,
                     apps=scope_apps,
+                    enhance=enhance,
                 )
             # `postcondition` is a `Gone`: `_validate_postcondition` has
             # already guaranteed it is a `Present`, `Gone`, or `Equals`
@@ -2725,7 +3044,8 @@ class Operations:
                 # second poll, so this fails deterministically instead of
                 # handing `ax_wait_gone` a timeout it cannot honor.
                 return _Verification(
-                    ok=False,
+                    state=Observation.UNOBSERVABLE,
+                    reason="deadline_exhausted",
                     observed=None,
                     error=_deadline_exhausted_error(
                         "deadline_exhausted_before_verification",
@@ -2739,15 +3059,20 @@ class Operations:
                 apps=scope_apps,
                 search_key=search_key,
                 text=postcondition.text,
+                title=postcondition.title,
+                identifier=postcondition.identifier,
+                description=postcondition.description,
                 visible_only=postcondition.visible_only,
                 direction=postcondition.direction,
                 immediate_descendants_only=postcondition.immediate_descendants_only,
                 timeout=effective_timeout,
                 interval=postcondition.interval,
+                enhance=enhance,
             )
-            return _Verification(ok=True, observed=None, error=None)
+            return _Verification(state=Observation.MET, observed=None, error=None)
         except MacOSError as exc:
-            return _Verification(ok=False, observed=None, error=exc.to_json())
+            state, reason = _observation_of(postcondition, exc)
+            return _Verification(state=state, observed=None, error=exc.to_json(), reason=reason)
 
     def _verify_equals(
         self,
@@ -2759,6 +3084,7 @@ class Operations:
         app: str | int | None,
         all_apps: bool,
         apps: str | int | Iterable[str | int] | None,
+        enhance: bool = True,
     ) -> _Verification:
         """Resolve the one match and read its attribute every
         ``postcondition.interval`` until the reading equals the expected
@@ -2781,11 +3107,15 @@ class Operations:
                 apps=apps,
                 search_key=search_key,
                 text=postcondition.text,
+                title=postcondition.title,
+                identifier=postcondition.identifier,
+                description=postcondition.description,
                 visible_only=postcondition.visible_only,
                 direction=postcondition.direction,
                 immediate_descendants_only=postcondition.immediate_descendants_only,
                 timeout=deadline.remaining(),
                 interval=postcondition.interval,
+                enhance=enhance,
             )
             return match, host.get(int(match["element_index"]), attribute)
 
@@ -2806,7 +3136,7 @@ class Operations:
                 },
             )
         return _Verification(
-            ok=True,
+            state=Observation.MET,
             observed={
                 **self._match_summary_payload(match),
                 "attribute": attribute,
@@ -2872,8 +3202,8 @@ class Operations:
             },
         )
 
-    @staticmethod
-    def _finish(receipt: Receipt) -> Receipt:
+    def _finish(self, receipt: Receipt) -> Receipt:
+        self._ledger.remember(receipt)
         if receipt.outcome is Outcome.FAILED:
             raise OperationError.from_receipt(receipt)
         return receipt

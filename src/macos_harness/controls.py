@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 import ApplicationServices as AS
 
 from .errors import ErrorCode, MacOSError
-from .macos import _AX_SAFE_ATTRIBUTES
+from .macos import _AX_SAFE_ATTRIBUTES, SearchMatches
 
 if TYPE_CHECKING:
     from .macos import MacOS
@@ -135,6 +135,9 @@ class Accessibility:
         element_index: int | None = None,
         role: str | None = None,
         search_key: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         limit: int = 20,
         direction: str = "next",
@@ -142,12 +145,15 @@ class Accessibility:
         attributes: Iterable[str] = _COMPACT_ATTRIBUTES,
         include_actions: bool = False,
         max_nodes: int = 500,
-    ) -> list[dict[str, Any]]:
+    ) -> SearchMatches:
         return self._host.ax_search(
             element_index=element_index,
             app=app,
             search_key=self._search_key(search_key, role),
             text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             limit=limit,
             direction=direction,
@@ -164,6 +170,9 @@ class Accessibility:
         apps: str | int | Iterable[str | int] | None = None,
         role: str | None = None,
         search_key: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         limit: int = 20,
         direction: str = "next",
@@ -171,11 +180,14 @@ class Accessibility:
         attributes: Iterable[str] = _SAFE_ATTRIBUTES,
         include_actions: bool = False,
         max_nodes: int = 500,
-    ) -> list[dict[str, Any]]:
+    ) -> SearchMatches:
         return self._host.ax_search_all(
             apps=apps,
             search_key=self._search_key(search_key, role),
             text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             limit=limit,
             direction=direction,
@@ -194,6 +206,9 @@ class Accessibility:
         apps: str | int | Iterable[str | int] | None = None,
         role: str | None = None,
         search_key: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
@@ -209,6 +224,9 @@ class Accessibility:
             apps=apps,
             search_key=self._search_key(search_key, role),
             text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             direction=direction,
             immediate_descendants_only=immediate_descendants_only,
@@ -228,6 +246,9 @@ class Accessibility:
         apps: str | int | Iterable[str | int] | None = None,
         role: str | None = None,
         search_key: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
@@ -242,6 +263,9 @@ class Accessibility:
             apps=apps,
             search_key=self._search_key(search_key, role),
             text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             direction=direction,
             immediate_descendants_only=immediate_descendants_only,
@@ -260,6 +284,9 @@ class Accessibility:
         apps: str | int | Iterable[str | int] | None = None,
         role: str | None = None,
         search_key: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
@@ -274,6 +301,9 @@ class Accessibility:
             apps=apps,
             search_key=self._search_key(search_key, role),
             text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             direction=direction,
             immediate_descendants_only=immediate_descendants_only,

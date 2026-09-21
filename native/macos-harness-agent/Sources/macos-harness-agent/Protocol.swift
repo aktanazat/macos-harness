@@ -2,7 +2,10 @@ import Foundation
 
 /// Major protocol version this agent speaks. Echoed in `ping`'s result under
 /// the `protocol` key; the Python client's `PROTOCOL_VERSION` constant must match it.
-let protocolVersion = 1
+/// Version 2 added exact selectors (`title`/`identifier`/`description`) and
+/// search completeness (`complete`/`visited`) to `ax_query`/`ax_press`, and
+/// an optional `details` object on every wire error.
+let protocolVersion = 2
 
 /// Wire-level request envelope: `{"v":1,"id":<int>,"op":<str>,"params":{...}}`.
 struct WireRequest: Codable {
@@ -13,29 +16,32 @@ struct WireRequest: Codable {
 }
 
 /// Wire-level error payload embedded in a failing `WireResponse`:
-/// `{"code":<str>,"message":<str>,"ax_error":<int?>}`. `axError` is omitted
-/// entirely on encode when absent, and decodes as `nil` when the key is
-/// missing.
+/// `{"code":<str>,"message":<str>,"ax_error":<int?>,"details":{...}?}`.
+/// `axError` and `details` are each omitted entirely on encode when absent,
+/// and decode as `nil` when the key is missing.
 struct WireError: Codable {
   let code: String
   let message: String
   let axError: Int?
+  let details: [String: JSONValue]?
 
   enum CodingKeys: String, CodingKey {
     case code
     case message
     case axError = "ax_error"
+    case details
   }
 
-  init(code: String, message: String, axError: Int? = nil) {
+  init(code: String, message: String, axError: Int? = nil, details: [String: JSONValue]? = nil) {
     self.code = code
     self.message = message
     self.axError = axError
+    self.details = details
   }
 
   /// Wire-shape projection of a thrown `AgentError`.
   init(_ error: AgentError) {
-    self.init(code: error.code, message: error.message, axError: error.axError)
+    self.init(code: error.code, message: error.message, axError: error.axError, details: error.details)
   }
 }
 
@@ -78,16 +84,21 @@ struct WireResponse: Codable, Error {
 /// `app.ambiguous`, `focus.changed`, `ax.error`, `element.unknown`,
 /// `timeout`, `bad_request`, `unsupported_op`. `axError` carries the raw
 /// `AXError` integer for `ax.error` and for a `timeout` mapped from
-/// `kAXErrorCannotComplete`; every other code leaves it `nil`.
+/// `kAXErrorCannotComplete`; every other code leaves it `nil`. `details`
+/// carries structured context the client merges into its own error
+/// details -- `PressCoordinator` reports `complete`/`visited` there so a
+/// timed-out press can say which bound stopped the search.
 struct AgentError: Error {
   let code: String
   let message: String
   let axError: Int?
+  let details: [String: JSONValue]?
 
-  init(code: String, message: String, axError: Int? = nil) {
+  init(code: String, message: String, axError: Int? = nil, details: [String: JSONValue]? = nil) {
     self.code = code
     self.message = message
     self.axError = axError
+    self.details = details
   }
 }
 

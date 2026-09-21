@@ -89,7 +89,7 @@ final class HandlerSeamTests: XCTestCase {
     XCTAssertNotEqual(response.error?.code, "permission.accessibility")
   }
 
-  func testPingResultCarriesProtocolMajorOne() throws {
+  func testPingResultCarriesTheCurrentProtocolVersion() throws {
     let handlers = AgentHandlers()
     let response = handlers.handle(WireRequest(v: 1, id: 22, op: "ping", params: .object([:])))
     XCTAssertTrue(response.ok)
@@ -99,7 +99,9 @@ final class HandlerSeamTests: XCTestCase {
     guard case .number(let protocolVersion)? = result["protocol"] else {
       return XCTFail("expected ping result to carry a numeric protocol field")
     }
-    XCTAssertEqual(protocolVersion, 1)
+    // Version 2 added `complete`/`visited` to ax_query results and exact selectors to the
+    // search ops; a client that pins 1 must be told this agent is newer.
+    XCTAssertEqual(protocolVersion, 2)
   }
 
   func testPingReportsThisProcessOwnProcessIdentifier() throws {
@@ -237,6 +239,52 @@ final class HandlerSeamTests: XCTestCase {
   func testQueryAcceptsMessagingTimeoutWithinRange() {
     let response = axQueryResponse(["messaging_timeout": .number(3.0)])
     XCTAssertNotEqual(response.error?.code, "bad_request")
+  }
+
+  func testQueryRejectsEmptyExactSelector() {
+    // An empty exact selector could never equal an attribute a search keeps, so it is a
+    // malformed request rather than a silent never-match. Mirrors validate_exact_selectors
+    // in receipts.py.
+    for key in ["title", "identifier", "description"] {
+      let response = axQueryResponse([key: .string("")])
+      XCTAssertEqual(response.error?.code, "bad_request", "empty \(key) must be rejected")
+    }
+  }
+
+  func testQueryRejectsNonStringExactSelector() {
+    let response = axQueryResponse(["identifier": .number(7)])
+    XCTAssertEqual(response.error?.code, "bad_request")
+  }
+
+  func testQueryRejectsOversizedExactSelector() {
+    let overlong = String(repeating: "x", count: 1024 * 1024 + 1)
+    let response = axQueryResponse(["title": .string(overlong)])
+    XCTAssertEqual(response.error?.code, "bad_request")
+  }
+
+  func testQueryAcceptsExactSelectorsWithoutText() {
+    // An exact selector is a complete search on its own; it needs no substring `text`.
+    let response = axQueryResponse([
+      "title": .string("Save"), "identifier": .string("_NS:9"), "description": .string("Save"),
+    ])
+    XCTAssertNotEqual(response.error?.code, "bad_request")
+  }
+
+  func testQueryTreatsNullExactSelectorAsUnset() {
+    let response = axQueryResponse(["title": .null])
+    XCTAssertNotEqual(response.error?.code, "bad_request")
+  }
+
+  func testPressRejectsEmptyExactSelector() {
+    let handlers = AgentHandlers(trustCheck: { true })
+    let response = handlers.handle(
+      WireRequest(
+        v: 2, id: 1, op: "ax_press",
+        // An expired deadline is valid and stops this seam before any AX access.
+        params: .object([
+          "app_pid": .number(1), "description": .string(""), "action_deadline": .number(0),
+        ])))
+    XCTAssertEqual(response.error?.code, "bad_request")
   }
 
   func testElementGetRejectsOversizedAttributesArray() {

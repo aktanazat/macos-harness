@@ -8,9 +8,11 @@ renders a specific window (see ``capture.py``).
 from __future__ import annotations
 
 import ctypes
+import errno
 import json
 import math
 import os
+import plistlib
 import re
 import subprocess
 import tempfile
@@ -30,8 +32,9 @@ from .errors import (
     MacOSError,
 )
 from .handoff import HandoffReason, HumanHandoff
+from .ops import _Deadline, _utc_timestamp
 from .overlay import LivePointerOverlay
-from .receipts import JSONValue
+from .receipts import JSONValue, Receipt, validate_exact_selectors
 
 if TYPE_CHECKING:
     # Only for annotations -- `native.py` imports from this module at
@@ -70,6 +73,13 @@ class _TargetWindow(NamedTuple):
     window_id: int
     origin: tuple[float, float]  # top-left screen point
 
+class _AppIdentity(NamedTuple):
+    pid: int
+    bundle_id: str | None
+    launched_at: float
+    name: str
+    path: str | None
+
 
 # A mouse or scroll event posted with ``CGEventPostToPid`` skips the window
 # server's hit test, so AppKit has to learn the destination window from the
@@ -96,12 +106,59 @@ def _load_window_location_setter() -> Callable[[int, _CGPoint], None] | None:
 
 _set_window_location = _load_window_location_setter() if AS else None
 
+class _ProcessBSDInfo(ctypes.Structure):
+    # sys/proc_info.h: PROC_PIDTBSDINFO / struct proc_bsdinfo.
+    _fields_ = (
+        ("pbi_flags", ctypes.c_uint32), ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32), ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32), ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32), ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32), ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32), ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16), ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32), ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32), ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32), ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64), ("pbi_start_tvusec", ctypes.c_uint64),
+    )
+
+
+def _load_process_info() -> Callable[[int, int, int, object, int], int] | None:
+    try:
+        function = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidinfo
+    except (OSError, AttributeError):
+        return None
+    function.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
+    function.restype = ctypes.c_int
+    return function
+
+
+_process_info = _load_process_info() if AS else None
+
+
+def _process_start_time(pid: int) -> float:
+    if _process_info is None:
+        raise MacOSError("Process start identity is unavailable", code=ErrorCode.UNSUPPORTED_OP)
+    info = _ProcessBSDInfo()
+    size = ctypes.sizeof(info)
+    returned = _process_info(pid, 3, 0, ctypes.byref(info), size)
+    if returned != size:
+        error = ctypes.get_errno()
+        if returned == 0 and error == errno.ESRCH:
+            raise ApplicationNotFoundError("The process exited before its identity could be read",
+                                           details={"pid": pid})
+        raise MacOSError("Could not read the process start identity", code=ErrorCode.UNSUPPORTED_OP,
+                         details={"pid": pid, "errno": error, "bytes_read": returned})
+    return info.pbi_start_tvsec + info.pbi_start_tvusec / 1_000_000
+
 
 _AX_SUCCESS = 0
 _AX_ATTRIBUTES = (
     "AXRole",
     "AXSubrole",
     "AXRoleDescription",
+    "AXMain",
+    "AXModal",
     "AXTitle",
     "AXDescription",
     "AXHelp",
@@ -122,6 +179,9 @@ _AX_ATTRIBUTES = (
 )
 _AX_SAFE_ATTRIBUTES = (
     "AXRole",
+    "AXSubrole",
+    "AXMain",
+    "AXModal",
     "AXTitle",
     "AXDescription",
     "AXPlaceholderValue",
@@ -141,6 +201,8 @@ _LAUNCH_GRACE_SECONDS = 5.0
 _LAUNCH_WINDOW_TIMEOUT = 2.0
 _AX_NODE_MAPPING = {
     "AXSubrole": "subrole",
+    "AXMain": "main",
+    "AXModal": "modal",
     "AXRoleDescription": "role_description",
     "AXTitle": "title",
     "AXDescription": "description",
@@ -178,6 +240,7 @@ _FOCUS_DETAIL_ATTRIBUTES = {
     "AXNumberOfCharacters": "characters",
 }
 _SECURE_SUBROLE = "AXSecureTextField"
+_SENSITIVE_ATTRIBUTES = frozenset({"AXValue", "AXSelectedText", "AXSelectedTextRange", "AXNumberOfCharacters"})
 _SETTABLE_CANDIDATES = ("AXValue", "AXFocused", "AXSelected")
 _ACTION_ALIASES = {
     "press": "AXPress",
@@ -436,6 +499,100 @@ def _ax_absent(error: int) -> bool:
     return error in (AS.kAXErrorNoValue, AS.kAXErrorAttributeUnsupported)
 
 
+class _AttributeValues(dict[str, Any | None]):
+    """Best-effort attribute values without treating failed reads as absence."""
+
+    __slots__ = ("complete",)
+
+    def __init__(
+        self, values: Iterable[tuple[str, Any | None]] = (), *, complete: bool = True
+    ) -> None:
+        super().__init__(values)
+        self.complete = complete
+
+
+class SearchMatches(list[dict[str, JSONValue]]):
+    """The matches of one AX search, plus whether they are all of them.
+
+    ``complete`` is True when no limit or failed read left part of the
+    searched scope unexamined. ``visited`` counts the candidates returned
+    by an app's optimized search, or nodes visited by the bounded walk.
+    Exact waits require completeness before accepting one match;
+    disappearance waits require it before accepting an empty search.
+    """
+
+    __slots__ = ("complete", "visited")
+
+    def __init__(
+        self,
+        matches: Iterable[dict[str, JSONValue]] = (),
+        *,
+        complete: bool,
+        visited: int,
+    ) -> None:
+        super().__init__(matches)
+        self.complete = complete
+        self.visited = visited
+
+
+class _ExactSelector(NamedTuple):
+    """The exact-equality half of a search: each field that is set must
+    equal the element's attribute of the same name, character for
+    character. Substring ``text`` narrows the candidates; this decides
+    them."""
+
+    title: str | None
+    identifier: str | None
+    description: str | None
+
+    @classmethod
+    def parse(
+        cls, *, title: str | None, identifier: str | None, description: str | None
+    ) -> _ExactSelector:
+        validate_exact_selectors(
+            title=title, identifier=identifier, description=description
+        )
+        return cls(title, identifier, description)
+
+    @property
+    def active(self) -> bool:
+        return any(value is not None for value in self)
+
+    @property
+    def attributes(self) -> tuple[str, ...]:
+        """The AX attributes a candidate must be read for before `matches`
+        can judge it."""
+        return tuple(
+            source
+            for source, target in _EXACT_ATTRIBUTES.items()
+            if getattr(self, target) is not None
+        )
+
+    def matches(self, fields: Mapping[str, JSONValue]) -> bool:
+        """Whether ``fields`` -- wire-named, as `_describe_element` builds
+        them -- carries every set selector's value exactly."""
+        return all(
+            value is None or fields.get(name) == value
+            for name, value in zip(self._fields, self, strict=True)
+        )
+
+
+_EXACT_ATTRIBUTES = {
+    "AXTitle": "title",
+    "AXIdentifier": "identifier",
+    "AXDescription": "description",
+}
+
+
+class _TreeSnapshot(NamedTuple):
+    """Visited nodes and the limits or failed reads that left gaps."""
+
+    nodes: list[dict[str, JSONValue]]
+    node_cut: bool
+    depth_cut: bool
+    read_cut: bool
+
+
 _BACKENDS = ("python", "native", "auto")
 
 
@@ -567,11 +724,13 @@ class MacOS:
 
         from .controls import Accessibility
         from .ops import Operations
+        from .routes import Routes
 
         self._pointer_position: tuple[float, float] | None = None
         self._overlay = LivePointerOverlay()
         self.ax = Accessibility(self)
         self.do = Operations(self)
+        self.route = Routes(self)
         self._backend = _resolve_backend(backend)
         self._native_client: NativeClient | None = None
         self._native_error: Exception | None = None
@@ -591,6 +750,147 @@ class MacOS:
         # every later native-session entry point can tell.
         self._creator_pid = os.getpid()
         _live_macos_instances.add(self)
+
+    def timeline(self) -> list[dict[str, JSONValue]]:
+        """Return recent receipted operations without observing the desktop."""
+        return [receipt.to_json() for receipt in self.do.history()]
+
+    def _diagnostic_identity(self, app: str | int | Receipt) -> _AppIdentity:
+        if not isinstance(app, Receipt):
+            return self._process_identity(app)
+        process, target = app.process, app.target
+        info = target.get("app") if isinstance(target, Mapping) else None
+        if not isinstance(process, Mapping) or not isinstance(info, Mapping):
+            raise MacOSError("Receipt has no bound app identity; select an app explicitly",
+                             code=ErrorCode.BAD_REQUEST)
+        pid, launched = process.get("pid"), process.get("launched_at")
+        if type(pid) is not int or type(launched) not in (int, float):
+            raise MacOSError("Receipt has no process launch identity", code=ErrorCode.BAD_REQUEST)
+        bundle, name, path = info.get("bundle_id"), info.get("name"), info.get("path")
+        return _AppIdentity(pid, bundle if isinstance(bundle, str) else None, launched,
+                            name if isinstance(name, str) else "", path if isinstance(path, str) else None)
+
+    def _status_identity(self, identity: _AppIdentity) -> dict[str, JSONValue]:
+        return {
+            "app": {"pid": identity.pid, "name": identity.name,
+                    "bundle_id": identity.bundle_id, "path": identity.path},
+            "process": self._observe_process(identity),
+            "build": self._build_status(identity), "observed_at": _utc_timestamp(time.time()),
+        }
+
+    def status(self, app: str | int | Receipt) -> dict[str, JSONValue]:
+        """Read app lifetime and on-disk build metadata without reading its UI."""
+        self.do._check_owner()
+        return self._status_identity(self._diagnostic_identity(app))
+
+    def inspect(
+        self, app: str | int | Receipt, *, max_depth: int = 12, max_nodes: int = 300,
+        include_values: bool = False, screenshot: bool = False,
+    ) -> dict[str, JSONValue]:
+        """Collect a bounded, non-enhancing snapshot; values and capture are opt-in."""
+        from .diagnostics import inspection_findings
+
+        self.do._check_owner()
+        if type(max_nodes) is not int or not 1 <= max_nodes <= 5000:
+            raise MacOSError("max_nodes must be between 1 and 5000", code=ErrorCode.BAD_REQUEST)
+        if type(max_depth) is not int or not 0 <= max_depth <= 25:
+            raise MacOSError("max_depth must be between 0 and 25", code=ErrorCode.BAD_REQUEST)
+        if not isinstance(include_values, bool) or not isinstance(screenshot, bool):
+            raise MacOSError("include_values and screenshot must be booleans", code=ErrorCode.BAD_REQUEST)
+        with self.do._dispatch_lock:
+            identity = self._diagnostic_identity(app)
+            status = self._status_identity(identity)
+            process = status["process"]
+            if isinstance(process, Mapping) and process.get("state") == "running":
+                try:
+                    state = self.get_app_state(
+                        identity.pid, max_depth=max_depth, max_nodes=max_nodes,
+                        include_values=include_values, screenshot=screenshot,
+                        include_actions=False, include_settable=False, enhance=False,
+                    )
+                except MacOSError as exc:
+                    state = {"error": exc.to_json()}
+                try:
+                    state["focus"] = self._focus_sample(identity.pid, include_values=include_values)
+                except MacOSError as exc:
+                    state["focus_error"] = exc.to_json()
+                state.update(status)
+                state["process"] = self._observe_process(identity)
+            else:
+                state = status
+            state["observed_at"] = _utc_timestamp(time.time())
+            state.update(inspection_findings(state, app if isinstance(app, Receipt) else None))
+            return state
+
+    def _diagnostic_pid(self, subject: Receipt | tuple[str, str], app: str | int | None) -> int:
+        from .diagnostics import receipt_pid
+
+        if isinstance(subject, Receipt):
+            if app is not None:
+                raise MacOSError("A receipt already supplies the target app", code=ErrorCode.BAD_REQUEST)
+            return receipt_pid(subject)
+        if isinstance(app, int) and not isinstance(app, bool) and app > 0:
+            return app
+        if isinstance(app, str):
+            return self._process_identity(app).pid
+        raise MacOSError("An explicit time interval needs an app or pid", code=ErrorCode.BAD_REQUEST)
+
+    def logs(
+        self, subject: Receipt | tuple[str, str], *, app: str | int | None = None,
+        subsystem: str | None = None, category: str | None = None, level: str = "info",
+        limit: int = 200, timeout: float = 5.0, max_bytes: int = 1024 * 1024,
+    ) -> dict[str, JSONValue]:
+        """Read bounded unified logs for an action or explicit UTC interval."""
+        from .diagnostics import collect_logs
+
+        self.do._check_owner()
+        return collect_logs(subject, self._diagnostic_pid(subject, app), subsystem=subsystem,
+                            category=category, level=level, limit=limit, timeout=timeout, max_bytes=max_bytes)
+
+    def crashes(
+        self, subject: Receipt | tuple[str, str], *, app: str | int | None = None,
+        limit: int = 3, max_files: int = 128,
+    ) -> dict[str, JSONValue]:
+        """Look up bounded modern crash reports; absence is only this lookup's result."""
+        from .diagnostics import collect_crashes
+
+        self.do._check_owner()
+        return collect_crashes(subject, self._diagnostic_pid(subject, app), limit=limit, max_files=max_files,
+                               directories=(Path.home() / "Library/Logs/DiagnosticReports",
+                                            Path("/Library/Logs/DiagnosticReports")))
+
+    def sample(
+        self, app: str | int | Receipt, *, duration: int = 1, timeout: float = 5.0,
+        max_bytes: int = 1024 * 1024,
+    ) -> dict[str, JSONValue]:
+        """Collect a bounded call graph explicitly, without diagnosing a hang from it."""
+        from .diagnostics import collect_sample
+
+        self.do._check_owner()
+        identity = self._diagnostic_identity(app)
+        process = self._observe_process(identity)
+        if process.get("state") != "running":
+            return {"kind": "sample", "status": "failed", "pid": identity.pid, "process": process,
+                    "error": MacOSError("The bound app is no longer available for sampling",
+                                        code=ErrorCode.APP_EXITED if process.get("state") == "exited"
+                                        else ErrorCode.UNSUPPORTED_OP).to_json()}
+        result = collect_sample(identity.pid, duration=duration, timeout=timeout, max_bytes=max_bytes)
+        result["process"] = self._observe_process(identity)
+        return result
+
+    @staticmethod
+    def explain(receipt: Receipt, *evidence: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        """Explain a receipt using only supplied evidence, without a fresh observation."""
+        from .diagnostics import explain
+
+        return explain(receipt, evidence)
+
+    @staticmethod
+    def diff_windows(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        """Compare supplied window snapshots without observing the desktop."""
+        from .diagnostics import diff_windows
+
+        return diff_windows(before, after)
 
     def _check_native_owner(self) -> None:
         """Fail closed before touching ``_native_lock`` from a forked child.
@@ -776,6 +1076,88 @@ class MacOS:
             "pid": int(app.processIdentifier()),
             "path": str(path) if path else None,
         }
+
+    def _process_identity(self, query: str | int) -> _AppIdentity:
+        try:
+            _, info = self._resolve_app(query)
+        except ApplicationNotFoundError:
+            if not isinstance(query, int) or isinstance(query, bool):
+                raise
+            # Command-line processes have a kernel identity without an AppKit record.
+            info = {"pid": query}
+        return self._identity_from_info(info)
+
+    @staticmethod
+    def _identity_from_info(info: Mapping[str, JSONValue]) -> _AppIdentity:
+        pid = info.get("pid")
+        if type(pid) is not int or pid <= 0:
+            raise MacOSError("Resolved app has no valid pid", code=ErrorCode.AX_ERROR)
+        bundle_id, name, path = info.get("bundle_id"), info.get("name"), info.get("path")
+        return _AppIdentity(
+            pid=pid, launched_at=_process_start_time(pid),
+            bundle_id=bundle_id if isinstance(bundle_id, str) else None,
+            name=name if isinstance(name, str) else "",
+            path=path if isinstance(path, str) else None,
+        )
+
+    def _observe_process(self, expected: _AppIdentity) -> dict[str, JSONValue]:
+        observation: dict[str, JSONValue] = {
+            "pid": expected.pid, "launched_at": expected.launched_at,
+        }
+        try:
+            observation["state"] = "running" if self._same_process(expected) else "exited"
+        except MacOSError as exc:
+            observation.update(state="unknown", error=exc.to_json())
+        return observation
+
+    def _same_process(self, expected: _AppIdentity) -> bool:
+        try:
+            current = self._process_identity(expected.pid)
+        except ApplicationNotFoundError:
+            return False
+        return (current.pid, current.bundle_id, current.launched_at) == (
+            expected.pid, expected.bundle_id, expected.launched_at
+        )
+
+    @staticmethod
+    def _bundle_info(path: str | None) -> dict[str, object]:
+        if path is None:
+            return {}
+        try:
+            with (Path(path) / "Contents" / "Info.plist").open("rb") as source:
+                info = plistlib.load(source)
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            return {}
+        return info if isinstance(info, dict) else {}
+
+    @classmethod
+    def _bundle_version(cls, path: str | None) -> tuple[str | None, str | None]:
+        info = cls._bundle_info(path)
+        version = info.get("CFBundleShortVersionString")
+        build = info.get("CFBundleVersion")
+        return (version if isinstance(version, str) else None,
+                build if isinstance(build, str) else None)
+
+    def _build_status(self, identity: _AppIdentity) -> dict[str, JSONValue]:
+        info = self._bundle_info(identity.path)
+        version, build = info.get("CFBundleShortVersionString"), info.get("CFBundleVersion")
+        result: dict[str, JSONValue] = {
+            "on_disk_version": version if isinstance(version, str) else None,
+            "on_disk_build": build if isinstance(build, str) else None,
+            "executable_modified_at": None, "potentially_stale": None,
+        }
+        executable = info.get("CFBundleExecutable")
+        if (identity.path is None or not isinstance(executable, str)
+                or not executable or Path(executable).name != executable):
+            return result
+        try:
+            modified = (Path(identity.path) / "Contents" / "MacOS" / executable).stat().st_mtime
+        except OSError as exc:
+            result["error"] = str(exc)
+        else:
+            result["executable_modified_at"] = _utc_timestamp(modified)
+            result["potentially_stale"] = modified > identity.launched_at
+        return result
 
     @classmethod
     def _frontmost_app(cls) -> dict[str, Any] | None:
@@ -987,7 +1369,7 @@ class MacOS:
     @staticmethod
     def _copy_attributes(
         element: Any, attributes: Iterable[str], *, checked: bool = False
-    ) -> dict[str, Any | None]:
+    ) -> _AttributeValues:
         """Read AX attributes in one application round trip when supported.
 
         A batch the app or the binding would not answer falls back to
@@ -997,24 +1379,32 @@ class MacOS:
         """
         names = tuple(dict.fromkeys(str(attribute) for attribute in attributes))
         if not names:
-            return {}
+            return _AttributeValues()
         try:
             error, values = AS.AXUIElementCopyMultipleAttributeValues(
                 element, names, 0, None
             )
         except (AttributeError, TypeError, ValueError):
             error, values = -1, None
+        result = _AttributeValues()
         if error != _AX_SUCCESS or values is None or len(values) != len(names):
-            return {
-                name: MacOS._copy_attribute(element, name, checked=checked) for name in names
-            }
+            for name in names:
+                try:
+                    result[name] = MacOS._copy_attribute(element, name, checked=True)
+                except MacOSError:
+                    if checked:
+                        raise
+                    result[name] = None
+                    result.complete = False
+            return result
 
-        result: dict[str, Any | None] = {}
         for name, value in zip(names, values, strict=True):
             slot_error = MacOS._slot_error(value)
             if slot_error is not None:
-                if checked and not _ax_absent(slot_error):
-                    raise _ax_error(f"Read {name}", slot_error)
+                if not _ax_absent(slot_error):
+                    if checked:
+                        raise _ax_error(f"Read {name}", slot_error)
+                    result.complete = False
                 value = None
             result[name] = value
         return result
@@ -1043,7 +1433,7 @@ class MacOS:
         error, value = AS.AXUIElementIsAttributeSettable(element, attribute, None)
         return bool(value) if error == _AX_SUCCESS else False
 
-    def _focus_sample(self, pid: int) -> dict[str, JSONValue]:
+    def _focus_sample(self, pid: int, *, include_values: bool = True) -> dict[str, JSONValue]:
         """What has keyboard focus in ``pid`` right now, in one cheap reading.
 
         Up to five AX calls and no ``AXEnhancedUserInterface`` toggle, so
@@ -1078,9 +1468,10 @@ class MacOS:
             return sample
         attributes = self._copy_attributes(focused, _FOCUS_IDENTITY_ATTRIBUTES, checked=True)
         if attributes.get("AXSubrole") != _SECURE_SUBROLE:
-            attributes.update(
-                self._copy_attributes(focused, _FOCUS_DETAIL_ATTRIBUTES, checked=True)
+            details = _FOCUS_DETAIL_ATTRIBUTES if include_values else (
+                name for name in _FOCUS_DETAIL_ATTRIBUTES if name not in _SENSITIVE_ATTRIBUTES
             )
+            attributes.update(self._copy_attributes(focused, details, checked=True))
         names = {**_FOCUS_IDENTITY_ATTRIBUTES, **_FOCUS_DETAIL_ATTRIBUTES}
         sample["focused"] = {
             names[name]: self._jsonable(value)
@@ -1195,11 +1586,12 @@ class MacOS:
         include_actions: bool = True,
         include_settable: bool = True,
         reset_elements: bool = True,
-    ) -> list[dict[str, Any]]:
+    ) -> _TreeSnapshot:
         if reset_elements:
             self._elements = {}
         nodes: list[dict[str, Any]] = []
-        seen: set[int] = set()
+        seen: set[Any] = set()
+        node_cut = depth_cut = read_cut = False
         requested_attributes = tuple(
             dict.fromkeys(
                 (
@@ -1218,18 +1610,29 @@ class MacOS:
             "AXWindows",
         }
 
-        def visit(element: Any, depth: int) -> None:
-            if depth > max_depth or len(nodes) >= max_nodes:
-                return
-            try:
-                identity = hash(element)
-            except TypeError:
-                identity = id(element)
-            if identity in seen:
-                return
-            seen.add(identity)
+        safe_attributes = tuple(name for name in requested_attributes if name not in _SENSITIVE_ATTRIBUTES)
+        reads_values = len(safe_attributes) != len(requested_attributes)
 
-            raw = self._copy_attributes(element, requested_attributes)
+        def visit(element: Any, depth: int) -> None:
+            nonlocal node_cut, depth_cut, read_cut
+            if element in seen:
+                return
+            if depth > max_depth:
+                depth_cut = True
+                return
+            if len(nodes) >= max_nodes:
+                node_cut = True
+                return
+            seen.add(element)
+
+            if reads_values:
+                identity = self._copy_attributes(element, _FOCUS_IDENTITY_ATTRIBUTES)
+                allowed = identity.complete and identity.get("AXSubrole") != _SECURE_SUBROLE
+                raw = self._copy_attributes(element, requested_attributes if allowed else safe_attributes)
+                raw.complete = raw.complete and identity.complete
+            else:
+                raw = self._copy_attributes(element, requested_attributes)
+            read_cut = read_cut or not raw.complete
             if raw.get("AXRole") == "AXMenuBar" and not include_menu_bar:
                 return
             index = self._remember_element(element)
@@ -1243,10 +1646,10 @@ class MacOS:
                 if value not in (None, "", [], {}):
                     node[target] = value
             extra = {
-                name: self._jsonable(raw[name])
+                name: self._jsonable(raw.get(name))
                 for name in requested_attributes
                 if name not in standard_attributes
-                and self._jsonable(raw[name]) not in (None, "", [], {})
+                and self._jsonable(raw.get(name)) not in (None, "", [], {})
             }
             if extra:
                 node["attributes"] = extra
@@ -1275,7 +1678,7 @@ class MacOS:
                         visit(child, depth + 1)
 
         visit(root, 0)
-        return nodes
+        return _TreeSnapshot(nodes, node_cut, depth_cut, read_cut)
 
     @staticmethod
     def _render_tree(nodes: list[dict[str, Any]], *, truncated: bool = False) -> str:
@@ -1306,7 +1709,7 @@ class MacOS:
 
     def get_app_state(
         self,
-        app: str,
+        app: str | int,
         *,
         screenshot: bool = False,
         max_depth: int = 25,
@@ -1316,26 +1719,36 @@ class MacOS:
         extra_attributes: Iterable[str] = (),
         include_actions: bool = True,
         include_settable: bool = True,
+        include_values: bool = True,
+        enhance: bool = True,
     ) -> dict[str, Any]:
         self._ensure_accessibility()
         _, info = self._resolve_app(app)
-        root = self._application_element(info["pid"])
-        nodes = self._snapshot_tree(
+        root = self._application_element(info["pid"], enhance=enhance)
+        snapshot = self._snapshot_tree(
             root,
             max_depth=max_depth,
             max_nodes=max_nodes,
             include_menu_bar=include_menu_bar,
-            extra_attributes=extra_attributes,
+            attributes=_AX_ATTRIBUTES if include_values else _AX_SAFE_ATTRIBUTES,
+            extra_attributes=tuple(name for name in extra_attributes
+                                   if include_values or name not in _SENSITIVE_ATTRIBUTES),
             include_actions=include_actions,
             include_settable=include_settable,
         )
+        nodes = snapshot.nodes
         self._last_app = info
-        self._last_windows = self.windows(app)
+        self._last_windows = self.windows(info["pid"])
         state: dict[str, Any] = {
             "app": info,
             "nodes": nodes,
-            "text": self._render_tree(nodes, truncated=len(nodes) >= max_nodes),
+            "text": self._render_tree(
+                nodes, truncated=snapshot.node_cut or snapshot.depth_cut or snapshot.read_cut
+            ),
             "windows": self._last_windows,
+            "coverage": {"complete": not (snapshot.node_cut or snapshot.depth_cut or snapshot.read_cut),
+                         "node_cut": snapshot.node_cut, "depth_cut": snapshot.depth_cut,
+                         "read_cut": snapshot.read_cut},
         }
         if screenshot:
             try:
@@ -1509,6 +1922,7 @@ class MacOS:
         pid: int,
         search_key: str,
         text: str | None,
+        exact: _ExactSelector,
         visible_only: bool,
         limit: int,
         direction: str,
@@ -1519,13 +1933,16 @@ class MacOS:
         reset_elements: bool,
         messaging_timeout: float | None,
         enhance: bool,
-    ) -> list[dict[str, Any]]:
+    ) -> SearchMatches:
         if reset_elements:
             self._elements = {}
         params = {
             "app_pid": pid,
             "search_key": search_key,
             "text": text,
+            "title": exact.title,
+            "identifier": exact.identifier,
+            "description": exact.description,
             "visible_only": bool(visible_only),
             "limit": int(limit),
             "direction": direction,
@@ -1537,7 +1954,12 @@ class MacOS:
             "messaging_timeout": messaging_timeout,
             "enhance": bool(enhance),
         }
-        return [self._intern_native_match(raw, client) for raw in client.query(params)]
+        result = client.query(params)
+        return SearchMatches(
+            (self._intern_native_match(raw, client) for raw in result.matches),
+            complete=result.complete,
+            visited=result.visited,
+        )
 
     def _native_press(
         self,
@@ -1546,30 +1968,39 @@ class MacOS:
         pid: int,
         search_key: str,
         text: str | None,
+        exact: _ExactSelector,
         visible_only: bool,
         direction: str,
         immediate_descendants_only: bool,
         attributes: Iterable[str],
         max_nodes: int,
         timeout: float,
+        deadline: _Deadline,
+        single_attempt: bool,
         interval: float,
     ) -> dict[str, Any]:
         """Press via the agent, retrying only a not-yet-unique match.
 
         Mirrors ``ax_wait``'s own deadline/retry shape: ``element.unknown``
         is the one outcome ``PressCoordinator`` (agent-side) guarantees
-        happens before any ``AXPress`` is ever dispatched, so it is the
-        only failure retried here, from one monotonic deadline. Every
-        other code -- ``focus.changed`` (the press already happened),
-        ``permission.accessibility``, or any transport/protocol failure
-        whose relation to dispatch is unknown -- propagates immediately:
-        retrying those could fire ``AXPress`` a second time.
+        happens before any ``AXPress`` is ever dispatched -- no match, or
+        one match from a search an exact selector needs complete -- so it
+        is the only failure retried here, from one monotonic deadline.
+        Every other code -- ``focus.changed`` (the press already
+        happened), ``permission.accessibility``, or any
+        transport/protocol failure whose relation to dispatch is unknown
+        -- propagates immediately: retrying those could fire ``AXPress``
+        a second time. A timeout carries the agent's last reason
+        (``complete``, ``visited``) beside ``max_nodes``.
         """
         self._elements = {}
         params = {
             "app_pid": pid,
             "search_key": search_key,
             "text": text,
+            "title": exact.title,
+            "identifier": exact.identifier,
+            "description": exact.description,
             "visible_only": bool(visible_only),
             "limit": 2,
             "direction": direction,
@@ -1580,22 +2011,25 @@ class MacOS:
             "reset_elements": True,
             "messaging_timeout": None,
             "enhance": True,
+            "action_deadline": None if single_attempt else deadline.expires_at,
         }
-        deadline = time.monotonic() + timeout
+        last_details: dict[str, JSONValue] | None = None
         while True:
+            if not single_attempt:
+                deadline.check_dispatch(last_details)
             try:
                 match = client.press(params)
             except MacOSError as exc:
                 if exc.code != ErrorCode.ELEMENT_UNKNOWN.value:
                     raise
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise MacOSError(
-                        "AX press timed out without a unique match",
-                        code=ErrorCode.TIMEOUT,
-                        details={"timeout": timeout, "pid": pid},
-                    ) from exc
-                time.sleep(min(interval, remaining))
+                last_details = {
+                    "timeout": timeout,
+                    "pid": pid,
+                    "max_nodes": max_nodes,
+                    **exc.details,
+                }
+                deadline.check_dispatch(last_details)
+                time.sleep(min(interval, deadline.remaining()))
                 continue
             return self._intern_native_match(match, client)
 
@@ -1670,6 +2104,9 @@ class MacOS:
         app_pid: int | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = False,
         limit: int = -1,
         direction: str = "next",
@@ -1680,8 +2117,26 @@ class MacOS:
         reset_elements: bool = True,
         messaging_timeout: float | None = None,
         enhance: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Search a Chromium/WebKit AX subtree, including virtualized nodes."""
+    ) -> SearchMatches:
+        """Search a Chromium/WebKit AX subtree, including virtualized nodes.
+
+        ``text`` is the app's own substring search. ``title``,
+        ``identifier`` and ``description`` are exact: a match must carry
+        that attribute with exactly that value. With any of them set the
+        app's search is asked for up to ``max_nodes`` candidates, which
+        are then judged here, so ``max_nodes`` bounds that path too. The
+        result's ``complete`` says whether it holds every match in scope.
+        """
+        exact = _ExactSelector.parse(
+            title=title, identifier=identifier, description=description
+        )
+        attributes = tuple(str(item) for item in attributes)
+        if exact.active and max_nodes <= 0:
+            raise MacOSError(
+                "AX search max_nodes must be positive with an exact selector",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "max_nodes", "value": max_nodes},
+            )
         if element_index is not None and (app is not None or app_pid is not None):
             raise MacOSError(
                 "AX search element_index cannot be combined with app",
@@ -1716,6 +2171,7 @@ class MacOS:
                     pid=native_pid,
                     search_key=search_key,
                     text=text,
+                    exact=exact,
                     visible_only=visible_only,
                     limit=limit,
                     direction=direction.casefold(),
@@ -1759,10 +2215,14 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "direction", "value": direction},
             ) from exc
+        # With an exact selector the app's search only narrows; the
+        # judgement happens here, so ask for every candidate the walk
+        # bound allows and apply ``limit`` after judging.
+        requested_limit = max_nodes if exact.active else int(limit)
         predicate: dict[str, Any] = {
             "AXSearchKey": search_key,
             "AXVisibleOnly": bool(visible_only),
-            "AXResultsLimit": int(limit),
+            "AXResultsLimit": requested_limit,
             "AXDirection": ax_direction,
             "AXImmediateDescendantsOnly": bool(immediate_descendants_only),
         }
@@ -1776,6 +2236,7 @@ class MacOS:
                 root,
                 search_key=search_key,
                 text=text,
+                exact=exact,
                 visible_only=visible_only,
                 limit=limit,
                 direction=direction,
@@ -1788,20 +2249,41 @@ class MacOS:
         if error != _AX_SUCCESS:
             raise _ax_error("AXUIElementsForSearchPredicate", error, element_index=element_index)
 
+        candidates = [
+            element for element in values or [] if self._is_ax_element(element)
+        ]
+        described = tuple(dict.fromkeys((*attributes, *exact.attributes)))
         matches: list[dict[str, Any]] = []
-        for element in values or []:
-            if not self._is_ax_element(element):
-                continue
+        read_complete = True
+        for element in candidates:
+            if exact.active:
+                raw = self._copy_attributes(element, exact.attributes)
+                read_complete = read_complete and raw.complete
+                fields = {
+                    _AX_NODE_MAPPING[name]: self._jsonable(value)
+                    for name, value in raw.items()
+                }
+                if not exact.matches(fields):
+                    continue
             index = self._remember_element(element)
             matches.append(
                 self._describe_element(
                     element,
                     index,
-                    attributes=attributes,
+                    attributes=described,
                     include_actions=include_actions,
                 )
             )
-        return matches
+        cut = 0 <= limit < len(matches)
+        if cut:
+            del matches[limit:]
+        # The app returns at most ``requested_limit`` candidates and says
+        # nothing more, so a full page may hide more; a short page is all
+        # there was.
+        complete = (
+            requested_limit < 0 or len(candidates) < requested_limit
+        ) and not cut and read_complete
+        return SearchMatches(matches, complete=complete, visited=len(candidates))
 
     def _bounded_ax_search(
         self,
@@ -1809,6 +2291,7 @@ class MacOS:
         *,
         search_key: str,
         text: str | None,
+        exact: _ExactSelector,
         visible_only: bool,
         limit: int,
         direction: str,
@@ -1817,7 +2300,7 @@ class MacOS:
         include_actions: bool,
         max_nodes: int,
         reset_elements: bool,
-    ) -> list[dict[str, Any]]:
+    ) -> SearchMatches:
         """Search a small ordinary AX tree when optimized search is unavailable."""
         if max_nodes <= 0:
             raise MacOSError(
@@ -1825,21 +2308,30 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "max_nodes", "value": max_nodes},
             )
+        role = _AX_SEARCH_ROLES.get(search_key)
+        if role is None and search_key != "AXAnyTypeSearchKey":
+            raise MacOSError(
+                f"AX fallback does not support {search_key!r}",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"search_key": search_key},
+            )
         result_limit = max_nodes if limit < 0 else int(limit)
         if result_limit <= 0:
-            return []
+            return SearchMatches(complete=False, visited=0)
 
-        role = _AX_SEARCH_ROLES.get(search_key)
         needle = text.casefold() if text is not None else None
+        attributes = tuple(str(item) for item in attributes)
+        described = tuple(dict.fromkeys((*attributes, *exact.attributes)))
         traversal_attributes = tuple(
             dict.fromkeys(
                 (
-                    *(str(item) for item in attributes),
+                    *attributes,
+                    *exact.attributes,
                     "AXHidden",
                 )
             )
         )
-        nodes = self._snapshot_tree(
+        snapshot = self._snapshot_tree(
             root,
             max_depth=1 if immediate_descendants_only else 25,
             max_nodes=max_nodes,
@@ -1848,11 +2340,13 @@ class MacOS:
             include_actions=include_actions,
             include_settable=False,
             reset_elements=reset_elements,
-        )[1:]
+        )
+        nodes = snapshot.nodes[1:]
         if direction.casefold() == "previous":
             nodes.reverse()
 
         matches: list[dict[str, Any]] = []
+        cut = False
         for node in nodes:
             values = (
                 node.get("title"),
@@ -1872,19 +2366,29 @@ class MacOS:
                 (role is None or node.get("role") == role)
                 and (not visible_only or not bool(node.get("hidden")))
                 and text_matches
+                and exact.matches(node)
             ):
+                if len(matches) >= result_limit:
+                    cut = True
+                    break
                 index = int(node["element_index"])
                 matches.append(
                     self._describe_element(
                         self._element(index),
                         index,
-                        attributes=attributes,
+                        attributes=described,
                         include_actions=include_actions,
                     )
                 )
-                if len(matches) >= result_limit:
-                    break
-        return matches
+        # A depth cut only matters when the walk was meant to go deep: an
+        # immediate-descendants search stops at depth 1 by design.
+        complete = (
+            not cut
+            and not snapshot.node_cut
+            and not snapshot.read_cut
+            and (immediate_descendants_only or not snapshot.depth_cut)
+        )
+        return SearchMatches(matches, complete=complete, visited=len(snapshot.nodes))
 
     @staticmethod
     def _normalize_apps(
@@ -1924,6 +2428,7 @@ class MacOS:
         all_apps: bool,
         apps: str | int | Iterable[str | int] | None,
         text: str | None,
+        exact: _ExactSelector,
     ) -> tuple[tuple[str, ...] | None, bool]:
         selectors = cls._normalize_apps(apps)
         if app is not None and (all_apps or selectors is not None):
@@ -1939,9 +2444,9 @@ class MacOS:
                 details={"parameter": "scope"},
             )
         cross_process = all_apps or selectors is not None
-        if cross_process and not text:
+        if cross_process and not text and not exact.active:
             raise MacOSError(
-                "Cross-app AX search requires non-empty text",
+                "Cross-app AX search requires non-empty text or an exact selector",
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "text"},
             )
@@ -1953,6 +2458,9 @@ class MacOS:
         apps: str | int | Iterable[str | int] | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         limit: int = 20,
         direction: str = "next",
@@ -1960,13 +2468,22 @@ class MacOS:
         attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
         include_actions: bool = False,
         max_nodes: int = 500,
-    ) -> list[dict[str, Any]]:
-        """Search selected running AX trees without activation."""
+    ) -> SearchMatches:
+        """Search selected running AX trees without activation.
+
+        The result is ``complete`` only when every app was searched to
+        completion and ``limit`` did not stop the sweep early. A skipped
+        app makes the result incomplete. Explicit ``apps`` failures raise;
+        a broad sweep raises its first error only when no app was searched.
+        """
+        exact = _ExactSelector.parse(
+            title=title, identifier=identifier, description=description
+        )
         if self._backend == "python":
             self._ensure_accessibility()
-        if not text:
+        if not text and not exact.active:
             raise MacOSError(
-                "Cross-app AX search requires non-empty text",
+                "Cross-app AX search requires non-empty text or an exact selector",
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "text"},
             )
@@ -1993,18 +2510,23 @@ class MacOS:
         infos = self._resolve_apps(selectors)
         strict = selectors is not None
         self._elements = {}
-        matches: list[dict[str, Any]] = []
+        matches = SearchMatches(complete=True, visited=0)
         first_error: MacOSError | None = None
         searched = False
         for info in infos:
             remaining = limit - len(matches)
             if remaining == 0:
+                # Apps after this one were never searched.
+                matches.complete = False
                 break
             try:
                 app_matches = self.ax_search(
                     app_pid=int(info["pid"]),
                     search_key=search_key,
                     text=text,
+                    title=title,
+                    identifier=identifier,
+                    description=description,
                     visible_only=visible_only,
                     limit=remaining,
                     direction=direction,
@@ -2025,10 +2547,13 @@ class MacOS:
                         code=exc.code,
                         details={**exc.details, "app": info},
                     ) from exc
+                matches.complete = False
                 if first_error is None:
                     first_error = exc
                 continue
             searched = True
+            matches.complete = matches.complete and app_matches.complete
+            matches.visited += app_matches.visited
             for match in app_matches:
                 match["app"] = dict(info)
                 matches.append(match)
@@ -2061,21 +2586,35 @@ class MacOS:
         apps: str | int | Iterable[str | int] | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
         include_actions: bool = False,
         max_nodes: int = 500,
+        enhance: bool = True,
         timeout: float = 5.0,
         interval: float = 0.1,
     ) -> dict[str, Any]:
-        """Wait for exactly one AX match and fail closed on ambiguity."""
+        """Wait for exactly one AX match and fail closed on ambiguity.
+
+        With an exact selector (``title``/``identifier``/``description``),
+        a single match requires a complete search to rule out a twin.
+        Substring-only waits retain best-effort uniqueness within the
+        returned results.
+        """
+        exact = _ExactSelector.parse(
+            title=title, identifier=identifier, description=description
+        )
         selectors, cross_process = self._ax_scope(
             app=app,
             all_apps=all_apps,
             apps=apps,
             text=text,
+            exact=exact,
         )
         if not math.isfinite(timeout) or timeout < 0:
             raise MacOSError(
@@ -2097,6 +2636,9 @@ class MacOS:
                     apps=selectors,
                     search_key=search_key,
                     text=text,
+                    title=title,
+                    identifier=identifier,
+                    description=description,
                     visible_only=visible_only,
                     limit=2,
                     direction=direction,
@@ -2110,6 +2652,9 @@ class MacOS:
                     app=app,
                     search_key=search_key,
                     text=text,
+                    title=title,
+                    identifier=identifier,
+                    description=description,
                     visible_only=visible_only,
                     limit=2,
                     direction=direction,
@@ -2117,8 +2662,9 @@ class MacOS:
                     attributes=attributes,
                     include_actions=include_actions,
                     max_nodes=max_nodes,
+                    enhance=enhance,
                 )
-            if len(matches) == 1:
+            if len(matches) == 1 and (matches.complete or not exact.active):
                 return matches[0]
             if len(matches) > 1:
                 summary = "; ".join(self._match_summary(match) for match in matches[:4])
@@ -2145,10 +2691,28 @@ class MacOS:
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if matches.complete:
+                    raise MacOSError(
+                        "AX wait timed out without a match",
+                        code=ErrorCode.TIMEOUT,
+                        details={"timeout": timeout},
+                    )
+                message = (
+                    "AX wait timed out before a complete search confirmed "
+                    "a unique match"
+                    if matches
+                    else "AX wait timed out without a match; the last search "
+                    "was incomplete"
+                )
                 raise MacOSError(
-                    "AX wait timed out without a match",
+                    message,
                     code=ErrorCode.TIMEOUT,
-                    details={"timeout": timeout},
+                    details={
+                        "timeout": timeout,
+                        "complete": False,
+                        "visited": matches.visited,
+                        "max_nodes": max_nodes,
+                    },
                 )
             time.sleep(min(interval, remaining))
 
@@ -2160,20 +2724,33 @@ class MacOS:
         apps: str | int | Iterable[str | int] | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
         max_nodes: int = 500,
+        enhance: bool = True,
         timeout: float = 5.0,
         interval: float = 0.1,
     ) -> None:
-        """Wait for an AX match to be absent in two consecutive polls."""
+        """Wait for an AX match to be absent in two consecutive polls.
+
+        Only a complete empty search counts as an empty poll: a walk that
+        ``max_nodes`` cut short before finding anything says nothing about
+        the part it did not reach, so it resets the count.
+        """
+        exact = _ExactSelector.parse(
+            title=title, identifier=identifier, description=description
+        )
         selectors, cross_process = self._ax_scope(
             app=app,
             all_apps=all_apps,
             apps=apps,
             text=text,
+            exact=exact,
         )
         if not math.isfinite(timeout) or timeout < 0:
             raise MacOSError(
@@ -2197,6 +2774,9 @@ class MacOS:
                         apps=selectors,
                         search_key=search_key,
                         text=text,
+                        title=title,
+                        identifier=identifier,
+                        description=description,
                         visible_only=visible_only,
                         limit=1,
                         direction=direction,
@@ -2209,31 +2789,40 @@ class MacOS:
                         app=app,
                         search_key=search_key,
                         text=text,
+                        title=title,
+                        identifier=identifier,
+                        description=description,
                         visible_only=visible_only,
                         limit=1,
                         direction=direction,
                         immediate_descendants_only=immediate_descendants_only,
                         attributes=attributes,
                         max_nodes=max_nodes,
+                        enhance=enhance,
                     )
             except ApplicationNotFoundError:
                 if app is not None or (selectors is not None and len(selectors) == 1):
                     return
                 raise
 
-            empty_polls = empty_polls + 1 if not matches else 0
+            empty_polls = empty_polls + 1 if not matches and matches.complete else 0
             if empty_polls >= 2:
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                details: dict[str, JSONValue] = {
+                    "timeout": timeout,
+                    "consecutive_empty_polls": empty_polls,
+                }
+                if not matches and not matches.complete:
+                    details.update(
+                        complete=False, visited=matches.visited, max_nodes=max_nodes
+                    )
                 raise MacOSError(
                     "AX wait timed out before two consecutive empty polls "
                     "confirmed the match was gone",
                     code=ErrorCode.TIMEOUT,
-                    details={
-                        "timeout": timeout,
-                        "consecutive_empty_polls": empty_polls,
-                    },
+                    details=details,
                 )
             time.sleep(min(interval, remaining))
 
@@ -2245,6 +2834,9 @@ class MacOS:
         apps: str | int | Iterable[str | int] | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
@@ -2252,8 +2844,19 @@ class MacOS:
         max_nodes: int = 500,
         timeout: float = 5.0,
         interval: float = 0.1,
+        _deadline: _Deadline | None = None,
     ) -> dict[str, Any]:
-        """Press one unique AX target and detect foreground activation."""
+        """Press one unique AX target and detect foreground activation.
+
+        Uniqueness follows `ax_wait`: an exact selector is pressed only
+        once a complete search has shown its single match. The deadline
+        includes app resolution, agent setup, search, and the focus reading.
+        A raw zero timeout allows one attempt without retry; a deadline
+        inherited from `mac.do` must still have time before dispatch.
+        """
+        exact = _ExactSelector.parse(
+            title=title, identifier=identifier, description=description
+        )
         if not math.isfinite(timeout) or timeout < 0:
             raise MacOSError(
                 "AX press timeout must be finite and non-negative",
@@ -2266,6 +2869,8 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "interval", "value": interval},
             )
+        single_attempt = _deadline is None and timeout == 0
+        deadline = _deadline if _deadline is not None else _Deadline(timeout, time.monotonic)
         targeted = not all_apps and apps is None
         if targeted and self._backend != "python":
             if direction.casefold() not in {"next", "previous"}:
@@ -2292,28 +2897,36 @@ class MacOS:
                     pid=target_pid,
                     search_key=search_key,
                     text=text,
+                    exact=exact,
                     visible_only=visible_only,
                     direction=direction.casefold(),
                     immediate_descendants_only=immediate_descendants_only,
                     attributes=attributes,
                     max_nodes=max_nodes,
                     timeout=timeout,
+                    deadline=deadline,
+                    single_attempt=single_attempt,
                     interval=interval,
                 )
 
+        if not single_attempt:
+            deadline.check_dispatch()
         match = self.ax_wait(
             app=app,
             all_apps=all_apps,
             apps=apps,
             search_key=search_key,
             text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             direction=direction,
             immediate_descendants_only=immediate_descendants_only,
             attributes=attributes,
             include_actions=True,
             max_nodes=max_nodes,
-            timeout=timeout,
+            timeout=deadline.remaining(),
             interval=interval,
         )
         owner = match.get("app")
@@ -2329,6 +2942,8 @@ class MacOS:
         # keeps its own error, so `FocusChangedError` from here always means
         # the press landed (`ops._atomic_press_acted` relies on that).
         before = self._frontmost_app()
+        if not single_attempt:
+            deadline.check_dispatch()
         self.perform_action(int(match["element_index"]), "AXPress")
         self._guard_focus(before, target_pid, "AX press")
         return match
