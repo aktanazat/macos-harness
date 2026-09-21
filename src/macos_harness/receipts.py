@@ -45,6 +45,7 @@ __all__ = [
     "Executor",
     "Gone",
     "JSONValue",
+    "Observation",
     "OperationError",
     "Outcome",
     "Postcondition",
@@ -224,6 +225,34 @@ class Executor(StrEnum):
     NATIVE = "native"
     INPUT = "input"
     SCRIPT = "script"
+
+
+class Observation(StrEnum):
+    """What one `Postcondition` check actually established about the app.
+
+    ``MET`` is the condition confirmed. The other two both leave a check
+    unverified and are *not* interchangeable, which is the whole reason
+    this is a receipt field rather than something a caller re-derives
+    from an error payload:
+
+    ``UNMET`` means the observation itself completed and the condition
+    is false -- a complete `Present` search that found nothing, a `Gone`
+    poll that found the match still there, an `Equals` attribute read
+    back with a different value. The app is in a state the caller did
+    not ask for, and acting on that is sound.
+
+    ``UNOBSERVABLE`` means the check never established anything: a
+    ``max_nodes``-truncated walk, more than one match, an attribute the
+    app refused, a deadline that expired before `Gone`'s two consecutive
+    empty polls could confirm absence. The condition may well hold. A
+    caller that treats this as ``UNMET`` is asserting a state it never
+    saw, so the safe response is to stop, widen the search, or retry --
+    never to act as though the app disagreed.
+    """
+
+    MET = "met"
+    UNMET = "unmet"
+    UNOBSERVABLE = "unobservable"
 
 
 class ErrorPayload(TypedDict):

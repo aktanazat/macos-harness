@@ -7,6 +7,15 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- A failed `mac.do.expect` receipt now reports what the check established.
+  `observed` carries `state` — the new public `Observation` enum, `UNMET` or
+  `UNOBSERVABLE` — and a `reason` naming the case: a completed search that
+  found nothing, a value that differed, a truncated tree walk, an ambiguous
+  match, a refused reading, an exhausted deadline, or a disappearance no
+  second poll confirmed. Route replay reads that state instead of re-deriving
+  it from error details, so a goal read that established nothing no longer
+  authorizes replaying presses; previously an unconfirmed disappearance was
+  treated as a definite unmet goal.
 - App-bound receipts retain process lifetime evidence without replacing the
   original action error or input classification. Otherwise-successful input
   fails with `app.exited` after an observed exit when the effect was unverified.
