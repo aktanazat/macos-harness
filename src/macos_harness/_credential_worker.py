@@ -1493,19 +1493,19 @@ def execute(
         # stale, and taking it here means an entry nobody enrolled is
         # refused before a browser child is ever spawned.
         stored = _take_secret(job.get("secret_env"))
-        resolve: _Resolver = lambda: stored  # noqa: E731
+        resolve: _Resolver = lambda: stored
     elif kind == "totp":
         # The seed is taken now -- popping it before any child is spawned
         # is what keeps it out of an inherited environment -- and only the
         # code is computed late.
         seed = _take_secret(job.get("secret_env"))
-        resolve = lambda: _totp_code(seed, now=now)  # noqa: E731
+        resolve = lambda: _totp_code(seed, now=now)
     else:
         # The authorization marker is likewise popped now, so the read
         # itself is already authorized by the time it is deferred.
         _authorize_gmail(job)
         policy = _gmail_policy(job)
-        resolve = lambda: _gmail_code_for(policy, run_gws=run_gws, now=now)  # noqa: E731
+        resolve = lambda: _gmail_code_for(policy, run_gws=run_gws, now=now)
     run_ego_browser(lambda fifo, stage: _browser_script(job, fifo, stage), resolve)
 
 

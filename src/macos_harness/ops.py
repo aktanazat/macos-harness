@@ -86,6 +86,7 @@ from .receipts import (
     Executor,
     Gone,
     JSONValue,
+    Observation,
     OperationError,
     Outcome,
     Postcondition,
@@ -384,11 +385,61 @@ def _atomic_press_acted(exc: MacOSError) -> Acted:
 
 @dataclass(frozen=True, slots=True)
 class _Verification:
-    """The result of checking one optional `Postcondition`."""
+    """The result of checking one optional `Postcondition`.
 
-    ok: bool
+    ``state`` is the whole result: `Observation.MET` is the only
+    verified outcome, and the other two record *why* the check did not
+    verify in the one place that still knows -- the code that called the
+    search and caught its error. ``ok`` is derived so the two can never
+    drift apart.
+    """
+
+    state: Observation
     observed: JSONValue
     error: ErrorPayload | None
+    reason: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.state is Observation.MET
+
+
+def _observation_of(postcondition: Postcondition, exc: MacOSError) -> tuple[Observation, str]:
+    """Classify one failed `Postcondition` check as `Observation.UNMET`
+    or `Observation.UNOBSERVABLE`, with the reason that decided it.
+
+    This is the one place that reads a search's failure payload for
+    meaning, and it sits next to the code that raised it. A caller that
+    re-derives the same distinction from ``error.details`` downstream
+    gets it wrong: a `Gone` check that timed out holding one complete
+    empty poll looks exactly like a plain timeout, yet it saw the match
+    *absent* -- it simply never got the second poll that confirms it.
+    """
+    details = exc.details
+    if exc.code != ErrorCode.TIMEOUT.value:
+        ambiguous = exc.code == ErrorCode.BAD_REQUEST.value and "count" in details
+        return Observation.UNOBSERVABLE, "ambiguous_match" if ambiguous else "observation_refused"
+    if "reason" in details:
+        # `_deadline_exhausted_error`: no window to look in at all.
+        return Observation.UNOBSERVABLE, "deadline_exhausted"
+    if details.get("complete") is False:
+        return Observation.UNOBSERVABLE, "incomplete_search"
+    if isinstance(postcondition, Gone):
+        polls = details.get("consecutive_empty_polls")
+        if not isinstance(polls, int):
+            return Observation.UNOBSERVABLE, "observation_refused"
+        # A complete empty poll already saw the match gone; only `Gone`'s
+        # two-poll confirmation rule is missing, so absence is unconfirmed
+        # rather than contradicted.
+        return (Observation.UNOBSERVABLE, "absence_unconfirmed") if polls else (
+            Observation.UNMET, "still_present"
+        )
+    if "expected" in details:
+        return Observation.UNMET, "value_differs"
+    if "timeout" in details:
+        # A complete search that ran out of time without a match.
+        return Observation.UNMET, "searched_and_absent"
+    return Observation.UNOBSERVABLE, "observation_refused"
 
 
 def _perform_guarded(
@@ -1354,6 +1405,17 @@ class Operations:
         Uses the same verifier as mutation postconditions. The condition's
         timeout defaults to five seconds; its interval controls polling.
         Accessibility enhancements and focus sampling are disabled.
+
+        A condition that does not hold still raises `OperationError`, and
+        that error's receipt says which kind of "no" it was: ``observed``
+        carries ``{"state", "reason"}``, where ``state`` is
+        `Observation.UNMET` when the check completed and the app really
+        is in another state, and `Observation.UNOBSERVABLE` when it
+        established nothing -- a truncated walk, more than one match, a
+        refused read, or a deadline too short for `Gone`'s two
+        confirming polls. Only ``UNMET`` licenses a caller to act as
+        though the app disagreed; ``UNOBSERVABLE`` means look again. A
+        verified check keeps ``observed`` as the match summary.
         """
         self._check_owner()
         host = self._host
@@ -1393,7 +1455,9 @@ class Operations:
                         if not isinstance(condition, Gone):
                             raise
                         if deadline.remaining() > 0:
-                            verification = _Verification(ok=True, observed=None, error=None)
+                            verification = _Verification(
+                                state=Observation.MET, observed=None, error=None
+                            )
                     else:
                         builder.bind_app(info)
                         condition = dataclasses.replace(condition, app=info["pid"], apps=None)
@@ -1402,14 +1466,20 @@ class Operations:
                         host, condition, deadline, app=None, all_apps=False, apps=None, enhance=False
                     )
             except MacOSError as exc:
-                verification = _Verification(ok=False, observed=None, error=exc.to_json())
+                state, reason = _observation_of(condition, exc)
+                verification = _Verification(
+                    state=state, observed=None, error=exc.to_json(), reason=reason
+                )
             builder.executor = self._default_executor(host)
             receipt = builder.build(
                 outcome=Outcome.DONE if verification.ok else Outcome.FAILED,
                 acted=Acted.NO,
                 changed=None,
                 verified=verification.ok,
-                observed=verification.observed,
+                observed=verification.observed if verification.ok else {
+                    "state": verification.state.value,
+                    "reason": verification.reason,
+                },
                 error=verification.error,
             )
             return self._finish(receipt)
@@ -2922,7 +2992,7 @@ class Operations:
         enhance: bool = True,
     ) -> _Verification:
         if postcondition is None:
-            return _Verification(ok=True, observed=None, error=None)
+            return _Verification(state=Observation.MET, observed=None, error=None)
         explicit = postcondition.app is not None or postcondition.all_apps or postcondition.apps is not None
         scope_app = postcondition.app if explicit else app
         scope_all_apps = postcondition.all_apps if explicit else all_apps
@@ -2948,7 +3018,9 @@ class Operations:
                     interval=postcondition.interval,
                     enhance=enhance,
                 )
-                return _Verification(ok=True, observed=self._match_summary_payload(match), error=None)
+                return _Verification(
+                    state=Observation.MET, observed=self._match_summary_payload(match), error=None
+                )
             if isinstance(postcondition, Equals):
                 return self._verify_equals(
                     host,
@@ -2972,7 +3044,8 @@ class Operations:
                 # second poll, so this fails deterministically instead of
                 # handing `ax_wait_gone` a timeout it cannot honor.
                 return _Verification(
-                    ok=False,
+                    state=Observation.UNOBSERVABLE,
+                    reason="deadline_exhausted",
                     observed=None,
                     error=_deadline_exhausted_error(
                         "deadline_exhausted_before_verification",
@@ -2996,9 +3069,10 @@ class Operations:
                 interval=postcondition.interval,
                 enhance=enhance,
             )
-            return _Verification(ok=True, observed=None, error=None)
+            return _Verification(state=Observation.MET, observed=None, error=None)
         except MacOSError as exc:
-            return _Verification(ok=False, observed=None, error=exc.to_json())
+            state, reason = _observation_of(postcondition, exc)
+            return _Verification(state=state, observed=None, error=exc.to_json(), reason=reason)
 
     def _verify_equals(
         self,
@@ -3062,7 +3136,7 @@ class Operations:
                 },
             )
         return _Verification(
-            ok=True,
+            state=Observation.MET,
             observed={
                 **self._match_summary_payload(match),
                 "attribute": attribute,

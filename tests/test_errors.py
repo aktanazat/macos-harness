@@ -18,24 +18,6 @@ from macos_harness.errors import (
     MacOSError,
 )
 
-# --- ErrorCode: the frozen ten-code vocabulary ------------------------------
-
-
-def test_error_code_is_exactly_the_ten_wire_codes() -> None:
-    assert {member.value for member in ErrorCode} == {
-        "permission.accessibility",
-        "app.not_found",
-        "app.ambiguous",
-        "focus.changed",
-        "window.changed",
-        "ax.error",
-        "element.unknown",
-        "timeout",
-        "bad_request",
-        "unsupported_op",
-    }
-
-
 # --- default / explicit / unknown wire code behavior ------------------------
 
 

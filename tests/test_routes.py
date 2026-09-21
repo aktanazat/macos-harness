@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from test_ops import FakeHost, _SleepClock
 
-from macos_harness import Acted, ErrorCode, MacOSError, OperationError, Outcome, present
+from macos_harness import (
+    Acted,
+    ErrorCode,
+    MacOSError,
+    OperationError,
+    Outcome,
+    gone,
+    present,
+)
 from macos_harness.macos import MacOS, _AppIdentity
 from macos_harness.ops import Operations
 from macos_harness.routes import Routes
@@ -196,13 +205,42 @@ def test_an_already_satisfied_goal_does_not_repeat_navigation(host: RouteHost) -
     assert host.pressed_pages == []
 
 
-@pytest.mark.parametrize("code", [ErrorCode.TIMEOUT, ErrorCode.AX_ERROR])
-def test_an_unobserved_goal_cannot_authorize_navigation(host: RouteHost, code: ErrorCode) -> None:
-    details = {"timeout": 0.0, "complete": False} if code == ErrorCode.TIMEOUT else {"ax_error": -25204}
-    record_navigation(host)
-    host.goal_error = MacOSError("Goal read refused", code=code, details=details)
+def record_dismissal(host: RouteHost) -> Path:
+    with host.route.record("dismiss", app=_APP,
+                           entry=present(role="button", identifier="page-0"),
+                           goal=gone(role="button", identifier="page-3")) as rec:
+        rec.press(role="button", identifier="next-0",
+                  postcondition=present(role="button", identifier="page-1"))
+    host.page = 0
+    host.pressed_pages.clear()
+    host.enhanced = False
+    return rec.path
 
-    result = host.route.run("navigate", app=_APP)
+
+@pytest.mark.parametrize(
+    ("route", "record", "code", "details"),
+    [
+        ("navigate", record_navigation, ErrorCode.TIMEOUT, {"timeout": 0.0, "complete": False}),
+        ("navigate", record_navigation, ErrorCode.AX_ERROR, {"ax_error": -25204}),
+        # One empty poll saw the match absent, but the confirming second poll never
+        # ran: absence is unconfirmed, so the route may not replay its presses.
+        ("dismiss", record_dismissal, ErrorCode.TIMEOUT,
+         {"timeout": 0.1, "consecutive_empty_polls": 1}),
+    ],
+)
+def test_an_unobserved_goal_cannot_authorize_navigation(
+    host: RouteHost,
+    route: str,
+    record: Callable[[RouteHost], Path],
+    code: ErrorCode,
+    details: dict[str, object],
+) -> None:
+    record(host)
+    refused = MacOSError("Goal read refused", code=code, details=details)
+    host.goal_error = refused
+    host.gone_error = refused
+
+    result = host.route.run(route, app=_APP)
 
     assert result.status == "diverged"
     assert result.at == "goal"

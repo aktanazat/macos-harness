@@ -10,7 +10,7 @@ import tempfile
 import threading
 import uuid
 import weakref
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -25,6 +25,7 @@ from .receipts import (
     ErrorPayload,
     Gone,
     JSONValue,
+    Observation,
     OperationError,
     Outcome,
     Postcondition,
@@ -477,13 +478,13 @@ class Routes:
                 try:
                     check = self._expect(route.goal, identity, deadline, probe=True)
                 except OperationError as exc:
-                    # Only a completed search or comparison can establish that
-                    # the goal does not hold. A refused/incomplete read stops.
-                    details = exc.details
-                    known_unmet = (exc.code == ErrorCode.TIMEOUT
-                        and details.get("complete") is not False
-                        and ("timeout" in details or "expected" in details))
-                    if not known_unmet:
+                    # Only a completed search or comparison can establish
+                    # that the goal does not hold; `expect` says which it
+                    # was, so nothing here re-reads the error payload.
+                    observed = exc.receipt.observed
+                    unmet = (isinstance(observed, Mapping)
+                        and observed.get("state") == Observation.UNMET)
+                    if not unmet:
                         raise
                 else:
                     return RouteResult(name, run_id, "planned" if dry_run else "already", (), deadline.elapsed(),

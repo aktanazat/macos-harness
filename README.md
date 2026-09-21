@@ -163,6 +163,13 @@ This uses the same verifier as postconditions, without enabling accessibility
 features, sampling focus, or reserving a `once` token. Success reports
 `outcome="done"`, `acted="no"`, `verified=True`, and `changed=None`.
 A failed check raises `OperationError` with the original verification error.
+Its receipt says which kind of failure it was under `observed`: `state` is
+`Observation.UNMET` when a completed search or comparison showed the condition
+false, and `Observation.UNOBSERVABLE` when the check established nothing — a
+truncated tree walk, an ambiguous match, a refused reading, an exhausted
+deadline, or a disappearance no second poll confirmed. `reason` names the
+specific case. Only `UNMET` is evidence about the app; treat `UNOBSERVABLE`
+as "look again", never as "the condition is false".
 
 ```python
 from macos_harness import equals
@@ -227,8 +234,10 @@ intact. Keep the handle on the thread that entered the block; it closes when the
 block exits. A definition has at most 64 steps and a 1 MiB file limit.
 
 Replay validates the whole definition before input. It returns `already` if the
-goal holds, otherwise checks the entry and runs each step once. A refused or
-incomplete goal read stops the run. One app process and one cooperative timeout
+goal holds, otherwise checks the entry and runs each step once. Only a goal
+read that came back `Observation.UNMET` authorizes the steps; any
+`UNOBSERVABLE` goal read stops the run rather than replay input against an app
+whose state is unknown. One app process and one cooperative timeout
 cover the sequence. A process exit or replacement stops further steps. The
 existing operations own target resolution, dispatch, and verification.
 
