@@ -67,12 +67,30 @@ except OperationError as exc:
 PY
 ```
 
-- `press`, `set`, `toggle`, `run`, `key`, `click`, and `type` mutate;
-  `expect(condition)` observes a condition, and `recall(once)` looks up a
-  past receipt by its token, without dispatching
+- `press`, `set`, `fill`, `toggle`, `run`, `key`, `click`, and `type` mutate;
+  `expect(condition)` and `expect_any(outcomes)` observe conditions, and
+  `recall(once)` looks up a past receipt by its token, without dispatching
   anything. `set`/`toggle` are convergent: they read the current state
   first and report `outcome="already"` instead of touching anything
   already correct.
+- Use `fill(value, app=..., identifier=...)` to replace a plain text field.
+  It focuses one unique enabled field, selects its full UTF-16 range, types
+  through the app's input handler, and verifies the text. Unlike an AX value
+  write, this sends the keyboard events a SwiftUI binding needs. Pass
+  `value=""` to clear. Secure fields are refused, and no Return key is sent.
+  Give `fill` an app-level postcondition when the result matters beyond the
+  field itself: `equals(title="Check", role="button", attribute="AXEnabled",
+  value=True)` checks that the app accepted the input.
+- `expect_any({"saved": present(app=app, identifier="saved"),
+  "error": present(app=app, identifier="error")}, timeout=5)` waits for the
+  first observation pass with a satisfied condition. Read
+  `receipt.observed["matched"]` for every matching name in that pass. Each
+  condition needs an explicit app scope. One cooperative deadline covers all
+  checks; an AX read already in progress can overrun it. Timeout receipts keep
+  each outcome's latest state and reason. No input or activation is sent.
+- Run stdin programs with `macos-harness --json-errors` for uncaught harness
+  errors as JSON on stderr. Operation failures include their receipt. The
+  nonzero exit status and the default text error format are unchanged.
 - Every call returns an immutable, JSON-safe `Receipt` on success, or
   raises `OperationError` on failure — `exc.receipt` is the exact same
   `Receipt` a success would have had, so you never have to choose between
@@ -223,19 +241,44 @@ print(mac.route.list(app=app))
 A route requires an exact bundle identifier, an entry condition, and a terminal
 goal. Every target and condition needs a role plus exactly one exact title,
 identifier, or description. There is no substring or alternate-field fallback.
-The supported steps are `press`, `set`, `toggle`, and `key`. Presses and keys
-require an explicit postcondition; set and toggle retain their value-convergence
-checks. Only boolean and numeric set/equals values are recordable. Selectors and
-key combinations are stored verbatim, so keep secrets out of them.
+The supported steps are `press`, `set`, `fill`, `toggle`, and `key`. Presses and
+keys require an explicit postcondition; set and toggle retain their
+value-convergence checks. Only boolean and numeric set/equals values are
+recordable. Selectors and key combinations are stored verbatim, so keep
+secrets out of them.
+
+For forms, record a parameter name with `fill` and supply its text separately:
+
+```python
+entry = present(role="text field", identifier="domain")
+goal = present(role="static text", identifier="result")
+with mac.route.record(
+    "check-domain", app=app, entry=entry, goal=goal,
+    inputs={"domain": "example.invalid"},
+) as rec:
+    rec.fill("domain", identifier="domain")
+    rec.press(role="button", identifier="check", postcondition=goal)
+
+result = mac.route.run(
+    "check-domain", app=app, inputs={"domain": "another.example.invalid"},
+)
+```
+
+The saved definition contains `domain`, not the supplied text.
+`mac.route.list(app=app)` lists the required input names. Missing or unknown
+names and invalid text stop replay before any step acts. Input-bearing routes
+check the entry and run even if the previous goal still holds: that goal may
+describe the previous input. Never put private text in selectors or labels.
 
 Recording checks the entry before yielding and the goal before saving. A failed
 step prevents saving even if its exception is caught. The previous file stays
 intact. Keep the handle on the thread that entered the block; it closes when the
 block exits. A definition has at most 64 steps and a 1 MiB file limit.
 
-Replay validates the whole definition before input. It returns `already` if the
-goal holds, otherwise checks the entry and runs each step once. Only a goal
-read that came back `Observation.UNMET` authorizes the steps; any
+Replay validates the whole definition before input. For routes without form
+inputs, it returns `already` if the goal holds, otherwise checks the entry and
+runs each step once. Only a goal read that came back `Observation.UNMET`
+authorizes those steps; any
 `UNOBSERVABLE` goal read stops the run rather than replay input against an app
 whose state is unknown. One app process and one cooperative timeout
 cover the sequence. A process exit or replacement stops further steps. The
@@ -301,6 +344,23 @@ selection, and character-count reads even when values are requested. Titles and
 labels can still contain private text. Snapshots are not atomic; the app can
 change between reads. `mac.diff_windows(before, after)` compares supplied
 snapshots for opened, closed, and changed windows without another observation.
+
+For control-level changes, compare two consecutive inspections of the same app:
+
+```python
+before = mac.inspect(app, include_values=True)
+# Perform the intended operation.
+after = mac.inspect(app, include_values=True)
+changes = mac.diff(before, after)
+print(changes["changed"], changes["added"], changes["removed"])
+```
+
+Stable `ref` values identify controls; `element_index` remains a short-lived
+action handle. A partial walk cannot prove a control was added or removed,
+so uncertain appearances and disappearances go under `unproven`. Diffing
+does not read the desktop. Both observations must come from one `MacOS`
+instance and the same app lifetime, with no intervening successful inspection.
+Values remain opt-in and may contain private text.
 
 Logs and crash lookups accept a receipt or a `(start, end)` pair of timezone-aware
 ISO-8601 strings with `app=pid`. Receipt intervals include 250 ms on each side.

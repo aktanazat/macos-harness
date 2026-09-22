@@ -42,6 +42,7 @@ from macos_harness.receipts import (
 
 class FakeAX:
     _ALIASES: ClassVar[dict[str, str]] = {
+        "any": "AXAnyTypeSearchKey",
         "button": "AXButtonSearchKey",
         "checkbox": "AXCheckBoxSearchKey",
         "textfield": "AXTextFieldSearchKey",
@@ -2084,6 +2085,147 @@ def test_type_failure_after_dispatch_is_acted_unknown() -> None:
     assert error.receipt.acted is Acted.UNKNOWN
     assert error.receipt.changed is None
     assert host.focus_sample_calls == 1
+
+
+class FormHost(FakeHost):
+    def __init__(self) -> None:
+        super().__init__()
+        self.value = "doubleclick.net"
+        self.model = ""
+        self.other_value = "untouched"
+        self.focused = False
+        self.enabled = True
+        self.subrole = "AXUnknown"
+        self.selection = {"location": 0, "length": 0}
+        self.selects_all = True
+        self.lose_focus = False
+        self.reject_text = False
+        self.match.update(role="AXTextField", title="Domain", identifier="domain")
+
+    def ax_wait(self, **kwargs: object) -> dict[str, object]:
+        match = super().ax_wait(**kwargs)
+        if kwargs.get("search_key") == "AXButtonSearchKey":
+            match.update(element_index=8, role="AXButton", title="Check")
+        return match
+
+    def get(
+        self, element_index: int, attribute: str = "AXValue", *, missing_ok: bool = False
+    ) -> object:
+        if element_index == 8:
+            return bool(self.model)
+        if attribute == "AXValue":
+            assert self.subrole != "AXSecureTextField", "a secure value was read"
+            return self.value
+        return {
+            "AXRole": "AXTextField", "AXSubrole": self.subrole,
+            "AXEnabled": self.enabled, "AXFocused": self.focused,
+            "AXSelectedTextRange": self.selection,
+        }[attribute]
+
+    def set(self, element_index: int, value: object, attribute: str = "AXValue") -> None:
+        if attribute == "AXFocused":
+            self.focused = bool(value)
+        elif attribute == "AXSelectedTextRange":
+            if self.selects_all and self.focused:
+                assert isinstance(value, dict)
+                self.selection = value
+            if self.lose_focus:
+                self.focused = False
+        else:
+            super().set(element_index, value, attribute)
+
+    def key(self, key: str, *, app: str | int | None = None) -> None:
+        if key == "backspace":
+            self.type("", app=app)
+        else:
+            super().key(key, app=app)
+
+    def type(self, text: str, *, app: str | int | None = None) -> None:
+        if self.reject_text:
+            return
+        if not self.focused:
+            self.other_value += text
+        elif self.selection == {"location": 0, "length": len(self.value.encode("utf-16-le")) // 2}:
+            self.value = self.model = text
+        else:
+            self.value += text
+            self.model = self.value
+
+
+def _form_ops() -> tuple[FormHost, Operations]:
+    host = FormHost()
+    clock = _SleepClock()
+    return host, Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+
+
+def test_fill_updates_the_app_model_even_when_visible_text_matches() -> None:
+    host, operations = _form_ops()
+    receipt = operations.fill(
+        "doubleclick.net", app="Demo", identifier="domain",
+        postcondition=equals(title="Check", role="button", attribute="AXEnabled", value=True),
+    )
+    assert host.model == "doubleclick.net"
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.verified is True
+    assert "doubleclick.net" not in canonical_json(receipt.to_json())
+
+
+def test_fill_clears_a_field_containing_non_bmp_text() -> None:
+    host, operations = _form_ops()
+    host.value = "a\U0001f600b"
+    receipt = operations.fill("", app="Demo")
+    assert host.value == ""
+    assert host.model == ""
+    assert receipt.verified is True
+
+
+@pytest.mark.parametrize(("failure", "code", "acted"), [
+    ("selection", ErrorCode.TIMEOUT, Acted.UNKNOWN),
+    ("focus", ErrorCode.FOCUS_CHANGED, Acted.YES),
+])
+def test_fill_leaves_text_untouched_when_it_cannot_replace_safely(
+    failure: str, code: ErrorCode, acted: Acted,
+) -> None:
+    host, operations = _form_ops()
+    host.selects_all = failure != "selection"
+    host.lose_focus = failure == "focus"
+    error = _failed(lambda: operations.fill("replacement", app="Demo", timeout=0.1))
+    assert error.code == code
+    assert error.receipt.acted is acted
+    assert host.value == "doubleclick.net"
+    assert host.other_value == "untouched"
+    assert host.model == ""
+
+
+@pytest.mark.parametrize("restriction", ["secure", "disabled"])
+def test_fill_refuses_restricted_fields_before_reading_or_focusing(restriction: str) -> None:
+    host, operations = _form_ops()
+    host.subrole = "AXSecureTextField" if restriction == "secure" else "AXUnknown"
+    host.enabled = restriction != "disabled"
+    error = _failed(lambda: operations.fill("replacement", app="Demo"))
+    assert error.code == ErrorCode.UNSUPPORTED_OP
+    assert error.receipt.acted is Acted.NO
+    assert host.focused is False
+    assert host.value == "doubleclick.net"
+
+
+def test_fill_replay_preserves_later_user_edits() -> None:
+    host, operations = _form_ops()
+    operations.fill("replacement", app="Demo", once="form")
+    host.value = host.model = "manual edit"
+    receipt = operations.fill("replacement", app="Demo", once="form")
+    assert receipt.replayed is True
+    assert host.value == "manual edit"
+    assert host.model == "manual edit"
+
+
+def test_fill_fails_when_the_app_drops_the_text() -> None:
+    host, operations = _form_ops()
+    host.reject_text = True
+    error = _failed(lambda: operations.fill("replacement", app="Demo", timeout=0.1))
+    assert error.code == ErrorCode.TIMEOUT
+    assert error.receipt.verified is False
+    assert host.value == "doubleclick.net"
 
 
 def test_once_collision_rejects_different_request_without_dispatch() -> None:

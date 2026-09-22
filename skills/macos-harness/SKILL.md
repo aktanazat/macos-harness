@@ -20,6 +20,10 @@ PY
 The CLI preloads `mac`, `browser`, `Path`, and `subprocess`. Prefer bounded stdin
 programs; reserve `macos-harness repl` for manual exploration and always exit it.
 
+Use `macos-harness --json-errors` for machine-readable failures from stdin
+programs. Harness errors go to stderr as JSON; operation failures include
+the receipt. The exit status remains nonzero.
+
 ## Minimize round trips
 
 - Bundle deterministic, reversible steps into one program, then verify once. Opening
@@ -54,11 +58,20 @@ receipt = mac.do.type(
 )
 ```
 
-- `press`, `set`, `toggle`, `run`, `key`, `click`, and `type` mutate;
-  `expect(condition)` observes a condition, and `recall(once)` looks up a past
-  receipt without dispatching anything. `set`/`toggle` check first and report
+- `press`, `set`, `fill`, `toggle`, `run`, `key`, `click`, and `type` mutate;
+  `expect(condition)` and `expect_any(outcomes)` observe conditions, and
+  `recall(once)` looks up a past receipt without dispatching anything.
+  `set`/`toggle` check first and report
   `outcome="already"` instead of re-mutating a target already in the
   requested state, so neither takes a `once` token.
+- Use `mac.do.fill(value, app=..., identifier=...)` for a plain text field,
+  especially when `set` changes visible text but leaves an app button disabled.
+  `fill` resolves one enabled field, focuses it, selects its full UTF-16 range,
+  types once, and verifies the text. It stops if focus or text changes before
+  typing. Pass `value=""` to clear. Secure fields are refused; it never submits.
+  Add an app-level postcondition, such as
+  `equals(title="Check", role="button", attribute="AXEnabled", value=True)`,
+  to verify that the app processed the input rather than just displaying it.
 - A call either returns a `Receipt`, or raises `OperationError` -- catch it
   and read `exc.receipt` for the same structured detail a success would
   have had (`.outcome`, `.acted`, `.error["code"]`). A bad argument (an
@@ -92,6 +105,12 @@ receipt = mac.do.type(
   `key`/`click`/`type` to confirm the text a field holds or where a
   selection landed. The receipt keeps length/SHA-256 summaries of the
   expected and observed values, never the values.
+- Use `mac.do.expect_any({"saved": present(app=app, identifier="saved"),
+  "error": present(app=app, identifier="error")}, timeout=5)` when several
+  outcomes can end a wait. Read `receipt.observed["matched"]` for the matching
+  names. Scope every condition explicitly. The call sends no input and uses
+  one cooperative deadline; a running AX read can overrun it. A timeout keeps
+  each outcome's latest state and reason, not a guessed winner.
 - Use `mac.do.expect(condition)` for read-only checks with `present`, `gone`,
   or `equals`. Give the condition an
   explicit scope. Its timeout defaults to five seconds and its interval controls
@@ -146,16 +165,23 @@ fresh run id and may repeat input. There is no retry, resume, rollback, or
 implicit activation.
 
 Record through `with mac.route.record(name, app=exact_bundle_id, entry=entry,
-goal=goal) as rec:`. Call `rec.press`, `rec.set`, `rec.toggle`, or `rec.key` only.
-Unrelated Python and calls outside the handle are not recorded. Keep the handle
-on its with-block thread. A failed step prevents saving, even when caught; the
-previous file remains intact.
+goal=goal) as rec:`. Call `rec.press`, `rec.set`, `rec.fill`, `rec.toggle`, or
+`rec.key` only. Unrelated Python and calls outside the handle are not recorded.
+Keep the handle on its with-block thread. A failed step prevents saving, even
+when caught; the previous file remains intact.
 
 Use a role plus one exact identifier, title, or description for every target
 and condition. Press/key steps require a postcondition. Set/toggle steps retain
 their convergence checks. Set and equals values must be boolean or numeric.
 Keep secrets out of selectors and keys, which are saved verbatim. Supply both
 an entry condition and a terminal goal. Definitions allow at most 64 steps.
+
+For a form, pass `inputs={"domain": text}` to recording and replay, then call
+`rec.fill("domain", identifier="domain-field")`. The definition saves the
+parameter name, not the text. Replay rejects missing names, extra names, and
+invalid text before any step acts. Routes with inputs check the entry and run
+even when the old goal holds; that goal may describe the previous input.
+`mac.route.list` includes the required names under `inputs`.
 
 `dry_run=True` validates the whole definition without input or accessibility
 feature changes. It checks the current goal, or the entry and first target;
@@ -184,6 +210,13 @@ when the task permits that data. Secure fields and failed identity reads still
 exclude content attributes. Titles and labels can contain private text.
 `mac.diff_windows(before, after)` compares supplied snapshots without another
 observation. Snapshots do not freeze the app.
+
+Compare consecutive inspections with `mac.diff(before, after)` for control
+changes. Use each node's stable `ref`, not its short-lived `element_index`, to
+match it across those observations. Both must come from the same `MacOS`
+instance and app lifetime. Check `status` and `coverage`; incomplete walks
+put uncertain appearances and disappearances under `unproven`. Comparing
+does not make another observation. Values still need an explicit opt-in.
 
 Collect `mac.logs(receipt)` or `mac.crashes(receipt)` only when those records can
 answer the failure. An explicit time pair needs `app=pid`. Check collection

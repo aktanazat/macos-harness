@@ -7,6 +7,26 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `mac.diff(before, after)` compares consecutive inspections using stable
+  control references. Partial observations separate uncertain appearances
+  and disappearances from proven additions and removals.
+- `mac.do.expect_any` waits for named outcomes in one read-only call and
+  reports every match in the first successful pass. One cooperative timeout
+  covers the checks; failures retain each outcome's observation state.
+- Saved routes accept named form inputs through `rec.fill`. Definitions keep
+  parameter names, not entered text. Replay validates all inputs before action
+  and does not mistake the previous input's goal for completion of a new run.
+- `mac.do.fill` replaces a plain text field through keyboard input and checks
+  the text readback. It handles UTF-16 selection on both backends, refuses
+  secure or disabled fields, and stops if focus or text changes before typing.
+  Use an app-level postcondition to check that the app processed the input.
+- Help and version commands defer loading macOS frameworks. `--json-errors`
+  emits structured harness errors and operation receipts on stderr when requested.
+- A failed AX attribute batch stays incomplete instead of repeating the
+  failed read for every attribute. Bounded searches collect action names
+  only for matches. Unsupported batch APIs retain their single-read fallback.
+- `mac.explain` retains partial or unavailable inspection coverage and shows
+  nearby controls for the `any` role as well as specific roles.
 - A failed `mac.do.expect` receipt now reports what the check established.
   `observed` carries `state` — the new public `Observation` enum, `UNMET` or
   `UNOBSERVABLE` — and a `reason` naming the case: a completed search that
