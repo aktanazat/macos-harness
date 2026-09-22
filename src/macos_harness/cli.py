@@ -19,12 +19,15 @@ from typing import IO, Protocol, TextIO
 
 from ._version import __version__
 from .browser import BrowserHarness
-from .macos import MacOS, MacOSError
+from .errors import MacOSError
+from .receipts import OperationError
 from .telemetry import capture_cli
 from .telemetry import run_cli as run_telemetry_cli
 
 
 def _namespace() -> dict[str, object]:
+    from .macos import MacOS
+
     return {
         "__name__": "__macos_harness__",
         "browser": BrowserHarness(),
@@ -62,6 +65,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    parser.add_argument(
+        "--json-errors",
+        action="store_true",
+        help="write native stdin execution errors as JSON to stderr",
     )
     subparsers = parser.add_subparsers(dest="command")
     doctor = subparsers.add_parser("doctor", help="check macOS permissions and runtime")
@@ -480,6 +488,8 @@ def main(argv: list[str] | None = None) -> int:
     result: int | None = None
     try:
         if args.command == "doctor":
+            from .macos import MacOS
+
             mac = MacOS()
             if args.request:
                 mac.request_permissions()
@@ -487,6 +497,8 @@ def main(argv: list[str] | None = None) -> int:
             result = 0
             return result
         if args.command == "apps":
+            from .macos import MacOS
+
             print(json.dumps(MacOS().list_apps(), indent=2))
             result = 0
             return result
@@ -506,6 +518,8 @@ def main(argv: list[str] | None = None) -> int:
             result = 0
             return result
         if args.command == "see":
+            from .macos import MacOS
+
             result = MacOS().see(
                 args.app,
                 max_width=args.max_width,
@@ -516,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
             result = 0
             return result
         if args.command == "state":
+            from .macos import MacOS
+
             state = MacOS().get_app_state(
                 args.app,
                 screenshot=args.screenshot,
@@ -538,7 +554,13 @@ def main(argv: list[str] | None = None) -> int:
             return result
         parser.error(f"unknown command: {args.command}")
     except (MacOSError, RuntimeError) as exc:
-        print(f"macos-harness: {exc}", file=sys.stderr)
+        if args.command is None and args.json_errors and isinstance(exc, MacOSError):
+            payload = exc.to_json()
+            if isinstance(exc, OperationError):
+                payload["receipt"] = exc.receipt.to_json()
+            _print_json_line(payload, file=sys.stderr)
+        else:
+            print(f"macos-harness: {exc}", file=sys.stderr)
         result = 1
         return result
     finally:
