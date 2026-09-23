@@ -34,29 +34,11 @@ from .receipts import (
 )
 
 if TYPE_CHECKING:
-    from .credentials import (
-        DEFAULT_CREDENTIAL_MANIFEST,
-        CredentialBroker,
-        CredentialEnrollment,
-        CredentialError,
-        CredentialManifest,
-        CredentialReceipt,
-    )
     from .macos import MacOS, SearchMatches
     from .routes import RouteResult
 
-# Import the native runtime and credential policy only when their public
-# exports are requested. Type checkers use the imports above.
-_CREDENTIAL_NAMES = frozenset(
-    {
-        "DEFAULT_CREDENTIAL_MANIFEST",
-        "CredentialBroker",
-        "CredentialEnrollment",
-        "CredentialError",
-        "CredentialManifest",
-        "CredentialReceipt",
-    }
-)
+# Import the native runtime only when its public exports are requested.
+# Type checkers use the imports above.
 
 
 def __getattr__(name: str) -> object:
@@ -68,10 +50,6 @@ def __getattr__(name: str) -> object:
         from .routes import RouteResult
 
         value = RouteResult
-    elif name in _CREDENTIAL_NAMES:
-        from . import credentials
-
-        value = getattr(credentials, name)
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = value
@@ -83,16 +61,10 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
-    "DEFAULT_CREDENTIAL_MANIFEST",
     "AccessibilityPermissionError",
     "Acted",
     "ApplicationNotFoundError",
     "BrowserHarness",
-    "CredentialBroker",
-    "CredentialEnrollment",
-    "CredentialError",
-    "CredentialManifest",
-    "CredentialReceipt",
     "Equals",
     "ErrorCode",
     "ErrorPayload",
