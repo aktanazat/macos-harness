@@ -239,6 +239,18 @@ follows [Semantic Versioning](https://semver.org/).
   `mac.ax.get_attributes` is unchanged: a bulk sample where an unreadable
   attribute is `None`.
 
+### Removed
+
+- The credential broker: `macos-harness credential` (`check`,
+  `fill-browser`, `fill-native`, `enroll`), `CredentialBroker`,
+  `CredentialManifest`, `CredentialEnrollment`, `CredentialReceipt`,
+  `CredentialError`, `DEFAULT_CREDENTIAL_MANIFEST`, the worker, and
+  `~/.config/macos-harness/credentials.toml`. Its one sink was a field in
+  a live ego-browser taskspace, and that route is retired: browser
+  credentials belong to the browser's own password manager, and a native
+  login field keeps its two owners, system AutoFill or `mac.handoff`.
+  Nothing else in the harness read the manifest or the vault.
+
 ## [0.5.0] - 2026-08-22
 
 ### Added
