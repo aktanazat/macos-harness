@@ -591,8 +591,26 @@ final class AXExecutor {
     try Self.requireTrust()
 
     let element = try Self.resolveElement(handle, registry: registry)
-    let error = AXUIElementSetAttributeValue(
-      element, attribute as CFString, value.foundationValue as CFTypeRef)
+    let nativeValue: CFTypeRef
+    if attribute == "AXSelectedTextRange", case .object(let fields) = value {
+      guard fields.count == 2,
+        let start = fields["location"]?.numberValue, let location = Int(exactly: start),
+        let count = fields["length"]?.numberValue, let length = Int(exactly: count),
+        location >= 0, length >= 0, location <= Int.max - length
+      else {
+        throw AgentError(
+          code: "bad_request",
+          message: "AXSelectedTextRange requires nonnegative integer location and length")
+      }
+      var range = CFRange(location: location, length: length)
+      guard let encoded = AXValueCreate(.cfRange, &range) else {
+        throw Self.axAgentError("Encode text selection", .failure)
+      }
+      nativeValue = encoded
+    } else {
+      nativeValue = value.foundationValue as CFTypeRef
+    }
+    let error = AXUIElementSetAttributeValue(element, attribute as CFString, nativeValue)
     guard error == .success else {
       throw Self.axAgentError("Set \(attribute) on element \(handle)", error)
     }

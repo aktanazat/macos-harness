@@ -707,7 +707,8 @@ def test_strict_wait_never_trusts_one_match_from_a_cut_search(monkeypatch) -> No
     }
 
 
-def test_strict_wait_rejects_a_branch_that_refused_its_children(monkeypatch) -> None:
+@pytest.mark.parametrize("failure", ["children", "batch"])
+def test_strict_wait_rejects_a_branch_that_refused_its_children(monkeypatch, failure) -> None:
     mac = MacOS()
     root, save, blocked = (object() for _ in range(3))
     data = {
@@ -721,13 +722,21 @@ def test_strict_wait_rejects_a_branch_that_refused_its_children(monkeypatch) -> 
         },
         blocked: {
             "AXRole": "AXGroup",
-            "AXChildren": _Refused(macos_module.AS.kAXErrorCannotComplete),
+            "AXChildren": _Refused(macos_module.AS.kAXErrorCannotComplete) if failure == "children" else [],
         },
     }
     copy_attributes = mac._copy_attributes
     _bounded_tree(monkeypatch, mac, root, {root: [save, blocked]}, data)
     monkeypatch.setattr(mac, "_copy_attributes", copy_attributes)
     _focus_ax(monkeypatch, mac, data, batch=False, focused=root)
+    if failure == "batch":
+        monkeypatch.setattr(
+            macos_module.AS, "AXUIElementCopyMultipleAttributeValues",
+            lambda element, *args: (
+                macos_module.AS.kAXErrorCannotComplete if element is blocked
+                else macos_module.AS.kAXErrorNotImplemented, None
+            ),
+        )
 
     with pytest.raises(MacOSError, match="complete search") as caught:
         mac.ax.wait(app="Pages", title="Save", timeout=0)

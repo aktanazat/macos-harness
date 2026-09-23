@@ -67,12 +67,30 @@ except OperationError as exc:
 PY
 ```
 
-- `press`, `set`, `toggle`, `run`, `key`, `click`, and `type` mutate;
-  `expect(condition)` observes a condition, and `recall(once)` looks up a
-  past receipt by its token, without dispatching
+- `press`, `set`, `fill`, `toggle`, `run`, `key`, `click`, and `type` mutate;
+  `expect(condition)` and `expect_any(outcomes)` observe conditions, and
+  `recall(once)` looks up a past receipt by its token, without dispatching
   anything. `set`/`toggle` are convergent: they read the current state
   first and report `outcome="already"` instead of touching anything
   already correct.
+- Use `fill(value, app=..., identifier=...)` to replace a plain text field.
+  It focuses one unique enabled field, selects its full UTF-16 range, types
+  through the app's input handler, and verifies the text. Unlike an AX value
+  write, this sends the keyboard events a SwiftUI binding needs. Pass
+  `value=""` to clear. Secure fields are refused, and no Return key is sent.
+  Give `fill` an app-level postcondition when the result matters beyond the
+  field itself: `equals(title="Check", role="button", attribute="AXEnabled",
+  value=True)` checks that the app accepted the input.
+- `expect_any({"saved": present(app=app, identifier="saved"),
+  "error": present(app=app, identifier="error")}, timeout=5)` waits for the
+  first observation pass with a satisfied condition. Read
+  `receipt.observed["matched"]` for every matching name in that pass. Each
+  condition needs an explicit app scope. One cooperative deadline covers all
+  checks; an AX read already in progress can overrun it. Timeout receipts keep
+  each outcome's latest state and reason. No input or activation is sent.
+- Run stdin programs with `macos-harness --json-errors` for uncaught harness
+  errors as JSON on stderr. Operation failures include their receipt. The
+  nonzero exit status and the default text error format are unchanged.
 - Every call returns an immutable, JSON-safe `Receipt` on success, or
   raises `OperationError` on failure — `exc.receipt` is the exact same
   `Receipt` a success would have had, so you never have to choose between
@@ -223,19 +241,44 @@ print(mac.route.list(app=app))
 A route requires an exact bundle identifier, an entry condition, and a terminal
 goal. Every target and condition needs a role plus exactly one exact title,
 identifier, or description. There is no substring or alternate-field fallback.
-The supported steps are `press`, `set`, `toggle`, and `key`. Presses and keys
-require an explicit postcondition; set and toggle retain their value-convergence
-checks. Only boolean and numeric set/equals values are recordable. Selectors and
-key combinations are stored verbatim, so keep secrets out of them.
+The supported steps are `press`, `set`, `fill`, `toggle`, and `key`. Presses and
+keys require an explicit postcondition; set and toggle retain their
+value-convergence checks. Only boolean and numeric set/equals values are
+recordable. Selectors and key combinations are stored verbatim, so keep
+secrets out of them.
+
+For forms, record a parameter name with `fill` and supply its text separately:
+
+```python
+entry = present(role="text field", identifier="domain")
+goal = present(role="static text", identifier="result")
+with mac.route.record(
+    "check-domain", app=app, entry=entry, goal=goal,
+    inputs={"domain": "example.invalid"},
+) as rec:
+    rec.fill("domain", identifier="domain")
+    rec.press(role="button", identifier="check", postcondition=goal)
+
+result = mac.route.run(
+    "check-domain", app=app, inputs={"domain": "another.example.invalid"},
+)
+```
+
+The saved definition contains `domain`, not the supplied text.
+`mac.route.list(app=app)` lists the required input names. Missing or unknown
+names and invalid text stop replay before any step acts. Input-bearing routes
+check the entry and run even if the previous goal still holds: that goal may
+describe the previous input. Never put private text in selectors or labels.
 
 Recording checks the entry before yielding and the goal before saving. A failed
 step prevents saving even if its exception is caught. The previous file stays
 intact. Keep the handle on the thread that entered the block; it closes when the
 block exits. A definition has at most 64 steps and a 1 MiB file limit.
 
-Replay validates the whole definition before input. It returns `already` if the
-goal holds, otherwise checks the entry and runs each step once. Only a goal
-read that came back `Observation.UNMET` authorizes the steps; any
+Replay validates the whole definition before input. For routes without form
+inputs, it returns `already` if the goal holds, otherwise checks the entry and
+runs each step once. Only a goal read that came back `Observation.UNMET`
+authorizes those steps; any
 `UNOBSERVABLE` goal read stops the run rather than replay input against an app
 whose state is unknown. One app process and one cooperative timeout
 cover the sequence. A process exit or replacement stops further steps. The
@@ -301,6 +344,23 @@ selection, and character-count reads even when values are requested. Titles and
 labels can still contain private text. Snapshots are not atomic; the app can
 change between reads. `mac.diff_windows(before, after)` compares supplied
 snapshots for opened, closed, and changed windows without another observation.
+
+For control-level changes, compare two consecutive inspections of the same app:
+
+```python
+before = mac.inspect(app, include_values=True)
+# Perform the intended operation.
+after = mac.inspect(app, include_values=True)
+changes = mac.diff(before, after)
+print(changes["changed"], changes["added"], changes["removed"])
+```
+
+Stable `ref` values identify controls; `element_index` remains a short-lived
+action handle. A partial walk cannot prove a control was added or removed,
+so uncertain appearances and disappearances go under `unproven`. Diffing
+does not read the desktop. Both observations must come from one `MacOS`
+instance and the same app lifetime, with no intervening successful inspection.
+Values remain opt-in and may contain private text.
 
 Logs and crash lookups accept a receipt or a `(start, end)` pair of timezone-aware
 ISO-8601 strings with `app=pid`. Receipt intervals include 250 ms on each side.
@@ -496,226 +556,6 @@ acknowledgement, not proof the human succeeded, and it carries no once-token,
 receipt, or resume method to skip that rediscovery. After `cancelled`, stop;
 do not rediscover or retry.
 
-## Credential broker for provisioned logins
-
-`macos-harness credential` fills a browser login field -- a password, a
-TOTP code, or a Gmail-delivered one-time code -- from a configured
-credential ref. Provisioning that ref, including copying the initial
-secret out of an already-unlocked Apple Passwords entry, is itself
-autonomous agent work in one bounded burst; it is not a step that waits on
-a human. The agent never unlocks Passwords, bypasses Touch ID or a
-passkey, or acts while a physical-presence prompt is on screen -- that
-boundary belongs to macOS. Once a ref is configured, nobody is asked to
-repeat that authorization or reveal the value again.
-
-```bash
-macos-harness credential check
-macos-harness credential fill-browser acme-login --space my-task
-macos-harness credential enroll acme-login              # hidden TTY prompt, or stdin when piped
-macos-harness credential enroll acme-login --clipboard  # secret already on the clipboard
-macos-harness credential enroll acme-email-otp          # Gmail ref: authorizes the policy, reads nothing
-```
-
-Default order for any login step:
-
-1. Reuse an already-authenticated session -- a page that is already signed
-   in needs no credential at all.
-2. If a ref is configured, run `fill-browser` against the ego-browser
-   taskspace already showing the page.
-3. If none is, provision one autonomously in the same bounded burst:
-   verify the live origin and field, write the nonsecret manifest entry,
-   reveal and copy the value from an already-unlocked Passwords entry
-   through ordinary UI automation, and run `enroll --clipboard` right
-   after. For a one-time or recovery code delivered by email, point the
-   entry at the configured Gmail source (`kind = "gmail_otp"`) instead and
-   run plain `enroll <ref>` once: the code is read live and never stored,
-   so that command stores no secret -- it authorizes exactly this policy.
-4. Call `mac.handoff(...)` only when macOS or the provider puts up a gate
-   that needs a physical human -- Touch ID, the Mac login password,
-   a passkey, a CAPTCHA, a sign-in approval -- or when there is nothing
-   safe to draw the value from (no matching Passwords entry and no Gmail
-   source). Missing provisioning is never by itself an immediate handoff;
-   try step 3 first.
-
-### Only a browser field is filled
-
-The one sink is a web input inside a live ego-browser taskspace. A
-manifest `field` is a CSS selector, so it can only ever mean a DOM node.
-A login window in a native app keeps one of two owners -- macOS AutoFill,
-accepted by the user, or an explicit `mac.handoff(...)` -- because typing
-a secret at whatever currently holds first responder can land it in the
-wrong control or the wrong app. Provisioning a ref from Passwords is
-unaffected: it runs through the ordinary UI primitives against an
-already-unlocked Passwords window plus `enroll --clipboard`.
-
-### What a browser fill verifies
-
-A fill is refused unless the taskspace named by `--space` exists, is
-unique, is agent-owned, and is active; the broker never creates a space or
-hands one off. Inside it, the fill confirms no dialog is open and that the
-page's current origin matches `origins` exactly, then resolves exactly one
-visible, enabled, writable input of the expected type and -- on that one
-resolved DOM object, not on a selector it might re-run -- validates,
-focuses, clears, and force-arms it while the page is still known good.
-
-Only then does the secret reach the browser step, through a private FIFO
-the worker creates for that fill -- the ego-browser utility does not
-inherit an environment, so a pipe is what there is. Between reading the
-value and typing it, the fill rechecks the page's current origin and
-revalidates that same object -- the object, not a fresh selector match --
-as still connected, focused, enabled, writable, visible, empty, and of the
-expected type through `Runtime.callFunctionOn`. It then injects the whole
-value with a single trusted CDP `Input.insertText`, confirms equality on
-that same object inside CDP -- the expected value passed as a call
-argument, never spliced into page source -- and confirms the origin once
-more. The value is never returned to the broker, printed, or logged. The
-broker fills one field -- the credential's own -- and never a username or
-any other part of the form.
-
-Every fill is bounded from the outside: 45 seconds for a password or TOTP
-fill, 120 seconds for a Gmail fill, and one process group owning the whole
-tree the broker starts -- mem-secret, the worker, and the `gws` and
-ego-browser commands under it. A wedged provider or a stalled browser is
-killed as a group and reported as `credential.timeout` instead of holding
-a login open.
-
-`check` lists the configured refs: `{"state":"checked","refs":[...]}`.
-`fill-browser` returns a `CredentialReceipt`:
-`{"state":"filled","credential_ref":...,"provider":...,"sink":"browser","acted":true}`.
-`enroll` prints `{"state":"enrolled","credential_ref":...}`.
-For a password or TOTP ref, `enroll` stores the new secret in the shared
-mem-secret sops+age vault -- invoked at its pinned absolute path,
-`~/.local/bin/mem-secret`, never resolved through `PATH` -- from a hidden
-TTY prompt, or from stdin when piped. `enroll --clipboard` takes it from
-whatever is already on the clipboard instead: normally the agent's own copy
-of an already-unlocked Passwords entry, revealed and copied through the
-same UI automation as any other primitive, inside the same bounded
-provisioning burst. It pipes `pbpaste` straight into `mem-secret`'s stdin
-at the OS level, so the secret bytes never enter the CLI's own Python
-process, and it clears the clipboard on every path, success or failure,
-including a failure raised before mem-secret runs -- and a clipboard it
-cannot prove empty afterward is a failed enrollment, not a successful one.
-It cannot make Passwords open, unlock, or reveal an entry: a Touch ID or
-account-password prompt there is a physical-user boundary and the agent
-stops at it.
-
-For a `gmail_otp` ref, `enroll <ref>` reads no secret at all -- no prompt,
-no stdin, no clipboard, and `--clipboard` on a Gmail ref fails before
-anything is spawned, with `credential.enroll_not_authored`. There is
-nothing to store, because the code is read live; what it stores is the
-nonsecret authorization for that one policy -- the policy digest itself --
-written straight to the vault under a name derived from that same digest.
-That single command is the whole authorization step for an emailed code.
-At fill time the Gmail worker runs under mem-secret with that authorization
-in its environment and compares it, in constant time, against the digest of
-the policy it was handed -- before it compiles a pattern or calls `gws` at
-all. Absent or mismatched, the fill is refused with zero provider traffic.
-Editing the manifest is therefore not enough to rebind a live Gmail code:
-repoint the entry at another mailbox, sender, pattern, origin, or field and
-the new policy has no authorization behind it until someone runs `enroll`
-again.
-
-Both halves of that path -- the manifest and the vault binary -- are
-resolved from the account's own home directory in the passwd record rather
-than from `$HOME`, so an exported `HOME` cannot move the policy file, the
-vault binary, or the browser toolkit the worker uses.
-
-Every command that fails prints one fixed, redacted `{"error":"<code>"}`
-line and nothing else. No secret, secret length, OTP, email body, provider
-output, clipboard value, or derived fingerprint ever reaches an argument,
-receipt, error, log, or return value.
-
-### The manifest
-
-Credentials are declared once in `~/.config/macos-harness/credentials.toml`.
-That path is fixed and is the only policy any command reads, so a fill can
-never be pointed at a manifest someone else wrote -- and it must be
-private to the current user before it is even parsed: a regular
-non-symlink file owned by this uid at mode exactly 0600, in a directory
-owned by the same uid that is neither group- nor world-writable. A 0644
-manifest, a symlink, or a group-writable parent is refused with
-`credential.manifest_untrusted` ("The credential manifest is not private
-to this user"). Set it up once:
-
-```bash
-mkdir -p ~/.config/macos-harness
-chmod 700 ~/.config/macos-harness
-chmod 600 ~/.config/macos-harness/credentials.toml
-```
-
-The entry itself is nonsecret and safe for the agent to write during
-provisioning. What binds it to an authorization is one policy digest: a
-SHA-256 over the entry's canonical full policy -- its ref, `kind`, sorted
-`origins`, `field`, and, for `gmail_otp`, every Gmail source key
-(`mailbox`, `sender`, `subject_regex`, `body_regex`, `max_age_seconds`).
-A password or TOTP secret is stored under a vault name derived from that
-whole digest; a Gmail entry's authorization is derived from the same digest.
-One enrollment therefore authorizes exactly one source and exactly one
-destination, and no manifest can name, borrow, or rebind another entry's.
-
-That has a practical consequence: changing any field of an entry --
-renaming the ref, changing `kind`, adding, removing, or rewriting an
-origin, pointing `field` at a different input, or editing a Gmail
-mailbox, sender, pattern, or age window -- derives a different digest with
-nothing enrolled behind it. The next fill fails rather than sending an old
-secret to a new origin or reading a code from a mailbox nobody authorized,
-so re-enroll after any edit. Only reordering `origins` is free; they are
-sorted before hashing. Each kind's key set is closed, so an unknown or
-misspelled key is rejected rather than half-honored and an outdated
-manifest fails loudly instead of half-working. Placeholders only below;
-never commit or paste a real value.
-
-```toml
-version = 1
-
-[credentials.example-login]
-kind = "password"
-origins = ["https://example.com"]
-field = "#password"
-
-[credentials.example-totp]
-kind = "totp"
-origins = ["https://example.com"]
-field = "#otp"
-
-[credentials.example-gmail-otp]
-kind = "gmail_otp"
-origins = ["https://example.com"]
-field = "#otp"
-mailbox = "you@example.com"
-sender = "noreply@example.com"
-subject_regex = "verification code"
-body_regex = "code is (?P<code>\\d{6})"
-max_age_seconds = 300
-```
-
-The same `gmail_otp` kind covers a one-time verification code or a
-temporary account-recovery PIN, as long as it arrives by email to the
-configured mailbox -- match it with its own `subject_regex`/`body_regex`
-rather than treating recovery as an automatic handoff. The newest matching
-message wins, so a resent code supersedes the one before it.
-
-Each pattern is bounded in length, must compile, and `body_regex` must
-carry a `code` group. Matching one message then runs under a one-second
-wall-clock alarm in the worker, so a pathological pattern is cut off
-rather than left to spin; if that alarm cannot be armed, the message is
-refused rather than matched unbounded. Nothing here claims a pattern is
-linear -- the bound is the clock.
-
-Bodies are matched as visible text. A `text/plain` part is used as it is;
-`text/html` is reduced with the standard library only when there is no
-plain part -- `script`, `style`, `head`, `title`, `template`, `noscript`,
-and any element marked `hidden`, `aria-hidden="true"`, `display:none`, or
-`visibility:hidden` dropped, entities resolved, tag boundaries becoming
-whitespace. A message is used only when it yields exactly one distinct
-code-shaped capture, so a quoted thread or a two-code digest is skipped
-instead of guessed at (the same code repeated is still one code).
-
-What all of that does and does not defend against -- it guards against
-leaks, a wrong page or mailbox, a stale policy, and a hung step, not
-against a hostile process already running as you -- is spelled out in
-[SECURITY.md](SECURITY.md#threat-boundary-for-the-credential-broker).
-
 ## Native backend
 
 `mac.*` runs entirely in Python by default. A separate, optional Swift agent
@@ -844,8 +684,6 @@ searching and again after reading the frontmost app.
   over a local socket; off by default, see [Native backend](#native-backend)
 - Declares an explicit human handoff at a known authentication boundary
   instead of guessing from a timeout — see [Human handoff](#human-handoff-for-authentication-boundaries)
-- Fills a provisioned login field in the real browser from one authorized
-  policy, and never a native control — see [Credential broker](#credential-broker-for-provisioned-logins)
 
 ## Permissions and privacy
 

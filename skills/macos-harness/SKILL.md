@@ -20,6 +20,10 @@ PY
 The CLI preloads `mac`, `browser`, `Path`, and `subprocess`. Prefer bounded stdin
 programs; reserve `macos-harness repl` for manual exploration and always exit it.
 
+Use `macos-harness --json-errors` for machine-readable failures from stdin
+programs. Harness errors go to stderr as JSON; operation failures include
+the receipt. The exit status remains nonzero.
+
 ## Minimize round trips
 
 - Bundle deterministic, reversible steps into one program, then verify once. Opening
@@ -54,11 +58,20 @@ receipt = mac.do.type(
 )
 ```
 
-- `press`, `set`, `toggle`, `run`, `key`, `click`, and `type` mutate;
-  `expect(condition)` observes a condition, and `recall(once)` looks up a past
-  receipt without dispatching anything. `set`/`toggle` check first and report
+- `press`, `set`, `fill`, `toggle`, `run`, `key`, `click`, and `type` mutate;
+  `expect(condition)` and `expect_any(outcomes)` observe conditions, and
+  `recall(once)` looks up a past receipt without dispatching anything.
+  `set`/`toggle` check first and report
   `outcome="already"` instead of re-mutating a target already in the
   requested state, so neither takes a `once` token.
+- Use `mac.do.fill(value, app=..., identifier=...)` for a plain text field,
+  especially when `set` changes visible text but leaves an app button disabled.
+  `fill` resolves one enabled field, focuses it, selects its full UTF-16 range,
+  types once, and verifies the text. It stops if focus or text changes before
+  typing. Pass `value=""` to clear. Secure fields are refused; it never submits.
+  Add an app-level postcondition, such as
+  `equals(title="Check", role="button", attribute="AXEnabled", value=True)`,
+  to verify that the app processed the input rather than just displaying it.
 - A call either returns a `Receipt`, or raises `OperationError` -- catch it
   and read `exc.receipt` for the same structured detail a success would
   have had (`.outcome`, `.acted`, `.error["code"]`). A bad argument (an
@@ -92,6 +105,12 @@ receipt = mac.do.type(
   `key`/`click`/`type` to confirm the text a field holds or where a
   selection landed. The receipt keeps length/SHA-256 summaries of the
   expected and observed values, never the values.
+- Use `mac.do.expect_any({"saved": present(app=app, identifier="saved"),
+  "error": present(app=app, identifier="error")}, timeout=5)` when several
+  outcomes can end a wait. Read `receipt.observed["matched"]` for the matching
+  names. Scope every condition explicitly. The call sends no input and uses
+  one cooperative deadline; a running AX read can overrun it. A timeout keeps
+  each outcome's latest state and reason, not a guessed winner.
 - Use `mac.do.expect(condition)` for read-only checks with `present`, `gone`,
   or `equals`. Give the condition an
   explicit scope. Its timeout defaults to five seconds and its interval controls
@@ -146,16 +165,23 @@ fresh run id and may repeat input. There is no retry, resume, rollback, or
 implicit activation.
 
 Record through `with mac.route.record(name, app=exact_bundle_id, entry=entry,
-goal=goal) as rec:`. Call `rec.press`, `rec.set`, `rec.toggle`, or `rec.key` only.
-Unrelated Python and calls outside the handle are not recorded. Keep the handle
-on its with-block thread. A failed step prevents saving, even when caught; the
-previous file remains intact.
+goal=goal) as rec:`. Call `rec.press`, `rec.set`, `rec.fill`, `rec.toggle`, or
+`rec.key` only. Unrelated Python and calls outside the handle are not recorded.
+Keep the handle on its with-block thread. A failed step prevents saving, even
+when caught; the previous file remains intact.
 
 Use a role plus one exact identifier, title, or description for every target
 and condition. Press/key steps require a postcondition. Set/toggle steps retain
 their convergence checks. Set and equals values must be boolean or numeric.
 Keep secrets out of selectors and keys, which are saved verbatim. Supply both
 an entry condition and a terminal goal. Definitions allow at most 64 steps.
+
+For a form, pass `inputs={"domain": text}` to recording and replay, then call
+`rec.fill("domain", identifier="domain-field")`. The definition saves the
+parameter name, not the text. Replay rejects missing names, extra names, and
+invalid text before any step acts. Routes with inputs check the entry and run
+even when the old goal holds; that goal may describe the previous input.
+`mac.route.list` includes the required names under `inputs`.
 
 `dry_run=True` validates the whole definition without input or accessibility
 feature changes. It checks the current goal, or the entry and first target;
@@ -184,6 +210,13 @@ when the task permits that data. Secure fields and failed identity reads still
 exclude content attributes. Titles and labels can contain private text.
 `mac.diff_windows(before, after)` compares supplied snapshots without another
 observation. Snapshots do not freeze the app.
+
+Compare consecutive inspections with `mac.diff(before, after)` for control
+changes. Use each node's stable `ref`, not its short-lived `element_index`, to
+match it across those observations. Both must come from the same `MacOS`
+instance and app lifetime. Check `status` and `coverage`; incomplete walks
+put uncertain appearances and disappearances under `unproven`. Comparing
+does not make another observation. Values still need an explicit opt-in.
 
 Collect `mac.logs(receipt)` or `mac.crashes(receipt)` only when those records can
 answer the failure. An explicit time pair needs `app=pid`. Check collection
@@ -362,80 +395,6 @@ it (`mac.see`, `mac.ax`, ...). The handoff is an acknowledgement, not proof
 the human succeeded, and carries no once-token, receipt, or resume method
 to skip that rediscovery. After `cancelled`, stop; do not rediscover or
 retry.
-
-## Fill provisioned credentials automatically
-
-`macos-harness credential` fills a browser login field from a configured
-ref. Provisioning a ref -- including copying the value out of an
-already-unlocked Apple Passwords entry -- is something you do
-autonomously in one bounded burst; do not wait on a human by default.
-
-```bash
-macos-harness credential check                               # which refs exist
-macos-harness credential fill-browser <ref> --space <space>  # --space is required
-macos-harness credential enroll <ref> --clipboard            # password/TOTP: from the clipboard
-macos-harness credential enroll <gmail-ref>                  # gmail_otp: authorize, no secret read
-```
-
-Order for every login step:
-
-1. Reuse an already-authenticated session.
-2. If the ref exists, run `fill-browser` against the ego-browser taskspace
-   already showing the page. That space must exist, be unique, be yours,
-   and be active -- the broker never creates one or hands one off.
-3. If it does not exist, provision it in the same burst: verify the live
-   origin and field, add the nonsecret manifest entry, reveal and copy the
-   value from an already-unlocked Passwords entry through ordinary UI
-   automation, then run `enroll --clipboard`. (`enroll <ref>` without
-   `--clipboard` reads a hidden TTY prompt, or stdin when piped.) For an
-   emailed one-time or recovery code use `kind = "gmail_otp"` and run
-   plain `enroll <ref>` once: that code is read live and never stored, so
-   the command stores no secret -- it authorizes this exact policy, and
-   `--clipboard` on a Gmail ref fails with
-   `credential.enroll_not_authored`.
-4. Call `mac.handoff(...)` only at a gate macOS or the provider owns:
-   Touch ID, a passkey, the Mac login password, a CAPTCHA, a
-   sign-in approval. Never unlock Passwords, bypass Touch ID, or act while
-   a physical-presence prompt is on screen. Missing provisioning is never
-   by itself a handoff.
-
-The only sink is a web field in that taskspace. A native app's login field
-belongs to macOS AutoFill or to a handoff: `field` is a CSS selector, and
-typing a secret into whatever currently holds first responder can land it
-in the wrong control, so the harness will not do it.
-
-Entries live in `~/.config/macos-harness/credentials.toml` -- the one
-policy any command reads, resolved from your account's home in the passwd
-record, not from `$HOME`. It is refused unless it is private to you
-(`chmod 700 ~/.config/macos-harness`, `chmod 600` the file; a symlink or a
-group-writable parent also fails). Write the entry during provisioning
-only, then enroll:
-
-```toml
-version = 1
-
-[credentials.example-login]
-kind = "password"            # password | totp | gmail_otp
-origins = ["https://example.com"]
-field = "#password"
-```
-
-One SHA-256 digest over the entry's whole policy -- ref, `kind`, sorted
-`origins`, `field`, and every Gmail source key -- owns the authorization.
-So editing any of those after enrolling means enrolling again; only
-reordering `origins` is free. A Gmail fill additionally checks its
-authorization against that digest before it reads mail, so editing the
-manifest alone cannot repoint a live code at another mailbox or field.
-
-Every command prints exactly one compact JSON line: a receipt on success,
-a fixed `{"error":"<code>"}` on failure. No secret, secret length, OTP,
-email body, provider output, or clipboard value ever reaches an argument,
-receipt, error, log, or return value -- and never ask a human to reveal
-one. A fill is bounded and self-cleaning: 45s for a password or TOTP, 120s
-for a Gmail code, after which the whole worker tree is killed and you get
-`credential.timeout`. Retry once, then read the code and stop. See
-[README](../../README.md#credential-broker-for-provisioned-logins) for the
-`gmail_otp` mailbox/pattern keys.
 
 ## Browser and permissions
 

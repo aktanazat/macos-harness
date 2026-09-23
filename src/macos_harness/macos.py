@@ -18,9 +18,11 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
 from .capture import capture_window, draw_pointer, write_png
@@ -696,6 +698,16 @@ if hasattr(os, "register_at_fork"):  # pragma: no branch - always true on macOS
 class MacOS:
     """Low-level macOS observation and control for one persistent process."""
 
+    # Identity for `inspect` and `diff`, held on the class so it reads as
+    # "nothing inspected yet" and every write below replaces it with an
+    # instance attribute. `_observation_refs` maps the accessibility
+    # elements of the previous inspection to their `ref`; only that one
+    # generation is kept.
+    _observation_session: str | None = None
+    _observation_sequence: int = 0
+    _observation_refs: Mapping[Any, int] = MappingProxyType({})
+    _observation_ref_seq: int = 0
+
     def __init__(self, *, backend: str | None = None) -> None:
         _require_macos()
         self._elements: dict[int, Any] = {}
@@ -819,8 +831,52 @@ class MacOS:
             else:
                 state = status
             state["observed_at"] = _utc_timestamp(time.time())
+            self._identify_observation(state)
             state.update(inspection_findings(state, app if isinstance(app, Receipt) else None))
             return state
+
+    def _identify_observation(self, state: dict[str, JSONValue]) -> None:
+        """Give each inspected control a `ref` that survives one re-inspection.
+
+        `element_index` cannot: `_snapshot_tree` clears `self._elements`
+        and `_remember_element` hands out the next unused integer, so the
+        same control is numbered differently in every snapshot and
+        comparing those numbers would read an untouched window as wholly
+        removed and re-added. A node keeps its previous `ref` whenever
+        accessibility returns an element equal to one seen last time --
+        `CFEqual`, the same equality the tree walk already uses to avoid
+        visiting a control twice -- and gets a fresh one otherwise.
+
+        Only the previous inspection's elements are retained, so this
+        holds one extra reference per node and costs one dictionary
+        lookup each. The price is that only consecutive inspections can
+        be compared, which `state["observation"]` records: the session
+        that numbered these refs, this inspection's number, and the
+        number of the inspection its refs were matched against.
+        `diagnostics.diff_inspections` refuses every other pair rather
+        than trusting two integers that happen to agree.
+        """
+        nodes = state.get("nodes")
+        if not isinstance(nodes, list):
+            return
+        previous, refs = self._observation_refs, {}
+        ref_seq = self._observation_ref_seq
+        for node in nodes:
+            element = self._elements[node["element_index"]]
+            ref = previous.get(element)
+            if ref is None:
+                ref, ref_seq = ref_seq, ref_seq + 1
+            refs[element] = ref
+            node["ref"] = ref
+        if self._observation_session is None:
+            self._observation_session = uuid.uuid4().hex
+        state["observation"] = {
+            "session": self._observation_session,
+            "sequence": self._observation_sequence + 1,
+            "previous": self._observation_sequence or None,
+        }
+        self._observation_refs, self._observation_ref_seq = refs, ref_seq
+        self._observation_sequence += 1
 
     def _diagnostic_pid(self, subject: Receipt | tuple[str, str], app: str | int | None) -> int:
         from .diagnostics import receipt_pid
@@ -891,6 +947,13 @@ class MacOS:
         from .diagnostics import diff_windows
 
         return diff_windows(before, after)
+
+    @staticmethod
+    def diff(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        """Compare two consecutive inspections of one app without observing it again."""
+        from .diagnostics import diff_inspections
+
+        return diff_inspections(before, after)
 
     def _check_native_owner(self) -> None:
         """Fail closed before touching ``_native_lock`` from a forked child.
@@ -1372,10 +1435,9 @@ class MacOS:
     ) -> _AttributeValues:
         """Read AX attributes in one application round trip when supported.
 
-        A batch the app or the binding would not answer falls back to
-        single reads. ``checked`` carries `_copy_attribute`'s contract
-        through both paths: a slot the batch answered with an AXError
-        other than an absence raises instead of reading as ``None``.
+        An unsupported batch API falls back to single reads. A failed
+        batch stays incomplete rather than repeating its failure for each
+        attribute. ``checked`` raises for failed reads on either path.
         """
         names = tuple(dict.fromkeys(str(attribute) for attribute in attributes))
         if not names:
@@ -1385,7 +1447,11 @@ class MacOS:
                 element, names, 0, None
             )
         except (AttributeError, TypeError, ValueError):
-            error, values = -1, None
+            error, values = AS.kAXErrorNotImplemented, None
+        if error not in (_AX_SUCCESS, AS.kAXErrorNotImplemented, AS.kAXErrorAttributeUnsupported):
+            if checked:
+                raise _ax_error("Read attribute batch", error)
+            return _AttributeValues(((name, None) for name in names), complete=False)
         result = _AttributeValues()
         if error != _AX_SUCCESS or values is None or len(values) != len(names):
             for name in names:
@@ -2070,11 +2136,22 @@ class MacOS:
                 node["actions"] = actions
         return node
 
-    def get(self, element_index: int, attribute: str = "AXValue") -> Any:
+    def get(
+        self, element_index: int, attribute: str = "AXValue", *, missing_ok: bool = False
+    ) -> Any:
+        """Read one attribute; missing_ok permits absence, never a failed read."""
         element = self._element(element_index)
         if not self._is_ax_element(element):
-            return element.client.get(element, attribute)
+            try:
+                return element.client.get(element, attribute)
+            except MacOSError as exc:
+                error = exc.details.get("ax_error")
+                if missing_ok and isinstance(error, int) and _ax_absent(error):
+                    return None
+                raise
         error, value = AS.AXUIElementCopyAttributeValue(element, attribute, None)
+        if missing_ok and _ax_absent(error):
+            return None
         if error != _AX_SUCCESS:
             raise _ax_error(
                 f"Read {attribute} from element {element_index}",
@@ -2337,7 +2414,7 @@ class MacOS:
             max_nodes=max_nodes,
             include_menu_bar=True,
             attributes=traversal_attributes,
-            include_actions=include_actions,
+            include_actions=False,
             include_settable=False,
             reset_elements=reset_elements,
         )
@@ -2949,10 +3026,24 @@ class MacOS:
         return match
 
     def set(self, element_index: int, value: Any, attribute: str = "AXValue") -> None:
+        if attribute == "AXSelectedTextRange" and isinstance(value, Mapping):
+            location, length = value.get("location"), value.get("length")
+            if (
+                set(value) != {"location", "length"}
+                or not isinstance(location, int) or isinstance(location, bool)
+                or not isinstance(length, int) or isinstance(length, bool)
+                or location < 0 or length < 0 or location + length > (1 << 63) - 1
+            ):
+                raise MacOSError(
+                    "AXSelectedTextRange requires nonnegative integer location and length",
+                    code=ErrorCode.BAD_REQUEST,
+                )
         element = self._element(element_index)
         if not self._is_ax_element(element):
             element.client.set(element, attribute, value)
             return
+        if attribute == "AXSelectedTextRange" and isinstance(value, Mapping):
+            value = AS.AXValueCreate(AS.kAXValueCFRangeType, (location, length))
         error = AS.AXUIElementSetAttributeValue(element, attribute, value)
         if error != _AX_SUCCESS:
             raise _ax_error(
