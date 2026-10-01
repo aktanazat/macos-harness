@@ -7,6 +7,9 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Exact app-name queries ignore same-named extensions nested inside the
+  matching app bundle. Explicit PID, bundle ID, and path selectors still
+  reach extensions; multiple matching apps remain ambiguous.
 - `mac.diff(before, after)` compares consecutive inspections using stable
   control references. Partial observations separate uncertain appearances
   and disappearances from proven additions and removals.

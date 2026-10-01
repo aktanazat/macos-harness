@@ -110,20 +110,24 @@ class _FakeRunningApp:
         name: str = "HelperApp",
         terminated: bool = False,
         launched_seconds_ago: float | None = None,
+        bundle_id: str | None = None,
+        path: str | None = None,
     ) -> None:
         self._pid = pid
         self._name = name
         self._terminated = terminated
         self._launched_seconds_ago = launched_seconds_ago
+        self._bundle_id = bundle_id
+        self._path = path
 
     def localizedName(self) -> str:
         return self._name
 
-    def bundleIdentifier(self) -> None:
-        return None
+    def bundleIdentifier(self) -> str | None:
+        return self._bundle_id
 
-    def bundleURL(self) -> None:
-        return None
+    def bundleURL(self) -> NSURL | None:
+        return NSURL.fileURLWithPath_(self._path) if self._path is not None else None
 
     def processIdentifier(self) -> int:
         return self._pid
@@ -278,6 +282,89 @@ def test_resolve_app_last_app_reuse_passes_an_int_pid(monkeypatch) -> None:
     assert info["pid"] == 4242
     assert seen == [4242]
     assert isinstance(seen[0], int)
+
+
+@pytest.fixture
+def messages_apps(monkeypatch):
+    apps = [
+        _FakeRunningApp(
+            41, name="Messages", bundle_id="com.apple.messages.AssistantExtension",
+            path="/System/Applications/Messages.app/Contents/PlugIns/Messages Assistant Extension.appex",
+        ),
+        _FakeRunningApp(
+            42, name="Messages", bundle_id="com.apple.MobileSMS",
+            path="/System/Applications/Messages.app",
+        ),
+    ]
+
+    class Workspace:
+        @staticmethod
+        def sharedWorkspace() -> type[Workspace]:
+            return Workspace
+
+        @staticmethod
+        def runningApplications() -> list[_FakeRunningApp]:
+            return apps
+
+        @staticmethod
+        def frontmostApplication() -> None:
+            return None
+
+    class RunningApplication:
+        @staticmethod
+        def runningApplicationWithProcessIdentifier_(pid: int) -> _FakeRunningApp | None:
+            return next((app for app in apps if app.processIdentifier() == pid), None)
+
+    monkeypatch.setattr(macos_module, "NSWorkspace", Workspace)
+    monkeypatch.setattr(macos_module, "NSRunningApplication", RunningApplication)
+    mac = MacOS()
+    _on_screen_windows(monkeypatch, (41, 101, 0, 0, 200, 200), (42, 102, 0, 0, 400, 400))
+    return mac, apps
+
+
+@pytest.mark.parametrize(
+    ("selector", "window_id"),
+    [
+        ("Messages", 102),
+        ("mEsSaGeS", 102),
+        ("com.apple.MobileSMS", 102),
+        ("/System/Applications/Messages.app", 102),
+        ("com.apple.messages.AssistantExtension", 101),
+        ("/System/Applications/Messages.app/Contents/PlugIns/Messages Assistant Extension.appex", 101),
+        (41, 101),
+        ("41", 101),
+    ],
+)
+def test_windows_app_name_ignores_nested_extension_but_explicit_identity_does_not(
+    messages_apps, selector, window_id,
+) -> None:
+    mac, _ = messages_apps
+    assert [window["window_id"] for window in mac.windows(selector)] == [window_id]
+
+
+@pytest.mark.parametrize(
+    "other_path",
+    [
+        "/Applications/Messages.app",
+        "/System/Applications/Messages.app",
+        "/Applications/Other.app/Contents/PlugIns/Messages.appex",
+    ],
+)
+def test_windows_app_name_keeps_distinct_apps_and_unrelated_extensions_ambiguous(
+    messages_apps, other_path,
+) -> None:
+    mac, apps = messages_apps
+    apps.append(_FakeRunningApp(43, name="Messages", path=other_path))
+    with pytest.raises(MacOSError) as error:
+        mac.windows("Messages")
+    assert error.value.code == ErrorCode.APP_AMBIGUOUS
+    assert {match["pid"] for match in error.value.details["matches"]} == {42, 43}
+
+
+def test_windows_app_name_still_resolves_extension_without_containing_app(messages_apps) -> None:
+    mac, apps = messages_apps
+    apps.pop()
+    assert [window["window_id"] for window in mac.windows("Messages")] == [101]
 
 
 def test_doctor_reports_real_permission_preflights(monkeypatch) -> None:

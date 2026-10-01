@@ -1288,6 +1288,26 @@ class MacOS:
                 candidates.append((app, info))
 
         matches = exact or candidates
+        if len(exact) > 1:
+            # Extensions can inherit their containing app's localized name.
+            # A name selects that app, not its nested extension; distinct apps
+            # still require the caller to choose an explicit identity.
+            app_paths = tuple(
+                info["path"].casefold() + "/"
+                for _, info in exact
+                if info["name"].casefold() == needle
+                and info["path"] and info["path"].casefold().endswith(".app")
+            )
+            if app_paths:
+                matches = [
+                    (app, info) for app, info in exact
+                    if not (
+                        info["name"].casefold() == needle
+                        and info["path"]
+                        and info["path"].casefold().endswith(".appex")
+                        and info["path"].casefold().startswith(app_paths)
+                    )
+                ]
         if not matches:
             raise ApplicationNotFoundError(
                 f"No running application matches {query!r}",
