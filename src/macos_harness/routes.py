@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol
 
 from ._paths import config_dir
 from .errors import ErrorCode, MacOSError
-from .ops import Operations, _Deadline
+from .ops import Operations, _Deadline, _validate_fill_value
 from .receipts import (
     Equals,
     ErrorPayload,
@@ -49,6 +49,18 @@ def _text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise _invalid(field, "requires a nonempty string")
     return value
+
+
+def _inputs(values: Mapping[str, str] | None) -> dict[str, str]:
+    if values is None:
+        return {}
+    if not isinstance(values, Mapping):
+        raise _invalid("inputs", "requires a mapping of names to text")
+    frozen = dict(values)
+    for name, value in frozen.items():
+        _text(name, "inputs.name")
+        _validate_fill_value(value)
+    return frozen
 
 
 def _value(value: object) -> bool | float:
@@ -203,7 +215,15 @@ class _Key:
     verb: ClassVar[str] = "key"
 
 
-_Step = _Press | _Set | _Toggle | _Key
+@dataclass(frozen=True, slots=True)
+class _Fill:
+    target: _Locator
+    parameter: str
+    postcondition: Postcondition | None
+    verb: ClassVar[str] = "fill"
+
+
+_Step = _Press | _Set | _Toggle | _Key | _Fill
 
 
 def _step_json(step: _Step) -> dict[str, JSONValue]:
@@ -215,6 +235,8 @@ def _step_json(step: _Step) -> dict[str, JSONValue]:
         data["target"] = step.target.to_json()
     if isinstance(step, (_Set, _Toggle)):
         data.update(value=step.value, attribute=step.attribute)
+    if isinstance(step, _Fill):
+        data["parameter"] = step.parameter
     return data
 
 
@@ -240,8 +262,12 @@ def _load_step(value: object, app: str) -> _Step:
                     raise _invalid("value", "toggle requires a boolean")
                 return _Toggle(target, desired, attribute, condition)
             return _Set(target, desired, attribute, condition)
+        case "fill":
+            data = _keys(value, {"verb", "expect", "target", "parameter"}, "step")
+            condition = None if data["expect"] is None else _load_condition(data["expect"], app)
+            return _Fill(_load_locator(data["target"]), _text(data["parameter"], "parameter"), condition)
         case _:
-            raise _invalid("step.verb", "only press, set, toggle and key are supported")
+            raise _invalid("step.verb", "only press, set, toggle, key and fill are supported")
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +281,10 @@ class _Route:
     entry: Postcondition
     goal: Postcondition
     steps: tuple[_Step, ...]
+
+    @property
+    def parameters(self) -> tuple[str, ...]:
+        return tuple(sorted({step.parameter for step in self.steps if isinstance(step, _Fill)}))
 
     def to_json(self) -> dict[str, JSONValue]:
         return {"schema": 1, "name": self.name, "app": self.app,
@@ -370,7 +400,7 @@ class Routes:
         for path in sorted(directory.glob("*.json")):
             route = self._load(path.stem, app)
             result.append({"name": route.name, "app": route.app, "steps": len(route.steps),
-                           "recorded": route.to_json()["recorded"]})
+                           "inputs": list(route.parameters), "recorded": route.to_json()["recorded"]})
         return result
 
     def _bind(self, app: str) -> _AppIdentity:
@@ -407,7 +437,7 @@ class Routes:
         return receipt
 
     def _dispatch(self, step: _Step, identity: _AppIdentity, deadline: _Deadline,
-                  token: str) -> Receipt:
+                  token: str, inputs: Mapping[str, str]) -> Receipt:
         self._check_identity(identity)
         deadline.check_dispatch()
         ops = self._host.do
@@ -418,17 +448,21 @@ class Routes:
             return ops.key(step.key, **args, once=token)
         if isinstance(step, _Press):
             return ops.press(**step.target.query(), **args, once=token)
+        if isinstance(step, _Fill):
+            return ops.fill(inputs[step.parameter], **step.target.query(), **args, once=token)
         if isinstance(step, _Toggle):
             return ops.toggle(step.value, attribute=step.attribute, **step.target.query(), **args)
         return ops.set(step.value, attribute=step.attribute, **step.target.query(), **args)
 
     @contextmanager
     def record(self, name: str, *, app: str, entry: Postcondition,
-               goal: Postcondition, timeout: float = 30.0) -> Iterator[_Recorder]:
-        """Record calls made through the yielded handle; other calls are not recorded."""
+               goal: Postcondition, timeout: float = 30.0,
+               inputs: Mapping[str, str] | None = None) -> Iterator[_Recorder]:
+        """Record explicit calls; fill steps save input names, never supplied text."""
         ops = self._host.do
         ops._check_owner()
         self._path(name, app)
+        values = _inputs(inputs)
         entry, goal = _condition(entry, app), _condition(goal, app)
         ops._validate_postcondition(ops._host, entry)
         ops._validate_postcondition(ops._host, goal)
@@ -437,7 +471,7 @@ class Routes:
             identity = self._bind(app)
             self._expect(entry, identity, deadline)
             version, build = self._host._bundle_version(identity.path)
-            recorder = _Recorder(self, app, identity, deadline)
+            recorder = _Recorder(self, app, identity, deadline, values)
             try:
                 yield recorder
                 if recorder._failed or not recorder._steps:
@@ -449,10 +483,11 @@ class Routes:
                 recorder.path = self._save(route)
             finally:
                 recorder._active = False
+                values.clear()
 
     def run(self, name: str, *, app: str, timeout: float = 30.0,
-            dry_run: bool = False) -> RouteResult:
-        """Run once with a fresh id; never retry, resume, activate or roll back."""
+            dry_run: bool = False, inputs: Mapping[str, str] | None = None) -> RouteResult:
+        """Replay once. Input-bearing routes always run; a prior goal is not this input's result."""
         ops = self._host.do
         ops._check_owner()
         deadline = _Deadline(timeout, ops._monotonic)
@@ -460,6 +495,9 @@ class Routes:
         receipts: list[Receipt] = []
         try:
             route = self._load(name, app)
+            values = _inputs(inputs)
+            if values.keys() != set(route.parameters):
+                raise _invalid("inputs", "must supply exactly the recorded parameter names")
             for condition in (route.entry, route.goal):
                 ops._validate_postcondition(ops._host, condition)
             for step in route.steps:
@@ -474,21 +512,20 @@ class Routes:
             try:
                 identity = self._bind(app)
                 versions["current_version"] = self._host._bundle_version(identity.path)
-                at = "goal"
-                try:
-                    check = self._expect(route.goal, identity, deadline, probe=True)
-                except OperationError as exc:
-                    # Only a completed search or comparison can establish
-                    # that the goal does not hold; `expect` says which it
-                    # was, so nothing here re-reads the error payload.
-                    observed = exc.receipt.observed
-                    unmet = (isinstance(observed, Mapping)
-                        and observed.get("state") == Observation.UNMET)
-                    if not unmet:
-                        raise
-                else:
-                    return RouteResult(name, run_id, "planned" if dry_run else "already", (), deadline.elapsed(),
-                                       check=check, **versions)
+                if not values:
+                    at = "goal"
+                    try:
+                        check = self._expect(route.goal, identity, deadline, probe=True)
+                    except OperationError as exc:
+                        # Only a completed search or comparison proves the goal unmet.
+                        observed = exc.receipt.observed
+                        unmet = (isinstance(observed, Mapping)
+                            and observed.get("state") == Observation.UNMET)
+                        if not unmet:
+                            raise
+                    else:
+                        return RouteResult(name, run_id, "planned" if dry_run else "already", (), deadline.elapsed(),
+                                           check=check, **versions)
                 at = "entry"
                 check = self._expect(route.entry, identity, deadline)
                 if dry_run:
@@ -502,7 +539,7 @@ class Routes:
                     at = f"steps[{index}]"
                     try:
                         receipt = self._dispatch(step, identity, deadline,
-                            f"route:{app}:{name}:{run_id}:{index}")
+                            f"route:{app}:{name}:{run_id}:{index}", values)
                     except OperationError as exc:
                         receipts.append(exc.receipt)
                         raise
@@ -522,11 +559,13 @@ class Routes:
 
 
 class _Recorder:
-    def __init__(self, routes: Routes, app: str, identity: _AppIdentity, deadline: _Deadline) -> None:
+    def __init__(self, routes: Routes, app: str, identity: _AppIdentity, deadline: _Deadline,
+                 inputs: dict[str, str]) -> None:
         self._routes = routes
         self._app = app
         self._identity = identity
         self._deadline = deadline
+        self._inputs = inputs
         self._run_id = uuid.uuid4().hex
         self._steps: list[_Step] = []
         self._receipts: list[Receipt] = []
@@ -554,7 +593,7 @@ class _Recorder:
         self._routes._validate_step(step)
         try:
             receipt = self._routes._dispatch(step, self._identity, self._deadline,
-                f"record:{self._app}:{self._run_id}:{len(self._steps)}")
+                f"record:{self._app}:{self._run_id}:{len(self._steps)}", self._inputs)
         except OperationError as exc:
             self._receipts.append(exc.receipt)
             raise
@@ -588,6 +627,16 @@ class _Recorder:
             raise _invalid("value", "toggle requires a boolean")
         return self._apply(_Toggle(_locator(role, title, identifier, description), desired,
             _text(attribute, "attribute"),
+            None if postcondition is None else _condition(postcondition, self._app)))
+
+    def fill(self, parameter: str, *, role: str = "text field", title: str | None = None,
+             identifier: str | None = None, description: str | None = None,
+             postcondition: Postcondition | None = None) -> Receipt:
+        self._begin()
+        _text(parameter, "parameter")
+        if parameter not in self._inputs:
+            raise _invalid("inputs", "fill requires a supplied parameter")
+        return self._apply(_Fill(_locator(role, title, identifier, description), parameter,
             None if postcondition is None else _condition(postcondition, self._app)))
 
     def key(self, key: str, *, postcondition: Postcondition) -> Receipt:

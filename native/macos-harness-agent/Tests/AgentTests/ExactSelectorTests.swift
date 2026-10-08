@@ -63,7 +63,7 @@ final class ExactSelectorTests: XCTestCase {
     reading.record("AXRole", status: .success, value: "AXButton" as NSString)
 
     XCTAssertEqual(reading.values["AXTitle"] as? String, "Save")
-    XCTAssertFalse(reading.complete)
+    XCTAssertFalse(reading.conclusive)
   }
 
   func testMissingAndUnsupportedAttributesAreKnownAbsences() {
@@ -71,7 +71,24 @@ final class ExactSelectorTests: XCTestCase {
     reading.record("AXChildren", status: .noValue, value: nil)
     reading.record("AXWindows", status: .attributeUnsupported, value: nil)
 
-    XCTAssertTrue(reading.complete)
+    XCTAssertTrue(reading.conclusive)
     XCTAssertTrue(reading.values.isEmpty)
+  }
+
+  func testAValueTheAppCannotProduceHidesNoMatch() {
+    // The Dock answers an item's description read with `.failure`: no read returns that value,
+    // so no search can match on it, and the walk that met it still saw every match.
+    var reading = AXExecutor.AttributeValues()
+    reading.record("AXDescription", status: .failure, value: nil)
+    reading.record("AXRole", status: .success, value: "AXDockItem" as NSString)
+
+    XCTAssertTrue(reading.conclusive)
+  }
+
+  func testAnElementThatVanishedMidReadMayHideAMatch() {
+    var reading = AXExecutor.AttributeValues()
+    reading.record("AXChildren", status: .invalidUIElement, value: nil)
+
+    XCTAssertFalse(reading.conclusive)
   }
 }

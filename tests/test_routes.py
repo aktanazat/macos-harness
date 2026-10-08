@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from test_ops import FakeHost, _SleepClock
+from test_ops import FakeHost, FormHost, _SleepClock
 
 from macos_harness import (
     Acted,
@@ -15,6 +15,7 @@ from macos_harness import (
     MacOSError,
     OperationError,
     Outcome,
+    equals,
     gone,
     present,
 )
@@ -258,3 +259,75 @@ def test_slow_identity_observation_cannot_extend_the_route_deadline(host: RouteH
     assert result.status == "diverged"
     assert result.error["details"]["reason"] == "deadline_exhausted_before_dispatch"
     assert host.pressed_pages == []
+
+
+class FormRouteHost(FormHost):
+    def __init__(self) -> None:
+        super().__init__()
+        self.identity = _AppIdentity(41, _APP, 1000.0, "Demo", None)
+        clock = _SleepClock()
+        self.do = Operations(self, _monotonic=clock.monotonic, _sleep=clock.sleep)
+        self.route = Routes(self)
+
+    def _process_identity(self, query: str | int) -> _AppIdentity:
+        return self.identity
+
+    def _same_process(self, expected: _AppIdentity) -> bool:
+        return MacOS._same_process(self, expected)
+
+    def _bundle_version(self, path: str | None) -> tuple[str | None, str | None]:
+        return None, None
+
+
+@pytest.fixture
+def form_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FormRouteHost:
+    monkeypatch.setenv("MACOS_HARNESS_HOME", str(tmp_path))
+    return FormRouteHost()
+
+
+def record_form(host: FormRouteHost) -> Path:
+    with host.route.record("domain", app=_APP,
+                           inputs={"domain": "recorded-domain-canary.invalid"},
+                           entry=present(role="text field", identifier="domain"),
+                           goal=equals(role="button", title="Check", attribute="AXEnabled", value=True)) as rec:
+        rec.fill("domain", identifier="domain")
+    return rec.path
+
+
+def test_form_replay_uses_new_inputs_when_the_previous_goal_still_holds(form_host: FormRouteHost) -> None:
+    record_form(form_host)
+
+    result = form_host.route.run("domain", app=_APP, inputs={"domain": "new-domain.invalid"})
+
+    assert form_host.model == "new-domain.invalid"
+    assert result.status == "done"
+    assert result.steps_run[0].verified is True
+
+
+def test_recorded_forms_do_not_persist_the_entered_text(form_host: FormRouteHost) -> None:
+    path = record_form(form_host)
+
+    assert form_host.model == "recorded-domain-canary.invalid"
+    assert "recorded-domain-canary.invalid" not in path.read_text()
+    assert form_host.route.list(app=_APP)[0]["inputs"] == ["domain"]
+
+
+@pytest.mark.parametrize("failure", ["missing", "unknown", "control-character"])
+def test_bad_form_inputs_stop_before_earlier_navigation(host: RouteHost, failure: str) -> None:
+    path = record_navigation(host)
+    data = json.loads(path.read_text())
+    data["steps"].append({"verb": "fill", "parameter": "domain", "expect": None,
+                          "target": {"role": "text field", "field": "identifier", "value": "domain"}})
+    path.write_text(json.dumps(data))
+    inputs = {} if failure == "missing" else {"domain": "new-domain.invalid"}
+    if failure == "unknown":
+        inputs["unknown"] = "unused"
+    elif failure == "control-character":
+        inputs["domain"] += "\n"
+
+    result = host.route.run("navigate", app=_APP, inputs=inputs)
+
+    assert result.status == "invalid"
+    assert result.error["code"] == ErrorCode.BAD_REQUEST
+    assert host.page == 0
+    assert result.steps_run == ()

@@ -9,6 +9,8 @@ import Foundation
 /// `Handlers.swift` documents: "every live AX call still ends up serialized on a single queue
 /// regardless of which connection issued it." Registry mutations (`register`/`resolve`) happen
 /// on that same queue for the same reason `ElementRegistry` itself carries no locking of its own.
+/// One exception, inside a single queue turn: `unansweredPIDs` reads one attribute of many app
+/// elements side by side, touching no registry and no other shared state.
 ///
 /// Every caller-facing method assumes `Handlers.swift` has already gated the request on
 /// `AXIsProcessTrusted()` (via `requireTrust()`); nothing here re-checks or prompts for
@@ -54,7 +56,33 @@ final class AXExecutor {
   }
 
   func frontmostApplicationPID() -> pid_t? {
-    Self.queue.sync { NSWorkspace.shared.frontmostApplication?.processIdentifier }
+    Self.queue.sync {
+      Self.takeInWorkspaceChanges()
+      return NSWorkspace.shared.frontmostApplication?.processIdentifier
+    }
+  }
+
+  /// The apps among `pids` that cannot answer Accessibility now: reading `AXRole` from the app
+  /// element fails with `cannotComplete` once `messagingTimeout` passes. A process that is not
+  /// serving Accessibility -- a web content helper, a stopped app -- otherwise costs a broad
+  /// sweep that whole timeout, every sweep, one app after another. The reads run side by side,
+  /// so those apps cost about one timeout together and the sweep can skip them. Mirrors
+  /// `MacOS._unanswered_pids` in `macos.py`.
+  func unansweredPIDs(_ pids: [pid_t], messagingTimeout: Double) -> [pid_t] {
+    Self.queue.sync {
+      var silent = [Bool](repeating: false, count: pids.count)
+      silent.withUnsafeMutableBufferPointer { flags in
+        DispatchQueue.concurrentPerform(iterations: pids.count) { index in
+          let element = AXUIElementCreateApplication(pids[index])
+          AXUIElementSetMessagingTimeout(element, Float(messagingTimeout))
+          var role: CFTypeRef?
+          flags[index] =
+            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+            == .cannotComplete
+        }
+      }
+      return zip(pids, silent).compactMap { pid, isSilent in isSilent ? pid : nil }
+    }
   }
 
   // MARK: - AX query
@@ -69,18 +97,23 @@ final class AXExecutor {
     let visited: Int
   }
 
+  /// One element's attribute reads. `conclusive` turns false once a read fails in a way that can
+  /// hide a search match, matching `_AttributeValues.conclusive` in `macos.py`: a missing or
+  /// unsupported attribute is a known absence, and `.failure` is the app answering that it
+  /// cannot produce the value, which no read ever returns, so no search can match on it. Any
+  /// other error (the app did not answer, the element went away) may hide a match.
   struct AttributeValues {
     var values: [String: AnyObject] = [:]
-    var complete = true
+    var conclusive = true
 
     mutating func record(_ name: String, status: AXError, value: AnyObject?) {
       switch status {
       case .success:
         if let value { values[name] = value }
-      case .noValue, .attributeUnsupported:
+      case .noValue, .attributeUnsupported, .failure:
         break
       default:
-        complete = false
+        conclusive = false
       }
     }
   }
@@ -179,8 +212,28 @@ final class AXExecutor {
 
   // MARK: - App discovery internals (must only run on `queue`)
 
+  /// Lets `NSWorkspace` take in every app launch, quit, and activation it has been told about
+  /// since this process last looked. It learns of them from notifications it handles on the
+  /// main thread's run loop, and this process never otherwise turns that loop: `Main.swift`
+  /// serves the session with blocking reads on the main thread. Without this turn,
+  /// `runningApplications` and `frontmostApplication` stay as they were at the first read, so an
+  /// app launched later -- the process behind a permission dialog, say -- never appears, and the
+  /// press focus guard never sees a target come to the front. Mirrors `MacOS._running_applications`
+  /// in `macos.py`.
+  ///
+  /// The turn must happen on the main thread; a turn on any other thread changes nothing. A
+  /// `queue.sync` block runs on its caller's thread, and the only production caller is the
+  /// session on the main thread. The turn cannot re-enter this agent: it adds nothing to the
+  /// main queue or the main run loop, and the session reads its socket with a blocking `read(2)`,
+  /// not a run-loop source, so only AppKit's own bookkeeping runs here.
+  private static func takeInWorkspaceChanges() {
+    precondition(Thread.isMainThread, "NSWorkspace app state is only fresh on the main thread")
+    RunLoop.current.run(mode: .default, before: Date())
+  }
+
   private static func runningApps() -> [AppInfo] {
-    NSWorkspace.shared.runningApplications
+    takeInWorkspaceChanges()
+    return NSWorkspace.shared.runningApplications
       .map(appInfo(from:))
       .filter { !$0.name.isEmpty }
       .sorted { lhs, rhs in
@@ -224,6 +277,10 @@ final class AXExecutor {
     return Dictionary(uniqueKeysWithValues: roles.map { ("AX\($0)SearchKey", "AX\($0)") })
   }()
 
+  /// Matches `_AX_MENU_SEARCH_KEYS` in `macos.py`: the searches for menus or their items, which
+  /// a closed menu holds too -- a closed menu's command still answers a press.
+  private static let menuSearchKeys: Set<String> = ["AXMenuSearchKey", "AXMenuItemSearchKey"]
+
   /// Matches `_AX_NODE_MAPPING` in `macos.py`: raw AX attribute name -> wire field name.
   private static let axNodeMapping: [String: String] = [
     "AXSubrole": "subrole",
@@ -261,6 +318,11 @@ final class AXExecutor {
   private static let matchFieldOrder = [
     "title", "description", "value", "help", "identifier", "dom_identifier", "placeholder",
   ]
+
+  /// The AX attributes behind `matchFieldOrder`, matching `_AX_MATCH_ATTRIBUTES` in `macos.py`:
+  /// of the caller's attributes, the bounded walk reads only these per node.
+  private static let matchAttributeNames = Set(
+    axNodeMapping.filter { matchFieldOrder.contains($0.value) }.keys)
 
   /// Matches `ax_search`/`_application_element` in `macos.py`: validate `direction`, build the
   /// application root (messaging timeout + optional enhanced UI), then try the optimized
@@ -329,7 +391,7 @@ final class AXExecutor {
       let element = value as! AXUIElement
       if exact.isActive {
         let reading = Self.copyAttributes(element, exact.attributeNames)
-        readComplete = readComplete && reading.complete
+        readComplete = readComplete && reading.conclusive
         let fields = Self.mappedFields(from: reading.values)
         guard exact.matches(fields) else { continue }
       }
@@ -365,7 +427,7 @@ final class AXExecutor {
   }
 
   /// The visited nodes and gaps: `nodeCut` or `depthCut` for traversal bounds, `readCut`
-  /// for a refused attribute read. Each can leave candidate matches unexamined.
+  /// for a read that can hide a match. Each can leave candidate matches unexamined.
   private struct TreeSnapshot {
     var nodes: [TraversalNode]
     var nodeCut: Bool
@@ -378,7 +440,11 @@ final class AXExecutor {
   /// positive (there is no tree to walk otherwise), a non-positive effective limit yields no
   /// results (and no certainty) rather than an error, the root itself is never a candidate,
   /// and `previous` walks the flattened traversal in reverse. The result is complete only when
-  /// the walk saw the whole tree and the limit did not stop it before a further match.
+  /// the walk saw the whole tree and the limit did not stop it before a further match. The walk
+  /// reads only what judging a node takes -- its role, whether it is hidden, and the requested
+  /// attributes a match can rest on -- and describes each match afresh. A search for what is
+  /// visible, unless it is for menus or menu items, leaves out what closed menus hold, matching
+  /// `_on_screen_only` in `macos.py`.
   private static func boundedSearch(
     root: AXUIElement, searchKey: String, text: String?, exact: ExactSelector, visibleOnly: Bool,
     limit: Int, direction: String, immediateDescendantsOnly: Bool, attributes: [String],
@@ -399,16 +465,19 @@ final class AXExecutor {
     let needle = text?.lowercased()
     let described = dedup(attributes + exact.attributeNames)
 
-    var traversalAttributes = dedup(described)
+    var traversalAttributes = dedup(
+      attributes.filter { matchAttributeNames.contains($0) } + exact.attributeNames)
     if !traversalAttributes.contains("AXHidden") {
       traversalAttributes.append("AXHidden")
     }
 
     let snapshot = try snapshotTree(
       root: root,
-      maxDepth: immediateDescendantsOnly ? 1 : 25,
+      // Chromium trees run deeper than native ones: Slack's reaches 28.
+      maxDepth: immediateDescendantsOnly ? 1 : 50,
       maxNodes: maxNodes,
       includeMenuBar: true,
+      skipClosedMenus: visibleOnly && !menuSearchKeys.contains(searchKey),
       attributes: traversalAttributes,
       registry: registry)
     var nodes = snapshot.nodes
@@ -449,7 +518,8 @@ final class AXExecutor {
   /// Depth-first, cycle-guarded walk mirroring `_snapshot_tree` in `macos.py`: bounded by
   /// `maxDepth` and `maxNodes`, descending into `AXChildren` (or, at the root only, `AXWindows`
   /// when there are no children), and — unless `includeMenuBar` — never visiting an
-  /// `AXMenuBar` element or its descendants. Every visited node is registered in `registry`
+  /// `AXMenuBar` element or its descendants; with `skipClosedMenus`, never a closed menu's
+  /// items either. Every visited node is registered in `registry`
   /// regardless of whether it later survives `boundedSearch`'s filtering, exactly like
   /// `_remember_element` runs unconditionally inside `_snapshot_tree`'s own `visit`.
   /// `AXChildren`/`AXWindows` are fetched only to steer this traversal; they are never mapped
@@ -457,8 +527,8 @@ final class AXExecutor {
   /// Reports which bound, if any, refused a node, so the caller can tell a finished walk from
   /// one that stopped short.
   private static func snapshotTree(
-    root: AXUIElement, maxDepth: Int, maxNodes: Int, includeMenuBar: Bool, attributes: [String],
-    registry: ElementRegistry
+    root: AXUIElement, maxDepth: Int, maxNodes: Int, includeMenuBar: Bool, skipClosedMenus: Bool,
+    attributes: [String], registry: ElementRegistry
   ) throws -> TreeSnapshot {
     var requestedNames = dedup(attributes)
     for name in ["AXRole", "AXChildren", "AXWindows"] where !requestedNames.contains(name) {
@@ -481,10 +551,12 @@ final class AXExecutor {
       seen.insert(element)
 
       let reading = copyAttributes(element, requestedNames)
-      snapshot.readCut = snapshot.readCut || !reading.complete
+      snapshot.readCut = snapshot.readCut || !reading.conclusive
       let raw = reading.values
       let role = raw["AXRole"].map(jsonable)?.stringValue
       if role == "AXMenuBar" && !includeMenuBar { return }
+      // AppKit keeps a closed menu in the tree, items and all, though none of it is on screen.
+      if skipClosedMenus && role == "AXMenu" && isClosedMenu(element) { return }
 
       let handle = registry.register(element)
       snapshot.nodes.append(
@@ -509,6 +581,15 @@ final class AXExecutor {
 
     try visit(root, depth: 0)
     return snapshot
+  }
+
+  /// Whether `menu` is closed, matching `MacOS._closed_menu` in `macos.py`: AppKit keeps a closed
+  /// menu at zero size and gives an open one its size on screen. A menu whose size does not read
+  /// counts as open.
+  private static func isClosedMenu(_ menu: AXUIElement) -> Bool {
+    let (status, value) = copyAttributeStatus(menu, "AXSize")
+    guard status == .success, let value else { return false }
+    return jsonable(value) == .object(["width": .number(0), "height": .number(0)])
   }
 
   /// Sets up the application-root AX element exactly like `_application_element` in
@@ -591,8 +672,26 @@ final class AXExecutor {
     try Self.requireTrust()
 
     let element = try Self.resolveElement(handle, registry: registry)
-    let error = AXUIElementSetAttributeValue(
-      element, attribute as CFString, value.foundationValue as CFTypeRef)
+    let nativeValue: CFTypeRef
+    if attribute == "AXSelectedTextRange", case .object(let fields) = value {
+      guard fields.count == 2,
+        let start = fields["location"]?.numberValue, let location = Int(exactly: start),
+        let count = fields["length"]?.numberValue, let length = Int(exactly: count),
+        location >= 0, length >= 0, location <= Int.max - length
+      else {
+        throw AgentError(
+          code: "bad_request",
+          message: "AXSelectedTextRange requires nonnegative integer location and length")
+      }
+      var range = CFRange(location: location, length: length)
+      guard let encoded = AXValueCreate(.cfRange, &range) else {
+        throw Self.axAgentError("Encode text selection", .failure)
+      }
+      nativeValue = encoded
+    } else {
+      nativeValue = value.foundationValue as CFTypeRef
+    }
+    let error = AXUIElementSetAttributeValue(element, attribute as CFString, nativeValue)
     guard error == .success else {
       throw Self.axAgentError("Set \(attribute) on element \(handle)", error)
     }

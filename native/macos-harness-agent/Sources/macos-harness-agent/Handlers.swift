@@ -93,6 +93,9 @@ final class AgentHandlers {
     case "ax_element_perform":
       try requireTrust()
       return try handleElementPerform(params: request.params)
+    case "ax_unanswered_apps":
+      try requireTrust()
+      return try handleUnansweredApps(params: request.params)
     default:
       throw AgentError(code: "unsupported_op", message: "Unsupported operation \"\(request.op)\"")
     }
@@ -125,6 +128,17 @@ final class AgentHandlers {
     return .object(["apps": .array(apps.map { Self.encode(app: $0) })])
   }
 
+  /// `pids` names the apps to ask and `messaging_timeout` how long each may take to answer;
+  /// the result's `pids` are the ones that did not answer, in the order asked.
+  private func handleUnansweredApps(params: JSONValue) throws -> JSONValue {
+    let pids = try Self.requiredPIDs(params, "pids")
+    guard let messagingTimeout = try Self.boundedMessagingTimeout(params) else {
+      throw AgentError(code: "bad_request", message: "Missing \"messaging_timeout\" parameter")
+    }
+    let silent = executor.unansweredPIDs(pids, messagingTimeout: messagingTimeout)
+    return .object(["pids": .array(silent.map { .number(Double($0)) })])
+  }
+
   /// Mirrors `MacOS._app_info` in `macos.py` field for field, including the `bundle_id`/`path`
   /// keys always being present (as JSON `null` when absent) rather than omitted.
   private static func encode(app: AppInfo) -> JSONValue {
@@ -148,7 +162,7 @@ final class AgentHandlers {
     let immediateDescendantsOnly = Self.bool(params, "immediate_descendants_only", default: false)
     let attributes = try Self.boundedAttributes(params, default: Self.defaultAttributes)
     let includeActions = Self.bool(params, "include_actions", default: true)
-    let maxNodes = try Self.boundedMaxNodes(params, default: 500)
+    let maxNodes = try Self.boundedMaxNodes(params, default: 5000)
     let limit = try Self.boundedLimit(params, effectiveMaxNodes: maxNodes)
     let resetElements = Self.bool(params, "reset_elements", default: true)
     let messagingTimeout = try Self.boundedMessagingTimeout(params)
@@ -184,10 +198,10 @@ final class AgentHandlers {
 
   /// Builds the `PressCoordinator` seam around `AXExecutor` and delegates to it. Ignores
   /// whatever `limit`/`include_actions`/`reset_elements` the wire params might claim: a
-  /// single-shot press always resets the registry first and always searches with an effective
-  /// limit of two, matching `MacOS._native_press` in `macos.py` — the agent enforces this
-  /// itself rather than trusting a client to have sent the right values. An exact selector
-  /// makes the press strict: one match counts only from a complete search.
+  /// single-shot press always resets the registry first and always searches with the limit
+  /// `PressCoordinator.searchLimit(text:)` picks, matching `MacOS.ax_wait` in `macos.py` — the
+  /// agent enforces this itself rather than trusting a client to have sent the right values. An
+  /// exact selector makes the press strict: one match counts only from a complete search.
   private func handlePress(params: JSONValue) throws -> JSONValue {
     let targetPID = try Self.requiredPID(params, "app_pid")
     let searchKey = Self.string(params, "search_key") ?? "AXAnyTypeSearchKey"
@@ -197,7 +211,7 @@ final class AgentHandlers {
     let direction = Self.string(params, "direction") ?? "next"
     let immediateDescendantsOnly = Self.bool(params, "immediate_descendants_only", default: false)
     let attributes = try Self.boundedAttributes(params, default: Self.defaultSafeAttributes)
-    let maxNodes = try Self.boundedMaxNodes(params, default: 500)
+    let maxNodes = try Self.boundedMaxNodes(params, default: 5000)
     let messagingTimeout = try Self.boundedMessagingTimeout(params)
     let deadline: Double?
     switch params["action_deadline"] {
@@ -216,14 +230,14 @@ final class AgentHandlers {
     let executor = self.executor
     let registry = self.registry
     let deps = PressCoordinator.Dependencies(
-      search: {
+      search: { limit in
         try executor.query(
           pid: targetPID,
           searchKey: searchKey,
           text: text,
           exact: exact,
           visibleOnly: visibleOnly,
-          limit: 2,
+          limit: limit,
           direction: direction,
           immediateDescendantsOnly: immediateDescendantsOnly,
           attributes: attributes,
@@ -239,7 +253,7 @@ final class AgentHandlers {
       })
 
     let match = try PressCoordinator.run(
-      targetPID: targetPID, strict: exact.isActive, deadline: deadline, deps)
+      targetPID: targetPID, text: text, strict: exact.isActive, deadline: deadline, deps)
     return .object(["match": match.wireValue])
   }
 
@@ -301,6 +315,7 @@ final class AgentHandlers {
   private static let attributeNameByteCeiling = 256
   private static let textByteCeiling = 1024 * 1024
   private static let messagingTimeoutRange = 0.01...6.0
+  private static let pidsCountCeiling = 4_096
 
   private static func requiredString(_ params: JSONValue, _ key: String) throws -> String {
     guard let value = params[key]?.stringValue else {
@@ -321,6 +336,21 @@ final class AgentHandlers {
       throw AgentError(code: "bad_request", message: "Missing or invalid \"\(key)\" parameter")
     }
     return value
+  }
+
+  /// A wire array of positive pids, at most `pidsCountCeiling` of them.
+  private static func requiredPIDs(_ params: JSONValue, _ key: String) throws -> [pid_t] {
+    guard let items = params[key]?.arrayValue, items.count <= pidsCountCeiling else {
+      throw AgentError(
+        code: "bad_request",
+        message: "\"\(key)\" must be an array of at most \(pidsCountCeiling) pids")
+    }
+    return try items.map { item in
+      guard let raw = item.numberValue, let pid = pid_t(exactly: raw), pid > 0 else {
+        throw AgentError(code: "bad_request", message: "\"\(key)\" must hold positive pids")
+      }
+      return pid
+    }
   }
 
   /// A single wire-supplied AX attribute name (currently just `ax_element_set`'s `attribute`

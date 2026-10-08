@@ -4,6 +4,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import NamedTuple, Never
 
@@ -110,20 +111,24 @@ class _FakeRunningApp:
         name: str = "HelperApp",
         terminated: bool = False,
         launched_seconds_ago: float | None = None,
+        bundle_id: str | None = None,
+        path: str | None = None,
     ) -> None:
         self._pid = pid
         self._name = name
         self._terminated = terminated
         self._launched_seconds_ago = launched_seconds_ago
+        self._bundle_id = bundle_id
+        self._path = path
 
     def localizedName(self) -> str:
         return self._name
 
-    def bundleIdentifier(self) -> None:
-        return None
+    def bundleIdentifier(self) -> str | None:
+        return self._bundle_id
 
-    def bundleURL(self) -> None:
-        return None
+    def bundleURL(self) -> NSURL | None:
+        return NSURL.fileURLWithPath_(self._path) if self._path is not None else None
 
     def processIdentifier(self) -> int:
         return self._pid
@@ -278,6 +283,89 @@ def test_resolve_app_last_app_reuse_passes_an_int_pid(monkeypatch) -> None:
     assert info["pid"] == 4242
     assert seen == [4242]
     assert isinstance(seen[0], int)
+
+
+@pytest.fixture
+def messages_apps(monkeypatch):
+    apps = [
+        _FakeRunningApp(
+            41, name="Messages", bundle_id="com.apple.messages.AssistantExtension",
+            path="/System/Applications/Messages.app/Contents/PlugIns/Messages Assistant Extension.appex",
+        ),
+        _FakeRunningApp(
+            42, name="Messages", bundle_id="com.apple.MobileSMS",
+            path="/System/Applications/Messages.app",
+        ),
+    ]
+
+    class Workspace:
+        @staticmethod
+        def sharedWorkspace() -> type[Workspace]:
+            return Workspace
+
+        @staticmethod
+        def runningApplications() -> list[_FakeRunningApp]:
+            return apps
+
+        @staticmethod
+        def frontmostApplication() -> None:
+            return None
+
+    class RunningApplication:
+        @staticmethod
+        def runningApplicationWithProcessIdentifier_(pid: int) -> _FakeRunningApp | None:
+            return next((app for app in apps if app.processIdentifier() == pid), None)
+
+    monkeypatch.setattr(macos_module, "NSWorkspace", Workspace)
+    monkeypatch.setattr(macos_module, "NSRunningApplication", RunningApplication)
+    mac = MacOS()
+    _on_screen_windows(monkeypatch, (41, 101, 0, 0, 200, 200), (42, 102, 0, 0, 400, 400))
+    return mac, apps
+
+
+@pytest.mark.parametrize(
+    ("selector", "window_id"),
+    [
+        ("Messages", 102),
+        ("mEsSaGeS", 102),
+        ("com.apple.MobileSMS", 102),
+        ("/System/Applications/Messages.app", 102),
+        ("com.apple.messages.AssistantExtension", 101),
+        ("/System/Applications/Messages.app/Contents/PlugIns/Messages Assistant Extension.appex", 101),
+        (41, 101),
+        ("41", 101),
+    ],
+)
+def test_windows_app_name_ignores_nested_extension_but_explicit_identity_does_not(
+    messages_apps, selector, window_id,
+) -> None:
+    mac, _ = messages_apps
+    assert [window["window_id"] for window in mac.windows(selector)] == [window_id]
+
+
+@pytest.mark.parametrize(
+    "other_path",
+    [
+        "/Applications/Messages.app",
+        "/System/Applications/Messages.app",
+        "/Applications/Other.app/Contents/PlugIns/Messages.appex",
+    ],
+)
+def test_windows_app_name_keeps_distinct_apps_and_unrelated_extensions_ambiguous(
+    messages_apps, other_path,
+) -> None:
+    mac, apps = messages_apps
+    apps.append(_FakeRunningApp(43, name="Messages", path=other_path))
+    with pytest.raises(MacOSError) as error:
+        mac.windows("Messages")
+    assert error.value.code == ErrorCode.APP_AMBIGUOUS
+    assert {match["pid"] for match in error.value.details["matches"]} == {42, 43}
+
+
+def test_windows_app_name_still_resolves_extension_without_containing_app(messages_apps) -> None:
+    mac, apps = messages_apps
+    apps.pop()
+    assert [window["window_id"] for window in mac.windows("Messages")] == [101]
 
 
 def test_doctor_reports_real_permission_preflights(monkeypatch) -> None:
@@ -505,7 +593,8 @@ def test_focus_sample_requests_no_text_after_a_refused_secure_field_check(
 def _bounded_tree(monkeypatch, mac: MacOS, root: object, children: dict, data: dict) -> None:
     """Serve a fake AX tree through the bounded-walk fallback: the app's
     own search predicate is unsupported, so every query walks ``children``
-    from ``root`` and reads each element's attributes from ``data``."""
+    from ``root`` and reads each element's attributes from ``data``, where
+    a `_Refused` value is a read the app refused with that AXError."""
     monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_application_element", lambda pid, **kwargs: root)
@@ -526,8 +615,10 @@ def _bounded_tree(monkeypatch, mac: MacOS, root: object, children: dict, data: d
             "AXChildren": children.get(element),
             "AXWindows": None,
         }
+        read = {attribute: values.get(attribute) for attribute in attributes}
         return macos_module._AttributeValues(
-            (attribute, values.get(attribute)) for attribute in attributes
+            ((name, None if isinstance(value, _Refused) else value) for name, value in read.items()),
+            failures=((name, value.code) for name, value in read.items() if isinstance(value, _Refused)),
         )
 
     monkeypatch.setattr(mac, "_copy_attributes", fake_attributes)
@@ -704,10 +795,13 @@ def test_strict_wait_never_trusts_one_match_from_a_cut_search(monkeypatch) -> No
         "complete": False,
         "visited": 1,
         "max_nodes": 300,
+        "partial": [],
+        "unanswered": 0,
     }
 
 
-def test_strict_wait_rejects_a_branch_that_refused_its_children(monkeypatch) -> None:
+@pytest.mark.parametrize("failure", ["children", "batch"])
+def test_strict_wait_rejects_a_branch_that_refused_its_children(monkeypatch, failure) -> None:
     mac = MacOS()
     root, save, blocked = (object() for _ in range(3))
     data = {
@@ -721,19 +815,57 @@ def test_strict_wait_rejects_a_branch_that_refused_its_children(monkeypatch) -> 
         },
         blocked: {
             "AXRole": "AXGroup",
-            "AXChildren": _Refused(macos_module.AS.kAXErrorCannotComplete),
+            "AXChildren": _Refused(macos_module.AS.kAXErrorCannotComplete) if failure == "children" else [],
         },
     }
     copy_attributes = mac._copy_attributes
     _bounded_tree(monkeypatch, mac, root, {root: [save, blocked]}, data)
     monkeypatch.setattr(mac, "_copy_attributes", copy_attributes)
     _focus_ax(monkeypatch, mac, data, batch=False, focused=root)
+    if failure == "batch":
+        monkeypatch.setattr(
+            macos_module.AS, "AXUIElementCopyMultipleAttributeValues",
+            lambda element, *args: (
+                macos_module.AS.kAXErrorCannotComplete if element is blocked
+                else macos_module.AS.kAXErrorNotImplemented, None
+            ),
+        )
 
     with pytest.raises(MacOSError, match="complete search") as caught:
         mac.ax.wait(app="Pages", title="Save", timeout=0)
 
     assert caught.value.code == ErrorCode.TIMEOUT
     assert caught.value.details["complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("code", "complete"),
+    [
+        pytest.param(macos_module.AS.kAXErrorFailure, True, id="app-cannot-produce-it"),
+        pytest.param(macos_module.AS.kAXErrorInvalidUIElement, False, id="element-vanished"),
+        pytest.param(macos_module.AS.kAXErrorCannotComplete, False, id="app-did-not-answer"),
+    ],
+)
+def test_a_refused_read_leaves_a_search_incomplete_only_when_it_can_hide_a_match(
+    monkeypatch, code, complete
+) -> None:
+    """The Dock answers a read of an item's description with
+    kAXErrorFailure: no read ever returns that value, so no search can
+    match on it, and the walk that met it still saw every match. An
+    element that vanished mid-read, or an app that did not answer, may
+    hide one."""
+    mac = MacOS()
+    root, save, item = (object() for _ in range(3))
+    data = {
+        save: {"AXRole": "AXButton", "AXTitle": "Save"},
+        item: {"AXRole": "AXDockItem", "AXTitle": _Refused(code)},
+    }
+    _bounded_tree(monkeypatch, mac, root, {root: [save, item]}, data)
+
+    matches = mac.ax.query(app="Pages", text="Save", include_actions=False)
+
+    assert [match["title"] for match in matches] == ["Save"]
+    assert matches.complete is complete
 
 
 def test_repeated_child_at_the_node_budget_is_still_complete(monkeypatch) -> None:
@@ -770,6 +902,8 @@ def test_wait_gone_never_certifies_absence_from_a_cut_search(monkeypatch) -> Non
         "complete": False,
         "visited": 0,
         "max_nodes": 300,
+        "partial": [],
+        "unanswered": 0,
     }
 
 
@@ -896,8 +1030,26 @@ def test_cleared_element_handles_never_alias() -> None:
         mac._element(old_index)
 
 
+class _ProbedMac(MacOS):
+    """A Mac whose sweep's up-front answer probe reports ``silent`` as the
+    apps that cannot answer, and whose window list reports ``showing`` as
+    the apps with a window on screen, so a test's scripted per-app search
+    decides every other app's outcome."""
+
+    def __init__(self, silent: frozenset[int] = frozenset(), *, showing: frozenset[int] = frozenset()) -> None:
+        super().__init__()
+        self.silent = silent
+        self.showing = showing
+
+    def _unanswered_pids(self, pids) -> frozenset[int]:
+        return self.silent
+
+    def _onscreen_window_owners(self) -> frozenset[int]:
+        return self.showing
+
+
 def test_ax_query_all_scans_every_app_without_mutating_targets(monkeypatch) -> None:
-    mac = MacOS()
+    mac = _ProbedMac()
     apps = [
         {"name": "First", "bundle_id": "one", "pid": 1, "path": "/First"},
         {"name": "Blocked", "bundle_id": "two", "pid": 2, "path": "/Blocked"},
@@ -955,14 +1107,22 @@ def test_ax_query_all_scans_every_app_without_mutating_targets(monkeypatch) -> N
 
 
 @pytest.mark.parametrize("method", ["wait", "wait_gone"])
-def test_cross_app_wait_cannot_certify_a_search_that_skipped_an_app(monkeypatch, method) -> None:
-    mac = MacOS()
+@pytest.mark.parametrize("gap", ["its search failed", "it did not answer"])
+def test_cross_app_wait_cannot_certify_a_search_that_skipped_an_app(monkeypatch, method, gap) -> None:
+    """One app left unsearched while it shows a window -- its search
+    failed, or it did not answer the up-front probe and was skipped
+    without a search -- leaves the sweep incomplete, so a wait can neither
+    confirm nor rule out a match."""
+    silent = frozenset({2}) if gap == "it did not answer" else frozenset()
+    mac = _ProbedMac(silent, showing=frozenset({1, 2}))
     apps = [{"name": "Readable", "pid": 1}, {"name": "Unreadable", "pid": 2}]
     answer = _found({"element_index": 7, "role": "AXButton", "title": "Save"}) if method == "wait" else _found()
     monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
     monkeypatch.setattr(mac, "list_apps", lambda: apps)
+    searched = []
 
     def search(*, app_pid, **kwargs):
+        searched.append(app_pid)
         if app_pid == 2:
             raise MacOSError("Unreadable app", code=ErrorCode.AX_ERROR)
         return answer
@@ -977,6 +1137,44 @@ def test_cross_app_wait_cannot_certify_a_search_that_skipped_an_app(monkeypatch,
 
     assert failure.value.code == ErrorCode.TIMEOUT
     assert failure.value.details["complete"] is False
+    assert failure.value.details["unanswered"] == 1
+    # An app that did not answer the probe costs no search of its own.
+    assert (2 in searched) == (not silent)
+
+
+class _TwoAppMac(_ProbedMac):
+    """A Mac running Readable (pid 1), whose every search finds
+    ``answer``, and Unreadable (pid 2), which a sweep cannot search: its
+    search fails, or it is ``silent`` and never searched."""
+
+    def __init__(self, answer: SearchMatches, *, silent: frozenset[int], showing: frozenset[int]) -> None:
+        super().__init__(silent, showing=showing)
+        self.answer = answer
+
+    def _ensure_accessibility(self) -> None:
+        return None
+
+    def list_apps(self) -> list[dict[str, object]]:
+        return [{"name": "Readable", "pid": 1}, {"name": "Unreadable", "pid": 2}]
+
+    def ax_search(self, *, app_pid: int | None = None, **options: object) -> SearchMatches:
+        if app_pid == 2:
+            raise MacOSError("Unreadable app", code=ErrorCode.AX_ERROR)
+        return self.answer
+
+
+@pytest.mark.parametrize("gap", ["its search failed", "it did not answer"])
+def test_cross_app_wait_settles_past_an_unsearched_app_with_no_window(gap) -> None:
+    """What an app shows lives in its windows on screen, so one with none
+    hides nothing from a sweep of what is on screen: leaving it unsearched
+    stops no wait from confirming a match, or that the match is gone."""
+    silent = frozenset({2}) if gap == "it did not answer" else frozenset()
+    save = {"element_index": 7, "role": "AXButton", "title": "Save"}
+    present = _TwoAppMac(_found(save), silent=silent, showing=frozenset({1}))
+    absent = _TwoAppMac(_found(), silent=silent, showing=frozenset({1}))
+
+    assert present.ax.wait(all_apps=True, title="Save", timeout=0)["app"]["pid"] == 1
+    assert absent.ax.wait_gone(all_apps=True, title="Save", timeout=5, interval=0.01) is None
 
 
 def test_ax_role_aliases_and_app_selectors_fail_closed(monkeypatch) -> None:
@@ -993,7 +1191,7 @@ def test_ax_role_aliases_and_app_selectors_fail_closed(monkeypatch) -> None:
 
     assert arguments["text"] == "Not Now"
     assert arguments["search_key"] == "AXTextFieldSearchKey"
-    assert arguments["apps"] == "Safari"
+    assert arguments["apps"] == ("Safari",)
     assert mac.ax._search_key(None, "any") == "AXAnyTypeSearchKey"
 
     with pytest.raises(MacOSError, match="Unknown AX role"):
@@ -1046,12 +1244,255 @@ def test_ax_wait_fails_closed_on_ambiguity_and_timeout(monkeypatch) -> None:
     with pytest.raises(MacOSError, match="timed out"):
         mac.ax.wait(app="Chrome", text="Missing", timeout=0)
 
-    with pytest.raises(MacOSError, match="exactly one"):
-        mac.ax.wait(app="Chrome", all_apps=True, text="Not Now")
-    with pytest.raises(MacOSError, match="all_apps=True or apps"):
-        mac.ax.wait(all_apps=True, apps=["Chrome"], text="Not Now")
     with pytest.raises(MacOSError, match="requires non-empty text"):
         mac.ax.wait(all_apps=True)
+
+
+_SCOPED_AX_CALLS = (
+    pytest.param(lambda mac, scope: mac.ax.query("Allow", **scope), id="ax.query"),
+    pytest.param(lambda mac, scope: mac.ax.query_all("Allow", **scope), id="ax.query_all"),
+    pytest.param(lambda mac, scope: mac.ax.wait("Allow", **scope), id="ax.wait"),
+    pytest.param(lambda mac, scope: mac.ax.wait_gone("Allow", **scope), id="ax.wait_gone"),
+    pytest.param(lambda mac, scope: mac.ax.press("Allow", **scope), id="ax.press"),
+    pytest.param(lambda mac, scope: mac.do.press(text="Allow", **scope), id="do.press"),
+    pytest.param(lambda mac, scope: mac.do.set("yes", text="Allow", **scope), id="do.set"),
+    pytest.param(lambda mac, scope: mac.do.toggle(True, text="Allow", **scope), id="do.toggle"),
+)
+_ONE_SCOPE = "Pass exactly one of app, all_apps=True, or apps"
+
+
+@pytest.mark.parametrize(
+    ("scope", "message", "details"),
+    (
+        pytest.param({"app": "Demo", "all_apps": True}, _ONE_SCOPE, {"parameter": "scope"}, id="app+all_apps"),
+        pytest.param({"all_apps": True, "apps": ["Demo"]}, _ONE_SCOPE, {"parameter": "scope"}, id="all_apps+apps"),
+        pytest.param({"app": "Demo", "apps": "Demo"}, _ONE_SCOPE, {"parameter": "scope"}, id="app+apps"),
+        pytest.param(
+            {"apps": []},
+            "apps must contain at least one non-empty selector",
+            {"parameter": "apps"},
+            id="no-apps",
+        ),
+        pytest.param({"app": "  "}, "app must be a nonempty string, not '  '", {"parameter": "app"}, id="blank-app"),
+        pytest.param({"app": 0}, "app must be a positive pid, not 0", {"parameter": "app", "value": 0}, id="zero-pid"),
+        pytest.param(
+            {"apps": ["Demo", ""]},
+            "apps must be a nonempty string, not ''",
+            {"parameter": "apps"},
+            id="blank-apps-entry",
+        ),
+        pytest.param(
+            {"apps": [-1]},
+            "apps must be a positive pid, not -1",
+            {"parameter": "apps", "value": -1},
+            id="negative-apps-pid",
+        ),
+    ),
+)
+@pytest.mark.parametrize("call", _SCOPED_AX_CALLS)
+def test_every_ax_search_and_mutation_rejects_a_bad_scope_alike(call, scope, message, details) -> None:
+    """``app``, ``all_apps=True``, and ``apps`` mean the same thing in
+    every call that takes them, so a bad scope fails with the same error
+    everywhere, before any app is searched."""
+    mac = _ScriptedAX(sweep=lambda **kwargs: pytest.fail("a bad scope must not search"))
+
+    with pytest.raises(MacOSError) as caught:
+        call(mac, scope)
+
+    assert caught.value.to_json() == {"code": "bad_request", "message": message, "details": details}
+    assert mac.reads == []
+
+
+class _ScriptedAX(MacOS):
+    """A Mac whose AX boundary is scripted instead of read from real apps.
+
+    Each of ``apps`` (name to pid) runs and shows one "Allow" button to the
+    per-app search. ``sweep``, when given, answers the cross-app search in
+    place of searching each app. Records the attributes every per-app
+    search read and every action performed.
+    """
+
+    def __init__(self, *, apps: dict[str, int] | None = None, sweep=None) -> None:
+        super().__init__()
+        self.apps = apps or {}
+        self.sweep = sweep
+        self.reads: list[tuple[str, ...]] = []
+        self.pressed: list[tuple[int, str]] = []
+
+    def _ensure_accessibility(self) -> None:
+        pass
+
+    def _unanswered_pids(self, pids) -> frozenset[int]:
+        return frozenset()
+
+    def list_apps(self) -> list[dict[str, object]]:
+        return [{"name": name, "pid": pid} for name, pid in self.apps.items()]
+
+    def _resolve_app(self, query):
+        return None, {"name": query, "pid": self.apps[query]}
+
+    def ax_search(self, *, attributes, app=None, app_pid=None, **kwargs) -> SearchMatches:
+        self.reads.append(tuple(attributes))
+        pid = app_pid if app_pid is not None else self.apps[app]
+        return _found({"element_index": pid, "role": "AXButton", "title": "Allow"})
+
+    def ax_search_all(self, **kwargs) -> SearchMatches:
+        if self.sweep is None:
+            return super().ax_search_all(**kwargs)
+        return self.sweep(**kwargs)
+
+    @classmethod
+    def _frontmost_app(cls) -> dict[str, object]:
+        return {"name": "Finder", "pid": 1}
+
+    def perform_action(self, element_index: int, action: str = "AXPress") -> None:
+        self.pressed.append((element_index, action))
+
+
+@pytest.mark.parametrize(
+    ("search", "owners"),
+    (
+        pytest.param(lambda ax: ax.query("Allow", all_apps=True), [11, 22], id="query-all_apps"),
+        pytest.param(lambda ax: ax.query("Allow", apps=["osascript"]), [22], id="query-apps"),
+        pytest.param(lambda ax: ax.query_all("Allow"), [11, 22], id="query_all"),
+        pytest.param(lambda ax: ax.query_all("Allow", all_apps=True), [11, 22], id="query_all-all_apps"),
+        pytest.param(lambda ax: ax.query_all("Allow", apps="osascript"), [22], id="query_all-apps"),
+    ),
+)
+def test_ax_query_and_query_all_search_the_apps_their_scope_names(search, owners) -> None:
+    """A cross-app search names each match's owner and, by default, never
+    reads ``AXValue`` out of another app."""
+    mac = _ScriptedAX(apps={"Finder": 11, "osascript": 22})
+
+    matches = search(mac.ax)
+
+    assert [match["app"]["pid"] for match in matches] == owners
+    assert mac.reads and all("AXValue" not in read for read in mac.reads)
+
+
+@pytest.mark.parametrize("method", ["query", "query_all"])
+def test_ax_query_and_query_all_search_only_the_app_named_by_app(method) -> None:
+    mac = _ScriptedAX(apps={"Finder": 11, "osascript": 22})
+
+    matches = getattr(mac.ax, method)("Allow", app="osascript")
+
+    assert [match["element_index"] for match in matches] == [22]
+    assert "app" not in matches[0]
+
+
+# Starts an AppKit app with no window or Dock icon, says "ready" once it
+# has finished launching, and stays up until killed.
+_LATE_APP_SCRIPT = """\
+from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
+from Foundation import NSDate, NSRunLoop
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+app.finishLaunching()
+print("ready", flush=True)
+NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(30))
+"""
+
+
+def test_list_apps_sees_an_app_launched_after_the_first_read() -> None:
+    """An app that starts after this process first listed apps -- the
+    process behind a permission dialog, say -- must appear in later
+    lists, or no all-apps sweep can ever reach it."""
+    mac = MacOS()
+    mac.list_apps()
+    late = subprocess.Popen([sys.executable, "-c", _LATE_APP_SCRIPT], stdout=subprocess.PIPE, text=True)
+    try:
+        assert late.stdout.readline().strip() == "ready"
+        deadline = time.monotonic() + 5
+        while late.pid not in {app["pid"] for app in mac.list_apps()}:
+            assert time.monotonic() < deadline, "an app launched after the first list never appeared"
+            time.sleep(0.05)
+    finally:
+        late.kill()
+        late.wait()
+
+
+def _dialog_button(element_index: int, field: str, label: str) -> dict[str, object]:
+    """A pressable dialog button whose ``field`` (title or description)
+    reads ``label``, as a cross-app sweep reports it."""
+    return {
+        "element_index": element_index,
+        "role": "AXButton",
+        field: label,
+        "actions": ["AXPress"],
+        "app": {"name": "osascript", "pid": 7},
+    }
+
+
+@pytest.mark.parametrize("field", ["title", "description"])
+def test_ax_press_takes_the_one_exact_label_among_substring_matches(field) -> None:
+    """Text is a substring search, so "Allow" also finds "Don't Allow".
+    The one button labelled exactly "Allow" is the target, even from a
+    sweep that could not read every app, as one substring match would be."""
+    mac = _ScriptedAX(
+        sweep=lambda **kwargs: _found(
+            _dialog_button(1, field, "Don't Allow"),
+            _dialog_button(2, field, "Allow"),
+            complete=False,
+        ),
+    )
+
+    match = mac.ax.press("Allow", role="button", all_apps=True)
+
+    assert match[field] == "Allow"
+    assert mac.pressed == [(2, "AXPress")]
+
+
+@pytest.mark.parametrize(
+    ("sweep", "selectors"),
+    (
+        pytest.param(
+            lambda **kwargs: _found(
+                _dialog_button(1, "title", "Allow"),
+                _dialog_button(2, "title", "Don't Allow"),
+                _dialog_button(3, "description", "Allow"),
+            ),
+            {},
+            id="two-exact-labels",
+        ),
+        pytest.param(
+            lambda **kwargs: _found(
+                _dialog_button(1, "title", "Allow Once"),
+                _dialog_button(2, "title", "Don't Allow"),
+            ),
+            {},
+            id="no-exact-label",
+        ),
+        pytest.param(
+            lambda *, limit, **kwargs: _found(
+                _dialog_button(0, "title", "Allow"),
+                *(_dialog_button(index, "title", f"Don't Allow {index}") for index in range(1, limit)),
+            ),
+            {},
+            id="search-filled-its-limit",
+        ),
+        pytest.param(
+            lambda **kwargs: _found(
+                _dialog_button(1, "title", "Allow"),
+                _dialog_button(2, "title", "Don't Allow"),
+                complete=False,
+            ),
+            {"identifier": "dialog-button"},
+            id="exact-selector-incomplete-search",
+        ),
+    ),
+)
+def test_ax_press_stays_ambiguous_unless_one_exact_label_is_proven(sweep, selectors) -> None:
+    """Two exact labels, none, a search that filled its limit (an unread
+    match could be a second "Allow"), or an exact selector's incomplete
+    search leave the tie unsettled, and nothing is pressed."""
+    mac = _ScriptedAX(sweep=sweep)
+
+    with pytest.raises(MacOSError, match=r"AX wait found \d+ matches") as caught:
+        mac.ax.press("Allow", role="button", all_apps=True, **selectors)
+
+    assert caught.value.code == ErrorCode.BAD_REQUEST
+    assert mac.pressed == []
 
 
 def test_ax_press_supports_one_line_cross_app_use(monkeypatch) -> None:
@@ -1643,8 +2084,9 @@ def test_click_screen_space_omits_image_coordinates_from_a_different_app(
 
 def test_screen_point_requires_screenshot() -> None:
     mac = MacOS()
-    with pytest.raises(MacOSError, match="Take a screenshot"):
+    with pytest.raises(MacOSError) as failure:
         mac._screen_point(10, 20, "screenshot")
+    assert failure.value.code == ErrorCode.BAD_REQUEST
 
 
 def test_screen_point_converts_retina_pixels() -> None:

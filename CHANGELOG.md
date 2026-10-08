@@ -7,6 +7,87 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- With the default Python backend, an all-apps search, query or press now
+  reaches an app that started after the harness first listed apps, such as
+  the process behind a permission dialog. Each listing reads the running
+  apps afresh; before, the list stayed as it was at the first read.
+- The frontmost app is read afresh on both backends. `mac.activate` now sees
+  its request take, and the focus guard after a press catches a target that
+  brings itself to the front; before, a process kept seeing whichever app was
+  in front at its first look. The native agent's app list and app lookup
+  likewise see apps launched after its first read.
+- A broad all-apps search, query, wait or press first asks every app at once
+  whether it can answer Accessibility, then skips the ones that cannot (a
+  stopped app, a web content helper) instead of waiting out each one's
+  half-second timeout in turn: about 1.8 s instead of 2.7 to 3.4 s per sweep
+  on the Python backend, and 1.6 s instead of 3.6 to 4.4 s on the native
+  backend, on a Mac running about 90 apps. The native agent asks through a
+  new op, `ax_unanswered_apps`; an agent binary that predates it refuses it
+  as `unsupported_op`. Skipped apps leave the search incomplete, so a wait
+  never confirms a match or its absence across them.
+- A wait that times out on an incomplete search names the apps it searched
+  only in part and counts the apps that did not answer, in the message and
+  in `details["partial"]` and `details["unanswered"]`.
+- An all-apps sweep for what is on screen now reaches the whole of big apps
+  like Safari and Slack and reports itself complete. A search that walks an
+  app's tree for what is on screen leaves out the items of closed menus,
+  which were most of Safari's tree; a search for menus or menu items still
+  reads them, so `role="menu item"` reaches a command in a closed menu. The
+  walk now goes 50 levels deep instead of 25 (Slack's tree reaches 28), and
+  `max_nodes` defaults to 5000 instead of 500 for AX queries, waits and
+  presses.
+- A broad sweep for what is on screen no longer counts an app it cannot
+  search against completeness unless that app has a window on screen; a
+  stopped background process or web content helper shows nothing to find.
+  An all-apps wait for something to disappear can now confirm it.
+- A value an app reports it cannot produce (AXError -25200) no longer leaves
+  a search or an exact-title match incomplete; a read that failed because the
+  element vanished or the app did not answer still does.
+- AXError messages say what the code means. An action that fails with -25204
+  warns that it may have taken effect.
+- `mac.do.press` takes the search text as its first positional argument,
+  like `mac.ax.press`.
+- The errors for an unknown role, an element index from an earlier search
+  or run, and screenshot coordinates with no screenshot in the run say what
+  to do instead.
+
+- A substring AX search that finds several matches now takes the one whose
+  whole title or description equals the search text, so
+  `mac.ax.press("Allow", all_apps=True)` presses "Allow" beside "Don't Allow".
+  Two exact labels, none, a search that filled its limit, or an exact
+  selector's incomplete search still fail closed. Raw waits and presses,
+  `mac.do`, and the native agent apply the same rule.
+- `mac.ax.query`, `query_all`, `wait`, `wait_gone`, and `press`, and
+  `mac.do.press`, `set`, and `toggle` take `app=`, `all_apps=True`, or `apps=`
+  through one check with one error. `query` gains `all_apps` and `apps`;
+  `query_all` gains `app` and `all_apps`. A blank selector is refused like an
+  empty one.
+- A stdin program that calls a harness method with a wrong keyword ends its
+  `TypeError` with the method's real signature. The skill lists each
+  primitive's exact signature.
+- Exact app-name queries ignore same-named extensions nested inside the
+  matching app bundle. Explicit PID, bundle ID, and path selectors still
+  reach extensions; multiple matching apps remain ambiguous.
+- `mac.diff(before, after)` compares consecutive inspections using stable
+  control references. Partial observations separate uncertain appearances
+  and disappearances from proven additions and removals.
+- `mac.do.expect_any` waits for named outcomes in one read-only call and
+  reports every match in the first successful pass. One cooperative timeout
+  covers the checks; failures retain each outcome's observation state.
+- Saved routes accept named form inputs through `rec.fill`. Definitions keep
+  parameter names, not entered text. Replay validates all inputs before action
+  and does not mistake the previous input's goal for completion of a new run.
+- `mac.do.fill` replaces a plain text field through keyboard input and checks
+  the text readback. It handles UTF-16 selection on both backends, refuses
+  secure or disabled fields, and stops if focus or text changes before typing.
+  Use an app-level postcondition to check that the app processed the input.
+- Help and version commands defer loading macOS frameworks. `--json-errors`
+  emits structured harness errors and operation receipts on stderr when requested.
+- A failed AX attribute batch stays incomplete instead of repeating the
+  failed read for every attribute. Bounded searches collect action names
+  only for matches. Unsupported batch APIs retain their single-read fallback.
+- `mac.explain` retains partial or unavailable inspection coverage and shows
+  nearby controls for the `any` role as well as specific roles.
 - A failed `mac.do.expect` receipt now reports what the check established.
   `observed` carries `state` — the new public `Observation` enum, `UNMET` or
   `UNOBSERVABLE` — and a `reason` naming the case: a completed search that
@@ -218,6 +299,18 @@ follows [Semantic Versioning](https://semver.org/).
   as `unsupported_op`; nothing downgrades to the batch read.
   `mac.ax.get_attributes` is unchanged: a bulk sample where an unreadable
   attribute is `None`.
+
+### Removed
+
+- The credential broker: `macos-harness credential` (`check`,
+  `fill-browser`, `fill-native`, `enroll`), `CredentialBroker`,
+  `CredentialManifest`, `CredentialEnrollment`, `CredentialReceipt`,
+  `CredentialError`, `DEFAULT_CREDENTIAL_MANIFEST`, the worker, and
+  `~/.config/macos-harness/credentials.toml`. Its one sink was a field in
+  a live ego-browser taskspace, and that route is retired: browser
+  credentials belong to the browser's own password manager, and a native
+  login field keeps its two owners, system AutoFill or `mac.handoff`.
+  Nothing else in the harness read the manifest or the vault.
 
 ## [0.5.0] - 2026-08-22
 

@@ -20,6 +20,10 @@ PY
 The CLI preloads `mac`, `browser`, `Path`, and `subprocess`. Prefer bounded stdin
 programs; reserve `macos-harness repl` for manual exploration and always exit it.
 
+Use `macos-harness --json-errors` for machine-readable failures from stdin
+programs. Harness errors go to stderr as JSON; operation failures include
+the receipt. The exit status remains nonzero.
+
 ## Minimize round trips
 
 - Bundle deterministic, reversible steps into one program, then verify once. Opening
@@ -54,11 +58,20 @@ receipt = mac.do.type(
 )
 ```
 
-- `press`, `set`, `toggle`, `run`, `key`, `click`, and `type` mutate;
-  `expect(condition)` observes a condition, and `recall(once)` looks up a past
-  receipt without dispatching anything. `set`/`toggle` check first and report
+- `press`, `set`, `fill`, `toggle`, `run`, `key`, `click`, and `type` mutate;
+  `expect(condition)` and `expect_any(outcomes)` observe conditions, and
+  `recall(once)` looks up a past receipt without dispatching anything.
+  `set`/`toggle` check first and report
   `outcome="already"` instead of re-mutating a target already in the
   requested state, so neither takes a `once` token.
+- Use `mac.do.fill(value, app=..., identifier=...)` for a plain text field,
+  especially when `set` changes visible text but leaves an app button disabled.
+  `fill` resolves one enabled field, focuses it, selects its full UTF-16 range,
+  types once, and verifies the text. It stops if focus or text changes before
+  typing. Pass `value=""` to clear. Secure fields are refused; it never submits.
+  Add an app-level postcondition, such as
+  `equals(title="Check", role="button", attribute="AXEnabled", value=True)`,
+  to verify that the app processed the input rather than just displaying it.
 - A call either returns a `Receipt`, or raises `OperationError` -- catch it
   and read `exc.receipt` for the same structured detail a success would
   have had (`.outcome`, `.acted`, `.error["code"]`). A bad argument (an
@@ -92,6 +105,12 @@ receipt = mac.do.type(
   `key`/`click`/`type` to confirm the text a field holds or where a
   selection landed. The receipt keeps length/SHA-256 summaries of the
   expected and observed values, never the values.
+- Use `mac.do.expect_any({"saved": present(app=app, identifier="saved"),
+  "error": present(app=app, identifier="error")}, timeout=5)` when several
+  outcomes can end a wait. Read `receipt.observed["matched"]` for the matching
+  names. Scope every condition explicitly. The call sends no input and uses
+  one cooperative deadline; a running AX read can overrun it. A timeout keeps
+  each outcome's latest state and reason, not a guessed winner.
 - Use `mac.do.expect(condition)` for read-only checks with `present`, `gone`,
   or `equals`. Give the condition an
   explicit scope. Its timeout defaults to five seconds and its interval controls
@@ -146,16 +165,23 @@ fresh run id and may repeat input. There is no retry, resume, rollback, or
 implicit activation.
 
 Record through `with mac.route.record(name, app=exact_bundle_id, entry=entry,
-goal=goal) as rec:`. Call `rec.press`, `rec.set`, `rec.toggle`, or `rec.key` only.
-Unrelated Python and calls outside the handle are not recorded. Keep the handle
-on its with-block thread. A failed step prevents saving, even when caught; the
-previous file remains intact.
+goal=goal) as rec:`. Call `rec.press`, `rec.set`, `rec.fill`, `rec.toggle`, or
+`rec.key` only. Unrelated Python and calls outside the handle are not recorded.
+Keep the handle on its with-block thread. A failed step prevents saving, even
+when caught; the previous file remains intact.
 
 Use a role plus one exact identifier, title, or description for every target
 and condition. Press/key steps require a postcondition. Set/toggle steps retain
 their convergence checks. Set and equals values must be boolean or numeric.
 Keep secrets out of selectors and keys, which are saved verbatim. Supply both
 an entry condition and a terminal goal. Definitions allow at most 64 steps.
+
+For a form, pass `inputs={"domain": text}` to recording and replay, then call
+`rec.fill("domain", identifier="domain-field")`. The definition saves the
+parameter name, not the text. Replay rejects missing names, extra names, and
+invalid text before any step acts. Routes with inputs check the entry and run
+even when the old goal holds; that goal may describe the previous input.
+`mac.route.list` includes the required names under `inputs`.
 
 `dry_run=True` validates the whole definition without input or accessibility
 feature changes. It checks the current goal, or the entry and first target;
@@ -185,6 +211,13 @@ exclude content attributes. Titles and labels can contain private text.
 `mac.diff_windows(before, after)` compares supplied snapshots without another
 observation. Snapshots do not freeze the app.
 
+Compare consecutive inspections with `mac.diff(before, after)` for control
+changes. Use each node's stable `ref`, not its short-lived `element_index`, to
+match it across those observations. Both must come from the same `MacOS`
+instance and app lifetime. Check `status` and `coverage`; incomplete walks
+put uncertain appearances and disappearances under `unproven`. Comparing
+does not make another observation. Values still need an explicit opt-in.
+
 Collect `mac.logs(receipt)` or `mac.crashes(receipt)` only when those records can
 answer the failure. An explicit time pair needs `app=pid`. Check collection
 status and truncation; delayed or absent records do not rule out a failure.
@@ -212,6 +245,56 @@ mac.ax.perform(item["element_index"], "AXPress")
 mac.script('tell application "Spotify" to play')
 ```
 
+Exact signatures. Parameters after `*` are keyword-only. When a stdin program
+passes a wrong keyword, its `TypeError` ends with the method's real signature.
+
+```text
+mac.see(app=None, *, window_index=0, path=None, max_width=1280, max_height=1280, show_pointer=False)
+mac.key(key, *, app=None)
+mac.type(text, *, app=None)
+mac.click(x, y, *, app=None, button="left", clicks=1, coordinate_space="screenshot")
+mac.scroll(delta_y, delta_x=0, *, app=None, unit="pixel", x=None, y=None, coordinate_space="screenshot")
+mac.drag(from_x, from_y, to_x, to_y, *, app=None, button="left", coordinate_space="screenshot", duration=0.25, steps=12)
+mac.move(x, y, *, app=None, coordinate_space="screenshot", duration=0.16)
+mac.script(source, *, language="AppleScript")
+mac.activate(app=None, *, timeout=0.5)
+mac.ax.at(x, y, *, app=None, coordinate_space="screenshot")
+mac.ax.get(element_index, attributes="AXValue")
+mac.ax.set(element_index, attribute, value)
+mac.ax.perform(element_index, action="AXPress")
+mac.ax.query(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, limit=20, max_nodes=5000)
+mac.ax.query_all(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, limit=20, max_nodes=5000)
+mac.ax.wait(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=5000, timeout=5.0, interval=0.1)
+mac.ax.wait_gone(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=5000, timeout=5.0, interval=0.1)
+mac.ax.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=5000, timeout=5.0, interval=0.1)
+mac.do.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=5000, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.set(value, *, app=None, all_apps=False, apps=None, role=None, text=None, title=None, identifier=None, description=None, attribute="AXValue", timeout=5.0, postcondition=None, dry_run=False)
+mac.do.toggle(desired, *, app=None, all_apps=False, apps=None, role=None, text=None, title=None, identifier=None, description=None, attribute="AXValue", timeout=5.0, postcondition=None, dry_run=False)
+mac.do.fill(value, *, app, role="text field", text=None, title=None, identifier=None, description=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.key(key, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.type(text, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.click(x, y, *, app, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.run(source, *, language="AppleScript", args=(), timeout=5.0, postcondition=None, once=None, dry_run=False, capture_output=False)
+mac.do.expect_any(outcomes, *, timeout=5.0, interval=0.1)
+mac.inspect(app, *, max_depth=12, max_nodes=300, include_values=False, screenshot=False)
+mac.windows(app=None)
+mac.list_apps()
+mac.handoff(*, reason, app)
+```
+
+The AX calls also take rarer keywords: `attributes`, `include_actions`,
+`search_key`, `visible_only`, `direction`, `immediate_descendants_only`, and
+`element_index` on `query`. `help(mac.ax.query)` lists them.
+
+`mac.scroll` moves pixels unless `unit="line"`; a negative `delta_y` scrolls
+down. With no `x`/`y` it scrolls the center of the window in the app's last
+screenshot:
+
+```python
+mac.see("Finder")
+mac.scroll(-300, app="Finder")
+```
+
 Use ordinary Python for local context and one-off logic. Do not add app-specific
 helpers when a short program can resolve the task.
 
@@ -226,34 +309,61 @@ mac.ax.press("Not Now", role="button", all_apps=True)
 the first positional argument. Use `role=` for common targets: `any`, `button`,
 `checkbox`, `combo box`, `image`, `link`, `list`, `menu`, `menu item`,
 `radio button`, `static text`, `table`, `text area`, and `text field`. An
-unknown role raises `MacOSError`. Do not pass both `role` and `search_key`.
+unknown role raises `MacOSError`. For a window, row, group, scroll bar, or any
+other kind, pass `role="any"` and read each match's `role`; `mac.windows(app)`
+lists an app's windows. Do not pass both `role` and `search_key`. A search
+for what is on screen, the default, leaves out the items of closed menus;
+pass `role="menu item"` to reach a command in a menu that is not open.
+
+Each of them, and `mac.do.press`, `set`, and `toggle`, takes one scope: `app=`
+for one app, `all_apps=True` for every running app, or `apps=` for a set. Two
+scopes, a blank selector, a pid below 1, or an empty `apps` raise `MacOSError`
+with code `bad_request` before anything is searched. With no scope, raw calls
+use the last app and `query_all` searches every app; `mac.do` mutations need
+one.
+
+`text` is a substring filter, so `"Allow"` also finds `"Don't Allow"`. When it
+finds several matches and exactly one has a title or description equal to
+`text`, case included, `wait`, `press`, and `mac.do` take that one. Two exact
+labels, none, or a search that filled its limit still fail closed.
 
 Use `title=`, `identifier=`, or `description=` for whole-attribute, case-sensitive
-matching. All supplied fields must match. `text` remains a substring filter.
-Query results are lists with `complete` and `visited` metadata. Exact waits and
-presses require a complete search before accepting a single match. If a limit,
-failed read, or skipped process leaves it incomplete, narrow the scope or inspect
-the reported bound. The ordinary tree fallback rejects unsupported search keys.
+matching. All supplied fields must match. Query results are lists with
+`complete` and `visited` metadata. Exact waits and presses require a complete
+search before accepting a single match. An `all_apps` sweep is often
+incomplete because some processes do not answer, so give an exact selector one
+app: `mac.ax.press(title="Allow", role="button", app="UserNotificationCenter")`.
+If a limit, failed read, or skipped process leaves a search incomplete, narrow
+the scope or inspect the reported bound; a wait that times out on an
+incomplete search names the apps it searched only in part. The ordinary tree
+fallback rejects unsupported search keys.
 
-Use `apps=` to limit a cross-process search. Pass one app name, bundle ID,
-path, or PID, or pass an iterable of selectors. Duplicate PIDs are removed.
-`apps="Safari"` is one selector, not an iterable of characters. An empty
-iterable raises instead of widening the search.
+Pass `apps=` one app name, bundle ID, path, or PID, or an iterable of
+selectors. Duplicate PIDs are removed. `apps="Safari"` is one selector, not an
+iterable of characters.
 
-`query_all` searches every running app or the set named in `apps`. It applies
-one positive global `limit`, times out each process, and returns owner metadata.
-A broad search skips inaccessible processes. A scoped search reports target
-failures. Element handles remain valid until the next AX snapshot or search.
+A cross-app search (`all_apps=True` or `apps=`) applies one positive global
+`limit`, times out each process, and returns owner metadata under `app`. A
+broad search first asks every app at once whether it can answer and skips the
+ones that cannot, which leaves it incomplete. A scoped search reports target
+failures. Element handles remain valid until the next AX snapshot or search in
+the same `macos-harness` run. Neither an element index nor a `mac.see()`
+screenshot carries over to the next run: query again, or call `mac.see()`
+earlier in the same program.
+
+An action that fails with AXError -25204 (the app did not answer in time) may
+still have taken effect, because apps often stop answering while the action
+opens a menu or dialog. Look before you retry.
 
 Cross-process calls require non-empty text or an exact selector. Default
 attributes exclude `AXValue`; read it with `ax.get` or explicit attributes.
 
-`wait` accepts exactly one scope: `app`, `all_apps=True`, or `apps`. Zero
-matches keep polling. Multiple matches fail closed and report owner, role, and
-title details. `wait_gone` requires two consecutive complete, empty searches; a named app
-that exits counts as gone. `press` waits for one match, requires `AXPress`, and
-returns the match. It never requests activation. If the target makes itself
-frontmost, `press` raises `FocusChangedError`; it cannot undo that focus change.
+`wait` returns the one match. Zero matches keep polling. Multiple matches fail
+closed and report owner, role, and title details. `wait_gone` requires two
+consecutive complete, empty searches; a named app that exits counts as gone.
+`press` waits for one match, requires `AXPress`, and returns the match. It
+never requests activation. If the target makes itself frontmost, `press`
+raises `FocusChangedError`; it cannot undo that focus change.
 
 These operations act only on accessible UI that macOS already rendered. They
 cannot make secure UI appear in an inactive app or bypass Touch ID, passkeys,
@@ -322,11 +432,13 @@ repeated keys, clicks, deletion loops, or bulk input.
   on-screen windows, then newest) and their pids; pass the pid you mean.
 
 Secondary primitives are `mac.move`, `drag`, `scroll`, `activate`,
-`show_pointer`, and `hide_pointer`. `mac.ax.query()` returns compact matches
-and bounds fallback traversal; lower `max_nodes` for especially large apps.
-`mac.ax.query_all()`, `.wait()`, `.press()`, and `.wait_gone()` extend that
-traversal across every running process for background AutoFill and system
-popovers.
+`show_pointer`, and `hide_pointer`; the signatures above cover all but the
+pointer pair. `mac.ax.query()` returns compact matches and bounds fallback
+traversal at `max_nodes`; a walk it cuts short reports itself incomplete. With
+`all_apps=True` or `apps=`, the AX searches extend that traversal across
+processes for background AutoFill and system popovers; `query_all` does so by
+default. A broad sweep counts an app it cannot search against completeness
+only while that app has a window on screen.
 
 ## Declare a human handoff at a known boundary
 
@@ -362,80 +474,6 @@ it (`mac.see`, `mac.ax`, ...). The handoff is an acknowledgement, not proof
 the human succeeded, and carries no once-token, receipt, or resume method
 to skip that rediscovery. After `cancelled`, stop; do not rediscover or
 retry.
-
-## Fill provisioned credentials automatically
-
-`macos-harness credential` fills a browser login field from a configured
-ref. Provisioning a ref -- including copying the value out of an
-already-unlocked Apple Passwords entry -- is something you do
-autonomously in one bounded burst; do not wait on a human by default.
-
-```bash
-macos-harness credential check                               # which refs exist
-macos-harness credential fill-browser <ref> --space <space>  # --space is required
-macos-harness credential enroll <ref> --clipboard            # password/TOTP: from the clipboard
-macos-harness credential enroll <gmail-ref>                  # gmail_otp: authorize, no secret read
-```
-
-Order for every login step:
-
-1. Reuse an already-authenticated session.
-2. If the ref exists, run `fill-browser` against the ego-browser taskspace
-   already showing the page. That space must exist, be unique, be yours,
-   and be active -- the broker never creates one or hands one off.
-3. If it does not exist, provision it in the same burst: verify the live
-   origin and field, add the nonsecret manifest entry, reveal and copy the
-   value from an already-unlocked Passwords entry through ordinary UI
-   automation, then run `enroll --clipboard`. (`enroll <ref>` without
-   `--clipboard` reads a hidden TTY prompt, or stdin when piped.) For an
-   emailed one-time or recovery code use `kind = "gmail_otp"` and run
-   plain `enroll <ref>` once: that code is read live and never stored, so
-   the command stores no secret -- it authorizes this exact policy, and
-   `--clipboard` on a Gmail ref fails with
-   `credential.enroll_not_authored`.
-4. Call `mac.handoff(...)` only at a gate macOS or the provider owns:
-   Touch ID, a passkey, the Mac login password, a CAPTCHA, a
-   sign-in approval. Never unlock Passwords, bypass Touch ID, or act while
-   a physical-presence prompt is on screen. Missing provisioning is never
-   by itself a handoff.
-
-The only sink is a web field in that taskspace. A native app's login field
-belongs to macOS AutoFill or to a handoff: `field` is a CSS selector, and
-typing a secret into whatever currently holds first responder can land it
-in the wrong control, so the harness will not do it.
-
-Entries live in `~/.config/macos-harness/credentials.toml` -- the one
-policy any command reads, resolved from your account's home in the passwd
-record, not from `$HOME`. It is refused unless it is private to you
-(`chmod 700 ~/.config/macos-harness`, `chmod 600` the file; a symlink or a
-group-writable parent also fails). Write the entry during provisioning
-only, then enroll:
-
-```toml
-version = 1
-
-[credentials.example-login]
-kind = "password"            # password | totp | gmail_otp
-origins = ["https://example.com"]
-field = "#password"
-```
-
-One SHA-256 digest over the entry's whole policy -- ref, `kind`, sorted
-`origins`, `field`, and every Gmail source key -- owns the authorization.
-So editing any of those after enrolling means enrolling again; only
-reordering `origins` is free. A Gmail fill additionally checks its
-authorization against that digest before it reads mail, so editing the
-manifest alone cannot repoint a live code at another mailbox or field.
-
-Every command prints exactly one compact JSON line: a receipt on success,
-a fixed `{"error":"<code>"}` on failure. No secret, secret length, OTP,
-email body, provider output, or clipboard value ever reaches an argument,
-receipt, error, log, or return value -- and never ask a human to reveal
-one. A fill is bounded and self-cleaning: 45s for a password or TOTP, 120s
-for a Gmail code, after which the whole worker tree is killed and you get
-`credential.timeout`. Retry once, then read the code and stop. See
-[README](../../README.md#credential-broker-for-provisioned-logins) for the
-`gmail_otp` mailbox/pattern keys.
 
 ## Browser and permissions
 

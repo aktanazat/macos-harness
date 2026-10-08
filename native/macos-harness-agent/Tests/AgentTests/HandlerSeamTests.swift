@@ -70,6 +70,10 @@ final class HandlerSeamTests: XCTestCase {
         15, "ax_element_get_value",
         .object(["handle": .number(1), "attribute": .string("AXValue")])
       ),
+      (
+        16, "ax_unanswered_apps",
+        .object(["pids": .array([.number(1)]), "messaging_timeout": .number(0.5)])
+      ),
     ]
     for (id, op, params) in axOps {
       let response = handlers.handle(WireRequest(v: 1, id: id, op: op, params: params))

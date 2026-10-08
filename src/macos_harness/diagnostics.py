@@ -371,7 +371,11 @@ def explain(receipt: Receipt, evidence: Sequence[Mapping[str, JSONValue]]) -> di
             findings.append({"kind": "build.modified_after_launch", "build": build})
         if item.get("kind") == "crashes" and item.get("rows"):
             findings.append({"kind": "crash.report_found", "reports": item["rows"]})
-        if item.get("status") in ("partial", "failed"):
+        if item.get("ax_status") in ("partial", "unavailable"):
+            findings.append({"kind": "diagnostic.incomplete", "source": "inspection",
+                             "ax_status": item["ax_status"], "coverage": item.get("coverage"),
+                             "error": item.get("error")})
+        elif item.get("status") in ("partial", "failed"):
             findings.append({"kind": "diagnostic.incomplete", "source": item.get("kind"), "error": item.get("error")})
     return {"receipt": receipt.to_json(), "findings": findings,
             "input_may_have_happened": receipt.acted is not Acted.NO,
@@ -400,7 +404,7 @@ def inspection_findings(state: Mapping[str, JSONValue], receipt: Receipt | None)
         role = scope.get("role") or scope.get("search_key")
         if isinstance(role, str):
             role = role.removesuffix("SearchKey").removeprefix("AX").replace(" ", "").casefold()
-        nearby = [node for node in controls if not role or role == "anytype"
+        nearby = [node for node in controls if not role or role in ("any", "anytype")
                   or str(node.get("role", "")).removeprefix("AX").casefold() == role]
         result["nearby"] = [{key: node[key] for key in _CONTROL_FIELDS if key in node} for node in nearby[:8]]
         result["previous_observation"] = {"finished_at": receipt.finished_at, "observed": receipt.to_json()["observed"]}
@@ -439,4 +443,96 @@ def diff_windows(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]
         "opened": [dict(new[key]) for key in sorted(new.keys() - old.keys())],
         "closed": [dict(old[key]) for key in sorted(old.keys() - new.keys())],
         "changed": changed,
+    }
+
+
+# `element_index` is the snapshot-local handle used to act on a control and
+# is reported as a pair instead; `ref` is the row key itself.
+_UNSTABLE_FIELDS = frozenset({"element_index", "ref"})
+
+
+def _control_row(node: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+    row: dict[str, JSONValue] = {"ref": node["ref"]}
+    row.update({key: node[key] for key in _CONTROL_FIELDS if key in node})
+    return row
+
+
+def _inspection_controls(state: Mapping[str, JSONValue], label: str) -> dict[int, Mapping[str, JSONValue]]:
+    nodes = state.get("nodes")
+    if not isinstance(nodes, (list, tuple)):
+        raise MacOSError(f"The {label} snapshot has no observed controls", code=ErrorCode.BAD_REQUEST)
+    result: dict[int, Mapping[str, JSONValue]] = {}
+    for node in nodes:
+        if not isinstance(node, Mapping) or type(node.get("ref")) is not int:
+            raise MacOSError(f"The {label} snapshot has a control without an observation ref",
+                             code=ErrorCode.BAD_REQUEST)
+        if node["ref"] in result:
+            raise MacOSError(f"The {label} snapshot has duplicate observation refs", code=ErrorCode.BAD_REQUEST)
+        result[node["ref"]] = node
+    return result
+
+
+def _same_observation(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> None:
+    """Reject any pair whose refs were not numbered against each other."""
+    left, right = before.get("observation"), after.get("observation")
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        raise MacOSError("Only snapshots taken by inspect can be compared", code=ErrorCode.BAD_REQUEST)
+    for key, field in (("app", "pid"), ("process", "launched_at")):
+        first, second = before.get(key), after.get(key)
+        if (not isinstance(first, Mapping) or not isinstance(second, Mapping)
+                or first.get(field) is None or first.get(field) != second.get(field)):
+            raise MacOSError("Snapshots do not share one app process", code=ErrorCode.BAD_REQUEST)
+    if not isinstance(left.get("session"), str) or left["session"] != right.get("session"):
+        raise MacOSError("Snapshots come from different observation sessions", code=ErrorCode.BAD_REQUEST)
+    if type(left.get("sequence")) is not int or left["sequence"] != right.get("previous"):
+        raise MacOSError("Snapshots are not consecutive inspections, so their refs mean nothing to each other",
+                         code=ErrorCode.BAD_REQUEST)
+
+
+def diff_inspections(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+    """Report what changed between two consecutive inspections of one app.
+
+    Controls are matched by the `ref` that `inspect` carries across one
+    re-inspection, never by their snapshot-local `element_index`, and a
+    pair the refs were not numbered against is refused outright. A field
+    is compared only where both snapshots observed it, since a missing
+    field never says whether it was unavailable, redacted, or simply not
+    requested: the fields `include_values=True` adds, and a secure
+    field's withheld value, are never read as a change against a
+    snapshot that never asked for them.
+
+    An addition is only claimed when the earlier snapshot covered the
+    whole tree, and a removal only when the later one did; otherwise the
+    row is `unproven`, because a truncated walk cannot tell a new control
+    apart from one it never reached. Focus and selection changes arrive as
+    the `focused` and `selected` fields of the controls that hold them.
+    Accessibility replacing a control rather than updating it reads here
+    as one removal and one addition, which is what was observed.
+    """
+    _same_observation(before, after)
+    old, new = _inspection_controls(before, "earlier"), _inspection_controls(after, "later")
+    changed: list[JSONValue] = []
+    for ref in sorted(old.keys() & new.keys()):
+        left, right = old[ref], new[ref]
+        fields = {key: {"before": left[key], "after": right[key]}
+                  for key in sorted((left.keys() & right.keys()) - _UNSTABLE_FIELDS)
+                  if left[key] != right[key]}
+        if fields:
+            changed.append({"ref": ref, "role": right.get("role"), "fields": fields,
+                            "element_index": {"before": left.get("element_index"),
+                                              "after": right.get("element_index")}})
+    covered = {side: isinstance(state.get("coverage"), Mapping) and state["coverage"].get("complete") is True
+               for side, state in (("before", before), ("after", after))}
+    appeared = [_control_row(new[ref]) for ref in sorted(new.keys() - old.keys())]
+    missing = [_control_row(old[ref]) for ref in sorted(old.keys() - new.keys())]
+    return {
+        "kind": "inspection_diff",
+        "status": "complete" if covered["before"] and covered["after"] else "partial",
+        "changed": changed,
+        "added": appeared if covered["before"] else [],
+        "removed": missing if covered["after"] else [],
+        "unproven": {"appeared": [] if covered["before"] else appeared,
+                     "missing": [] if covered["after"] else missing},
+        "coverage": {side: dict(state["coverage"]) if isinstance(state.get("coverage"), Mapping) else None
+                     for side, state in (("before", before), ("after", after))},
     }

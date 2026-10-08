@@ -12,7 +12,6 @@ from .errors import (
     MacOSError,
 )
 from .handoff import HandoffReason, HumanHandoff
-from .macos import MacOS, SearchMatches
 from .receipts import (
     Acted,
     Equals,
@@ -33,56 +32,39 @@ from .receipts import (
     present,
     request_fingerprint,
 )
-from .routes import RouteResult
 
 if TYPE_CHECKING:
-    from .credentials import (
-        DEFAULT_CREDENTIAL_MANIFEST,
-        CredentialBroker,
-        CredentialEnrollment,
-        CredentialError,
-        CredentialManifest,
-        CredentialReceipt,
-    )
+    from .macos import MacOS, SearchMatches
+    from .routes import RouteResult
 
-# `credentials` is the only module here that parses TOML and shells out to
-# the vault, and nothing but the credential commands ever touches it, so
-# it is imported on first use rather than at package import. Type checkers
-# read the block above; `from macos_harness import CredentialBroker` still
-# works, because that is a `getattr` on this module.
-_CREDENTIAL_NAMES = frozenset(
-    {
-        "DEFAULT_CREDENTIAL_MANIFEST",
-        "CredentialBroker",
-        "CredentialEnrollment",
-        "CredentialError",
-        "CredentialManifest",
-        "CredentialReceipt",
-    }
-)
+# Import the native runtime only when its public exports are requested.
+# Type checkers use the imports above.
 
 
 def __getattr__(name: str) -> object:
-    if name not in _CREDENTIAL_NAMES:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    from . import credentials
+    if name in {"MacOS", "SearchMatches"}:
+        from . import macos
 
-    value = getattr(credentials, name)
+        value = getattr(macos, name)
+    elif name == "RouteResult":
+        from .routes import RouteResult
+
+        value = RouteResult
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = value
     return value
 
 
+def __dir__() -> list[str]:
+    return sorted(globals().keys() | {"MacOS", "SearchMatches", "RouteResult"})
+
+
 __all__ = [
-    "DEFAULT_CREDENTIAL_MANIFEST",
     "AccessibilityPermissionError",
     "Acted",
     "ApplicationNotFoundError",
     "BrowserHarness",
-    "CredentialBroker",
-    "CredentialEnrollment",
-    "CredentialError",
-    "CredentialManifest",
-    "CredentialReceipt",
     "Equals",
     "ErrorCode",
     "ErrorPayload",
