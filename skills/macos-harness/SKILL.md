@@ -262,12 +262,12 @@ mac.ax.at(x, y, *, app=None, coordinate_space="screenshot")
 mac.ax.get(element_index, attributes="AXValue")
 mac.ax.set(element_index, attribute, value)
 mac.ax.perform(element_index, action="AXPress")
-mac.ax.query(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, limit=20, max_nodes=500)
-mac.ax.query_all(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, limit=20, max_nodes=500)
-mac.ax.wait(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=500, timeout=5.0, interval=0.1)
-mac.ax.wait_gone(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=500, timeout=5.0, interval=0.1)
-mac.ax.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=500, timeout=5.0, interval=0.1)
-mac.do.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=500, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.ax.query(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, limit=20, max_nodes=5000)
+mac.ax.query_all(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, limit=20, max_nodes=5000)
+mac.ax.wait(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=5000, timeout=5.0, interval=0.1)
+mac.ax.wait_gone(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=5000, timeout=5.0, interval=0.1)
+mac.ax.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=5000, timeout=5.0, interval=0.1)
+mac.do.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=5000, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.set(value, *, app=None, all_apps=False, apps=None, role=None, text=None, title=None, identifier=None, description=None, attribute="AXValue", timeout=5.0, postcondition=None, dry_run=False)
 mac.do.toggle(desired, *, app=None, all_apps=False, apps=None, role=None, text=None, title=None, identifier=None, description=None, attribute="AXValue", timeout=5.0, postcondition=None, dry_run=False)
 mac.do.fill(value, *, app, role="text field", text=None, title=None, identifier=None, description=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
@@ -311,7 +311,9 @@ the first positional argument. Use `role=` for common targets: `any`, `button`,
 `radio button`, `static text`, `table`, `text area`, and `text field`. An
 unknown role raises `MacOSError`. For a window, row, group, scroll bar, or any
 other kind, pass `role="any"` and read each match's `role`; `mac.windows(app)`
-lists an app's windows. Do not pass both `role` and `search_key`.
+lists an app's windows. Do not pass both `role` and `search_key`. A search
+for what is on screen, the default, leaves out the items of closed menus;
+pass `role="menu item"` to reach a command in a menu that is not open.
 
 Each of them, and `mac.do.press`, `set`, and `toggle`, takes one scope: `app=`
 for one app, `all_apps=True` for every running app, or `apps=` for a set. Two
@@ -432,9 +434,11 @@ repeated keys, clicks, deletion loops, or bulk input.
 Secondary primitives are `mac.move`, `drag`, `scroll`, `activate`,
 `show_pointer`, and `hide_pointer`; the signatures above cover all but the
 pointer pair. `mac.ax.query()` returns compact matches and bounds fallback
-traversal; lower `max_nodes` for especially large apps. With `all_apps=True`
-or `apps=`, the AX searches extend that traversal across processes for
-background AutoFill and system popovers; `query_all` does so by default.
+traversal at `max_nodes`; a walk it cuts short reports itself incomplete. With
+`all_apps=True` or `apps=`, the AX searches extend that traversal across
+processes for background AutoFill and system popovers; `query_all` does so by
+default. A broad sweep counts an app it cannot search against completeness
+only while that app has a window on screen.
 
 ## Declare a human handoff at a known boundary
 

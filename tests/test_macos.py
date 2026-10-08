@@ -593,7 +593,8 @@ def test_focus_sample_requests_no_text_after_a_refused_secure_field_check(
 def _bounded_tree(monkeypatch, mac: MacOS, root: object, children: dict, data: dict) -> None:
     """Serve a fake AX tree through the bounded-walk fallback: the app's
     own search predicate is unsupported, so every query walks ``children``
-    from ``root`` and reads each element's attributes from ``data``."""
+    from ``root`` and reads each element's attributes from ``data``, where
+    a `_Refused` value is a read the app refused with that AXError."""
     monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_application_element", lambda pid, **kwargs: root)
@@ -614,8 +615,10 @@ def _bounded_tree(monkeypatch, mac: MacOS, root: object, children: dict, data: d
             "AXChildren": children.get(element),
             "AXWindows": None,
         }
+        read = {attribute: values.get(attribute) for attribute in attributes}
         return macos_module._AttributeValues(
-            (attribute, values.get(attribute)) for attribute in attributes
+            ((name, None if isinstance(value, _Refused) else value) for name, value in read.items()),
+            failures=((name, value.code) for name, value in read.items() if isinstance(value, _Refused)),
         )
 
     monkeypatch.setattr(mac, "_copy_attributes", fake_attributes)
@@ -835,6 +838,36 @@ def test_strict_wait_rejects_a_branch_that_refused_its_children(monkeypatch, fai
     assert caught.value.details["complete"] is False
 
 
+@pytest.mark.parametrize(
+    ("code", "complete"),
+    [
+        pytest.param(macos_module.AS.kAXErrorFailure, True, id="app-cannot-produce-it"),
+        pytest.param(macos_module.AS.kAXErrorInvalidUIElement, False, id="element-vanished"),
+        pytest.param(macos_module.AS.kAXErrorCannotComplete, False, id="app-did-not-answer"),
+    ],
+)
+def test_a_refused_read_leaves_a_search_incomplete_only_when_it_can_hide_a_match(
+    monkeypatch, code, complete
+) -> None:
+    """The Dock answers a read of an item's description with
+    kAXErrorFailure: no read ever returns that value, so no search can
+    match on it, and the walk that met it still saw every match. An
+    element that vanished mid-read, or an app that did not answer, may
+    hide one."""
+    mac = MacOS()
+    root, save, item = (object() for _ in range(3))
+    data = {
+        save: {"AXRole": "AXButton", "AXTitle": "Save"},
+        item: {"AXRole": "AXDockItem", "AXTitle": _Refused(code)},
+    }
+    _bounded_tree(monkeypatch, mac, root, {root: [save, item]}, data)
+
+    matches = mac.ax.query(app="Pages", text="Save", include_actions=False)
+
+    assert [match["title"] for match in matches] == ["Save"]
+    assert matches.complete is complete
+
+
 def test_repeated_child_at_the_node_budget_is_still_complete(monkeypatch) -> None:
     mac = MacOS()
     root, save = object(), object()
@@ -999,15 +1032,20 @@ def test_cleared_element_handles_never_alias() -> None:
 
 class _ProbedMac(MacOS):
     """A Mac whose sweep's up-front answer probe reports ``silent`` as the
-    apps that cannot answer, so a test's scripted per-app search decides
-    every other app's outcome."""
+    apps that cannot answer, and whose window list reports ``showing`` as
+    the apps with a window on screen, so a test's scripted per-app search
+    decides every other app's outcome."""
 
-    def __init__(self, silent: frozenset[int] = frozenset()) -> None:
+    def __init__(self, silent: frozenset[int] = frozenset(), *, showing: frozenset[int] = frozenset()) -> None:
         super().__init__()
         self.silent = silent
+        self.showing = showing
 
     def _unanswered_pids(self, pids) -> frozenset[int]:
         return self.silent
+
+    def _onscreen_window_owners(self) -> frozenset[int]:
+        return self.showing
 
 
 def test_ax_query_all_scans_every_app_without_mutating_targets(monkeypatch) -> None:
@@ -1071,11 +1109,12 @@ def test_ax_query_all_scans_every_app_without_mutating_targets(monkeypatch) -> N
 @pytest.mark.parametrize("method", ["wait", "wait_gone"])
 @pytest.mark.parametrize("gap", ["its search failed", "it did not answer"])
 def test_cross_app_wait_cannot_certify_a_search_that_skipped_an_app(monkeypatch, method, gap) -> None:
-    """One app left unsearched -- its search failed, or it did not answer
-    the up-front probe and was skipped without a search -- leaves the
-    sweep incomplete, so a wait can neither confirm nor rule out a match."""
+    """One app left unsearched while it shows a window -- its search
+    failed, or it did not answer the up-front probe and was skipped
+    without a search -- leaves the sweep incomplete, so a wait can neither
+    confirm nor rule out a match."""
     silent = frozenset({2}) if gap == "it did not answer" else frozenset()
-    mac = _ProbedMac(silent)
+    mac = _ProbedMac(silent, showing=frozenset({1, 2}))
     apps = [{"name": "Readable", "pid": 1}, {"name": "Unreadable", "pid": 2}]
     answer = _found({"element_index": 7, "role": "AXButton", "title": "Save"}) if method == "wait" else _found()
     monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
@@ -1101,6 +1140,41 @@ def test_cross_app_wait_cannot_certify_a_search_that_skipped_an_app(monkeypatch,
     assert failure.value.details["unanswered"] == 1
     # An app that did not answer the probe costs no search of its own.
     assert (2 in searched) == (not silent)
+
+
+class _TwoAppMac(_ProbedMac):
+    """A Mac running Readable (pid 1), whose every search finds
+    ``answer``, and Unreadable (pid 2), which a sweep cannot search: its
+    search fails, or it is ``silent`` and never searched."""
+
+    def __init__(self, answer: SearchMatches, *, silent: frozenset[int], showing: frozenset[int]) -> None:
+        super().__init__(silent, showing=showing)
+        self.answer = answer
+
+    def _ensure_accessibility(self) -> None:
+        return None
+
+    def list_apps(self) -> list[dict[str, object]]:
+        return [{"name": "Readable", "pid": 1}, {"name": "Unreadable", "pid": 2}]
+
+    def ax_search(self, *, app_pid: int | None = None, **options: object) -> SearchMatches:
+        if app_pid == 2:
+            raise MacOSError("Unreadable app", code=ErrorCode.AX_ERROR)
+        return self.answer
+
+
+@pytest.mark.parametrize("gap", ["its search failed", "it did not answer"])
+def test_cross_app_wait_settles_past_an_unsearched_app_with_no_window(gap) -> None:
+    """What an app shows lives in its windows on screen, so one with none
+    hides nothing from a sweep of what is on screen: leaving it unsearched
+    stops no wait from confirming a match, or that the match is gone."""
+    silent = frozenset({2}) if gap == "it did not answer" else frozenset()
+    save = {"element_index": 7, "role": "AXButton", "title": "Save"}
+    present = _TwoAppMac(_found(save), silent=silent, showing=frozenset({1}))
+    absent = _TwoAppMac(_found(), silent=silent, showing=frozenset({1}))
+
+    assert present.ax.wait(all_apps=True, title="Save", timeout=0)["app"]["pid"] == 1
+    assert absent.ax.wait_gone(all_apps=True, title="Save", timeout=5, interval=0.01) is None
 
 
 def test_ax_role_aliases_and_app_selectors_fail_closed(monkeypatch) -> None:

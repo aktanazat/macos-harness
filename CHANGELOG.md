@@ -28,6 +28,21 @@ follows [Semantic Versioning](https://semver.org/).
 - A wait that times out on an incomplete search names the apps it searched
   only in part and counts the apps that did not answer, in the message and
   in `details["partial"]` and `details["unanswered"]`.
+- An all-apps sweep for what is on screen now reaches the whole of big apps
+  like Safari and Slack and reports itself complete. A search that walks an
+  app's tree for what is on screen leaves out the items of closed menus,
+  which were most of Safari's tree; a search for menus or menu items still
+  reads them, so `role="menu item"` reaches a command in a closed menu. The
+  walk now goes 50 levels deep instead of 25 (Slack's tree reaches 28), and
+  `max_nodes` defaults to 5000 instead of 500 for AX queries, waits and
+  presses.
+- A broad sweep for what is on screen no longer counts an app it cannot
+  search against completeness unless that app has a window on screen; a
+  stopped background process or web content helper shows nothing to find.
+  An all-apps wait for something to disappear can now confirm it.
+- A value an app reports it cannot produce (AXError -25200) no longer leaves
+  a search or an exact-title match incomplete; a read that failed because the
+  element vanished or the app did not answer still does.
 - AXError messages say what the code means. An action that fails with -25204
   warns that it may have taken effect.
 - `mac.do.press` takes the search text as its first positional argument,

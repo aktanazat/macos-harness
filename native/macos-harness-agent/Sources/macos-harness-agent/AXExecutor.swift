@@ -97,18 +97,23 @@ final class AXExecutor {
     let visited: Int
   }
 
+  /// One element's attribute reads. `conclusive` turns false once a read fails in a way that can
+  /// hide a search match, matching `_AttributeValues.conclusive` in `macos.py`: a missing or
+  /// unsupported attribute is a known absence, and `.failure` is the app answering that it
+  /// cannot produce the value, which no read ever returns, so no search can match on it. Any
+  /// other error (the app did not answer, the element went away) may hide a match.
   struct AttributeValues {
     var values: [String: AnyObject] = [:]
-    var complete = true
+    var conclusive = true
 
     mutating func record(_ name: String, status: AXError, value: AnyObject?) {
       switch status {
       case .success:
         if let value { values[name] = value }
-      case .noValue, .attributeUnsupported:
+      case .noValue, .attributeUnsupported, .failure:
         break
       default:
-        complete = false
+        conclusive = false
       }
     }
   }
@@ -272,6 +277,10 @@ final class AXExecutor {
     return Dictionary(uniqueKeysWithValues: roles.map { ("AX\($0)SearchKey", "AX\($0)") })
   }()
 
+  /// Matches `_AX_MENU_SEARCH_KEYS` in `macos.py`: the searches for menus or their items, which
+  /// a closed menu holds too -- a closed menu's command still answers a press.
+  private static let menuSearchKeys: Set<String> = ["AXMenuSearchKey", "AXMenuItemSearchKey"]
+
   /// Matches `_AX_NODE_MAPPING` in `macos.py`: raw AX attribute name -> wire field name.
   private static let axNodeMapping: [String: String] = [
     "AXSubrole": "subrole",
@@ -309,6 +318,11 @@ final class AXExecutor {
   private static let matchFieldOrder = [
     "title", "description", "value", "help", "identifier", "dom_identifier", "placeholder",
   ]
+
+  /// The AX attributes behind `matchFieldOrder`, matching `_AX_MATCH_ATTRIBUTES` in `macos.py`:
+  /// of the caller's attributes, the bounded walk reads only these per node.
+  private static let matchAttributeNames = Set(
+    axNodeMapping.filter { matchFieldOrder.contains($0.value) }.keys)
 
   /// Matches `ax_search`/`_application_element` in `macos.py`: validate `direction`, build the
   /// application root (messaging timeout + optional enhanced UI), then try the optimized
@@ -377,7 +391,7 @@ final class AXExecutor {
       let element = value as! AXUIElement
       if exact.isActive {
         let reading = Self.copyAttributes(element, exact.attributeNames)
-        readComplete = readComplete && reading.complete
+        readComplete = readComplete && reading.conclusive
         let fields = Self.mappedFields(from: reading.values)
         guard exact.matches(fields) else { continue }
       }
@@ -413,7 +427,7 @@ final class AXExecutor {
   }
 
   /// The visited nodes and gaps: `nodeCut` or `depthCut` for traversal bounds, `readCut`
-  /// for a refused attribute read. Each can leave candidate matches unexamined.
+  /// for a read that can hide a match. Each can leave candidate matches unexamined.
   private struct TreeSnapshot {
     var nodes: [TraversalNode]
     var nodeCut: Bool
@@ -426,7 +440,11 @@ final class AXExecutor {
   /// positive (there is no tree to walk otherwise), a non-positive effective limit yields no
   /// results (and no certainty) rather than an error, the root itself is never a candidate,
   /// and `previous` walks the flattened traversal in reverse. The result is complete only when
-  /// the walk saw the whole tree and the limit did not stop it before a further match.
+  /// the walk saw the whole tree and the limit did not stop it before a further match. The walk
+  /// reads only what judging a node takes -- its role, whether it is hidden, and the requested
+  /// attributes a match can rest on -- and describes each match afresh. A search for what is
+  /// visible, unless it is for menus or menu items, leaves out what closed menus hold, matching
+  /// `_on_screen_only` in `macos.py`.
   private static func boundedSearch(
     root: AXUIElement, searchKey: String, text: String?, exact: ExactSelector, visibleOnly: Bool,
     limit: Int, direction: String, immediateDescendantsOnly: Bool, attributes: [String],
@@ -447,16 +465,19 @@ final class AXExecutor {
     let needle = text?.lowercased()
     let described = dedup(attributes + exact.attributeNames)
 
-    var traversalAttributes = dedup(described)
+    var traversalAttributes = dedup(
+      attributes.filter { matchAttributeNames.contains($0) } + exact.attributeNames)
     if !traversalAttributes.contains("AXHidden") {
       traversalAttributes.append("AXHidden")
     }
 
     let snapshot = try snapshotTree(
       root: root,
-      maxDepth: immediateDescendantsOnly ? 1 : 25,
+      // Chromium trees run deeper than native ones: Slack's reaches 28.
+      maxDepth: immediateDescendantsOnly ? 1 : 50,
       maxNodes: maxNodes,
       includeMenuBar: true,
+      skipClosedMenus: visibleOnly && !menuSearchKeys.contains(searchKey),
       attributes: traversalAttributes,
       registry: registry)
     var nodes = snapshot.nodes
@@ -497,7 +518,8 @@ final class AXExecutor {
   /// Depth-first, cycle-guarded walk mirroring `_snapshot_tree` in `macos.py`: bounded by
   /// `maxDepth` and `maxNodes`, descending into `AXChildren` (or, at the root only, `AXWindows`
   /// when there are no children), and — unless `includeMenuBar` — never visiting an
-  /// `AXMenuBar` element or its descendants. Every visited node is registered in `registry`
+  /// `AXMenuBar` element or its descendants; with `skipClosedMenus`, never a closed menu's
+  /// items either. Every visited node is registered in `registry`
   /// regardless of whether it later survives `boundedSearch`'s filtering, exactly like
   /// `_remember_element` runs unconditionally inside `_snapshot_tree`'s own `visit`.
   /// `AXChildren`/`AXWindows` are fetched only to steer this traversal; they are never mapped
@@ -505,8 +527,8 @@ final class AXExecutor {
   /// Reports which bound, if any, refused a node, so the caller can tell a finished walk from
   /// one that stopped short.
   private static func snapshotTree(
-    root: AXUIElement, maxDepth: Int, maxNodes: Int, includeMenuBar: Bool, attributes: [String],
-    registry: ElementRegistry
+    root: AXUIElement, maxDepth: Int, maxNodes: Int, includeMenuBar: Bool, skipClosedMenus: Bool,
+    attributes: [String], registry: ElementRegistry
   ) throws -> TreeSnapshot {
     var requestedNames = dedup(attributes)
     for name in ["AXRole", "AXChildren", "AXWindows"] where !requestedNames.contains(name) {
@@ -529,10 +551,12 @@ final class AXExecutor {
       seen.insert(element)
 
       let reading = copyAttributes(element, requestedNames)
-      snapshot.readCut = snapshot.readCut || !reading.complete
+      snapshot.readCut = snapshot.readCut || !reading.conclusive
       let raw = reading.values
       let role = raw["AXRole"].map(jsonable)?.stringValue
       if role == "AXMenuBar" && !includeMenuBar { return }
+      // AppKit keeps a closed menu in the tree, items and all, though none of it is on screen.
+      if skipClosedMenus && role == "AXMenu" && isClosedMenu(element) { return }
 
       let handle = registry.register(element)
       snapshot.nodes.append(
@@ -557,6 +581,15 @@ final class AXExecutor {
 
     try visit(root, depth: 0)
     return snapshot
+  }
+
+  /// Whether `menu` is closed, matching `MacOS._closed_menu` in `macos.py`: AppKit keeps a closed
+  /// menu at zero size and gives an open one its size on screen. A menu whose size does not read
+  /// counts as open.
+  private static func isClosedMenu(_ menu: AXUIElement) -> Bool {
+    let (status, value) = copyAttributeStatus(menu, "AXSize")
+    guard status == .success, let value else { return false }
+    return jsonable(value) == .object(["width": .number(0), "height": .number(0)])
   }
 
   /// Sets up the application-root AX element exactly like `_application_element` in

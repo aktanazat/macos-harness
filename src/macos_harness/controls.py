@@ -149,7 +149,7 @@ class Accessibility:
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] | None = None,
         include_actions: bool = False,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
     ) -> SearchMatches:
         """Search one app, or every app (``all_apps=True``) or ``apps``.
 
@@ -196,7 +196,7 @@ class Accessibility:
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _SAFE_ATTRIBUTES,
         include_actions: bool = False,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
     ) -> SearchMatches:
         """`query` that searches every running app unless a scope narrows it."""
         return self.query(
@@ -235,7 +235,7 @@ class Accessibility:
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _SAFE_ATTRIBUTES,
         include_actions: bool = False,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
         timeout: float = 5.0,
         interval: float = 0.1,
     ) -> dict[str, Any]:
@@ -274,7 +274,7 @@ class Accessibility:
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _SAFE_ATTRIBUTES,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
         timeout: float = 5.0,
         interval: float = 0.1,
     ) -> None:
@@ -312,7 +312,7 @@ class Accessibility:
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _SAFE_ATTRIBUTES,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
         timeout: float = 5.0,
         interval: float = 0.1,
     ) -> dict[str, Any]:

@@ -162,7 +162,7 @@ final class AgentHandlers {
     let immediateDescendantsOnly = Self.bool(params, "immediate_descendants_only", default: false)
     let attributes = try Self.boundedAttributes(params, default: Self.defaultAttributes)
     let includeActions = Self.bool(params, "include_actions", default: true)
-    let maxNodes = try Self.boundedMaxNodes(params, default: 500)
+    let maxNodes = try Self.boundedMaxNodes(params, default: 5000)
     let limit = try Self.boundedLimit(params, effectiveMaxNodes: maxNodes)
     let resetElements = Self.bool(params, "reset_elements", default: true)
     let messagingTimeout = try Self.boundedMessagingTimeout(params)
@@ -211,7 +211,7 @@ final class AgentHandlers {
     let direction = Self.string(params, "direction") ?? "next"
     let immediateDescendantsOnly = Self.bool(params, "immediate_descendants_only", default: false)
     let attributes = try Self.boundedAttributes(params, default: Self.defaultSafeAttributes)
-    let maxNodes = try Self.boundedMaxNodes(params, default: 500)
+    let maxNodes = try Self.boundedMaxNodes(params, default: 5000)
     let messagingTimeout = try Self.boundedMessagingTimeout(params)
     let deadline: Double?
     switch params["action_deadline"] {

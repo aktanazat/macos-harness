@@ -232,6 +232,17 @@ _AX_NODE_MAPPING = {
     "AXSize": "size",
     "AXFrame": "frame",
 }
+# The attributes a bounded walk's substring match reads, in the order it
+# checks them (`MacOS._bounded_ax_search`).
+_AX_MATCH_ATTRIBUTES = (
+    "AXTitle",
+    "AXDescription",
+    "AXValue",
+    "AXHelp",
+    "AXIdentifier",
+    "AXDOMIdentifier",
+    "AXPlaceholderValue",
+)
 # What `_focus_sample` reads from the focused element, and the receipt
 # name for each. Identity first, on its own: it decides whether the
 # details may be read at all, so a secure field's value, length and
@@ -323,6 +334,17 @@ _AX_SEARCH_ROLES = {
         "TextField",
     )
 }
+# The searches for menus or their items, which a closed menu holds too: a
+# closed menu's command still answers a press.
+_AX_MENU_SEARCH_KEYS = frozenset({"AXMenuSearchKey", "AXMenuItemSearchKey"})
+
+
+def _on_screen_only(visible_only: bool, search_key: str) -> bool:
+    """Whether a search looks only at what is on screen: ``visible_only``,
+    and not a search for menus or their items (`_AX_MENU_SEARCH_KEYS`)."""
+    return visible_only and search_key not in _AX_MENU_SEARCH_KEYS
+
+
 _KEYCODES = {
     "a": 0,
     "s": 1,
@@ -532,16 +554,46 @@ def _ax_absent(error: int) -> bool:
     return error in (AS.kAXErrorNoValue, AS.kAXErrorAttributeUnsupported)
 
 
-class _AttributeValues(dict[str, Any | None]):
-    """Best-effort attribute values without treating failed reads as absence."""
+def _hides_match(error: int) -> bool:
+    """Whether a read that failed with ``error`` can hide a search match.
 
-    __slots__ = ("complete",)
+    kAXErrorFailure is the app answering that it cannot produce the value
+    -- the Dock for an item's description, Ghostty for a radio button's.
+    No read ever returns that value, so no search can match on it, and a
+    search that met the failure still saw everything it could. Every other
+    failure (the app did not answer, the element went away mid-read) may
+    hide a match.
+    """
+    return error != AS.kAXErrorFailure
+
+
+class _AttributeValues(dict[str, Any | None]):
+    """Best-effort attribute values without treating failed reads as absence.
+
+    ``failures`` maps each attribute whose read failed -- as opposed to one
+    the element lacks or has no value for (`_ax_absent`) -- to its AXError.
+    """
+
+    __slots__ = ("failures",)
 
     def __init__(
-        self, values: Iterable[tuple[str, Any | None]] = (), *, complete: bool = True
+        self,
+        values: Iterable[tuple[str, Any | None]] = (),
+        *,
+        failures: Iterable[tuple[str, int]] = (),
     ) -> None:
         super().__init__(values)
-        self.complete = complete
+        self.failures = dict(failures)
+
+    @property
+    def complete(self) -> bool:
+        """Every read succeeded or found the attribute absent."""
+        return not self.failures
+
+    @property
+    def conclusive(self) -> bool:
+        """No failed read can hide a search match (`_hides_match`)."""
+        return not any(_hides_match(error) for error in self.failures.values())
 
 
 class SearchMatches(list[dict[str, JSONValue]]):
@@ -1568,17 +1620,21 @@ class MacOS:
         if error not in (_AX_SUCCESS, AS.kAXErrorNotImplemented, AS.kAXErrorAttributeUnsupported):
             if checked:
                 raise _ax_error("Read attribute batch", error)
-            return _AttributeValues(((name, None) for name in names), complete=False)
+            return _AttributeValues(
+                ((name, None) for name in names),
+                failures=((name, int(error)) for name in names),
+            )
         result = _AttributeValues()
         if error != _AX_SUCCESS or values is None or len(values) != len(names):
             for name in names:
-                try:
-                    result[name] = MacOS._copy_attribute(element, name, checked=True)
-                except MacOSError:
-                    if checked:
-                        raise
-                    result[name] = None
-                    result.complete = False
+                single_error, value = AS.AXUIElementCopyAttributeValue(element, name, None)
+                if single_error != _AX_SUCCESS:
+                    if not _ax_absent(single_error):
+                        if checked:
+                            raise _ax_error(f"Read {name}", single_error)
+                        result.failures[name] = int(single_error)
+                    value = None
+                result[name] = value
             return result
 
         for name, value in zip(names, values, strict=True):
@@ -1587,7 +1643,7 @@ class MacOS:
                 if not _ax_absent(slot_error):
                     if checked:
                         raise _ax_error(f"Read {name}", slot_error)
-                    result.complete = False
+                    result.failures[name] = slot_error
                 value = None
             result[name] = value
         return result
@@ -1769,6 +1825,7 @@ class MacOS:
         include_actions: bool = True,
         include_settable: bool = True,
         reset_elements: bool = True,
+        skip_closed_menus: bool = False,
     ) -> _TreeSnapshot:
         if reset_elements:
             self._elements = {}
@@ -1812,11 +1869,17 @@ class MacOS:
                 identity = self._copy_attributes(element, _FOCUS_IDENTITY_ATTRIBUTES)
                 allowed = identity.complete and identity.get("AXSubrole") != _SECURE_SUBROLE
                 raw = self._copy_attributes(element, requested_attributes if allowed else safe_attributes)
-                raw.complete = raw.complete and identity.complete
+                # An identity that did not read in full left the values unread.
+                read_cut = read_cut or not identity.complete
             else:
                 raw = self._copy_attributes(element, requested_attributes)
-            read_cut = read_cut or not raw.complete
-            if raw.get("AXRole") == "AXMenuBar" and not include_menu_bar:
+            read_cut = read_cut or not raw.conclusive
+            role = raw.get("AXRole")
+            if role == "AXMenuBar" and not include_menu_bar:
+                return
+            # AppKit keeps a closed menu in the tree, items and all, though
+            # none of it is on screen.
+            if skip_closed_menus and role == "AXMenu" and self._closed_menu(element):
                 return
             index = self._remember_element(element)
             node: dict[str, Any] = {
@@ -1862,6 +1925,12 @@ class MacOS:
 
         visit(root, 0)
         return _TreeSnapshot(nodes, node_cut, depth_cut, read_cut)
+
+    def _closed_menu(self, menu: object) -> bool:
+        """Whether ``menu`` is closed: AppKit keeps a closed menu at zero
+        size and gives an open one its size on screen. A menu whose size
+        does not read counts as open."""
+        return self._jsonable(self._copy_attribute(menu, "AXSize")) == {"width": 0.0, "height": 0.0}
 
     @staticmethod
     def _render_tree(nodes: list[dict[str, Any]], *, truncated: bool = False) -> str:
@@ -2308,7 +2377,7 @@ class MacOS:
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_ATTRIBUTES,
         include_actions: bool = True,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
         reset_elements: bool = True,
         messaging_timeout: float | None = None,
         enhance: bool = True,
@@ -2453,7 +2522,7 @@ class MacOS:
         for element in candidates:
             if exact.active:
                 raw = self._copy_attributes(element, exact.attributes)
-                read_complete = read_complete and raw.complete
+                read_complete = read_complete and raw.conclusive
                 fields = {
                     _AX_NODE_MAPPING[name]: self._jsonable(value)
                     for name, value in raw.items()
@@ -2496,7 +2565,14 @@ class MacOS:
         max_nodes: int,
         reset_elements: bool,
     ) -> SearchMatches:
-        """Search a small ordinary AX tree when optimized search is unavailable."""
+        """Search a small ordinary AX tree when optimized search is unavailable.
+
+        The walk reads only what judging a node takes -- its role, whether
+        it is hidden, and the requested attributes a match can rest on --
+        and describes each match afresh, so the rest of ``attributes``
+        costs nothing per node. A search for what is on screen
+        (`_on_screen_only`) leaves out what closed menus hold.
+        """
         if max_nodes <= 0:
             raise MacOSError(
                 "AX fallback max_nodes must be positive",
@@ -2520,7 +2596,7 @@ class MacOS:
         traversal_attributes = tuple(
             dict.fromkeys(
                 (
-                    *attributes,
+                    *(name for name in attributes if name in _AX_MATCH_ATTRIBUTES),
                     *exact.attributes,
                     "AXHidden",
                 )
@@ -2528,13 +2604,15 @@ class MacOS:
         )
         snapshot = self._snapshot_tree(
             root,
-            max_depth=1 if immediate_descendants_only else 25,
+            # Chromium trees run deeper than native ones: Slack's reaches 28.
+            max_depth=1 if immediate_descendants_only else 50,
             max_nodes=max_nodes,
             include_menu_bar=True,
             attributes=traversal_attributes,
             include_actions=False,
             include_settable=False,
             reset_elements=reset_elements,
+            skip_closed_menus=_on_screen_only(visible_only, search_key),
         )
         nodes = snapshot.nodes[1:]
         if direction.casefold() == "previous":
@@ -2543,15 +2621,7 @@ class MacOS:
         matches: list[dict[str, Any]] = []
         cut = False
         for node in nodes:
-            values = (
-                node.get("title"),
-                node.get("description"),
-                node.get("value"),
-                node.get("help"),
-                node.get("identifier"),
-                node.get("dom_identifier"),
-                node.get("placeholder"),
-            )
+            values = tuple(node.get(_AX_NODE_MAPPING[name]) for name in _AX_MATCH_ATTRIBUTES)
             text_matches = needle is None or any(
                 needle in str(value).casefold()
                 for value in values
@@ -2642,6 +2712,14 @@ class MacOS:
             quiet = tuple(pool.map(silent, pids))
         return frozenset(pid for pid, is_silent in zip(pids, quiet, strict=True) if is_silent)
 
+    @staticmethod
+    def _onscreen_window_owners() -> frozenset[int]:
+        """The pids that own a window on screen now."""
+        values = AS.CGWindowListCopyWindowInfo(
+            AS.kCGWindowListOptionOnScreenOnly, AS.kCGNullWindowID
+        )
+        return frozenset(int(value[AS.kCGWindowOwnerPID]) for value in values or ())
+
     @classmethod
     def _ax_scope(
         cls,
@@ -2678,14 +2756,18 @@ class MacOS:
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
         include_actions: bool = False,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
     ) -> SearchMatches:
         """Search selected running AX trees without activation.
 
         The result is ``complete`` only when every app was searched to
-        completion and ``limit`` did not stop the sweep early. A skipped
-        app makes the result incomplete. Explicit ``apps`` failures raise;
-        a broad sweep raises its first error only when no app was searched.
+        completion and ``limit`` did not stop the sweep early. A broad
+        sweep for what is on screen (`_on_screen_only`, no ``apps``)
+        counts an app it cannot search as a gap only while the app has a
+        window on screen; what such an app draws outside its windows -- a
+        Dock tile, a menu bar extra -- goes unchecked. Explicit ``apps``
+        failures raise; a broad sweep raises its first error only when no
+        app was searched.
         """
         exact = _ExactSelector.parse(
             title=title, identifier=identifier, description=description
@@ -2720,17 +2802,31 @@ class MacOS:
         selectors = self._normalize_apps(apps)
         infos = self._resolve_apps(selectors)
         strict = selectors is not None
+        on_screen = not strict and _on_screen_only(visible_only, search_key)
         # A broad sweep skips the apps that cannot answer instead of
-        # waiting out each one's timeout; they still leave it incomplete.
+        # waiting out each one's timeout.
         silent = (
             frozenset()
             if strict
             else self._unanswered_pids(int(info["pid"]) for info in infos)
         )
+        # What an app shows lives in its windows on screen, so a sweep of
+        # what is on screen loses nothing to an app without one, bar what
+        # it draws elsewhere (see above).
+        showing = self._onscreen_window_owners() if on_screen else frozenset()
         self._elements = {}
         matches = SearchMatches(complete=True, visited=0)
         first_error: MacOSError | None = None
         searched = False
+
+        def unsearched(pid: int, error: MacOSError) -> None:
+            nonlocal first_error
+            if first_error is None:
+                first_error = error
+            if not on_screen or pid in showing:
+                matches.complete = False
+                matches.unanswered += 1
+
         for info in infos:
             remaining = limit - len(matches)
             if remaining == 0:
@@ -2739,10 +2835,7 @@ class MacOS:
                 break
             pid = int(info["pid"])
             if pid in silent:
-                matches.complete = False
-                matches.unanswered += 1
-                if first_error is None:
-                    first_error = _ax_error("Read AXRole", AS.kAXErrorCannotComplete, pid=pid)
+                unsearched(pid, _ax_error("Read AXRole", AS.kAXErrorCannotComplete, pid=pid))
                 continue
             try:
                 app_matches = self.ax_search(
@@ -2772,10 +2865,7 @@ class MacOS:
                         code=exc.code,
                         details={**exc.details, "app": info},
                     ) from exc
-                matches.complete = False
-                matches.unanswered += 1
-                if first_error is None:
-                    first_error = exc
+                unsearched(pid, exc)
                 continue
             searched = True
             matches.complete = matches.complete and app_matches.complete
@@ -2807,7 +2897,7 @@ class MacOS:
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
         include_actions: bool = False,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
     ) -> SearchMatches:
         """Search once under the scope rules `ax_wait` polls with.
 
@@ -2916,7 +3006,7 @@ class MacOS:
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
         include_actions: bool = False,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
         enhance: bool = True,
         timeout: float = 5.0,
         interval: float = 0.1,
@@ -3060,7 +3150,7 @@ class MacOS:
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
         enhance: bool = True,
         timeout: float = 5.0,
         interval: float = 0.1,
@@ -3169,7 +3259,7 @@ class MacOS:
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
         timeout: float = 5.0,
         interval: float = 0.1,
         _deadline: _Deadline | None = None,
