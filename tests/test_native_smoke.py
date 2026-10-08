@@ -7,8 +7,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
-from typing import Any
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Concatenate, ParamSpec
 
 import pytest
 
@@ -19,6 +19,7 @@ from macos_harness.macos import (
     FocusChangedError,
     MacOS,
     MacOSError,
+    SearchMatches,
 )
 from macos_harness.native import NativeQueryResult
 from macos_harness.receipts import JSONValue
@@ -1108,6 +1109,16 @@ app.run()
 '''
 
 
+def _require_live_ax(backend: str) -> None:
+    """Skip unless live smoke tests are on and ``backend`` holds trust."""
+    if backend == "native":
+        _require_trusted_native_agent()
+    elif os.environ.get("MACOS_HARNESS_RUN_NATIVE_SMOKE") != "1":
+        pytest.skip("set MACOS_HARNESS_RUN_NATIVE_SMOKE=1 to run live smoke tests")
+    elif not macos_module.AS.AXIsProcessTrusted():
+        pytest.skip("this process lacks Accessibility trust")
+
+
 @pytest.mark.smoke
 @pytest.mark.parametrize("backend", ["python", pytest.param("native", marks=pytest.mark.native)])
 def test_press_reports_a_target_that_makes_itself_frontmost(backend: str) -> None:
@@ -1115,12 +1126,7 @@ def test_press_reports_a_target_that_makes_itself_frontmost(backend: str) -> Non
     `FocusChangedError`, even as the first thing a fresh process does:
     the guard must compare the frontmost app before and after the press,
     not one reading taken at the process's first look."""
-    if backend == "native":
-        _require_trusted_native_agent()
-    elif os.environ.get("MACOS_HARNESS_RUN_NATIVE_SMOKE") != "1":
-        pytest.skip("set MACOS_HARNESS_RUN_NATIVE_SMOKE=1 to run live smoke tests")
-    elif not macos_module.AS.AXIsProcessTrusted():
-        pytest.skip("this process lacks Accessibility trust")
+    _require_live_ax(backend)
 
     helper = subprocess.Popen(
         [sys.executable, "-c", _SELF_ACTIVATING_HELPER],
@@ -1137,15 +1143,41 @@ def test_press_reports_a_target_that_makes_itself_frontmost(backend: str) -> Non
         helper.wait()
 
 
+_P = ParamSpec("_P")
+
+
+def _recording_app_pids(
+    search: Callable[Concatenate[MacOS, _P], SearchMatches],
+) -> Callable[Concatenate[_SearchRecordingMac, _P], SearchMatches]:
+    """Wrap ``MacOS.ax_search`` so the Mac lists every app it searches one by one."""
+
+    def record(mac: _SearchRecordingMac, /, *args: _P.args, **kwargs: _P.kwargs) -> SearchMatches:
+        pid = kwargs.get("app_pid")
+        if isinstance(pid, int):
+            mac.searched.append(pid)
+        return search(mac, *args, **kwargs)
+
+    return record
+
+
+class _SearchRecordingMac(MacOS):
+    """A real Mac that lists every app its sweeps search one by one."""
+
+    def __init__(self, *, backend: str) -> None:
+        super().__init__(backend=backend)
+        self.searched: list[int] = []
+
+    ax_search = _recording_app_pids(MacOS.ax_search)
+
+
 @pytest.mark.smoke
-def test_all_apps_sweep_reaches_an_answering_app_and_flags_a_frozen_one() -> None:
-    """An all-apps search finds the button of an app that answers, and an
-    app that cannot answer -- here one stopped mid-run -- neither hides
-    that match nor passes for searched: the sweep says it is incomplete."""
-    if os.environ.get("MACOS_HARNESS_RUN_NATIVE_SMOKE") != "1":
-        pytest.skip("set MACOS_HARNESS_RUN_NATIVE_SMOKE=1 to run live smoke tests")
-    if not macos_module.AS.AXIsProcessTrusted():
-        pytest.skip("this process lacks Accessibility trust")
+@pytest.mark.parametrize("backend", ["python", pytest.param("native", marks=pytest.mark.native)])
+def test_all_apps_sweep_skips_a_frozen_app_and_still_finds_an_answering_one(backend: str) -> None:
+    """An all-apps search finds the button of an app that answers. An app
+    that cannot answer -- here one stopped mid-run -- is never searched on
+    its own, so it costs the sweep no timeout of its own, and the sweep
+    says it is incomplete rather than passing it for searched."""
+    _require_live_ax(backend)
 
     helpers = [
         subprocess.Popen(
@@ -1159,11 +1191,13 @@ def test_all_apps_sweep_reaches_an_answering_app_and_flags_a_frozen_one() -> Non
     try:
         answering, frozen = (int(_read_ready_line(helper).split(" ", 1)[1]) for helper in helpers)
         os.kill(frozen, signal.SIGSTOP)
-        with MacOS(backend="python") as mac:
+        with _SearchRecordingMac(backend=backend) as mac:
             found = mac.ax.query_all("harness-activate", role="button", limit=10)
         assert [match["app"]["pid"] for match in found] == [answering]
         assert found.complete is False
         assert found.unanswered >= 1
+        assert answering in mac.searched
+        assert frozen not in mac.searched
     finally:
         for helper in helpers:
             helper.kill()

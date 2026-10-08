@@ -16,13 +16,15 @@ follows [Semantic Versioning](https://semver.org/).
   brings itself to the front; before, a process kept seeing whichever app was
   in front at its first look. The native agent's app list and app lookup
   likewise see apps launched after its first read.
-- A broad all-apps search, query, wait or press on the Python backend first
-  asks every app at once whether it can answer Accessibility, then skips the
-  ones that cannot (a stopped app, a web content helper) instead of waiting
-  out each one's half-second timeout in turn: about 1.8 s instead of 2.7 to
-  3.4 s per sweep on a Mac running about 90 apps. Skipped apps leave the
-  search incomplete, so a wait never confirms a match or its absence across
-  them.
+- A broad all-apps search, query, wait or press first asks every app at once
+  whether it can answer Accessibility, then skips the ones that cannot (a
+  stopped app, a web content helper) instead of waiting out each one's
+  half-second timeout in turn: about 1.8 s instead of 2.7 to 3.4 s per sweep
+  on the Python backend, and 1.6 s instead of 3.6 to 4.4 s on the native
+  backend, on a Mac running about 90 apps. The native agent asks through a
+  new op, `ax_unanswered_apps`; an agent binary that predates it refuses it
+  as `unsupported_op`. Skipped apps leave the search incomplete, so a wait
+  never confirms a match or its absence across them.
 - A wait that times out on an incomplete search names the apps it searched
   only in part and counts the apps that did not answer, in the message and
   in `details["partial"]` and `details["unanswered"]`.

@@ -9,6 +9,8 @@ import Foundation
 /// `Handlers.swift` documents: "every live AX call still ends up serialized on a single queue
 /// regardless of which connection issued it." Registry mutations (`register`/`resolve`) happen
 /// on that same queue for the same reason `ElementRegistry` itself carries no locking of its own.
+/// One exception, inside a single queue turn: `unansweredPIDs` reads one attribute of many app
+/// elements side by side, touching no registry and no other shared state.
 ///
 /// Every caller-facing method assumes `Handlers.swift` has already gated the request on
 /// `AXIsProcessTrusted()` (via `requireTrust()`); nothing here re-checks or prompts for
@@ -57,6 +59,29 @@ final class AXExecutor {
     Self.queue.sync {
       Self.takeInWorkspaceChanges()
       return NSWorkspace.shared.frontmostApplication?.processIdentifier
+    }
+  }
+
+  /// The apps among `pids` that cannot answer Accessibility now: reading `AXRole` from the app
+  /// element fails with `cannotComplete` once `messagingTimeout` passes. A process that is not
+  /// serving Accessibility -- a web content helper, a stopped app -- otherwise costs a broad
+  /// sweep that whole timeout, every sweep, one app after another. The reads run side by side,
+  /// so those apps cost about one timeout together and the sweep can skip them. Mirrors
+  /// `MacOS._unanswered_pids` in `macos.py`.
+  func unansweredPIDs(_ pids: [pid_t], messagingTimeout: Double) -> [pid_t] {
+    Self.queue.sync {
+      var silent = [Bool](repeating: false, count: pids.count)
+      silent.withUnsafeMutableBufferPointer { flags in
+        DispatchQueue.concurrentPerform(iterations: pids.count) { index in
+          let element = AXUIElementCreateApplication(pids[index])
+          AXUIElementSetMessagingTimeout(element, Float(messagingTimeout))
+          var role: CFTypeRef?
+          flags[index] =
+            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+            == .cannotComplete
+        }
+      }
+      return zip(pids, silent).compactMap { pid, isSilent in isSilent ? pid : nil }
     }
   }
 

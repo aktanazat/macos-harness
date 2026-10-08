@@ -93,6 +93,9 @@ final class AgentHandlers {
     case "ax_element_perform":
       try requireTrust()
       return try handleElementPerform(params: request.params)
+    case "ax_unanswered_apps":
+      try requireTrust()
+      return try handleUnansweredApps(params: request.params)
     default:
       throw AgentError(code: "unsupported_op", message: "Unsupported operation \"\(request.op)\"")
     }
@@ -123,6 +126,17 @@ final class AgentHandlers {
   private func handleListApps() throws -> JSONValue {
     let apps = try executor.listApps()
     return .object(["apps": .array(apps.map { Self.encode(app: $0) })])
+  }
+
+  /// `pids` names the apps to ask and `messaging_timeout` how long each may take to answer;
+  /// the result's `pids` are the ones that did not answer, in the order asked.
+  private func handleUnansweredApps(params: JSONValue) throws -> JSONValue {
+    let pids = try Self.requiredPIDs(params, "pids")
+    guard let messagingTimeout = try Self.boundedMessagingTimeout(params) else {
+      throw AgentError(code: "bad_request", message: "Missing \"messaging_timeout\" parameter")
+    }
+    let silent = executor.unansweredPIDs(pids, messagingTimeout: messagingTimeout)
+    return .object(["pids": .array(silent.map { .number(Double($0)) })])
   }
 
   /// Mirrors `MacOS._app_info` in `macos.py` field for field, including the `bundle_id`/`path`
@@ -301,6 +315,7 @@ final class AgentHandlers {
   private static let attributeNameByteCeiling = 256
   private static let textByteCeiling = 1024 * 1024
   private static let messagingTimeoutRange = 0.01...6.0
+  private static let pidsCountCeiling = 4_096
 
   private static func requiredString(_ params: JSONValue, _ key: String) throws -> String {
     guard let value = params[key]?.stringValue else {
@@ -321,6 +336,21 @@ final class AgentHandlers {
       throw AgentError(code: "bad_request", message: "Missing or invalid \"\(key)\" parameter")
     }
     return value
+  }
+
+  /// A wire array of positive pids, at most `pidsCountCeiling` of them.
+  private static func requiredPIDs(_ params: JSONValue, _ key: String) throws -> [pid_t] {
+    guard let items = params[key]?.arrayValue, items.count <= pidsCountCeiling else {
+      throw AgentError(
+        code: "bad_request",
+        message: "\"\(key)\" must be an array of at most \(pidsCountCeiling) pids")
+    }
+    return try items.map { item in
+      guard let raw = item.numberValue, let pid = pid_t(exactly: raw), pid > 0 else {
+        throw AgentError(code: "bad_request", message: "\"\(key)\" must hold positive pids")
+      }
+      return pid
+    }
   }
 
   /// A single wire-supplied AX attribute name (currently just `ax_element_set`'s `attribute`

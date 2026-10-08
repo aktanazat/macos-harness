@@ -1006,7 +1006,7 @@ class _ProbedMac(MacOS):
         super().__init__()
         self.silent = silent
 
-    def _silent_pids(self, pids) -> frozenset[int]:
+    def _unanswered_pids(self, pids) -> frozenset[int]:
         return self.silent
 
 
@@ -1248,7 +1248,7 @@ class _ScriptedAX(MacOS):
     def _ensure_accessibility(self) -> None:
         pass
 
-    def _silent_pids(self, pids) -> frozenset[int]:
+    def _unanswered_pids(self, pids) -> frozenset[int]:
         return frozenset()
 
     def list_apps(self) -> list[dict[str, object]]:

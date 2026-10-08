@@ -2609,16 +2609,21 @@ class MacOS:
             resolved.append(info)
         return resolved
 
-    @staticmethod
-    def _silent_pids(pids: Iterable[int]) -> frozenset[int]:
+    def _unanswered_pids(self, pids: Iterable[int]) -> frozenset[int]:
         """The apps among ``pids`` that cannot answer Accessibility now.
 
         A process that is not serving Accessibility -- a web content
         helper, a command-line tool registered as an app -- fails a search
         only after the full cross-app messaging timeout, every sweep, one
         after another. One cheap read of every app at once finds them in
-        about one timeout together, so a sweep can skip them.
+        about one timeout together, so a sweep can skip them. The native
+        backend asks its agent, which holds the Accessibility trust.
         """
+        pids = tuple(pids)
+        if self._backend != "python":
+            client = self._acquire_native()
+            if client is not None:
+                return client.unanswered_apps(pids, _AX_CROSS_APP_MESSAGING_TIMEOUT)
         # PyObjC binds framework symbols lazily, and two threads binding
         # the same one at once can fail with KeyError: bind them here,
         # on one thread, before fanning out.
@@ -2633,7 +2638,6 @@ class MacOS:
             error, _ = copy_value(element, "AXRole", None)
             return error == cannot_complete
 
-        pids = tuple(pids)
         with ThreadPoolExecutor(max_workers=_AX_PROBE_WORKERS) as pool:
             quiet = tuple(pool.map(silent, pids))
         return frozenset(pid for pid, is_silent in zip(pids, quiet, strict=True) if is_silent)
@@ -2720,8 +2724,8 @@ class MacOS:
         # waiting out each one's timeout; they still leave it incomplete.
         silent = (
             frozenset()
-            if strict or self._backend != "python"
-            else self._silent_pids(int(info["pid"]) for info in infos)
+            if strict
+            else self._unanswered_pids(int(info["pid"]) for info in infos)
         )
         self._elements = {}
         matches = SearchMatches(complete=True, visited=0)
