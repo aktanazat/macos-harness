@@ -144,4 +144,7 @@ def test_stdin_misused_call_shows_the_real_signature(program, error, signature) 
     )
 
     assert result.returncode == 1
-    assert result.stderr.splitlines()[-2:] == [error, signature]
+    *_, raised, shown = result.stderr.splitlines()
+    # Python 3.13 adds a "Did you mean ...?" hint to the TypeError.
+    assert raised.startswith(error)
+    assert shown == signature
