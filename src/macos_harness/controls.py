@@ -132,6 +132,8 @@ class Accessibility:
         text: str | None = None,
         *,
         app: str | int | None = None,
+        all_apps: bool = False,
+        apps: str | int | Iterable[str | int] | None = None,
         element_index: int | None = None,
         role: str | None = None,
         search_key: str | None = None,
@@ -142,13 +144,23 @@ class Accessibility:
         limit: int = 20,
         direction: str = "next",
         immediate_descendants_only: bool = False,
-        attributes: Iterable[str] = _COMPACT_ATTRIBUTES,
+        attributes: Iterable[str] | None = None,
         include_actions: bool = False,
         max_nodes: int = 500,
     ) -> SearchMatches:
-        return self._host.ax_search(
-            element_index=element_index,
+        """Search one app, or every app (``all_apps=True``) or ``apps``.
+
+        ``attributes`` defaults to role, title, description, value, and
+        frame; a cross-app search leaves ``AXValue`` out by default.
+        """
+        if attributes is None:
+            cross_process = all_apps or apps is not None
+            attributes = self._SAFE_ATTRIBUTES if cross_process else self._COMPACT_ATTRIBUTES
+        return self._host.ax_query(
             app=app,
+            all_apps=all_apps,
+            apps=apps,
+            element_index=element_index,
             search_key=self._search_key(search_key, role),
             text=text,
             title=title,
@@ -167,6 +179,8 @@ class Accessibility:
         self,
         text: str | None = None,
         *,
+        app: str | int | None = None,
+        all_apps: bool = False,
         apps: str | int | Iterable[str | int] | None = None,
         role: str | None = None,
         search_key: str | None = None,
@@ -181,10 +195,14 @@ class Accessibility:
         include_actions: bool = False,
         max_nodes: int = 500,
     ) -> SearchMatches:
-        return self._host.ax_search_all(
+        """`query` that searches every running app unless a scope narrows it."""
+        return self.query(
+            text,
+            app=app,
+            all_apps=all_apps or (app is None and apps is None),
             apps=apps,
-            search_key=self._search_key(search_key, role),
-            text=text,
+            role=role,
+            search_key=search_key,
             title=title,
             identifier=identifier,
             description=description,

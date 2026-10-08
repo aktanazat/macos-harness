@@ -7,6 +7,20 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- A substring AX search that finds several matches now takes the one whose
+  whole title or description equals the search text, so
+  `mac.ax.press("Allow", all_apps=True)` presses "Allow" beside "Don't Allow".
+  Two exact labels, none, a search that filled its limit, or an exact
+  selector's incomplete search still fail closed. Raw waits and presses,
+  `mac.do`, and the native agent apply the same rule.
+- `mac.ax.query`, `query_all`, `wait`, `wait_gone`, and `press`, and
+  `mac.do.press`, `set`, and `toggle` take `app=`, `all_apps=True`, or `apps=`
+  through one check with one error. `query` gains `all_apps` and `apps`;
+  `query_all` gains `app` and `all_apps`. A blank selector is refused like an
+  empty one.
+- A stdin program that calls a harness method with a wrong keyword ends its
+  `TypeError` with the method's real signature. The skill lists each
+  primitive's exact signature.
 - Exact app-name queries ignore same-named extensions nested inside the
   matching app bundle. Explicit PID, bundle ID, and path selectors still
   reach extensions; multiple matching apps remain ambiguous.

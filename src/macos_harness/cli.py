@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import code
+import inspect
 import json
+import re
 import subprocess
 import sys
 import time
@@ -33,12 +35,52 @@ def _namespace() -> dict[str, object]:
     }
 
 
+# A call with the wrong arguments raises before its body runs, naming the
+# method by qualified name: "MacOS.scroll() got an unexpected keyword ...".
+_BAD_CALL = re.compile(r"(\w+)\.(\w+)\(\) ")
+
+
+def _signature_note(exc: TypeError, namespace: Mapping[str, object]) -> str | None:
+    """The real signature of the preloaded harness method ``exc`` names."""
+    from .macos import MacOS
+
+    call = _BAD_CALL.match(str(exc))
+    if call is None or call[2].startswith("_"):
+        return None
+    mac = namespace.get("mac")
+    surfaces: dict[str, object] = {"mac": mac, "browser": namespace.get("browser")}
+    if isinstance(mac, MacOS):
+        surfaces.update({"mac.ax": mac.ax, "mac.do": mac.do})
+    for label, surface in surfaces.items():
+        if type(surface).__name__ != call[1]:
+            continue
+        method = getattr(surface, call[2], None)
+        if not callable(method):
+            return None
+        signature = inspect.signature(method)
+        plain = signature.replace(
+            parameters=[
+                parameter.replace(annotation=parameter.empty)
+                for parameter in signature.parameters.values()
+            ],
+            return_annotation=signature.empty,
+        )
+        return f"Signature: {label}.{call[2]}{plain}"
+    return None
+
+
 def _execute(code: str) -> int:
     if not code.strip():
         print("No Python code received on stdin", file=sys.stderr)
         return 2
     namespace = _namespace()
-    exec(compile(code, "<macos-harness>", "exec"), namespace, namespace)  # noqa: S102
+    try:
+        exec(compile(code, "<macos-harness>", "exec"), namespace, namespace)  # noqa: S102
+    except TypeError as exc:
+        note = _signature_note(exc, namespace)
+        if note is not None:
+            exc.add_note(note)
+        raise
     return 0
 
 

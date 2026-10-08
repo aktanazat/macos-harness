@@ -184,10 +184,10 @@ final class AgentHandlers {
 
   /// Builds the `PressCoordinator` seam around `AXExecutor` and delegates to it. Ignores
   /// whatever `limit`/`include_actions`/`reset_elements` the wire params might claim: a
-  /// single-shot press always resets the registry first and always searches with an effective
-  /// limit of two, matching `MacOS._native_press` in `macos.py` — the agent enforces this
-  /// itself rather than trusting a client to have sent the right values. An exact selector
-  /// makes the press strict: one match counts only from a complete search.
+  /// single-shot press always resets the registry first and always searches with the limit
+  /// `PressCoordinator.searchLimit(text:)` picks, matching `MacOS.ax_wait` in `macos.py` — the
+  /// agent enforces this itself rather than trusting a client to have sent the right values. An
+  /// exact selector makes the press strict: one match counts only from a complete search.
   private func handlePress(params: JSONValue) throws -> JSONValue {
     let targetPID = try Self.requiredPID(params, "app_pid")
     let searchKey = Self.string(params, "search_key") ?? "AXAnyTypeSearchKey"
@@ -216,14 +216,14 @@ final class AgentHandlers {
     let executor = self.executor
     let registry = self.registry
     let deps = PressCoordinator.Dependencies(
-      search: {
+      search: { limit in
         try executor.query(
           pid: targetPID,
           searchKey: searchKey,
           text: text,
           exact: exact,
           visibleOnly: visibleOnly,
-          limit: 2,
+          limit: limit,
           direction: direction,
           immediateDescendantsOnly: immediateDescendantsOnly,
           attributes: attributes,
@@ -239,7 +239,7 @@ final class AgentHandlers {
       })
 
     let match = try PressCoordinator.run(
-      targetPID: targetPID, strict: exact.isActive, deadline: deadline, deps)
+      targetPID: targetPID, text: text, strict: exact.isActive, deadline: deadline, deps)
     return .object(["match": match.wireValue])
   }
 

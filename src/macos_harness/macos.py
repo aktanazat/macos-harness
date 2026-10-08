@@ -36,7 +36,7 @@ from .errors import (
 from .handoff import HandoffReason, HumanHandoff
 from .ops import _Deadline, _utc_timestamp
 from .overlay import LivePointerOverlay
-from .receipts import JSONValue, Receipt, validate_exact_selectors
+from .receipts import JSONValue, Receipt, validate_exact_selectors, validate_scope
 
 if TYPE_CHECKING:
     # Only for annotations -- `native.py` imports from this module at
@@ -197,6 +197,11 @@ _AX_SAFE_ATTRIBUTES = (
     "AXFrame",
 )
 _AX_CROSS_APP_MESSAGING_TIMEOUT = 0.5
+# How many matches a wait with search text reads: enough for the whole-label
+# tiebreak (`MacOS._sole_label_match`) to see every candidate a label search
+# plausibly finds -- "Allow" also finds "Don't Allow". Mirrors
+# `PressCoordinator.labelSearchLimit` in the native agent.
+_AX_LABEL_SEARCH_LIMIT = 20
 # A process younger than this with no window is presumed still launching,
 # and a capture waits for its first window instead of failing at once.
 _LAUNCH_GRACE_SECONDS = 5.0
@@ -2088,7 +2093,6 @@ class MacOS:
             "identifier": exact.identifier,
             "description": exact.description,
             "visible_only": bool(visible_only),
-            "limit": 2,
             "direction": direction,
             "immediate_descendants_only": bool(immediate_descendants_only),
             "attributes": [str(item) for item in attributes],
@@ -2491,17 +2495,11 @@ class MacOS:
     def _normalize_apps(
         apps: str | int | Iterable[str | int] | None,
     ) -> tuple[str, ...] | None:
+        apps = validate_scope(app=None, all_apps=False, apps=apps, required=False)
         if apps is None:
             return None
-        values = (apps,) if isinstance(apps, (str, int)) else tuple(apps)
-        normalized = tuple(str(value).strip() for value in values)
-        if not normalized or any(not value for value in normalized):
-            raise MacOSError(
-                "apps must contain at least one non-empty selector",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "apps"},
-            )
-        return normalized
+        values = (apps,) if isinstance(apps, (str, int)) else apps
+        return tuple(str(value).strip() for value in values)
 
     def _resolve_apps(self, selectors: tuple[str, ...] | None) -> list[dict[str, Any]]:
         if selectors is None:
@@ -2527,19 +2525,8 @@ class MacOS:
         text: str | None,
         exact: _ExactSelector,
     ) -> tuple[tuple[str, ...] | None, bool]:
+        apps = validate_scope(app=app, all_apps=all_apps, apps=apps, required=False)
         selectors = cls._normalize_apps(apps)
-        if app is not None and (all_apps or selectors is not None):
-            raise MacOSError(
-                "Pass exactly one of app, all_apps=True, or apps",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "scope"},
-            )
-        if all_apps and selectors is not None:
-            raise MacOSError(
-                "Pass all_apps=True or apps, not both",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "scope"},
-            )
         cross_process = all_apps or selectors is not None
         if cross_process and not text and not exact.active:
             raise MacOSError(
@@ -2658,6 +2645,77 @@ class MacOS:
             raise first_error
         return matches
 
+    def ax_query(
+        self,
+        *,
+        app: str | int | None = None,
+        all_apps: bool = False,
+        apps: str | int | Iterable[str | int] | None = None,
+        element_index: int | None = None,
+        search_key: str = "AXAnyTypeSearchKey",
+        text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
+        visible_only: bool = True,
+        limit: int = 20,
+        direction: str = "next",
+        immediate_descendants_only: bool = False,
+        attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
+        include_actions: bool = False,
+        max_nodes: int = 500,
+    ) -> SearchMatches:
+        """Search once under the scope rules `ax_wait` polls with.
+
+        ``app`` -- or, with no scope, ``element_index`` or the last app --
+        is one `ax_search`. ``all_apps=True`` or ``apps`` is one
+        `ax_search_all`, whose matches name their owner under ``"app"``.
+        """
+        exact = _ExactSelector.parse(
+            title=title, identifier=identifier, description=description
+        )
+        selectors, cross_process = self._ax_scope(
+            app=app, all_apps=all_apps, apps=apps, text=text, exact=exact
+        )
+        if not cross_process:
+            return self.ax_search(
+                element_index=element_index,
+                app=app,
+                search_key=search_key,
+                text=text,
+                title=title,
+                identifier=identifier,
+                description=description,
+                visible_only=visible_only,
+                limit=limit,
+                direction=direction,
+                immediate_descendants_only=immediate_descendants_only,
+                attributes=attributes,
+                include_actions=include_actions,
+                max_nodes=max_nodes,
+            )
+        if element_index is not None:
+            raise MacOSError(
+                "AX search element_index cannot be combined with all_apps or apps",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "element_index"},
+            )
+        return self.ax_search_all(
+            apps=selectors,
+            search_key=search_key,
+            text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
+            visible_only=visible_only,
+            limit=limit,
+            direction=direction,
+            immediate_descendants_only=immediate_descendants_only,
+            attributes=attributes,
+            include_actions=include_actions,
+            max_nodes=max_nodes,
+        )
+
     @staticmethod
     def _match_summary(match: dict[str, Any]) -> str:
         owner = match.get("app")
@@ -2674,6 +2732,29 @@ class MacOS:
             or "untitled"
         )
         return f"{app_name}: {role} {label!r}"
+
+    @staticmethod
+    def _sole_label_match(
+        matches: SearchMatches, *, text: str | None, limit: int, strict: bool
+    ) -> dict[str, JSONValue] | None:
+        """The one match labelled exactly ``text``, when the search shows
+        no other match can be.
+
+        ``text`` is a substring search, so "Allow" also finds "Don't
+        Allow". A title or description equal to ``text`` -- whole and
+        case-sensitive, like ``title=`` -- settles that tie, but only from
+        a search that stopped short of ``limit`` (an unread match could be
+        a second exact label) and, under an exact selector (``strict``),
+        a complete one. Two exact labels, or none, stay ambiguous.
+        """
+        if not text or len(matches) >= limit or (strict and not matches.complete):
+            return None
+        labelled = [
+            match
+            for match in matches
+            if text in (match.get("title"), match.get("description"))
+        ]
+        return labelled[0] if len(labelled) == 1 else None
 
     def ax_wait(
         self,
@@ -2701,7 +2782,8 @@ class MacOS:
         With an exact selector (``title``/``identifier``/``description``),
         a single match requires a complete search to rule out a twin.
         Substring-only waits retain best-effort uniqueness within the
-        returned results.
+        returned results. When ``text`` finds several matches, the only
+        one labelled exactly ``text`` wins (see `_sole_label_match`).
         """
         exact = _ExactSelector.parse(
             title=title, identifier=identifier, description=description
@@ -2726,6 +2808,11 @@ class MacOS:
                 details={"parameter": "interval", "value": interval},
             )
 
+        # Text is a substring search, so a wait for "Allow" also finds
+        # "Don't Allow": reading up to _AX_LABEL_SEARCH_LIMIT matches lets
+        # `_sole_label_match` settle that tie from this one search. Without
+        # text, a second match already proves ambiguity.
+        limit = _AX_LABEL_SEARCH_LIMIT if text else 2
         deadline = time.monotonic() + timeout
         while True:
             if cross_process:
@@ -2737,7 +2824,7 @@ class MacOS:
                     identifier=identifier,
                     description=description,
                     visible_only=visible_only,
-                    limit=2,
+                    limit=limit,
                     direction=direction,
                     immediate_descendants_only=immediate_descendants_only,
                     attributes=attributes,
@@ -2753,7 +2840,7 @@ class MacOS:
                     identifier=identifier,
                     description=description,
                     visible_only=visible_only,
-                    limit=2,
+                    limit=limit,
                     direction=direction,
                     immediate_descendants_only=immediate_descendants_only,
                     attributes=attributes,
@@ -2764,6 +2851,11 @@ class MacOS:
             if len(matches) == 1 and (matches.complete or not exact.active):
                 return matches[0]
             if len(matches) > 1:
+                labelled = self._sole_label_match(
+                    matches, text=text, limit=limit, strict=exact.active
+                )
+                if labelled is not None:
+                    return labelled
                 summary = "; ".join(self._match_summary(match) for match in matches[:4])
                 # More than one match is the caller's search criteria being too loose,
                 # not an unknown element -- and not worth retrying, since a second
@@ -2954,6 +3046,9 @@ class MacOS:
         exact = _ExactSelector.parse(
             title=title, identifier=identifier, description=description
         )
+        selectors, cross_process = self._ax_scope(
+            app=app, all_apps=all_apps, apps=apps, text=text, exact=exact
+        )
         if not math.isfinite(timeout) or timeout < 0:
             raise MacOSError(
                 "AX press timeout must be finite and non-negative",
@@ -2968,7 +3063,7 @@ class MacOS:
             )
         single_attempt = _deadline is None and timeout == 0
         deadline = _deadline if _deadline is not None else _Deadline(timeout, time.monotonic)
-        targeted = not all_apps and apps is None
+        targeted = not cross_process
         if targeted and self._backend != "python":
             if direction.casefold() not in {"next", "previous"}:
                 raise MacOSError(
@@ -3011,7 +3106,7 @@ class MacOS:
         match = self.ax_wait(
             app=app,
             all_apps=all_apps,
-            apps=apps,
+            apps=selectors,
             search_key=search_key,
             text=text,
             title=title,

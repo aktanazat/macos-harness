@@ -114,3 +114,34 @@ raise OperationError.from_receipt(Receipt(
     assert receipt["changed"] is False
     assert receipt["verified"] is False
     assert receipt["error"] == error
+
+
+@pytest.mark.parametrize(
+    ("program", "error", "signature"),
+    (
+        pytest.param(
+            'mac.scroll(dy=-300, app="Finder")\n',
+            "TypeError: MacOS.scroll() got an unexpected keyword argument 'dy'",
+            "Signature: mac.scroll(delta_y, delta_x=0, *, app=None, unit='pixel', "
+            "x=None, y=None, coordinate_space='screenshot')",
+            id="mac",
+        ),
+        pytest.param(
+            'mac.ax.get(3, attribute="AXValue")\n',
+            "TypeError: Accessibility.get() got an unexpected keyword argument 'attribute'",
+            "Signature: mac.ax.get(element_index, attributes='AXValue')",
+            id="mac.ax",
+        ),
+    ),
+)
+def test_stdin_misused_call_shows_the_real_signature(program, error, signature) -> None:
+    """A call with a wrong keyword fails before it does anything; the error
+    ends with the method's real signature so the retry can be right."""
+    result = subprocess.run(
+        [sys.executable, "-m", "macos_harness.cli"],
+        input=program, text=True, capture_output=True, timeout=10, check=False,
+        env={**os.environ, "DO_NOT_TRACK": "1", "MACOS_HARNESS_BACKEND": "python"},
+    )
+
+    assert result.returncode == 1
+    assert result.stderr.splitlines()[-2:] == [error, signature]

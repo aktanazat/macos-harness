@@ -245,6 +245,43 @@ mac.ax.perform(item["element_index"], "AXPress")
 mac.script('tell application "Spotify" to play')
 ```
 
+Exact signatures. Parameters after `*` are keyword-only. When a stdin program
+passes a wrong keyword, its `TypeError` ends with the method's real signature.
+
+```text
+mac.see(app=None, *, window_index=0, path=None, max_width=1280, max_height=1280, show_pointer=False)
+mac.key(key, *, app=None)
+mac.type(text, *, app=None)
+mac.click(x, y, *, app=None, button="left", clicks=1, coordinate_space="screenshot")
+mac.scroll(delta_y, delta_x=0, *, app=None, unit="pixel", x=None, y=None, coordinate_space="screenshot")
+mac.drag(from_x, from_y, to_x, to_y, *, app=None, button="left", coordinate_space="screenshot", duration=0.25, steps=12)
+mac.move(x, y, *, app=None, coordinate_space="screenshot", duration=0.16)
+mac.script(source, *, language="AppleScript")
+mac.activate(app=None, *, timeout=0.5)
+mac.ax.at(x, y, *, app=None, coordinate_space="screenshot")
+mac.ax.get(element_index, attributes="AXValue")
+mac.ax.set(element_index, attribute, value)
+mac.ax.perform(element_index, action="AXPress")
+mac.ax.query(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, limit=20, max_nodes=500)
+mac.ax.query_all(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, limit=20, max_nodes=500)
+mac.ax.wait(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=500, timeout=5.0, interval=0.1)
+mac.ax.wait_gone(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=500, timeout=5.0, interval=0.1)
+mac.ax.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=500, timeout=5.0, interval=0.1)
+```
+
+The AX calls also take rarer keywords: `attributes`, `include_actions`,
+`search_key`, `visible_only`, `direction`, `immediate_descendants_only`, and
+`element_index` on `query`. `help(mac.ax.query)` lists them.
+
+`mac.scroll` moves pixels unless `unit="line"`; a negative `delta_y` scrolls
+down. With no `x`/`y` it scrolls the center of the window in the app's last
+screenshot:
+
+```python
+mac.see("Finder")
+mac.scroll(-300, app="Finder")
+```
+
 Use ordinary Python for local context and one-off logic. Do not add app-specific
 helpers when a short program can resolve the task.
 
@@ -261,32 +298,46 @@ the first positional argument. Use `role=` for common targets: `any`, `button`,
 `radio button`, `static text`, `table`, `text area`, and `text field`. An
 unknown role raises `MacOSError`. Do not pass both `role` and `search_key`.
 
+Each of them, and `mac.do.press`, `set`, and `toggle`, takes one scope: `app=`
+for one app, `all_apps=True` for every running app, or `apps=` for a set. Two
+scopes, a blank selector, a pid below 1, or an empty `apps` raise `MacOSError`
+with code `bad_request` before anything is searched. With no scope, raw calls
+use the last app and `query_all` searches every app; `mac.do` mutations need
+one.
+
+`text` is a substring filter, so `"Allow"` also finds `"Don't Allow"`. When it
+finds several matches and exactly one has a title or description equal to
+`text`, case included, `wait`, `press`, and `mac.do` take that one. Two exact
+labels, none, or a search that filled its limit still fail closed.
+
 Use `title=`, `identifier=`, or `description=` for whole-attribute, case-sensitive
-matching. All supplied fields must match. `text` remains a substring filter.
-Query results are lists with `complete` and `visited` metadata. Exact waits and
-presses require a complete search before accepting a single match. If a limit,
-failed read, or skipped process leaves it incomplete, narrow the scope or inspect
-the reported bound. The ordinary tree fallback rejects unsupported search keys.
+matching. All supplied fields must match. Query results are lists with
+`complete` and `visited` metadata. Exact waits and presses require a complete
+search before accepting a single match. An `all_apps` sweep is often
+incomplete because some processes do not answer, so give an exact selector one
+app: `mac.ax.press(title="Allow", role="button", app="UserNotificationCenter")`.
+If a limit, failed read, or skipped process leaves a search incomplete, narrow
+the scope or inspect the reported bound. The ordinary tree fallback rejects
+unsupported search keys.
 
-Use `apps=` to limit a cross-process search. Pass one app name, bundle ID,
-path, or PID, or pass an iterable of selectors. Duplicate PIDs are removed.
-`apps="Safari"` is one selector, not an iterable of characters. An empty
-iterable raises instead of widening the search.
+Pass `apps=` one app name, bundle ID, path, or PID, or an iterable of
+selectors. Duplicate PIDs are removed. `apps="Safari"` is one selector, not an
+iterable of characters.
 
-`query_all` searches every running app or the set named in `apps`. It applies
-one positive global `limit`, times out each process, and returns owner metadata.
-A broad search skips inaccessible processes. A scoped search reports target
+A cross-app search (`all_apps=True` or `apps=`) applies one positive global
+`limit`, times out each process, and returns owner metadata under `app`. A
+broad search skips inaccessible processes. A scoped search reports target
 failures. Element handles remain valid until the next AX snapshot or search.
 
 Cross-process calls require non-empty text or an exact selector. Default
 attributes exclude `AXValue`; read it with `ax.get` or explicit attributes.
 
-`wait` accepts exactly one scope: `app`, `all_apps=True`, or `apps`. Zero
-matches keep polling. Multiple matches fail closed and report owner, role, and
-title details. `wait_gone` requires two consecutive complete, empty searches; a named app
-that exits counts as gone. `press` waits for one match, requires `AXPress`, and
-returns the match. It never requests activation. If the target makes itself
-frontmost, `press` raises `FocusChangedError`; it cannot undo that focus change.
+`wait` returns the one match. Zero matches keep polling. Multiple matches fail
+closed and report owner, role, and title details. `wait_gone` requires two
+consecutive complete, empty searches; a named app that exits counts as gone.
+`press` waits for one match, requires `AXPress`, and returns the match. It
+never requests activation. If the target makes itself frontmost, `press`
+raises `FocusChangedError`; it cannot undo that focus change.
 
 These operations act only on accessible UI that macOS already rendered. They
 cannot make secure UI appear in an inactive app or bypass Touch ID, passkeys,
@@ -355,11 +406,11 @@ repeated keys, clicks, deletion loops, or bulk input.
   on-screen windows, then newest) and their pids; pass the pid you mean.
 
 Secondary primitives are `mac.move`, `drag`, `scroll`, `activate`,
-`show_pointer`, and `hide_pointer`. `mac.ax.query()` returns compact matches
-and bounds fallback traversal; lower `max_nodes` for especially large apps.
-`mac.ax.query_all()`, `.wait()`, `.press()`, and `.wait_gone()` extend that
-traversal across every running process for background AutoFill and system
-popovers.
+`show_pointer`, and `hide_pointer`; the signatures above cover all but the
+pointer pair. `mac.ax.query()` returns compact matches and bounds fallback
+traversal; lower `max_nodes` for especially large apps. With `all_apps=True`
+or `apps=`, the AX searches extend that traversal across processes for
+background AutoFill and system popovers; `query_all` does so by default.
 
 ## Declare a human handoff at a known boundary
 

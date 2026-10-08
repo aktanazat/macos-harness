@@ -18,7 +18,7 @@ receipt: nothing was ever attempted (see `OperationError`).
 `click`, `type`, `fill`, `expect`, `expect_any`, and `recall`. It is not a workflow
 engine, a selector language of its own,
 or an app-adapter framework -- it reuses `MacOS.ax`'s role/search-key
-vocabulary and `MacOS`'s own AX scope rules verbatim (see `_require_scope`
+vocabulary and `MacOS`'s own AX scope rules verbatim (see `validate_scope`
 and `Accessibility._search_key`) rather than inventing a second one, and it
 never adds another matcher. ``expect`` checks one condition and ``expect_any``
 watches several named ones on a single budget; mutation calls resolve
@@ -97,7 +97,9 @@ from .receipts import (
     canonical_json,
     canonicalize,
     request_fingerprint,
+    validate_app_selector,
     validate_exact_selectors,
+    validate_scope,
 )
 
 if TYPE_CHECKING:
@@ -151,53 +153,6 @@ def _validate_interval(interval: float) -> None:
             code=ErrorCode.BAD_REQUEST,
             details={"parameter": "interval", "value": interval},
         )
-
-
-def _validate_app_selector(value: str | int | None, *, parameter: str) -> None:
-    """Reject an empty ``app``/``apps`` string or a non-positive pid
-    before any resolution, dispatch, or ``once``-token reservation.
-
-    A resolution failure downstream (``ApplicationNotFoundError`` and
-    friends) already covers a selector that is merely *wrong*; this
-    catches one that could never have been right -- ``""`` never names
-    a running app, and a pid is never zero or negative -- so those fail
-    fast as a plain `BAD_REQUEST`, before ever reaching `MacOS`'s own
-    resolution machinery (or, worse, a live AX call).
-    """
-    if value is None:
-        return
-    if isinstance(value, str):
-        if not value:
-            raise MacOSError(
-                f"{parameter} must be a nonempty string, not ''",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": parameter},
-            )
-        return
-    if value <= 0:
-        raise MacOSError(
-            f"{parameter} must be a positive pid, not {value}",
-            code=ErrorCode.BAD_REQUEST,
-            details={"parameter": parameter, "value": value},
-        )
-
-
-def _validate_apps_selector(apps: str | int | tuple[str | int, ...] | None) -> None:
-    """Reject an empty string or non-positive pid inside an already
-    materialized ``apps`` selector, item by item.
-
-    Must run *after* `Operations._freeze_apps` has already turned any
-    generator/iterable into a concrete `tuple` -- validating straight
-    off the caller's own ``apps`` argument would risk consuming a
-    generator a second time, silently losing items to
-    `test_apps_generator_is_materialized_once_and_reused`'s
-    single-materialization contract.
-    """
-    if apps is None or isinstance(apps, (str, int)):
-        _validate_app_selector(apps, parameter="apps")
-        return
-    for item in apps:
-        _validate_app_selector(item, parameter="apps")
 
 
 def _validate_set_value(value: JSONValue) -> JSONValue:
@@ -1686,9 +1641,7 @@ class Operations:
         """
         self._check_owner()
         host = self._host
-        self._require_scope(app=app, all_apps=all_apps, apps=apps)
-        apps = self._freeze_apps(apps)
-        _validate_apps_selector(apps)
+        apps = validate_scope(app=app, all_apps=all_apps, apps=apps, required=True)
         validate_exact_selectors(title=title, identifier=identifier, description=description)
         self._validate_postcondition(host, postcondition)
         self._validate_postcondition_inheritance(postcondition, has_scope=True)
@@ -1984,9 +1937,7 @@ class Operations:
         self._check_owner()
         host = self._host
         canonical_value = _validate_set_value(value)
-        self._require_scope(app=app, all_apps=all_apps, apps=apps)
-        apps = self._freeze_apps(apps)
-        _validate_apps_selector(apps)
+        apps = validate_scope(app=app, all_apps=all_apps, apps=apps, required=True)
         validate_exact_selectors(title=title, identifier=identifier, description=description)
         self._validate_postcondition(host, postcondition)
         self._validate_postcondition_inheritance(postcondition, has_scope=True)
@@ -2192,9 +2143,7 @@ class Operations:
         """
         self._check_owner()
         host = self._host
-        self._require_scope(app=app, all_apps=all_apps, apps=apps)
-        apps = self._freeze_apps(apps)
-        _validate_apps_selector(apps)
+        apps = validate_scope(app=app, all_apps=all_apps, apps=apps, required=True)
         validate_exact_selectors(title=title, identifier=identifier, description=description)
         self._validate_postcondition(host, postcondition)
         self._validate_postcondition_inheritance(postcondition, has_scope=True)
@@ -2830,7 +2779,7 @@ class Operations:
         """
         self._check_owner()
         host = self._host
-        _validate_app_selector(app, parameter="app")
+        validate_app_selector(app, parameter="app")
         self._validate_postcondition(host, postcondition)
         self._validate_postcondition_inheritance(postcondition, has_scope=True)
         once = self._normalize_once(once)
@@ -3065,31 +3014,12 @@ class Operations:
     # --- shared validation -------------------------------------------------
 
     @staticmethod
-    def _require_scope(
-        *, app: str | int | None, all_apps: bool, apps: str | int | Iterable[str | int] | None
-    ) -> None:
-        provided = sum((app is not None, bool(all_apps), apps is not None))
-        if provided != 1:
-            raise MacOSError(
-                "Pass exactly one of app, all_apps=True, or apps", code=ErrorCode.BAD_REQUEST
-            )
-        _validate_app_selector(app, parameter="app")
-
-    @staticmethod
     def _normalize_once(once: str | None) -> str | None:
         if once is None:
             return None
         if not once:
             raise MacOSError("once must be a nonempty token", code=ErrorCode.BAD_REQUEST)
         return once
-
-    @staticmethod
-    def _freeze_apps(
-        apps: str | int | Iterable[str | int] | None,
-    ) -> str | int | tuple[str | int, ...] | None:
-        if apps is None or isinstance(apps, (str, int)):
-            return apps
-        return tuple(apps)
 
     @staticmethod
     def _validate_postcondition(host: _Host, postcondition: Postcondition | None) -> None:

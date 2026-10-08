@@ -1089,7 +1089,7 @@ def test_ax_role_aliases_and_app_selectors_fail_closed(monkeypatch) -> None:
 
     assert arguments["text"] == "Not Now"
     assert arguments["search_key"] == "AXTextFieldSearchKey"
-    assert arguments["apps"] == "Safari"
+    assert arguments["apps"] == ("Safari",)
     assert mac.ax._search_key(None, "any") == "AXAnyTypeSearchKey"
 
     with pytest.raises(MacOSError, match="Unknown AX role"):
@@ -1142,12 +1142,220 @@ def test_ax_wait_fails_closed_on_ambiguity_and_timeout(monkeypatch) -> None:
     with pytest.raises(MacOSError, match="timed out"):
         mac.ax.wait(app="Chrome", text="Missing", timeout=0)
 
-    with pytest.raises(MacOSError, match="exactly one"):
-        mac.ax.wait(app="Chrome", all_apps=True, text="Not Now")
-    with pytest.raises(MacOSError, match="all_apps=True or apps"):
-        mac.ax.wait(all_apps=True, apps=["Chrome"], text="Not Now")
     with pytest.raises(MacOSError, match="requires non-empty text"):
         mac.ax.wait(all_apps=True)
+
+
+_SCOPED_AX_CALLS = (
+    pytest.param(lambda mac, scope: mac.ax.query("Allow", **scope), id="ax.query"),
+    pytest.param(lambda mac, scope: mac.ax.query_all("Allow", **scope), id="ax.query_all"),
+    pytest.param(lambda mac, scope: mac.ax.wait("Allow", **scope), id="ax.wait"),
+    pytest.param(lambda mac, scope: mac.ax.wait_gone("Allow", **scope), id="ax.wait_gone"),
+    pytest.param(lambda mac, scope: mac.ax.press("Allow", **scope), id="ax.press"),
+    pytest.param(lambda mac, scope: mac.do.press(text="Allow", **scope), id="do.press"),
+    pytest.param(lambda mac, scope: mac.do.set("yes", text="Allow", **scope), id="do.set"),
+    pytest.param(lambda mac, scope: mac.do.toggle(True, text="Allow", **scope), id="do.toggle"),
+)
+_ONE_SCOPE = "Pass exactly one of app, all_apps=True, or apps"
+
+
+@pytest.mark.parametrize(
+    ("scope", "message", "details"),
+    (
+        pytest.param({"app": "Demo", "all_apps": True}, _ONE_SCOPE, {"parameter": "scope"}, id="app+all_apps"),
+        pytest.param({"all_apps": True, "apps": ["Demo"]}, _ONE_SCOPE, {"parameter": "scope"}, id="all_apps+apps"),
+        pytest.param({"app": "Demo", "apps": "Demo"}, _ONE_SCOPE, {"parameter": "scope"}, id="app+apps"),
+        pytest.param(
+            {"apps": []},
+            "apps must contain at least one non-empty selector",
+            {"parameter": "apps"},
+            id="no-apps",
+        ),
+        pytest.param({"app": "  "}, "app must be a nonempty string, not '  '", {"parameter": "app"}, id="blank-app"),
+        pytest.param({"app": 0}, "app must be a positive pid, not 0", {"parameter": "app", "value": 0}, id="zero-pid"),
+        pytest.param(
+            {"apps": ["Demo", ""]},
+            "apps must be a nonempty string, not ''",
+            {"parameter": "apps"},
+            id="blank-apps-entry",
+        ),
+        pytest.param(
+            {"apps": [-1]},
+            "apps must be a positive pid, not -1",
+            {"parameter": "apps", "value": -1},
+            id="negative-apps-pid",
+        ),
+    ),
+)
+@pytest.mark.parametrize("call", _SCOPED_AX_CALLS)
+def test_every_ax_search_and_mutation_rejects_a_bad_scope_alike(call, scope, message, details) -> None:
+    """``app``, ``all_apps=True``, and ``apps`` mean the same thing in
+    every call that takes them, so a bad scope fails with the same error
+    everywhere, before any app is searched."""
+    mac = _ScriptedAX(sweep=lambda **kwargs: pytest.fail("a bad scope must not search"))
+
+    with pytest.raises(MacOSError) as caught:
+        call(mac, scope)
+
+    assert caught.value.to_json() == {"code": "bad_request", "message": message, "details": details}
+    assert mac.reads == []
+
+
+class _ScriptedAX(MacOS):
+    """A Mac whose AX boundary is scripted instead of read from real apps.
+
+    Each of ``apps`` (name to pid) runs and shows one "Allow" button to the
+    per-app search. ``sweep``, when given, answers the cross-app search in
+    place of searching each app. Records the attributes every per-app
+    search read and every action performed.
+    """
+
+    def __init__(self, *, apps: dict[str, int] | None = None, sweep=None) -> None:
+        super().__init__()
+        self.apps = apps or {}
+        self.sweep = sweep
+        self.reads: list[tuple[str, ...]] = []
+        self.pressed: list[tuple[int, str]] = []
+
+    def _ensure_accessibility(self) -> None:
+        pass
+
+    def list_apps(self) -> list[dict[str, object]]:
+        return [{"name": name, "pid": pid} for name, pid in self.apps.items()]
+
+    def _resolve_app(self, query):
+        return None, {"name": query, "pid": self.apps[query]}
+
+    def ax_search(self, *, attributes, app=None, app_pid=None, **kwargs) -> SearchMatches:
+        self.reads.append(tuple(attributes))
+        pid = app_pid if app_pid is not None else self.apps[app]
+        return _found({"element_index": pid, "role": "AXButton", "title": "Allow"})
+
+    def ax_search_all(self, **kwargs) -> SearchMatches:
+        if self.sweep is None:
+            return super().ax_search_all(**kwargs)
+        return self.sweep(**kwargs)
+
+    @classmethod
+    def _frontmost_app(cls) -> dict[str, object]:
+        return {"name": "Finder", "pid": 1}
+
+    def perform_action(self, element_index: int, action: str = "AXPress") -> None:
+        self.pressed.append((element_index, action))
+
+
+@pytest.mark.parametrize(
+    ("search", "owners"),
+    (
+        pytest.param(lambda ax: ax.query("Allow", all_apps=True), [11, 22], id="query-all_apps"),
+        pytest.param(lambda ax: ax.query("Allow", apps=["osascript"]), [22], id="query-apps"),
+        pytest.param(lambda ax: ax.query_all("Allow"), [11, 22], id="query_all"),
+        pytest.param(lambda ax: ax.query_all("Allow", all_apps=True), [11, 22], id="query_all-all_apps"),
+        pytest.param(lambda ax: ax.query_all("Allow", apps="osascript"), [22], id="query_all-apps"),
+    ),
+)
+def test_ax_query_and_query_all_search_the_apps_their_scope_names(search, owners) -> None:
+    """A cross-app search names each match's owner and, by default, never
+    reads ``AXValue`` out of another app."""
+    mac = _ScriptedAX(apps={"Finder": 11, "osascript": 22})
+
+    matches = search(mac.ax)
+
+    assert [match["app"]["pid"] for match in matches] == owners
+    assert mac.reads and all("AXValue" not in read for read in mac.reads)
+
+
+@pytest.mark.parametrize("method", ["query", "query_all"])
+def test_ax_query_and_query_all_search_only_the_app_named_by_app(method) -> None:
+    mac = _ScriptedAX(apps={"Finder": 11, "osascript": 22})
+
+    matches = getattr(mac.ax, method)("Allow", app="osascript")
+
+    assert [match["element_index"] for match in matches] == [22]
+    assert "app" not in matches[0]
+
+
+def _dialog_button(element_index: int, field: str, label: str) -> dict[str, object]:
+    """A pressable dialog button whose ``field`` (title or description)
+    reads ``label``, as a cross-app sweep reports it."""
+    return {
+        "element_index": element_index,
+        "role": "AXButton",
+        field: label,
+        "actions": ["AXPress"],
+        "app": {"name": "osascript", "pid": 7},
+    }
+
+
+@pytest.mark.parametrize("field", ["title", "description"])
+def test_ax_press_takes_the_one_exact_label_among_substring_matches(field) -> None:
+    """Text is a substring search, so "Allow" also finds "Don't Allow".
+    The one button labelled exactly "Allow" is the target, even from a
+    sweep that could not read every app, as one substring match would be."""
+    mac = _ScriptedAX(
+        sweep=lambda **kwargs: _found(
+            _dialog_button(1, field, "Don't Allow"),
+            _dialog_button(2, field, "Allow"),
+            complete=False,
+        ),
+    )
+
+    match = mac.ax.press("Allow", role="button", all_apps=True)
+
+    assert match[field] == "Allow"
+    assert mac.pressed == [(2, "AXPress")]
+
+
+@pytest.mark.parametrize(
+    ("sweep", "selectors"),
+    (
+        pytest.param(
+            lambda **kwargs: _found(
+                _dialog_button(1, "title", "Allow"),
+                _dialog_button(2, "title", "Don't Allow"),
+                _dialog_button(3, "description", "Allow"),
+            ),
+            {},
+            id="two-exact-labels",
+        ),
+        pytest.param(
+            lambda **kwargs: _found(
+                _dialog_button(1, "title", "Allow Once"),
+                _dialog_button(2, "title", "Don't Allow"),
+            ),
+            {},
+            id="no-exact-label",
+        ),
+        pytest.param(
+            lambda *, limit, **kwargs: _found(
+                _dialog_button(0, "title", "Allow"),
+                *(_dialog_button(index, "title", f"Don't Allow {index}") for index in range(1, limit)),
+            ),
+            {},
+            id="search-filled-its-limit",
+        ),
+        pytest.param(
+            lambda **kwargs: _found(
+                _dialog_button(1, "title", "Allow"),
+                _dialog_button(2, "title", "Don't Allow"),
+                complete=False,
+            ),
+            {"identifier": "dialog-button"},
+            id="exact-selector-incomplete-search",
+        ),
+    ),
+)
+def test_ax_press_stays_ambiguous_unless_one_exact_label_is_proven(sweep, selectors) -> None:
+    """Two exact labels, none, a search that filled its limit (an unread
+    match could be a second "Allow"), or an exact selector's incomplete
+    search leave the tie unsettled, and nothing is pressed."""
+    mac = _ScriptedAX(sweep=sweep)
+
+    with pytest.raises(MacOSError, match=r"AX wait found \d+ matches") as caught:
+        mac.ax.press("Allow", role="button", all_apps=True, **selectors)
+
+    assert caught.value.code == ErrorCode.BAD_REQUEST
+    assert mac.pressed == []
 
 
 def test_ax_press_supports_one_line_cross_app_use(monkeypatch) -> None:

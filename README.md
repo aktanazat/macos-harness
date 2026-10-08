@@ -431,39 +431,52 @@ targets: `any`, `button`, `checkbox`, `combo box`, `image`, `link`, `list`,
 `text field`. An unknown role raises `MacOSError`. Do not pass both `role` and
 `search_key`.
 
+Each of them, and `mac.do.press`, `set`, and `toggle`, takes one scope: `app=`
+for one app, `all_apps=True` for every running app, or `apps=` for a set. One
+check covers all of them: two scopes, a blank selector, a pid below 1, or an
+empty `apps` raise `MacOSError` (`bad_request`) before any search. With no
+scope, raw calls use the last app and `query_all` searches every app; `mac.do`
+mutations need one.
+
+`text` is a substring filter, so `"Allow"` also finds `"Don't Allow"`. When it
+finds several matches and exactly one has a title or description equal to
+`text`, case included, `wait`, `press`, and `mac.do` take that one. Two exact
+labels, none, or a search that filled its limit still fail closed. The native
+agent applies the same rule.
+
 `title=`, `identifier=`, and `description=` compare the whole attribute,
-including case. Every supplied exact selector must match; `text` remains a
-substring filter. Exact filtering happens before the result limit. The ordinary
-tree fallback rejects unsupported search keys instead of treating them as `any`.
+including case. Every supplied exact selector must match. Exact filtering
+happens before the result limit. The ordinary tree fallback rejects unsupported
+search keys instead of treating them as `any`.
 
 Query results remain lists and expose `complete` and `visited`. A result or
 traversal limit, failed attribute read, or skipped process can leave the search
 incomplete. `visited` counts returned candidates for optimized searches and
 visited nodes for tree walks. A complete result does not freeze the app's state.
 
-Use `apps=` to limit a cross-process search. Pass one app selector or an
-iterable of selectors. Each selector can be an app name, bundle ID, path, or
-PID. Duplicate PIDs are removed.
+Pass `apps=` one app selector or an iterable of selectors. Each selector can be
+an app name, bundle ID, path, or PID. Duplicate PIDs are removed.
 
 ```python
 mac.ax.wait("Not Now", role="button", apps="Spotify")
 mac.ax.wait_gone("Not Now", role="button", apps=["Spotify"])
 ```
 
-`query_all` searches every running app, or only the apps named in `apps`. It
-uses one positive global `limit`, applies a timeout to each process, and adds
-owner metadata (`name`, `bundle_id`, `pid`, `path`) to every match. A broad
-search skips inaccessible processes. A scoped `apps` search reports a target
-failure. Element handles remain valid until the next AX snapshot or search.
+A cross-app search (`all_apps=True` or `apps=`) uses one positive global
+`limit`, applies a timeout to each process, and adds owner metadata (`name`,
+`bundle_id`, `pid`, `path`) to every match. A broad search skips inaccessible
+processes. A scoped `apps` search reports a target failure. Element handles
+remain valid until the next AX snapshot or search.
 
 Cross-process calls require non-empty search text or an exact selector. Default
 result attributes exclude `AXValue`. Reading a value remains a separate, explicit
 `ax.get` call or custom `attributes` choice.
 
-`wait` polls one `app`, every app with `all_apps=True`, or the target set in
-`apps`. Pass exactly one scope. Zero matches keep polling until `timeout`.
-Multiple matches fail closed with owner, role, and title details. With an exact
-selector, a single match is accepted only from a complete search.
+`wait` polls its scope until one match appears. Zero matches keep polling until
+`timeout`. Multiple matches fail closed with owner, role, and title details.
+With an exact selector, a single match is accepted only from a complete search.
+A sweep of every app is often incomplete because some processes do not answer,
+so give an exact selector one app.
 
 `wait_gone` requires two consecutive complete, empty searches. A named app that
 exits counts as gone. `press` waits for one match, requires `AXPress`, performs it, and
