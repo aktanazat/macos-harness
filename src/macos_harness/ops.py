@@ -1605,13 +1605,13 @@ class Operations:
 
     def press(
         self,
+        text: str | None = None,
         *,
         app: str | int | None = None,
         all_apps: bool = False,
         apps: str | int | Iterable[str | int] | None = None,
         role: str | None = None,
         search_key: str | None = None,
-        text: str | None = None,
         title: str | None = None,
         identifier: str | None = None,
         description: str | None = None,

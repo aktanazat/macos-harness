@@ -54,7 +54,10 @@ final class AXExecutor {
   }
 
   func frontmostApplicationPID() -> pid_t? {
-    Self.queue.sync { NSWorkspace.shared.frontmostApplication?.processIdentifier }
+    Self.queue.sync {
+      Self.takeInWorkspaceChanges()
+      return NSWorkspace.shared.frontmostApplication?.processIdentifier
+    }
   }
 
   // MARK: - AX query
@@ -179,8 +182,28 @@ final class AXExecutor {
 
   // MARK: - App discovery internals (must only run on `queue`)
 
+  /// Lets `NSWorkspace` take in every app launch, quit, and activation it has been told about
+  /// since this process last looked. It learns of them from notifications it handles on the
+  /// main thread's run loop, and this process never otherwise turns that loop: `Main.swift`
+  /// serves the session with blocking reads on the main thread. Without this turn,
+  /// `runningApplications` and `frontmostApplication` stay as they were at the first read, so an
+  /// app launched later -- the process behind a permission dialog, say -- never appears, and the
+  /// press focus guard never sees a target come to the front. Mirrors `MacOS._running_applications`
+  /// in `macos.py`.
+  ///
+  /// The turn must happen on the main thread; a turn on any other thread changes nothing. A
+  /// `queue.sync` block runs on its caller's thread, and the only production caller is the
+  /// session on the main thread. The turn cannot re-enter this agent: it adds nothing to the
+  /// main queue or the main run loop, and the session reads its socket with a blocking `read(2)`,
+  /// not a run-loop source, so only AppKit's own bookkeeping runs here.
+  private static func takeInWorkspaceChanges() {
+    precondition(Thread.isMainThread, "NSWorkspace app state is only fresh on the main thread")
+    RunLoop.current.run(mode: .default, before: Date())
+  }
+
   private static func runningApps() -> [AppInfo] {
-    NSWorkspace.shared.runningApplications
+    takeInWorkspaceChanges()
+    return NSWorkspace.shared.runningApplications
       .map(appInfo(from:))
       .filter { !$0.name.isEmpty }
       .sorted { lhs, rhs in

@@ -792,6 +792,8 @@ def test_strict_wait_never_trusts_one_match_from_a_cut_search(monkeypatch) -> No
         "complete": False,
         "visited": 1,
         "max_nodes": 300,
+        "partial": [],
+        "unanswered": 0,
     }
 
 
@@ -867,6 +869,8 @@ def test_wait_gone_never_certifies_absence_from_a_cut_search(monkeypatch) -> Non
         "complete": False,
         "visited": 0,
         "max_nodes": 300,
+        "partial": [],
+        "unanswered": 0,
     }
 
 
@@ -993,8 +997,21 @@ def test_cleared_element_handles_never_alias() -> None:
         mac._element(old_index)
 
 
+class _ProbedMac(MacOS):
+    """A Mac whose sweep's up-front answer probe reports ``silent`` as the
+    apps that cannot answer, so a test's scripted per-app search decides
+    every other app's outcome."""
+
+    def __init__(self, silent: frozenset[int] = frozenset()) -> None:
+        super().__init__()
+        self.silent = silent
+
+    def _silent_pids(self, pids) -> frozenset[int]:
+        return self.silent
+
+
 def test_ax_query_all_scans_every_app_without_mutating_targets(monkeypatch) -> None:
-    mac = MacOS()
+    mac = _ProbedMac()
     apps = [
         {"name": "First", "bundle_id": "one", "pid": 1, "path": "/First"},
         {"name": "Blocked", "bundle_id": "two", "pid": 2, "path": "/Blocked"},
@@ -1052,14 +1069,21 @@ def test_ax_query_all_scans_every_app_without_mutating_targets(monkeypatch) -> N
 
 
 @pytest.mark.parametrize("method", ["wait", "wait_gone"])
-def test_cross_app_wait_cannot_certify_a_search_that_skipped_an_app(monkeypatch, method) -> None:
-    mac = MacOS()
+@pytest.mark.parametrize("gap", ["its search failed", "it did not answer"])
+def test_cross_app_wait_cannot_certify_a_search_that_skipped_an_app(monkeypatch, method, gap) -> None:
+    """One app left unsearched -- its search failed, or it did not answer
+    the up-front probe and was skipped without a search -- leaves the
+    sweep incomplete, so a wait can neither confirm nor rule out a match."""
+    silent = frozenset({2}) if gap == "it did not answer" else frozenset()
+    mac = _ProbedMac(silent)
     apps = [{"name": "Readable", "pid": 1}, {"name": "Unreadable", "pid": 2}]
     answer = _found({"element_index": 7, "role": "AXButton", "title": "Save"}) if method == "wait" else _found()
     monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
     monkeypatch.setattr(mac, "list_apps", lambda: apps)
+    searched = []
 
     def search(*, app_pid, **kwargs):
+        searched.append(app_pid)
         if app_pid == 2:
             raise MacOSError("Unreadable app", code=ErrorCode.AX_ERROR)
         return answer
@@ -1074,6 +1098,9 @@ def test_cross_app_wait_cannot_certify_a_search_that_skipped_an_app(monkeypatch,
 
     assert failure.value.code == ErrorCode.TIMEOUT
     assert failure.value.details["complete"] is False
+    assert failure.value.details["unanswered"] == 1
+    # An app that did not answer the probe costs no search of its own.
+    assert (2 in searched) == (not silent)
 
 
 def test_ax_role_aliases_and_app_selectors_fail_closed(monkeypatch) -> None:
@@ -1220,6 +1247,9 @@ class _ScriptedAX(MacOS):
 
     def _ensure_accessibility(self) -> None:
         pass
+
+    def _silent_pids(self, pids) -> frozenset[int]:
+        return frozenset()
 
     def list_apps(self) -> list[dict[str, object]]:
         return [{"name": name, "pid": pid} for name, pid in self.apps.items()]
@@ -1980,8 +2010,9 @@ def test_click_screen_space_omits_image_coordinates_from_a_different_app(
 
 def test_screen_point_requires_screenshot() -> None:
     mac = MacOS()
-    with pytest.raises(MacOSError, match="Take a screenshot"):
+    with pytest.raises(MacOSError) as failure:
         mac._screen_point(10, 20, "screenshot")
+    assert failure.value.code == ErrorCode.BAD_REQUEST
 
 
 def test_screen_point_converts_retina_pixels() -> None:

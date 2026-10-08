@@ -11,6 +11,28 @@ follows [Semantic Versioning](https://semver.org/).
   reaches an app that started after the harness first listed apps, such as
   the process behind a permission dialog. Each listing reads the running
   apps afresh; before, the list stayed as it was at the first read.
+- The frontmost app is read afresh on both backends. `mac.activate` now sees
+  its request take, and the focus guard after a press catches a target that
+  brings itself to the front; before, a process kept seeing whichever app was
+  in front at its first look. The native agent's app list and app lookup
+  likewise see apps launched after its first read.
+- A broad all-apps search, query, wait or press on the Python backend first
+  asks every app at once whether it can answer Accessibility, then skips the
+  ones that cannot (a stopped app, a web content helper) instead of waiting
+  out each one's half-second timeout in turn: about 1.8 s instead of 2.7 to
+  3.4 s per sweep on a Mac running about 90 apps. Skipped apps leave the
+  search incomplete, so a wait never confirms a match or its absence across
+  them.
+- A wait that times out on an incomplete search names the apps it searched
+  only in part and counts the apps that did not answer, in the message and
+  in `details["partial"]` and `details["unanswered"]`.
+- AXError messages say what the code means. An action that fails with -25204
+  warns that it may have taken effect.
+- `mac.do.press` takes the search text as its first positional argument,
+  like `mac.ax.press`.
+- The errors for an unknown role, an element index from an earlier search
+  or run, and screenshot coordinates with no screenshot in the run say what
+  to do instead.
 
 - A substring AX search that finds several matches now takes the one whose
   whole title or description equals the search text, so

@@ -122,7 +122,10 @@ class Accessibility:
                 "menu item, radio button, static text, table, text area, text field"
             )
             raise MacOSError(
-                f"Unknown AX role {role!r}; choose one of: {valid}",
+                f"Unknown AX role {role!r}; choose one of: {valid}. For any "
+                "other kind (window, row, group, scroll bar, ...) pass "
+                "role='any' and read each match's 'role'; mac.windows(app) "
+                "lists an app's windows",
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "role", "value": role},
             ) from exc

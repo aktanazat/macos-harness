@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -160,13 +162,18 @@ def _native_agent_status() -> dict[str, Any] | None:
         session.close()
 
 
-def _require_trusted_native_agent() -> None:
+def _require_native_agent() -> bool:
+    """Skip unless the native agent runs here; say whether it is trusted."""
     if os.environ.get("MACOS_HARNESS_RUN_NATIVE_SMOKE") != "1":
         pytest.skip("set MACOS_HARNESS_RUN_NATIVE_SMOKE=1 to run native smoke tests")
     status = _native_agent_status()
     if status is None:
         pytest.skip("native agent toolchain/runtime is unavailable")
-    if not status.get("trusted"):
+    return bool(status.get("trusted"))
+
+
+def _require_trusted_native_agent() -> None:
+    if not _require_native_agent():
         pytest.skip("native agent lacks Accessibility trust")
 
 
@@ -1020,6 +1027,147 @@ def test_native_press_round_trip_without_activation() -> None:
                 proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+
+# An AppKit app with no window, Dock icon, or activation: says "ready" once
+# it has finished launching and stays up until killed.
+_LATE_APP_SCRIPT = """\
+from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
+from Foundation import NSDate, NSRunLoop
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+app.finishLaunching()
+print("ready", flush=True)
+NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(30))
+"""
+
+
+@pytest.mark.native
+@pytest.mark.smoke
+def test_native_list_apps_sees_an_app_launched_after_the_first_read() -> None:
+    """An app that starts after the agent first listed apps -- the process
+    behind a permission dialog, say -- must appear in later native lists,
+    or no all-apps sweep through the agent can ever reach it."""
+    _require_native_agent()
+
+    with MacOS(backend="native") as mac:
+        mac.list_apps()
+        late = subprocess.Popen(
+            [sys.executable, "-c", _LATE_APP_SCRIPT], stdout=subprocess.PIPE, text=True
+        )
+        try:
+            assert _read_ready_line(late) == "ready"
+            deadline = time.monotonic() + 5
+            while late.pid not in {app["pid"] for app in mac.list_apps()}:
+                assert time.monotonic() < deadline, (
+                    "an app launched after the agent's first list never appeared"
+                )
+                time.sleep(0.05)
+        finally:
+            late.kill()
+            late.wait()
+
+
+# A background AppKit app whose one button brings the app itself to the
+# front, as an app that answers a press by activating does.
+_SELF_ACTIVATING_HELPER = r'''
+import os
+
+from AppKit import (
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+    NSBackingStoreBuffered,
+    NSButton,
+    NSMakeRect,
+    NSObject,
+    NSWindow,
+    NSWindowStyleMaskTitled,
+)
+
+
+class _Target(NSObject):
+    def pressed_(self, sender):
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+    NSMakeRect(100.0, 100.0, 240.0, 120.0), NSWindowStyleMaskTitled, NSBackingStoreBuffered, False
+)
+button = NSButton.alloc().initWithFrame_(NSMakeRect(40.0, 40.0, 160.0, 32.0))
+button.setTitle_("harness-activate")
+target = _Target.alloc().init()
+button.setTarget_(target)
+button.setAction_("pressed:")
+window.contentView().addSubview_(button)
+window.orderFrontRegardless()
+print(f"READY {os.getpid()}", flush=True)
+app.run()
+'''
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("backend", ["python", pytest.param("native", marks=pytest.mark.native)])
+def test_press_reports_a_target_that_makes_itself_frontmost(backend: str) -> None:
+    """A press whose target answers by coming to the front raises
+    `FocusChangedError`, even as the first thing a fresh process does:
+    the guard must compare the frontmost app before and after the press,
+    not one reading taken at the process's first look."""
+    if backend == "native":
+        _require_trusted_native_agent()
+    elif os.environ.get("MACOS_HARNESS_RUN_NATIVE_SMOKE") != "1":
+        pytest.skip("set MACOS_HARNESS_RUN_NATIVE_SMOKE=1 to run live smoke tests")
+    elif not macos_module.AS.AXIsProcessTrusted():
+        pytest.skip("this process lacks Accessibility trust")
+
+    helper = subprocess.Popen(
+        [sys.executable, "-c", _SELF_ACTIVATING_HELPER],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        helper_pid = int(_read_ready_line(helper).split(" ", 1)[1])
+        with MacOS(backend=backend) as mac, pytest.raises(FocusChangedError, match="became frontmost"):
+            mac.ax.press("harness-activate", app=helper_pid, role="button", timeout=10.0)
+    finally:
+        helper.kill()
+        helper.wait()
+
+
+@pytest.mark.smoke
+def test_all_apps_sweep_reaches_an_answering_app_and_flags_a_frozen_one() -> None:
+    """An all-apps search finds the button of an app that answers, and an
+    app that cannot answer -- here one stopped mid-run -- neither hides
+    that match nor passes for searched: the sweep says it is incomplete."""
+    if os.environ.get("MACOS_HARNESS_RUN_NATIVE_SMOKE") != "1":
+        pytest.skip("set MACOS_HARNESS_RUN_NATIVE_SMOKE=1 to run live smoke tests")
+    if not macos_module.AS.AXIsProcessTrusted():
+        pytest.skip("this process lacks Accessibility trust")
+
+    helpers = [
+        subprocess.Popen(
+            [sys.executable, "-c", _SELF_ACTIVATING_HELPER],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    try:
+        answering, frozen = (int(_read_ready_line(helper).split(" ", 1)[1]) for helper in helpers)
+        os.kill(frozen, signal.SIGSTOP)
+        with MacOS(backend="python") as mac:
+            found = mac.ax.query_all("harness-activate", role="button", limit=10)
+        assert [match["app"]["pid"] for match in found] == [answering]
+        assert found.complete is False
+        assert found.unanswered >= 1
+    finally:
+        for helper in helpers:
+            helper.kill()
+            helper.wait()
 
 
 def test_native_press_retries_only_on_delayed_appearance(monkeypatch) -> None:

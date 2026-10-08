@@ -21,6 +21,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
@@ -202,6 +203,10 @@ _AX_CROSS_APP_MESSAGING_TIMEOUT = 0.5
 # plausibly finds -- "Allow" also finds "Don't Allow". Mirrors
 # `PressCoordinator.labelSearchLimit` in the native agent.
 _AX_LABEL_SEARCH_LIMIT = 20
+# How many apps a broad sweep asks at once whether they can answer
+# Accessibility (`MacOS._silent_pids`): enough that the few that never
+# answer cost one messaging timeout together instead of one each.
+_AX_PROBE_WORKERS = 16
 # A process younger than this with no window is presumed still launching,
 # and a capture waits for its first window instead of failing at once.
 _LAUNCH_GRACE_SECONDS = 5.0
@@ -489,9 +494,30 @@ def _truncate(value: str, limit: int = 160) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
-def _ax_error(operation: str, error: int, **details: object) -> MacOSError:
+# What the AXError codes agents meet mean, so an error says what happened
+# instead of only a number. Apple's `AXError.h`, in words.
+_AX_ERROR_MEANINGS = {
+    -25202: "the element is gone; query it again",
+    -25204: "the app did not answer in time",
+    -25205: "the element has no such attribute",
+    -25206: "the element does not support that action",
+    -25208: "the app does not implement Accessibility",
+    -25211: "Accessibility is off for this process, or the app refuses it",
+    -25212: "the attribute has no value",
+}
+
+
+def _ax_error(
+    operation: str, error: int, *, hint: str | None = None, **details: object
+) -> MacOSError:
+    meaning = _AX_ERROR_MEANINGS.get(int(error))
+    message = f"{operation} failed with AXError {error}"
+    if meaning is not None:
+        message += f" ({meaning})"
+    if hint is not None:
+        message += f"; {hint}"
     return MacOSError(
-        f"{operation} failed with AXError {error}",
+        message,
         code=ErrorCode.AX_ERROR,
         details={"ax_error": int(error), "operation": operation, **details},
     )
@@ -528,7 +554,7 @@ class SearchMatches(list[dict[str, JSONValue]]):
     disappearance waits require it before accepting an empty search.
     """
 
-    __slots__ = ("complete", "visited")
+    __slots__ = ("complete", "partial", "unanswered", "visited")
 
     def __init__(
         self,
@@ -540,6 +566,36 @@ class SearchMatches(list[dict[str, JSONValue]]):
         super().__init__(matches)
         self.complete = complete
         self.visited = visited
+        # A cross-app sweep's gaps: the apps it searched only in part, by
+        # name, and how many apps did not answer at all.
+        self.partial: list[str] = []
+        self.unanswered = 0
+
+
+def _search_gaps(matches: SearchMatches, max_nodes: int) -> tuple[str, dict[str, JSONValue]]:
+    """What an incomplete search left out, for a timeout to say: the apps
+    a sweep searched only in part, the apps that did not answer, or the
+    node budget that cut one app's walk short."""
+    note = ""
+    if matches.partial:
+        shown = ", ".join(matches.partial[:5])
+        more = len(matches.partial) - 5
+        note += (
+            f"; searched only in part: {shown}"
+            + (f" and {more} more" if more > 0 else "")
+            + " (pass app= to search one of them alone, or a larger max_nodes)"
+        )
+    elif not matches.unanswered and matches.visited >= max_nodes:
+        note += f"; the search stopped at max_nodes={max_nodes}, so pass a larger max_nodes"
+    if matches.unanswered:
+        note += f"; {matches.unanswered} apps did not answer"
+    return note, {
+        "complete": False,
+        "visited": matches.visited,
+        "max_nodes": max_nodes,
+        "partial": list(matches.partial),
+        "unanswered": matches.unanswered,
+    }
 
 
 class _ExactSelector(NamedTuple):
@@ -1134,18 +1190,27 @@ class MacOS:
         return sorted(apps, key=lambda item: (item["name"].casefold(), item["pid"]))
 
     @staticmethod
-    def _running_applications() -> Iterable[NSRunningApplication]:
-        """Every running app as of now, not as of this process's last look.
+    def _take_in_workspace_changes() -> None:
+        """Let `NSWorkspace` catch up with every app that launched, quit,
+        or came to the front since this process last looked.
 
-        `NSWorkspace` updates `runningApplications` from notifications it
-        takes in on the run loop, which this process otherwise never turns:
-        an app that launches after the first read -- the process behind a
-        permission dialog, say -- stays missing for good, and no all-apps
-        sweep can reach it. One zero-wait turn first takes them in.
+        It updates ``runningApplications`` and ``frontmostApplication``
+        from notifications it takes in on the main thread's run loop,
+        which this process otherwise never turns. Without a turn, an app
+        that launches after the first read -- the process behind a
+        permission dialog, say -- stays missing for good, and the
+        frontmost app stays whatever it was: `activate` never sees its
+        request take, and every focus guard compares one stale reading
+        with itself. One zero-wait turn takes the changes in.
         """
         from Foundation import NSDate, NSDefaultRunLoopMode, NSRunLoop
 
         NSRunLoop.currentRunLoop().runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.date())
+
+    @classmethod
+    def _running_applications(cls) -> Iterable[NSRunningApplication]:
+        """Every running app as of now, not as of this process's last look."""
+        cls._take_in_workspace_changes()
         return NSWorkspace.sharedWorkspace().runningApplications()
 
     @staticmethod
@@ -1244,6 +1309,8 @@ class MacOS:
 
     @classmethod
     def _frontmost_app(cls) -> dict[str, Any] | None:
+        """The app in front now, not as of this process's last look."""
+        cls._take_in_workspace_changes()
         app = NSWorkspace.sharedWorkspace().frontmostApplication()
         return None if app is None else cls._app_info(app)
 
@@ -1336,8 +1403,18 @@ class MacOS:
         if len(matches) > 1:
             ranked = self._rank_matches(matches)
             names = ", ".join(self._describe_match(info) for info in ranked[:8])
+            # Only partial matches usually means the app itself is not
+            # running and the name hit its helpers ("Passwords" finding
+            # PasswordsMenuBarExtra): picking a pid would act on the wrong
+            # process.
+            choose = (
+                "pass a pid"
+                if exact
+                else f"no running app is named exactly {query!r}, so launch it "
+                "first, or pass the pid of one of these"
+            )
             raise MacOSError(
-                f"Application query {query!r} is ambiguous; pass a pid: {names}",
+                f"Application query {query!r} is ambiguous; {choose}: {names}",
                 code=ErrorCode.APP_AMBIGUOUS,
                 details={"query": query, "matches": ranked},
             )
@@ -1878,7 +1955,9 @@ class MacOS:
             return self._elements[int(element_index)]
         except (KeyError, ValueError) as exc:
             raise MacOSError(
-                f"Unknown element index {element_index!r}; take a fresh snapshot first",
+                f"Unknown element index {element_index!r}; an index lasts only "
+                "until the next search or snapshot in the same macos-harness "
+                "run, so query the element again first",
                 code=ErrorCode.ELEMENT_UNKNOWN,
                 details={"element_index": element_index},
             ) from exc
@@ -2530,6 +2609,35 @@ class MacOS:
             resolved.append(info)
         return resolved
 
+    @staticmethod
+    def _silent_pids(pids: Iterable[int]) -> frozenset[int]:
+        """The apps among ``pids`` that cannot answer Accessibility now.
+
+        A process that is not serving Accessibility -- a web content
+        helper, a command-line tool registered as an app -- fails a search
+        only after the full cross-app messaging timeout, every sweep, one
+        after another. One cheap read of every app at once finds them in
+        about one timeout together, so a sweep can skip them.
+        """
+        # PyObjC binds framework symbols lazily, and two threads binding
+        # the same one at once can fail with KeyError: bind them here,
+        # on one thread, before fanning out.
+        create = AS.AXUIElementCreateApplication
+        set_timeout = AS.AXUIElementSetMessagingTimeout
+        copy_value = AS.AXUIElementCopyAttributeValue
+        cannot_complete = AS.kAXErrorCannotComplete
+
+        def silent(pid: int) -> bool:
+            element = create(pid)
+            set_timeout(element, _AX_CROSS_APP_MESSAGING_TIMEOUT)
+            error, _ = copy_value(element, "AXRole", None)
+            return error == cannot_complete
+
+        pids = tuple(pids)
+        with ThreadPoolExecutor(max_workers=_AX_PROBE_WORKERS) as pool:
+            quiet = tuple(pool.map(silent, pids))
+        return frozenset(pid for pid, is_silent in zip(pids, quiet, strict=True) if is_silent)
+
     @classmethod
     def _ax_scope(
         cls,
@@ -2608,6 +2716,13 @@ class MacOS:
         selectors = self._normalize_apps(apps)
         infos = self._resolve_apps(selectors)
         strict = selectors is not None
+        # A broad sweep skips the apps that cannot answer instead of
+        # waiting out each one's timeout; they still leave it incomplete.
+        silent = (
+            frozenset()
+            if strict or self._backend != "python"
+            else self._silent_pids(int(info["pid"]) for info in infos)
+        )
         self._elements = {}
         matches = SearchMatches(complete=True, visited=0)
         first_error: MacOSError | None = None
@@ -2618,9 +2733,16 @@ class MacOS:
                 # Apps after this one were never searched.
                 matches.complete = False
                 break
+            pid = int(info["pid"])
+            if pid in silent:
+                matches.complete = False
+                matches.unanswered += 1
+                if first_error is None:
+                    first_error = _ax_error("Read AXRole", AS.kAXErrorCannotComplete, pid=pid)
+                continue
             try:
                 app_matches = self.ax_search(
-                    app_pid=int(info["pid"]),
+                    app_pid=pid,
                     search_key=search_key,
                     text=text,
                     title=title,
@@ -2647,11 +2769,14 @@ class MacOS:
                         details={**exc.details, "app": info},
                     ) from exc
                 matches.complete = False
+                matches.unanswered += 1
                 if first_error is None:
                     first_error = exc
                 continue
             searched = True
             matches.complete = matches.complete and app_matches.complete
+            if not app_matches.complete:
+                matches.partial.append(info["name"])
             matches.visited += app_matches.visited
             for match in app_matches:
                 match["app"] = dict(info)
@@ -2908,15 +3033,11 @@ class MacOS:
                     else "AX wait timed out without a match; the last search "
                     "was incomplete"
                 )
+                note, gaps = _search_gaps(matches, max_nodes)
                 raise MacOSError(
-                    message,
+                    message + note,
                     code=ErrorCode.TIMEOUT,
-                    details={
-                        "timeout": timeout,
-                        "complete": False,
-                        "visited": matches.visited,
-                        "max_nodes": max_nodes,
-                    },
+                    details={"timeout": timeout, **gaps},
                 )
             time.sleep(min(interval, remaining))
 
@@ -3014,20 +3135,19 @@ class MacOS:
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                message = (
+                    "AX wait timed out before two consecutive empty polls "
+                    "confirmed the match was gone"
+                )
                 details: dict[str, JSONValue] = {
                     "timeout": timeout,
                     "consecutive_empty_polls": empty_polls,
                 }
                 if not matches and not matches.complete:
-                    details.update(
-                        complete=False, visited=matches.visited, max_nodes=max_nodes
-                    )
-                raise MacOSError(
-                    "AX wait timed out before two consecutive empty polls "
-                    "confirmed the match was gone",
-                    code=ErrorCode.TIMEOUT,
-                    details=details,
-                )
+                    note, gaps = _search_gaps(matches, max_nodes)
+                    message += note
+                    details.update(gaps)
+                raise MacOSError(message, code=ErrorCode.TIMEOUT, details=details)
             time.sleep(min(interval, remaining))
 
     def ax_press(
@@ -3207,6 +3327,13 @@ class MacOS:
             raise _ax_error(
                 f"Perform {normalized} on element {element_index}",
                 error,
+                hint=(
+                    "an app often stops answering while the action opens a "
+                    "menu or dialog, so it may have taken effect: look before "
+                    "you retry"
+                    if error == AS.kAXErrorCannotComplete
+                    else None
+                ),
                 element_index=element_index,
                 action=normalized,
             )
@@ -3522,8 +3649,10 @@ class MacOS:
             return float(x), float(y)
         if self._last_screenshot is None:
             raise MacOSError(
-                "Take a screenshot before using window or screenshot coordinates, "
-                "or pass coordinate_space='screen'",
+                "No screenshot in this run to map window or screenshot "
+                "coordinates through: a screenshot does not carry over between "
+                "macos-harness runs, so call mac.see() earlier in the same "
+                "script, or pass coordinate_space='screen'",
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "coordinate_space", "value": coordinate_space},
             )

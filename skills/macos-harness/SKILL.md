@@ -267,6 +267,19 @@ mac.ax.query_all(text=None, *, app=None, all_apps=False, apps=None, role=None, t
 mac.ax.wait(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=500, timeout=5.0, interval=0.1)
 mac.ax.wait_gone(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=500, timeout=5.0, interval=0.1)
 mac.ax.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=500, timeout=5.0, interval=0.1)
+mac.do.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=500, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.set(value, *, app=None, all_apps=False, apps=None, role=None, text=None, title=None, identifier=None, description=None, attribute="AXValue", timeout=5.0, postcondition=None, dry_run=False)
+mac.do.toggle(desired, *, app=None, all_apps=False, apps=None, role=None, text=None, title=None, identifier=None, description=None, attribute="AXValue", timeout=5.0, postcondition=None, dry_run=False)
+mac.do.fill(value, *, app, role="text field", text=None, title=None, identifier=None, description=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.key(key, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.type(text, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.click(x, y, *, app, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.run(source, *, language="AppleScript", args=(), timeout=5.0, postcondition=None, once=None, dry_run=False, capture_output=False)
+mac.do.expect_any(outcomes, *, timeout=5.0, interval=0.1)
+mac.inspect(app, *, max_depth=12, max_nodes=300, include_values=False, screenshot=False)
+mac.windows(app=None)
+mac.list_apps()
+mac.handoff(*, reason, app)
 ```
 
 The AX calls also take rarer keywords: `attributes`, `include_actions`,
@@ -296,7 +309,9 @@ mac.ax.press("Not Now", role="button", all_apps=True)
 the first positional argument. Use `role=` for common targets: `any`, `button`,
 `checkbox`, `combo box`, `image`, `link`, `list`, `menu`, `menu item`,
 `radio button`, `static text`, `table`, `text area`, and `text field`. An
-unknown role raises `MacOSError`. Do not pass both `role` and `search_key`.
+unknown role raises `MacOSError`. For a window, row, group, scroll bar, or any
+other kind, pass `role="any"` and read each match's `role`; `mac.windows(app)`
+lists an app's windows. Do not pass both `role` and `search_key`.
 
 Each of them, and `mac.do.press`, `set`, and `toggle`, takes one scope: `app=`
 for one app, `all_apps=True` for every running app, or `apps=` for a set. Two
@@ -317,8 +332,9 @@ search before accepting a single match. An `all_apps` sweep is often
 incomplete because some processes do not answer, so give an exact selector one
 app: `mac.ax.press(title="Allow", role="button", app="UserNotificationCenter")`.
 If a limit, failed read, or skipped process leaves a search incomplete, narrow
-the scope or inspect the reported bound. The ordinary tree fallback rejects
-unsupported search keys.
+the scope or inspect the reported bound; a wait that times out on an
+incomplete search names the apps it searched only in part. The ordinary tree
+fallback rejects unsupported search keys.
 
 Pass `apps=` one app name, bundle ID, path, or PID, or an iterable of
 selectors. Duplicate PIDs are removed. `apps="Safari"` is one selector, not an
@@ -326,8 +342,16 @@ iterable of characters.
 
 A cross-app search (`all_apps=True` or `apps=`) applies one positive global
 `limit`, times out each process, and returns owner metadata under `app`. A
-broad search skips inaccessible processes. A scoped search reports target
-failures. Element handles remain valid until the next AX snapshot or search.
+broad search first asks every app at once whether it can answer and skips the
+ones that cannot, which leaves it incomplete. A scoped search reports target
+failures. Element handles remain valid until the next AX snapshot or search in
+the same `macos-harness` run. Neither an element index nor a `mac.see()`
+screenshot carries over to the next run: query again, or call `mac.see()`
+earlier in the same program.
+
+An action that fails with AXError -25204 (the app did not answer in time) may
+still have taken effect, because apps often stop answering while the action
+opens a menu or dialog. Look before you retry.
 
 Cross-process calls require non-empty text or an exact selector. Default
 attributes exclude `AXValue`; read it with `ax.get` or explicit attributes.
