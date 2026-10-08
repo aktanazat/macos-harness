@@ -7,6 +7,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- With the default Python backend, an all-apps search, query or press now
+  reaches an app that started after the harness first listed apps, such as
+  the process behind a permission dialog. Each listing reads the running
+  apps afresh; before, the list stayed as it was at the first read.
+
 - A substring AX search that finds several matches now takes the one whose
   whole title or description equals the search text, so
   `mac.ax.press("Allow", all_apps=True)` presses "Allow" beside "Don't Allow".

@@ -4,6 +4,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import NamedTuple, Never
 
@@ -1273,6 +1274,38 @@ def test_ax_query_and_query_all_search_only_the_app_named_by_app(method) -> None
 
     assert [match["element_index"] for match in matches] == [22]
     assert "app" not in matches[0]
+
+
+# Starts an AppKit app with no window or Dock icon, says "ready" once it
+# has finished launching, and stays up until killed.
+_LATE_APP_SCRIPT = """\
+from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
+from Foundation import NSDate, NSRunLoop
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+app.finishLaunching()
+print("ready", flush=True)
+NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(30))
+"""
+
+
+def test_list_apps_sees_an_app_launched_after_the_first_read() -> None:
+    """An app that starts after this process first listed apps -- the
+    process behind a permission dialog, say -- must appear in later
+    lists, or no all-apps sweep can ever reach it."""
+    mac = MacOS()
+    mac.list_apps()
+    late = subprocess.Popen([sys.executable, "-c", _LATE_APP_SCRIPT], stdout=subprocess.PIPE, text=True)
+    try:
+        assert late.stdout.readline().strip() == "ready"
+        deadline = time.monotonic() + 5
+        while late.pid not in {app["pid"] for app in mac.list_apps()}:
+            assert time.monotonic() < deadline, "an app launched after the first list never appeared"
+            time.sleep(0.05)
+    finally:
+        late.kill()
+        late.wait()
 
 
 def _dialog_button(element_index: int, field: str, label: str) -> dict[str, object]:

@@ -1126,12 +1126,27 @@ class MacOS:
             if client is not None:
                 return client.list_apps()
         apps: list[dict[str, Any]] = []
-        for app in NSWorkspace.sharedWorkspace().runningApplications():
+        for app in self._running_applications():
             info = self._app_info(app)
             if not info["name"]:
                 continue
             apps.append(info)
         return sorted(apps, key=lambda item: (item["name"].casefold(), item["pid"]))
+
+    @staticmethod
+    def _running_applications() -> Iterable[NSRunningApplication]:
+        """Every running app as of now, not as of this process's last look.
+
+        `NSWorkspace` updates `runningApplications` from notifications it
+        takes in on the run loop, which this process otherwise never turns:
+        an app that launches after the first read -- the process behind a
+        permission dialog, say -- stays missing for good, and no all-apps
+        sweep can reach it. One zero-wait turn first takes them in.
+        """
+        from Foundation import NSDate, NSDefaultRunLoopMode, NSRunLoop
+
+        NSRunLoop.currentRunLoop().runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.date())
+        return NSWorkspace.sharedWorkspace().runningApplications()
 
     @staticmethod
     def _app_info(app: Any) -> dict[str, Any]:
@@ -1283,7 +1298,7 @@ class MacOS:
         needle = str(query).casefold()
         candidates: list[tuple[Any, dict[str, Any]]] = []
         exact: list[tuple[Any, dict[str, Any]]] = []
-        for app in NSWorkspace.sharedWorkspace().runningApplications():
+        for app in self._running_applications():
             info = self._app_info(app)
             values = [str(info["pid"]), info["name"], info["bundle_id"], info["path"]]
             lowered = [str(value).casefold() for value in values if value]
