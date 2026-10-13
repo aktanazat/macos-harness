@@ -169,7 +169,7 @@ def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
 
     assert results == [
         {
-            "element_index": 3,
+            "element_index": 0,
             "role": "AXStaticText",
             "value": "Alessia playlist",
         }
@@ -229,6 +229,41 @@ def test_ax_query_fallback_keeps_earlier_element_handles(monkeypatch) -> None:
     mac.ax.query(app="Notes", text="Quit", include_actions=False)
 
     assert mac._elements[save_index] is save
+
+
+def test_ax_query_fallback_hands_out_handles_only_for_matches(monkeypatch) -> None:
+    """Repeated fallback searches grow the handle registry by their matches only."""
+    mac = MacOS()
+    root, button, match = (object() for _ in range(3))
+    data = {
+        root: {"AXRole": "AXApplication", "AXChildren": [button, match]},
+        button: {"AXRole": "AXButton", "AXTitle": "Save"},
+        match: {"AXRole": "AXStaticText", "AXValue": "Alessia playlist"},
+    }
+    monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
+    monkeypatch.setattr(mac, "_pid", lambda app: 42)
+    monkeypatch.setattr(mac, "_application_element", lambda pid: root)
+    monkeypatch.setattr(mac, "_is_ax_element", lambda value: value in data)
+    monkeypatch.setattr(
+        mac,
+        "_copy_attributes",
+        lambda element, attributes: {
+            attribute: data[element].get(attribute) for attribute in attributes
+        },
+    )
+    monkeypatch.setattr(
+        macos_module.AS,
+        "AXUIElementCopyParameterizedAttributeValue",
+        lambda *args: (
+            macos_module.AS.kAXErrorParameterizedAttributeUnsupported,
+            None,
+        ),
+    )
+
+    for _ in range(3):
+        mac.ax.query(app="Spotify", text="Alessia", include_actions=False)
+
+    assert list(mac._elements.values()) == [match, match, match]
 
 
 def test_background_click_posts_to_pid_without_warp_or_activate(monkeypatch) -> None:
