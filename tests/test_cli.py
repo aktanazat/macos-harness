@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -148,3 +149,62 @@ def test_stdin_misused_call_shows_the_real_signature(program, error, signature) 
     # Python 3.13 adds a "Did you mean ...?" hint to the TypeError.
     assert raised.startswith(error)
     assert shown == signature
+
+
+@pytest.mark.parametrize(
+    ("ending", "status", "raised"),
+    [
+        ("", 0, None),
+        ("mac = None", 0, None),
+        ("raise RuntimeError('stop')", 1, None),
+        ("raise KeyboardInterrupt('stop')", None, KeyboardInterrupt),
+        ("raise SystemExit('stop')", None, SystemExit),
+        ("raise TypeError('stop')", None, TypeError),
+    ],
+)
+def test_stdin_return_reaps_the_original_mac_even_when_retained_or_rebound(
+    monkeypatch, pointer_children, ending, status, raised,
+) -> None:
+    retained = []
+    monkeypatch.setenv("MACOS_HARNESS_BACKEND", "python")
+    monkeypatch.setattr(sys, "_macos_harness_retained", retained, raising=False)
+    program = (
+        "import sys\n"
+        "sys._macos_harness_retained.append(mac)\n"
+        "mac.move(10, 20, coordinate_space='screen')\n"
+        + ending
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(program))
+    if raised is None:
+        assert cli.main([]) == status
+    else:
+        with pytest.raises(raised):
+            cli.main([])
+
+    assert len(retained) == 1
+    assert pointer_children[0].returncode == 0
+
+
+@pytest.mark.parametrize("ending", ["", "raise SystemExit('stop')"])
+def test_repl_return_reaps_its_retained_mac(monkeypatch, pointer_children, ending) -> None:
+    retained = []
+    monkeypatch.setenv("MACOS_HARNESS_BACKEND", "python")
+    monkeypatch.setattr(sys, "_macos_harness_retained", retained, raising=False)
+    program = (
+        "import sys\n"
+        "sys._macos_harness_retained.append(mac)\n"
+        "mac.move(10, 20, coordinate_space='screen')\n"
+        "mac = None\n"
+        + ending
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(program))
+    if ending:
+        with pytest.raises(SystemExit, match="stop"):
+            cli.main(["repl"])
+    else:
+        assert cli.main(["repl"]) == 0
+
+    assert len(retained) == 1
+    assert pointer_children[0].returncode == 0
+
+

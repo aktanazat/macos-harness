@@ -751,23 +751,26 @@ class _Unresolved:
 _UNRESOLVED = _Unresolved()
 
 
-def _finalize_native_session(session_box: list[Any | None]) -> None:
-    """Finalizer callback for one ``MacOS`` instance's native agent child.
+def _finalize_native_session(
+    session_box: list[Any | None], overlay: LivePointerOverlay
+) -> None:
+    """Finalize this instance's private agent and disposable pointer child.
 
-    Deliberately a free function taking only a plain mutable box, never a
-    bound method or closure over the owning ``MacOS`` instance itself:
-    ``MacOS`` and ``Accessibility`` hold references to each other
-    (``self.ax = Accessibility(self)``), and a ``weakref.finalize``
-    callback that captures its own target, even indirectly, keeps that
-    target permanently unreachable-but-never-collectable. ``MacOS.close()``
+    The callback keeps only the session box and the separately owned pointer,
+    never a bound method or closure over ``MacOS`` itself. Neither resource
+    refers back to the instance, so the finalizer cannot keep it alive.
+    ``MacOS.close()``
     calls this same finalizer directly (idempotent: a finalizer only ever
     fires once), and it also runs automatically once the owning instance
     is unreachable or the interpreter exits, even if ``close()`` was
     never called at all.
     """
     session, session_box[0] = session_box[0], None
-    if session is not None:
-        session.close()
+    try:
+        if session is not None:
+            session.close()
+    finally:
+        overlay.close()
 
 
 #: Every ``MacOS`` instance that might still hold a live native-agent
@@ -867,7 +870,7 @@ class MacOS:
         # and `close()`/`_acquire_native()` mutate its one slot in place.
         self._native_session_box: list[Any | None] = [None]
         self._native_finalizer = weakref.finalize(
-            self, _finalize_native_session, self._native_session_box
+            self, _finalize_native_session, self._native_session_box, self._overlay
         )
         # See `_check_native_owner` below: a forked child inherits a
         # byte-for-byte copy of this instance, including `_native_lock`,
@@ -1093,7 +1096,7 @@ class MacOS:
             )
 
     def close(self) -> None:
-        """Tear down this instance's private native agent child, if any.
+        """Reap this instance's private helpers, never app windows or documents.
 
         Idempotent: safe to call more than once, and safe when no native
         session was ever launched (the common, default ``python`` backend
@@ -1117,7 +1120,10 @@ class MacOS:
         with self._native_lock:
             self._native_closed = True
             self._native_client = None
-        self._native_finalizer()
+        try:
+            self._native_finalizer()
+        finally:
+            self._overlay.close()
 
     def __enter__(self) -> Self:
         return self

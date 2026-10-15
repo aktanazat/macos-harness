@@ -622,14 +622,25 @@ with MacOS(backend="native") as mac:
     ...
 ```
 
-`close()` stops the child process and closes the socket. It is idempotent
-and safe to call even on a `python`-backend instance that never launched an
-agent. An instance left open at interpreter exit, or dropped without
-`close()`, still cleans up its child process through a finalizer, but do not
-rely on that for anything time-sensitive — call `close()` yourself. Once
-closed, further native-routed calls on that instance raise `MacOSError`
-instead of relaunching or falling back; construct a new `MacOS()` to use
-`native`/`auto` again.
+`close()` stops and reaps the private accessibility agent and the disposable
+pointer helper, then closes their socket or pipe. It is idempotent and also
+cleans up the pointer on the default `python` backend. Dropping an instance
+or exiting the interpreter runs the same cleanup through finalizers, but use
+`close()` or a context manager when cleanup must finish before returning.
+The CLI does this for its preloaded instance on normal return, errors, and
+interruptions, even if a program retains or replaces the `mac` variable.
+
+Only the pointer position and other in-memory context need remain between
+actions. An explicit `mac.move()` or `mac.show_pointer()` can recreate the
+pointer after cleanup. Further native-routed calls on a closed instance still
+raise `MacOSError`; construct a new `MacOS()` to use `native`/`auto` again.
+
+Cleanup never closes app windows, documents, or human handoffs. A receipt
+records an action and its target process, not ownership of the target's UI
+or proof that a document is saved. Do not discard an existing window based on
+its title, age, or appearance. Reopening a saved document does not recover
+unsaved edits. Resume app work by observing its current state again; save
+only safe task context, never credentials or unsent form values.
 
 The harness resolves which executable to launch, in order: an explicit
 `MACOS_HARNESS_AGENT_BIN` path (must already exist and be executable, or the

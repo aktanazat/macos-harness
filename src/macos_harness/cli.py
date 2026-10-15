@@ -10,7 +10,8 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
 from typing import TextIO
@@ -23,16 +24,18 @@ from .telemetry import capture_cli
 from .telemetry import run_cli as run_telemetry_cli
 
 
-def _namespace() -> dict[str, object]:
+@contextmanager
+def _namespace() -> Iterator[dict[str, object]]:
     from .macos import MacOS
 
-    return {
-        "__name__": "__macos_harness__",
-        "browser": BrowserHarness(),
-        "mac": MacOS(),
-        "Path": Path,
-        "subprocess": subprocess,
-    }
+    with MacOS() as mac:
+        yield {
+            "__name__": "__macos_harness__",
+            "browser": BrowserHarness(),
+            "mac": mac,
+            "Path": Path,
+            "subprocess": subprocess,
+        }
 
 
 # A call with the wrong arguments raises before its body runs, naming the
@@ -73,14 +76,14 @@ def _execute(code: str) -> int:
     if not code.strip():
         print("No Python code received on stdin", file=sys.stderr)
         return 2
-    namespace = _namespace()
-    try:
-        exec(compile(code, "<macos-harness>", "exec"), namespace, namespace)  # noqa: S102
-    except TypeError as exc:
-        note = _signature_note(exc, namespace)
-        if note is not None:
-            exc.add_note(note)
-        raise
+    with _namespace() as namespace:
+        try:
+            exec(compile(code, "<macos-harness>", "exec"), namespace, namespace)  # noqa: S102
+        except TypeError as exc:
+            note = _signature_note(exc, namespace)
+            if note is not None:
+                exc.add_note(note)
+            raise
     return 0
 
 
@@ -155,16 +158,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             from .macos import MacOS
 
-            mac = MacOS()
-            if args.request:
-                mac.request_permissions()
-            print(json.dumps(mac.doctor(), indent=2))
+            with MacOS() as mac:
+                if args.request:
+                    mac.request_permissions()
+                print(json.dumps(mac.doctor(), indent=2))
             result = 0
             return result
         if args.command == "apps":
             from .macos import MacOS
 
-            print(json.dumps(MacOS().list_apps(), indent=2))
+            with MacOS() as mac:
+                print(json.dumps(mac.list_apps(), indent=2))
             result = 0
             return result
         if args.command == "skill":
@@ -172,38 +176,41 @@ def main(argv: list[str] | None = None) -> int:
             result = 0
             return result
         if args.command == "repl":
-            code.interact(
-                banner=(
-                    "macos-harness: mac.see/key/type/click/ax/script, browser, "
-                    "Path, and subprocess are ready"
-                ),
-                local=_namespace(),
-                exitmsg="",
-            )
+            with _namespace() as namespace:
+                code.interact(
+                    banner=(
+                        "macos-harness: mac.see/key/type/click/ax/script, browser, "
+                        "Path, and subprocess are ready"
+                    ),
+                    local=namespace,
+                    exitmsg="",
+                )
             result = 0
             return result
         if args.command == "see":
             from .macos import MacOS
 
-            result = MacOS().see(
-                args.app,
-                max_width=args.max_width,
-                max_height=args.max_height,
-                show_pointer=args.pointer,
-            )
+            with MacOS() as mac:
+                result = mac.see(
+                    args.app,
+                    max_width=args.max_width,
+                    max_height=args.max_height,
+                    show_pointer=args.pointer,
+                )
             print(json.dumps(result, indent=2, ensure_ascii=False))
             result = 0
             return result
         if args.command == "state":
             from .macos import MacOS
 
-            state = MacOS().get_app_state(
-                args.app,
-                screenshot=args.screenshot,
-                max_depth=args.max_depth,
-                max_nodes=args.max_nodes,
-                include_menu_bar=args.include_menu_bar,
-            )
+            with MacOS() as mac:
+                state = mac.get_app_state(
+                    args.app,
+                    screenshot=args.screenshot,
+                    max_depth=args.max_depth,
+                    max_nodes=args.max_nodes,
+                    include_menu_bar=args.include_menu_bar,
+                )
             print(json.dumps(state, indent=2, ensure_ascii=False))
             result = 0
             return result

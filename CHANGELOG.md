@@ -7,6 +7,13 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- CLI commands and the REPL close their original `MacOS` instance before
+  returning, including on errors and interruptions. Retaining or replacing
+  the preloaded `mac` variable no longer keeps its private helpers alive.
+- `MacOS.close()` and instance finalization also reap the disposable pointer
+  helper, including on the default Python backend. Pointer helpers are no
+  longer retained until interpreter exit. Explicit pointer use can recreate
+  one lazily; cleanup never closes app windows, documents, or human handoffs.
 - With the default Python backend, an all-apps search, query or press now
   reaches an app that started after the harness first listed apps, such as
   the process behind a permission dialog. Each listing reads the running

@@ -24,6 +24,19 @@ Use `macos-harness --json-errors` for machine-readable failures from stdin
 programs. Harness errors go to stderr as JSON; operation failures include
 the receipt. The exit status remains nonzero.
 
+Finishing includes cleanup of resources the caller actually owns. The CLI
+closes its own accessibility agent and disposable pointer helper before it
+returns, including on errors and interruptions. In an embedded process, use
+`with MacOS() as mac:` or `try/finally: mac.close()`. The pointer is created
+only when needed and can be shown again explicitly after cleanup.
+
+App windows do not become caller-owned when the harness reads or changes
+them. Do not automatically close documents, existing windows, or human
+handoffs. A receipt does not prove window ownership or saved-state safety.
+Reopening a saved document does not restore unsaved edits. Retain only safe
+task context and observe the app again when resuming; never save credentials
+or unsent form values.
+
 ## Minimize round trips
 
 - Bundle deterministic, reversible steps into one program, then verify once. Opening
@@ -512,9 +525,10 @@ the launch fails immediately with no fallback), then the binary bundled
 with the installed package, then a fresh local SwiftPM release build
 (requires the Xcode Command Line Tools; rebuilt only when missing or stale,
 and only at this tier). Call `mac.close()` when done, or use
-`with MacOS(backend=...) as mac:` — both stop the child process and close
-the socket; `close()` is idempotent and safe even on a `python`-backend
-instance. A closed instance raises `MacOSError` on further native-routed
+`with MacOS(backend=...) as mac:` — both reap its private agent and pointer
+helper and close their socket or pipe; `close()` is idempotent and also
+cleans up the pointer on the `python` backend. A closed instance raises
+`MacOSError` on further native-routed
 calls instead of relaunching; construct a new `MacOS()` to use `native`/
 `auto` again.
 

@@ -7,12 +7,14 @@ seconds so a finished action never leaves a stray arrow on screen.
 
 from __future__ import annotations
 
-import atexit
+import contextlib
 import json
+import os
 import subprocess
 import sys
 import threading
 import time
+import weakref
 from typing import Any, TextIO
 
 from .pointer import POINTER_HOTSPOT, POINTER_PRESS_SCALE
@@ -21,74 +23,124 @@ from .pointer import POINTER_HOTSPOT, POINTER_PRESS_SCALE
 IDLE_HIDE_SECONDS = 3.0
 
 
-class LivePointerOverlay:
-    """Send pointer updates to a disposable AppKit helper process.
+def _close_overlay_process(
+    process_box: list[subprocess.Popen[str] | None],
+    creator_pid: int,
+    lock: threading.RLock,
+) -> None:
+    """Close and reap only this caller's disposable pointer child."""
+    if os.getpid() != creator_pid:
+        return
+    with lock:
+        process = process_box[0]
+        if process is None:
+            return
+        if process.stdin is not None:
+            try:
+                if process.poll() is None:
+                    process.stdin.write('{"cmd":"quit"}\n')
+                    process.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                with contextlib.suppress(BrokenPipeError, OSError):
+                    process.stdin.close()
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                process.terminate()
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                process.wait(timeout=2.0)
+        process_box[0] = None
 
-    ``hide()`` is sticky: nothing is drawn, and no helper is spawned, until
-    ``show()`` re-enables the pointer. ``visible`` mirrors the helper's own
-    idle timer, so it reads ``False`` once the arrow has faded on screen.
+
+class LivePointerOverlay:
+    """Own one lazy, disposable pointer helper, never an app document.
+
+    ``hide()`` is sticky until ``show()``. ``close()`` reaps the helper;
+    a later explicit move or show can recreate it without keeping UI alive.
     """
 
     def __init__(self) -> None:
-        self._process: subprocess.Popen[str] | None = None
+        self._process_box: list[subprocess.Popen[str] | None] = [None]
+        self._creator_pid = os.getpid()
+        self._lock = threading.RLock()
         self._enabled = True
         self._last_shown: float | None = None
-        atexit.register(self.close)
+        self._finalizer = weakref.finalize(
+            self, _close_overlay_process, self._process_box, self._creator_pid, self._lock
+        )
+
+    def _check_owner(self) -> None:
+        if os.getpid() != self._creator_pid:
+            raise RuntimeError("Pointer overlay belongs to another process; create a fresh MacOS")
 
     @property
     def visible(self) -> bool:
         return (
-            self._enabled
+            os.getpid() == self._creator_pid
+            and self._enabled
             and self._last_shown is not None
             and time.monotonic() - self._last_shown < IDLE_HIDE_SECONDS
         )
 
     @property
     def running(self) -> bool:
-        return self._process is not None and self._process.poll() is None
+        if os.getpid() != self._creator_pid:
+            return False
+        with self._lock:
+            process = self._process_box[0]
+            return process is not None and process.poll() is None
 
     def move(self, x: float, y: float, *, duration: float = 0.16) -> None:
-        if not self._enabled:
-            return
-        self._last_shown = time.monotonic()
-        self._send(
-            {
-                "cmd": "move",
-                "x": float(x),
-                "y": float(y),
-                "duration": max(0.0, float(duration)),
-            }
-        )
+        self._check_owner()
+        with self._lock:
+            if not self._enabled:
+                return
+            self._last_shown = time.monotonic()
+            self._send(
+                {
+                    "cmd": "move",
+                    "x": float(x),
+                    "y": float(y),
+                    "duration": max(0.0, float(duration)),
+                }
+            )
 
     def show(self, x: float, y: float) -> None:
-        self._enabled = True
-        self._last_shown = time.monotonic()
-        self._send({"cmd": "show", "x": float(x), "y": float(y)})
+        self._check_owner()
+        with self._lock:
+            self._enabled = True
+            self._last_shown = time.monotonic()
+            self._send({"cmd": "show", "x": float(x), "y": float(y)})
 
     def hide(self) -> None:
-        self._enabled = False
-        self._last_shown = None
-        if self.running:
-            self._send({"cmd": "hide"}, start=False)
+        self._check_owner()
+        with self._lock:
+            self._enabled = False
+            self._last_shown = None
+            if self.running:
+                self._send({"cmd": "hide"}, start=False)
 
     def click(self) -> None:
-        if not self._enabled:
-            return
-        self._last_shown = time.monotonic()
-        self._send({"cmd": "click"})
+        self._check_owner()
+        with self._lock:
+            if not self._enabled:
+                return
+            self._last_shown = time.monotonic()
+            self._send({"cmd": "click"})
 
     def close(self) -> None:
-        process = self._process
-        self._process = None
-        if process is None:
+        if os.getpid() != self._creator_pid:
             return
-        if process.poll() is None and process.stdin is not None:
-            try:
-                process.stdin.write('{"cmd":"quit"}\n')
-                process.stdin.flush()
-                process.stdin.close()
-            except (BrokenPipeError, OSError):
-                pass
+        with self._lock:
+            self._last_shown = None
+            _close_overlay_process(self._process_box, self._creator_pid, self._lock)
 
     def _start(self) -> subprocess.Popen[str]:
         process = subprocess.Popen(
@@ -99,12 +151,13 @@ class LivePointerOverlay:
             text=True,
             bufsize=1,
         )
-        self._process = process
+        self._process_box[0] = process
         return process
 
-    def _send(self, payload: dict[str, Any], *, start: bool = True) -> None:
-        process = self._process
+    def _send(self, payload: dict[str, str | float], *, start: bool = True) -> None:
+        process = self._process_box[0]
         if process is None or process.poll() is not None:
+            _close_overlay_process(self._process_box, self._creator_pid, self._lock)
             if not start:
                 return
             process = self._start()
@@ -115,13 +168,17 @@ class LivePointerOverlay:
             stream.write(json.dumps(payload, separators=(",", ":")) + "\n")
             stream.flush()
         except (BrokenPipeError, OSError):
+            _close_overlay_process(self._process_box, self._creator_pid, self._lock)
             if not start:
                 return
-            self._process = None
             retry = self._start()
             assert retry.stdin is not None
-            retry.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
-            retry.stdin.flush()
+            try:
+                retry.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+                retry.stdin.flush()
+            except BaseException:
+                _close_overlay_process(self._process_box, self._creator_pid, self._lock)
+                raise
 
 
 def _read_commands(stream: TextIO, controller: Any) -> None:
