@@ -18,7 +18,7 @@ from typing import TextIO
 
 from ._version import __version__
 from .browser import BrowserHarness
-from .errors import MacOSError
+from .errors import ErrorCode, MacOSError
 from .receipts import OperationError
 from .telemetry import capture_cli
 from .telemetry import run_cli as run_telemetry_cli
@@ -87,12 +87,21 @@ def _execute(code: str) -> int:
     return 0
 
 
-def _skill_text() -> str:
-    bundled = resources.files("macos_harness").joinpath("SKILL.md")
-    if bundled.is_file():
-        return bundled.read_text(encoding="utf-8")
-    checkout = Path(__file__).resolve().parents[2] / "skills/macos-harness/SKILL.md"
-    return checkout.read_text(encoding="utf-8")
+def _skill_text(reference: str | None) -> str:
+    root = resources.files("macos_harness").joinpath("skill")
+    if not root.joinpath("SKILL.md").is_file():
+        root = Path(__file__).resolve().parents[2] / "skills/macos-harness"
+    if reference is None:
+        return root.joinpath("SKILL.md").read_text(encoding="utf-8")
+    references = root.joinpath("references")
+    page = references.joinpath(f"{reference.removesuffix('.md')}.md")
+    if not page.is_file():
+        names = sorted(item.name.removesuffix(".md") for item in references.iterdir())
+        raise MacOSError(
+            f"no skill reference {reference!r}; choose one of: {', '.join(names)}",
+            code=ErrorCode.BAD_REQUEST,
+        )
+    return page.read_text(encoding="utf-8")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -119,7 +128,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser("apps", help="list running macOS applications")
     subparsers.add_parser("repl", help="start a persistent interactive Python session")
-    subparsers.add_parser("skill", help="print the macOS Harness skill")
+    skill = subparsers.add_parser("skill", help="print the macOS Harness skill card or one reference")
+    skill.add_argument("reference", nargs="?", help="a reference name, such as signatures")
     telemetry = subparsers.add_parser(
         "telemetry", help="inspect or change telemetry (off by default)"
     )
@@ -172,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
             result = 0
             return result
         if args.command == "skill":
-            print(_skill_text(), end="")
+            print(_skill_text(args.reference), end="")
             result = 0
             return result
         if args.command == "repl":
