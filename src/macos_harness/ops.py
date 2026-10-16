@@ -80,6 +80,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Literal, Protocol, TypeVar
 
+from . import receipt_log
 from .errors import ApplicationNotFoundError, ErrorCode, FocusChangedError, MacOSError
 from .receipts import (
     Acted,
@@ -3540,6 +3541,7 @@ class Operations:
 
     def _finish(self, receipt: Receipt) -> Receipt:
         self._ledger.remember(receipt)
+        receipt_log.append(receipt, now=self._wall_clock())
         if receipt.outcome is Outcome.FAILED:
             raise OperationError.from_receipt(receipt)
         return receipt

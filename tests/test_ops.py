@@ -18,6 +18,7 @@ from typing import ClassVar, NamedTuple
 
 import pytest
 
+from macos_harness import receipt_log
 from macos_harness.errors import (
     ApplicationNotFoundError,
     ErrorCode,
@@ -2643,3 +2644,70 @@ def test_failed_lifetime_observation_does_not_fail_a_successful_action() -> None
     assert receipt.acted is Acted.YES
     assert receipt.process["state"] == "unknown"
     assert receipt.process["error"]["code"] == ErrorCode.UNSUPPORTED_OP
+
+
+def _receipt_log(tmp_path: Path) -> Path:
+    return tmp_path / "Library" / "Logs" / "macos-harness" / "receipts.jsonl"
+
+
+def test_receipt_log_records_each_receipt_without_the_typed_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(receipt_log.ENV, "1")
+    host, operations = _ops(wall_clock=lambda: 1_760_000_000.0)
+
+    operations.type("hunter2", app="Demo")
+    host.type_error = MacOSError("could not type hunter2", code=ErrorCode.AX_ERROR)
+    _failed(lambda: operations.type("hunter2", app="Demo"))
+
+    text = _receipt_log(tmp_path).read_text(encoding="utf-8")
+    lines = [json.loads(line) for line in text.splitlines()]
+    assert [(line["op"], line["outcome"], line["acted"]) for line in lines] == [
+        ("type", "done", "yes"),
+        ("type", "failed", "unknown"),
+    ]
+    assert lines[0]["time"] == "2025-10-09T08:53:20.000+00:00"
+    assert lines[0]["app"] == {"name": "Demo", "bundle_id": "com.example.demo", "pid": 41}
+    assert lines[1]["error"] == {"code": "ax.error"}
+    assert "hunter2" not in text
+
+
+def test_receipt_log_names_the_app_of_a_press_that_never_found_its_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(receipt_log.ENV, "1")
+    _host, operations = _ops()
+
+    _failed(lambda: operations.press("Missing", app="Demo", role="button", timeout=0))
+
+    line = json.loads(_receipt_log(tmp_path).read_text(encoding="utf-8"))
+    assert (line["op"], line["outcome"], line["app"]) == ("press", "failed", "Demo")
+
+
+def test_receipt_log_is_off_unless_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(receipt_log.ENV, raising=False)
+    _host, operations = _ops()
+
+    operations.key("return", app="Demo")
+
+    assert not (tmp_path / "Library").exists()
+
+
+def test_receipt_log_rotates_before_passing_its_size_bound(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(receipt_log.ENV, "1")
+    log = _receipt_log(tmp_path)
+    log.parent.mkdir(parents=True)
+    with log.open("wb") as full:
+        full.truncate(receipt_log.MAX_BYTES)
+    _host, operations = _ops()
+
+    operations.key("return", app="Demo")
+
+    assert log.with_name("receipts.jsonl.1").stat().st_size == receipt_log.MAX_BYTES
+    assert [json.loads(line)["op"] for line in log.read_text(encoding="utf-8").splitlines()] == ["key"]
