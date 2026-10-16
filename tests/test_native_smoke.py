@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Mapping, Sequence
-from typing import Any
+import time
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Concatenate, ParamSpec
 
 import pytest
 
@@ -17,6 +19,7 @@ from macos_harness.macos import (
     FocusChangedError,
     MacOS,
     MacOSError,
+    SearchMatches,
 )
 from macos_harness.native import NativeQueryResult
 from macos_harness.receipts import JSONValue
@@ -160,13 +163,18 @@ def _native_agent_status() -> dict[str, Any] | None:
         session.close()
 
 
-def _require_trusted_native_agent() -> None:
+def _require_native_agent() -> bool:
+    """Skip unless the native agent runs here; say whether it is trusted."""
     if os.environ.get("MACOS_HARNESS_RUN_NATIVE_SMOKE") != "1":
         pytest.skip("set MACOS_HARNESS_RUN_NATIVE_SMOKE=1 to run native smoke tests")
     status = _native_agent_status()
     if status is None:
         pytest.skip("native agent toolchain/runtime is unavailable")
-    if not status.get("trusted"):
+    return bool(status.get("trusted"))
+
+
+def _require_trusted_native_agent() -> None:
+    if not _require_native_agent():
         pytest.skip("native agent lacks Accessibility trust")
 
 
@@ -872,21 +880,23 @@ def test_query_parity_on_finder_bounded_fallback() -> None:
 
 
 # A small, real AppKit target app -- not an osascript dialog, which is not
-# reliably a running NSApplication `_resolve_app` can bind to. Accessory
-# activation policy keeps it out of the Dock/Cmd+Tab and off the frontmost
-# app without making it any less real: it is a genuine NSApplication with a
-# genuine NSWindow and NSButton, discoverable and pressable through the
-# exact same Accessibility APIs as any regular app. `orderFrontRegardless`
-# shows the window without ever activating (and so never focus-stealing)
-# the helper app itself. The button's target-action really flips its own
-# title on press, so a round trip through AXPress is verified by an actual
-# state change, not just a non-error return.
+# reliably a running NSApplication `_resolve_app` can bind to. It launches
+# unable to come to the front, since an app that may takes the front at
+# launch whenever the terminal that started it is in front; once launched
+# it turns accessory, out of the Dock and Cmd+Tab, and is a genuine
+# NSApplication with a genuine NSWindow and NSButton, discoverable and
+# pressable through the same Accessibility APIs as any regular app.
+# `orderFrontRegardless` shows the window without activating the helper.
+# The button's target-action really flips its own title on press, so a
+# round trip through AXPress is verified by an actual state change, not
+# just a non-error return.
 _HARNESS_PROBE_HELPER = r'''
 import os
 
 from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
+    NSApplicationActivationPolicyProhibited,
     NSBackingStoreBuffered,
     NSBezelStyleRounded,
     NSButton,
@@ -901,13 +911,18 @@ from AppKit import (
 
 
 class _Target(NSObject):
+    def applicationDidFinishLaunching_(self, notification):
+        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        _window.orderFrontRegardless()
+        print(f"READY {os.getpid()}", flush=True)
+
     def pressed_(self, sender):
         sender.setTitle_("harness-pressed")
 
 
 def main():
     app = NSApplication.sharedApplication()
-    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
 
     style = (
         NSWindowStyleMaskTitled
@@ -930,7 +945,6 @@ def main():
     button.setAction_("pressed:")
 
     window.contentView().addSubview_(button)
-    window.orderFrontRegardless()
 
     # Keep strong references alive for the whole run -- not merely
     # implied by the still-active `main()` frame while `app.run()`
@@ -938,8 +952,7 @@ def main():
     global _window, _button, _target_ref
     _window, _button, _target_ref = window, button, target
 
-    print(f"READY {os.getpid()}", flush=True)
-
+    app.setDelegate_(target)
     app.run()
 
 
@@ -1020,6 +1033,324 @@ def test_native_press_round_trip_without_activation() -> None:
                 proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+
+# An AppKit app with no window, Dock icon, or activation: says "ready" once
+# it has finished launching and stays up until killed.
+_LATE_APP_SCRIPT = """\
+from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
+from Foundation import NSDate, NSRunLoop
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+app.finishLaunching()
+print("ready", flush=True)
+NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(30))
+"""
+
+
+@pytest.mark.native
+@pytest.mark.smoke
+def test_native_list_apps_sees_an_app_launched_after_the_first_read() -> None:
+    """An app that starts after the agent first listed apps -- the process
+    behind a permission dialog, say -- must appear in later native lists,
+    or no all-apps sweep through the agent can ever reach it."""
+    _require_native_agent()
+
+    with MacOS(backend="native") as mac:
+        mac.list_apps()
+        late = subprocess.Popen(
+            [sys.executable, "-c", _LATE_APP_SCRIPT], stdout=subprocess.PIPE, text=True
+        )
+        try:
+            assert _read_ready_line(late) == "ready"
+            deadline = time.monotonic() + 5
+            while late.pid not in {app["pid"] for app in mac.list_apps()}:
+                assert time.monotonic() < deadline, (
+                    "an app launched after the agent's first list never appeared"
+                )
+                time.sleep(0.05)
+        finally:
+            late.kill()
+            late.wait()
+
+
+# A background AppKit app whose one button brings the app itself to the
+# front, as an app that answers a press by activating does. It launches
+# unable to come to the front, as `_HARNESS_PROBE_HELPER` does, so the
+# press finds it behind another app and the focus guard has a change to
+# report.
+_SELF_ACTIVATING_HELPER = r'''
+import os
+
+from AppKit import (
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+    NSApplicationActivationPolicyProhibited,
+    NSBackingStoreBuffered,
+    NSButton,
+    NSMakeRect,
+    NSObject,
+    NSWindow,
+    NSWindowStyleMaskTitled,
+)
+
+
+class _Target(NSObject):
+    def applicationDidFinishLaunching_(self, notification):
+        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        window.orderFrontRegardless()
+        print(f"READY {os.getpid()}", flush=True)
+
+    def pressed_(self, sender):
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+    NSMakeRect(100.0, 100.0, 240.0, 120.0), NSWindowStyleMaskTitled, NSBackingStoreBuffered, False
+)
+button = NSButton.alloc().initWithFrame_(NSMakeRect(40.0, 40.0, 160.0, 32.0))
+button.setTitle_("harness-activate")
+target = _Target.alloc().init()
+button.setTarget_(target)
+button.setAction_("pressed:")
+window.contentView().addSubview_(button)
+app.setDelegate_(target)
+app.run()
+'''
+
+
+def _require_live_ax(backend: str) -> None:
+    """Skip unless live smoke tests are on and ``backend`` holds trust."""
+    if backend == "native":
+        _require_trusted_native_agent()
+    elif os.environ.get("MACOS_HARNESS_RUN_NATIVE_SMOKE") != "1":
+        pytest.skip("set MACOS_HARNESS_RUN_NATIVE_SMOKE=1 to run live smoke tests")
+    elif not macos_module.AS.AXIsProcessTrusted():
+        pytest.skip("this process lacks Accessibility trust")
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("backend", ["python", pytest.param("native", marks=pytest.mark.native)])
+def test_press_reports_a_target_that_makes_itself_frontmost(backend: str) -> None:
+    """A press whose target answers by coming to the front raises
+    `FocusChangedError`, even as the first thing a fresh process does:
+    the guard must compare the frontmost app before and after the press,
+    not one reading taken at the process's first look."""
+    _require_live_ax(backend)
+
+    helper = subprocess.Popen(
+        [sys.executable, "-c", _SELF_ACTIVATING_HELPER],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        helper_pid = int(_read_ready_line(helper).split(" ", 1)[1])
+        with MacOS(backend=backend) as mac, pytest.raises(FocusChangedError, match="became frontmost"):
+            mac.ax.press("harness-activate", app=helper_pid, role="button", timeout=10.0)
+    finally:
+        helper.kill()
+        helper.wait()
+
+
+_P = ParamSpec("_P")
+
+
+def _recording_app_pids(
+    search: Callable[Concatenate[MacOS, _P], SearchMatches],
+) -> Callable[Concatenate[_SearchRecordingMac, _P], SearchMatches]:
+    """Wrap ``MacOS.ax_search`` so the Mac lists every app it searches one by one."""
+
+    def record(mac: _SearchRecordingMac, /, *args: _P.args, **kwargs: _P.kwargs) -> SearchMatches:
+        pid = kwargs.get("app_pid")
+        if isinstance(pid, int):
+            mac.searched.append(pid)
+        return search(mac, *args, **kwargs)
+
+    return record
+
+
+class _SearchRecordingMac(MacOS):
+    """A real Mac that lists every app its sweeps search one by one."""
+
+    def __init__(self, *, backend: str) -> None:
+        super().__init__(backend=backend)
+        self.searched: list[int] = []
+
+    ax_search = _recording_app_pids(MacOS.ax_search)
+
+
+# A background AppKit app whose one window is on screen. Unlike the
+# helpers above it may take the front at launch: an app that launches
+# unable to come to the front never gets its window on screen.
+_WINDOW_HELPER = r'''
+import os
+
+from AppKit import (
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+    NSBackingStoreBuffered,
+    NSMakeRect,
+    NSWindow,
+    NSWindowStyleMaskTitled,
+)
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+    NSMakeRect(100.0, 100.0, 240.0, 120.0), NSWindowStyleMaskTitled, NSBackingStoreBuffered, False
+)
+window.orderFrontRegardless()
+print(f"READY {os.getpid()}", flush=True)
+app.run()
+'''
+
+
+def _wait_for_a_window_on_screen(pid: int) -> None:
+    """Block until ``pid`` owns a window on screen: an app frozen before
+    its run loop draws its window shows nothing."""
+    deadline = time.monotonic() + 5
+    with MacOS(backend="python") as mac:
+        while not any(window["on_screen"] for window in mac.windows(pid)):
+            assert time.monotonic() < deadline, f"pid {pid} never put a window on screen"
+            time.sleep(0.05)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("backend", ["python", pytest.param("native", marks=pytest.mark.native)])
+def test_all_apps_sweep_skips_a_frozen_app_and_still_finds_an_answering_one(backend: str) -> None:
+    """An all-apps search finds the button of an app that answers. An app
+    that cannot answer while it shows a window -- here one stopped
+    mid-run -- is never searched on its own, so it costs the sweep no
+    timeout of its own, and the sweep says it is incomplete rather than
+    passing it for searched."""
+    _require_live_ax(backend)
+
+    helpers = [
+        subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        for script in (_SELF_ACTIVATING_HELPER, _WINDOW_HELPER)
+    ]
+    try:
+        answering, frozen = (int(_read_ready_line(helper).split(" ", 1)[1]) for helper in helpers)
+        _wait_for_a_window_on_screen(frozen)
+        os.kill(frozen, signal.SIGSTOP)
+        with _SearchRecordingMac(backend=backend) as mac:
+            found = mac.ax.query_all("harness-activate", role="button", limit=10)
+        assert [match["app"]["pid"] for match in found] == [answering]
+        assert found.complete is False
+        assert found.unanswered >= 1
+        assert answering in mac.searched
+        assert frozen not in mac.searched
+    finally:
+        for helper in helpers:
+            helper.kill()
+            helper.wait()
+
+
+class _HelperScopedMac(MacOS):
+    """A real Mac whose all-apps sweeps reach only the given apps, so what
+    a sweep reports rests on those apps alone."""
+
+    def __init__(self, *, backend: str, pids: set[int]) -> None:
+        super().__init__(backend=backend)
+        self.pids = pids
+
+    def _resolve_apps(self, selectors: tuple[str, ...] | None) -> list[dict[str, object]]:
+        return [info for info in super()._resolve_apps(selectors) if info["pid"] in self.pids]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("backend", ["python", pytest.param("native", marks=pytest.mark.native)])
+def test_on_screen_sweep_stays_complete_past_a_frozen_app_that_shows_nothing(backend: str) -> None:
+    """A sweep of what is on screen loses nothing to an app that cannot
+    answer but has no window on screen -- a stopped background process --
+    so it still reports itself complete."""
+    _require_live_ax(backend)
+
+    answering = subprocess.Popen(
+        [sys.executable, "-c", _SELF_ACTIVATING_HELPER],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    hidden = subprocess.Popen(
+        [sys.executable, "-c", _LATE_APP_SCRIPT],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        answering_pid = int(_read_ready_line(answering).split(" ", 1)[1])
+        assert _read_ready_line(hidden) == "ready"
+        os.kill(hidden.pid, signal.SIGSTOP)
+        with _HelperScopedMac(backend=backend, pids={answering_pid, hidden.pid}) as mac:
+            found = mac.ax.query_all("harness-activate", role="button", limit=10)
+        assert [match["app"]["pid"] for match in found] == [answering_pid]
+        assert found.complete is True
+        assert found.unanswered == 0
+    finally:
+        for helper in (answering, hidden):
+            helper.kill()
+            helper.wait()
+
+
+# A background AppKit app with no window whose main menu holds one closed
+# menu, and in it the item "harness-menu-entry".
+_MENU_HELPER = r'''
+import os
+
+from AppKit import NSApplication, NSApplicationActivationPolicyAccessory, NSMenu, NSMenuItem
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+top = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("harness-menu", None, "")
+menu = NSMenu.alloc().initWithTitle_("harness-menu")
+menu.addItemWithTitle_action_keyEquivalent_("harness-menu-entry", None, "")
+top.setSubmenu_(menu)
+main = NSMenu.alloc().initWithTitle_("main")
+main.addItem_(top)
+app.setMainMenu_(main)
+print(f"READY {os.getpid()}", flush=True)
+app.run()
+'''
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("backend", ["python", pytest.param("native", marks=pytest.mark.native)])
+def test_a_search_for_what_is_on_screen_leaves_out_closed_menus_bar_one_for_menu_items(backend: str) -> None:
+    """A closed menu's items are not on screen, so a search for what is on
+    screen leaves them out -- in Safari they are most of the tree -- while
+    a search for menu items, the one a menu command's press takes, still
+    finds them."""
+    _require_live_ax(backend)
+
+    helper = subprocess.Popen(
+        [sys.executable, "-c", _MENU_HELPER],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        pid = int(_read_ready_line(helper).split(" ", 1)[1])
+        with _HelperScopedMac(backend=backend, pids={pid}) as mac:
+            swept = mac.ax.query_all("harness-menu-entry", role="any", limit=10)
+            scoped = mac.ax.query("harness-menu-entry", app=pid, role="any")
+            items = mac.ax.query("harness-menu-entry", app=pid, role="menu item")
+        for search in (swept, scoped):
+            assert list(search) == []
+            assert search.complete is True
+        assert [match["title"] for match in items] == ["harness-menu-entry"]
+    finally:
+        helper.kill()
+        helper.wait()
 
 
 def test_native_press_retries_only_on_delayed_appearance(monkeypatch) -> None:

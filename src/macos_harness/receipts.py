@@ -281,6 +281,71 @@ def _freeze_apps(
     return tuple(apps)
 
 
+def validate_app_selector(value: str | int | None, *, parameter: str) -> None:
+    """Reject an ``app``/``apps`` selector that could never name a running
+    app: a blank string or a pid that is zero or negative.
+
+    A selector that is merely wrong is left to resolution
+    (``ApplicationNotFoundError`` and friends); this one fails fast as a
+    plain ``BAD_REQUEST``, before any resolution, AX call, dispatch, or
+    ``once``-token reservation.
+    """
+    if value is None:
+        return
+    if isinstance(value, str):
+        if not value.strip():
+            raise MacOSError(
+                f"{parameter} must be a nonempty string, not {value!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": parameter},
+            )
+        return
+    if value <= 0:
+        raise MacOSError(
+            f"{parameter} must be a positive pid, not {value}",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": parameter, "value": value},
+        )
+
+
+def validate_scope(
+    *,
+    app: str | int | None,
+    all_apps: bool,
+    apps: str | int | Iterable[str | int] | None,
+    required: bool,
+) -> str | int | tuple[str | int, ...] | None:
+    """Check one AX scope and return ``apps`` materialized exactly once.
+
+    The one scope rule `MacOS.ax` and ``mac.do`` share: ``app``,
+    ``all_apps=True``, and ``apps`` exclude each other, and ``required``
+    (``mac.do``'s mutations) demands one of them; a raw search without
+    one uses the last app. ``app`` and every ``apps`` entry must pass
+    `validate_app_selector`, and ``apps`` must hold at least one entry, so
+    an empty iterable never widens a search to every app.
+    """
+    apps = _freeze_apps(apps)
+    provided = sum((app is not None, bool(all_apps), apps is not None))
+    if provided > 1 or (required and provided == 0):
+        raise MacOSError(
+            "Pass exactly one of app, all_apps=True, or apps",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": "scope"},
+        )
+    validate_app_selector(app, parameter="app")
+    if apps is not None:
+        entries = (apps,) if isinstance(apps, (str, int)) else apps
+        if not entries:
+            raise MacOSError(
+                "apps must contain at least one non-empty selector",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "apps"},
+            )
+        for entry in entries:
+            validate_app_selector(entry, parameter="apps")
+    return apps
+
+
 def validate_exact_selectors(**selectors: str | None) -> None:
     """Reject an exact selector (``title``, ``identifier``, ``description``)
     that is set but is not a non-empty ``str``.

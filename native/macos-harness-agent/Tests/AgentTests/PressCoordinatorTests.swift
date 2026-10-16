@@ -2,11 +2,12 @@ import XCTest
 
 @testable import macos_harness_agent
 
-// `PressCoordinator` never activates or raises an app itself; it searches with an effective
-// limit of two, fails closed on anything but exactly one AXPress-capable match (and, when
-// strict, only from a search that saw every candidate), and samples frontmost state
-// immediately before and after delegating to the injected `performPress` closure — reporting
-// focus.changed only when a target that was not already frontmost becomes frontmost.
+// `PressCoordinator` never activates or raises an app itself; it searches with a limit of two
+// (or `labelSearchLimit` with text), fails closed on anything but exactly one AXPress-capable
+// match (a whole-label match may settle a substring tie, and when strict, only a search that
+// saw every candidate counts), and samples frontmost state immediately before and after
+// delegating to the injected `performPress` closure — reporting focus.changed only when a
+// target that was not already frontmost becomes frontmost.
 
 final class PressCoordinatorTests: XCTestCase {
 
@@ -61,12 +62,13 @@ final class PressCoordinatorTests: XCTestCase {
     let performer = RecordingPerformer()
     let frontmost = ScriptedFrontmost([bystander, bystander])
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([]) },
+      search: { _ in self.found([]) },
       frontmostPID: { frontmost.next() },
       performPress: performer.perform
     )
     assertAgentErrorCode(
-      try PressCoordinator.run(targetPID: target, strict: false, deadline: nil, deps), equals: "element.unknown")
+      try PressCoordinator.run(targetPID: target, text: nil, strict: false, deadline: nil, deps),
+      equals: "element.unknown")
     XCTAssertTrue(performer.invocations.isEmpty)
   }
 
@@ -74,11 +76,13 @@ final class PressCoordinatorTests: XCTestCase {
     // A caller deciding whether to retry with a bigger max_nodes needs to know whether the
     // empty result came from a search that saw everything or one that was cut short.
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([], complete: false, visited: 500) },
+      search: { _ in self.found([], complete: false, visited: 500) },
       frontmostPID: { self.bystander },
       performPress: { _ in }
     )
-    XCTAssertThrowsError(try PressCoordinator.run(targetPID: target, strict: false, deadline: nil, deps)) { error in
+    XCTAssertThrowsError(
+      try PressCoordinator.run(targetPID: target, text: nil, strict: false, deadline: nil, deps)
+    ) { error in
       guard let agentError = error as? AgentError else {
         return XCTFail("expected an AgentError, got \(error)")
       }
@@ -94,11 +98,13 @@ final class PressCoordinatorTests: XCTestCase {
     let performer = RecordingPerformer()
     let frontmost = ScriptedFrontmost([bystander, bystander])
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([self.descriptor()], complete: false, visited: 500) },
+      search: { _ in self.found([self.descriptor()], complete: false, visited: 500) },
       frontmostPID: { frontmost.next() },
       performPress: performer.perform
     )
-    XCTAssertThrowsError(try PressCoordinator.run(targetPID: target, strict: true, deadline: nil, deps)) { error in
+    XCTAssertThrowsError(
+      try PressCoordinator.run(targetPID: target, text: nil, strict: true, deadline: nil, deps)
+    ) { error in
       guard let agentError = error as? AgentError else {
         return XCTFail("expected an AgentError, got \(error)")
       }
@@ -113,26 +119,28 @@ final class PressCoordinatorTests: XCTestCase {
     let performer = RecordingPerformer()
     let frontmost = ScriptedFrontmost([bystander, bystander])
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([self.descriptor(handle: 9)], complete: true, visited: 120) },
+      search: { _ in self.found([self.descriptor(handle: 9)], complete: true, visited: 120) },
       frontmostPID: { frontmost.next() },
       performPress: performer.perform
     )
-    let match = try PressCoordinator.run(targetPID: target, strict: true, deadline: nil, deps)
+    let match = try PressCoordinator.run(
+      targetPID: target, text: nil, strict: true, deadline: nil, deps)
     XCTAssertEqual(match.handle, 9)
     XCTAssertEqual(performer.invocations.count, 1)
   }
 
   func testNonStrictSingleMatchFromIncompleteSearchStillPresses() throws {
     // Substring presses keep their pre-existing contract: the first unique hit within the
-    // limit-two search wins even when the walk was cut short.
+    // press search wins even when the walk was cut short.
     let performer = RecordingPerformer()
     let frontmost = ScriptedFrontmost([bystander, bystander])
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([self.descriptor(handle: 3)], complete: false, visited: 500) },
+      search: { _ in self.found([self.descriptor(handle: 3)], complete: false, visited: 500) },
       frontmostPID: { frontmost.next() },
       performPress: performer.perform
     )
-    let match = try PressCoordinator.run(targetPID: target, strict: false, deadline: nil, deps)
+    let match = try PressCoordinator.run(
+      targetPID: target, text: "Not Now", strict: false, deadline: nil, deps)
     XCTAssertEqual(match.handle, 3)
     XCTAssertEqual(performer.invocations.count, 1)
   }
@@ -141,11 +149,13 @@ final class PressCoordinatorTests: XCTestCase {
     let performer = RecordingPerformer()
     let frontmost = ScriptedFrontmost([bystander, bystander])
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([self.descriptor(handle: 1), self.descriptor(handle: 2)]) },
+      search: { _ in self.found([self.descriptor(handle: 1), self.descriptor(handle: 2)]) },
       frontmostPID: { frontmost.next() },
       performPress: performer.perform
     )
-    XCTAssertThrowsError(try PressCoordinator.run(targetPID: target, strict: false, deadline: nil, deps)) { error in
+    XCTAssertThrowsError(
+      try PressCoordinator.run(targetPID: target, text: nil, strict: false, deadline: nil, deps)
+    ) { error in
       guard let agentError = error as? AgentError else {
         return XCTFail("expected an AgentError, got \(error)")
       }
@@ -165,14 +175,15 @@ final class PressCoordinatorTests: XCTestCase {
     let performer = RecordingPerformer()
     let frontmost = ScriptedFrontmost([bystander, bystander])
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([self.descriptor(actions: ["AXShowMenu"])]) },
+      search: { _ in self.found([self.descriptor(actions: ["AXShowMenu"])]) },
       frontmostPID: { frontmost.next() },
       performPress: performer.perform
     )
     // A single, unambiguous match that simply cannot be pressed is `unsupported_op`, not
     // `element.unknown`: the element was found just fine, it just has no AXPress action.
     assertAgentErrorCode(
-      try PressCoordinator.run(targetPID: target, strict: false, deadline: nil, deps), equals: "unsupported_op")
+      try PressCoordinator.run(targetPID: target, text: nil, strict: false, deadline: nil, deps),
+      equals: "unsupported_op")
     XCTAssertTrue(performer.invocations.isEmpty, "an element without AXPress must not be pressed")
   }
 
@@ -180,11 +191,12 @@ final class PressCoordinatorTests: XCTestCase {
     let performer = RecordingPerformer()
     let frontmost = ScriptedFrontmost([bystander, bystander])
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([self.descriptor(handle: 7)]) },
+      search: { _ in self.found([self.descriptor(handle: 7)]) },
       frontmostPID: { frontmost.next() },
       performPress: performer.perform
     )
-    let match = try PressCoordinator.run(targetPID: target, strict: false, deadline: nil, deps)
+    let match = try PressCoordinator.run(
+      targetPID: target, text: nil, strict: false, deadline: nil, deps)
     XCTAssertEqual(match.handle, 7)
     XCTAssertEqual(performer.invocations.count, 1)
   }
@@ -194,11 +206,13 @@ final class PressCoordinatorTests: XCTestCase {
     // Was not frontmost before the press, becomes frontmost immediately after it.
     let frontmost = ScriptedFrontmost([bystander, target])
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([self.descriptor()]) },
+      search: { _ in self.found([self.descriptor()]) },
       frontmostPID: { frontmost.next() },
       performPress: performer.perform
     )
-    assertAgentErrorCode(try PressCoordinator.run(targetPID: target, strict: false, deadline: nil, deps), equals: "focus.changed")
+    assertAgentErrorCode(
+      try PressCoordinator.run(targetPID: target, text: nil, strict: false, deadline: nil, deps),
+      equals: "focus.changed")
     XCTAssertEqual(
       performer.invocations.count, 1, "the press must still be attempted before the focus check")
   }
@@ -208,11 +222,12 @@ final class PressCoordinatorTests: XCTestCase {
     // Already frontmost before the press, and remains frontmost after it.
     let frontmost = ScriptedFrontmost([target, target])
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([self.descriptor()]) },
+      search: { _ in self.found([self.descriptor()]) },
       frontmostPID: { frontmost.next() },
       performPress: performer.perform
     )
-    let match = try PressCoordinator.run(targetPID: target, strict: false, deadline: nil, deps)
+    let match = try PressCoordinator.run(
+      targetPID: target, text: nil, strict: false, deadline: nil, deps)
     XCTAssertEqual(match.handle, 1)
   }
 
@@ -223,11 +238,12 @@ final class PressCoordinatorTests: XCTestCase {
     let otherApp: pid_t = 700
     let frontmost = ScriptedFrontmost([bystander, otherApp])
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([self.descriptor()]) },
+      search: { _ in self.found([self.descriptor()]) },
       frontmostPID: { frontmost.next() },
       performPress: performer.perform
     )
-    let match = try PressCoordinator.run(targetPID: target, strict: false, deadline: nil, deps)
+    let match = try PressCoordinator.run(
+      targetPID: target, text: nil, strict: false, deadline: nil, deps)
     XCTAssertEqual(match.handle, 1)
   }
 
@@ -236,11 +252,13 @@ final class PressCoordinatorTests: XCTestCase {
     performer.shouldSucceed = false
     let frontmost = ScriptedFrontmost([bystander, bystander])
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([self.descriptor()]) },
+      search: { _ in self.found([self.descriptor()]) },
       frontmostPID: { frontmost.next() },
       performPress: performer.perform
     )
-    XCTAssertThrowsError(try PressCoordinator.run(targetPID: target, strict: false, deadline: nil, deps)) { error in
+    XCTAssertThrowsError(
+      try PressCoordinator.run(targetPID: target, text: nil, strict: false, deadline: nil, deps)
+    ) { error in
       XCTAssertEqual((error as NSError).domain, "PressCoordinatorTests")
       XCTAssertEqual((error as NSError).code, 1)
     }
@@ -251,7 +269,7 @@ final class PressCoordinatorTests: XCTestCase {
     var now = 10.0
     let performer = RecordingPerformer()
     let deps = PressCoordinator.Dependencies(
-      search: {
+      search: { _ in
         now += 0.06
         return self.found([self.descriptor()])
       },
@@ -259,7 +277,7 @@ final class PressCoordinatorTests: XCTestCase {
       performPress: performer.perform)
 
     XCTAssertThrowsError(try PressCoordinator.run(
-      targetPID: target, strict: true, deadline: 10.05, deps, monotonic: { now }
+      targetPID: target, text: nil, strict: true, deadline: 10.05, deps, monotonic: { now }
     )) { error in
       XCTAssertEqual((error as? AgentError)?.code, "timeout")
       XCTAssertEqual((error as? AgentError)?.details?["reason"],
@@ -272,7 +290,7 @@ final class PressCoordinatorTests: XCTestCase {
     var now = 10.0
     let performer = RecordingPerformer()
     let deps = PressCoordinator.Dependencies(
-      search: { self.found([self.descriptor()]) },
+      search: { _ in self.found([self.descriptor()]) },
       frontmostPID: {
         now += 0.06
         return self.bystander
@@ -280,12 +298,88 @@ final class PressCoordinatorTests: XCTestCase {
       performPress: performer.perform)
 
     XCTAssertThrowsError(try PressCoordinator.run(
-      targetPID: target, strict: true, deadline: 10.05, deps, monotonic: { now }
+      targetPID: target, text: nil, strict: true, deadline: 10.05, deps, monotonic: { now }
     )) { error in
       XCTAssertEqual((error as? AgentError)?.code, "timeout")
       XCTAssertEqual((error as? AgentError)?.details?["reason"],
                      .string("deadline_exhausted_before_dispatch"))
     }
     XCTAssertTrue(performer.invocations.isEmpty)
+  }
+
+  // MARK: - Whole-label tiebreak
+
+  /// A pressable match whose `field` ("title" or "description") reads `label`.
+  private func labelled(_ handle: Int, _ field: String, _ label: String) -> ElementDescriptor {
+    ElementDescriptor(handle: handle, actions: ["AXPress"], fields: [field: .string(label)])
+  }
+
+  private func assertAmbiguousWithoutPressing(
+    text: String, strict: Bool, _ search: @escaping (Int) -> AXExecutor.QueryResult,
+    file: StaticString = #filePath, line: UInt = #line
+  ) {
+    let performer = RecordingPerformer()
+    let deps = PressCoordinator.Dependencies(
+      search: search, frontmostPID: { self.bystander }, performPress: performer.perform)
+    assertAgentErrorCode(
+      try PressCoordinator.run(
+        targetPID: target, text: text, strict: strict, deadline: nil, deps),
+      equals: "bad_request", file: file, line: line)
+    XCTAssertTrue(performer.invocations.isEmpty, file: file, line: line)
+  }
+
+  func testWholeLabelMatchSettlesASubstringTie() throws {
+    // Text is a substring search, so "Allow" also finds "Don't Allow". The one match labelled
+    // exactly "Allow" -- by title or by description -- is the target, even from a search that
+    // did not see every node, just as a substring press accepts one match from such a search.
+    for field in ["title", "description"] {
+      let performer = RecordingPerformer()
+      let deps = PressCoordinator.Dependencies(
+        search: { _ in
+          self.found(
+            [self.labelled(1, field, "Don't Allow"), self.labelled(2, field, "Allow")],
+            complete: false, visited: 500)
+        },
+        frontmostPID: { self.bystander },
+        performPress: performer.perform
+      )
+      let match = try PressCoordinator.run(
+        targetPID: target, text: "Allow", strict: false, deadline: nil, deps)
+      XCTAssertEqual(match.handle, 2, field)
+      XCTAssertEqual(performer.invocations.map(\.handle), [2], field)
+    }
+  }
+
+  func testTwoWholeLabelMatchesStayAmbiguous() {
+    assertAmbiguousWithoutPressing(text: "Allow", strict: false) { _ in
+      self.found([
+        self.labelled(1, "title", "Allow"), self.labelled(2, "title", "Don't Allow"),
+        self.labelled(3, "description", "Allow"),
+      ])
+    }
+  }
+
+  func testNoWholeLabelMatchStaysAmbiguous() {
+    assertAmbiguousWithoutPressing(text: "Allow", strict: false) { _ in
+      self.found([self.labelled(1, "title", "Allow All"), self.labelled(2, "title", "Don't Allow")])
+    }
+  }
+
+  func testSearchThatFilledItsLimitCannotSettleATie() {
+    // Every slot the limit allowed came back, so an unread match could be a second "Allow".
+    assertAmbiguousWithoutPressing(text: "Allow", strict: false) { limit in
+      self.found(
+        [self.labelled(0, "title", "Allow")]
+          + (1..<limit).map { self.labelled($0, "title", "Don't Allow \($0)") })
+    }
+  }
+
+  func testStrictSearchMustBeCompleteToSettleATie() {
+    // An exact selector promises uniqueness, which a search cut short cannot prove.
+    assertAmbiguousWithoutPressing(text: "Allow", strict: true) { _ in
+      self.found(
+        [self.labelled(1, "title", "Allow"), self.labelled(2, "title", "Don't Allow")],
+        complete: false, visited: 500)
+    }
   }
 }

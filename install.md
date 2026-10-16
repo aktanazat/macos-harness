@@ -20,6 +20,11 @@ macos-harness skill > "${CODEX_HOME:-$HOME/.codex}/skills/macos-harness/SKILL.md
 macos-harness doctor
 ```
 
+The card stays short; `macos-harness skill signatures` (or `receipts`,
+`ax-search`, and the other names the card lists) prints one reference on
+demand. From a checkout, `scripts/install-skill.sh [dir]` copies the card and
+every reference into `~/.agents/skills/macos-harness` or the directory given.
+
 Grant only the permissions reported by `doctor`. macOS may request Accessibility,
 Screen Recording, and Automation access. Input Monitoring is not required.
 

@@ -667,6 +667,25 @@ class NativeClient:
             key=lambda item: (str(item.get("name", "")).casefold(), item.get("pid", 0)),
         )
 
+    def unanswered_apps(self, pids: Iterable[int], messaging_timeout: float) -> frozenset[int]:
+        """Run ``ax_unanswered_apps``: the ``pids`` whose app cannot answer
+        Accessibility within ``messaging_timeout`` seconds, asked side by
+        side in the agent."""
+        result = self._request(
+            "ax_unanswered_apps",
+            {"pids": [int(pid) for pid in pids], "messaging_timeout": messaging_timeout},
+        )
+        silent = result.get("pids")
+        if not isinstance(silent, list) or not all(
+            isinstance(pid, int) and not isinstance(pid, bool) for pid in silent
+        ):
+            raise NativeProtocolError(
+                f"Malformed ax_unanswered_apps result: {result!r}",
+                code=ErrorCode.AX_ERROR,
+                details={"op": "ax_unanswered_apps"},
+            )
+        return frozenset(silent)
+
     def query(self, params: dict[str, JSONValue]) -> NativeQueryResult:
         """Run ``ax_query`` and return its matches with their completeness."""
         resets = bool(params.get("reset_elements", True))

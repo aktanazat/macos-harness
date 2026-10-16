@@ -123,18 +123,20 @@ def test_failed_search_inspection_shows_current_controls_without_retrying_the_ac
     assert host.do.history() == (receipt,)
 
 
-def test_failed_expectation_retains_its_app_for_diagnostics(inspection) -> None:
+@pytest.mark.parametrize("role", ["button", "any"])
+def test_failed_expectation_retains_its_app_for_diagnostics(inspection, role) -> None:
     host, _requested = inspection
     host.wait_results.append(MacOSError("No matching control", code=ErrorCode.TIMEOUT))
     with pytest.raises(OperationError, match="No matching control") as failure:
-        host.do.expect(present(app="Demo", role="button", identifier="missing", timeout=0))
+        host.do.expect(present(app="Demo", role=role, identifier="missing", timeout=0))
     receipt = failure.value.receipt
 
     state = host.inspect(receipt)
 
     assert state["process"]["pid"] == 41
     assert state["process"]["launched_at"] == 1000.0
-    assert [(node["identifier"], node["enabled"]) for node in state["nearby"]] == [("save-as", False)]
+    identifiers = [node.get("identifier") for node in state["nearby"]]
+    assert identifiers == (["save-as"] if role == "button" else [None, "name", "save-as", None])
     assert receipt.error["code"] == ErrorCode.TIMEOUT
     assert host.do.history() == (receipt,)
 
@@ -251,6 +253,20 @@ def test_explanation_does_not_replace_the_action_error_with_a_diagnostic_failure
     assert explanation["findings"][0]["kind"] == "diagnostic.incomplete"
 
 
+def test_explanation_retains_the_limits_of_a_partial_inspection(inspection) -> None:
+    host, _requested = inspection
+    partial = host.inspect("Demo", max_nodes=2)
+    receipt = _make_receipt(process=partial["process"], target={"app": {"pid": 41}})
+
+    explanation = MacOS.explain(receipt, partial)
+
+    finding = next(item for item in explanation["findings"] if item["kind"] == "diagnostic.incomplete")
+    assert finding["source"] == "inspection"
+    assert finding["coverage"] == partial["coverage"]
+    assert finding["ax_status"] == "partial"
+    assert explanation["receipt"] == receipt.to_json()
+
+
 @pytest.mark.parametrize("kind", ["reused-pid", "old-interval"])
 def test_explanation_refuses_evidence_from_another_action(kind) -> None:
     receipt = _make_receipt(process={"pid": 41, "launched_at": 1000.0})
@@ -260,5 +276,84 @@ def test_explanation_refuses_evidence_from_another_action(kind) -> None:
 
     with pytest.raises(MacOSError, match="another process incarnation|outside the action interval") as failure:
         MacOS.explain(receipt, evidence)
+
+    assert failure.value.code == ErrorCode.BAD_REQUEST
+
+
+def test_diff_follows_a_control_whose_snapshot_index_was_reallocated(inspection) -> None:
+    host, _requested = inspection
+    before = host.inspect("Demo")
+    banner = object()
+    host.data[banner] = {"AXRole": "AXStaticText", "AXTitle": "Saved"}
+    # A new first child renumbers every control after it, and the sheet is gone.
+    host.data[host.root]["AXChildren"] = [banner, host.field, host.button]
+    host.data[host.button].update({"AXTitle": "Save", "AXEnabled": True})
+    after = host.inspect("Demo")
+    save = [next(node for node in state["nodes"] if node.get("identifier") == "save-as")
+            for state in (before, after)]
+
+    result = MacOS.diff(before, after)
+
+    assert save[0]["element_index"] != save[1]["element_index"]
+    assert save[0]["ref"] == save[1]["ref"]
+    assert result["status"] == "complete"
+    assert result["changed"] == [{
+        "ref": save[1]["ref"], "role": "AXButton",
+        "fields": {"enabled": {"before": False, "after": True},
+                   "title": {"before": "Save as", "after": "Save"}},
+        "element_index": {"before": save[0]["element_index"], "after": save[1]["element_index"]},
+    }]
+    assert [row["title"] for row in result["added"]] == ["Saved"]
+    assert [row["title"] for row in result["removed"]] == ["Confirm"]
+    assert result["unproven"] == {"appeared": [], "missing": []}
+
+
+def test_diff_does_not_claim_a_control_appeared_when_the_earlier_walk_stopped_short(inspection) -> None:
+    host, _requested = inspection
+    before = host.inspect("Demo", max_nodes=2)
+    after = host.inspect("Demo")
+
+    result = MacOS.diff(before, after)
+
+    assert before["coverage"]["node_cut"] is True
+    assert result["status"] == "partial"
+    assert result["added"] == []
+    assert [row["role"] for row in result["unproven"]["appeared"]] == ["AXButton", "AXSheet"]
+    assert result["unproven"]["missing"] == []
+    assert result["coverage"] == {"before": before["coverage"], "after": after["coverage"]}
+
+
+def test_diff_never_reports_a_value_the_other_snapshot_was_not_allowed_to_read(inspection) -> None:
+    host, _requested = inspection
+    before = host.inspect("Demo", include_values=True)
+    host.data[host.field]["AXValue"] = "different text"
+    host.data[host.button]["AXEnabled"] = True
+    after = host.inspect("Demo")
+
+    result = MacOS.diff(before, after)
+
+    assert before["nodes"][1]["value"] == "private text"
+    assert "value" not in after["nodes"][1]
+    assert [row["fields"] for row in result["changed"]] == [{"enabled": {"before": False, "after": True}}]
+
+
+@pytest.mark.parametrize("kind", ["other-session", "broken-chain", "relaunched-app"])
+def test_diff_refuses_snapshots_whose_refs_were_never_matched(inspection, monkeypatch, kind) -> None:
+    host, _requested = inspection
+    before = host.inspect("Demo")
+    if kind == "other-session":
+        # Another instance of the same app, wound forward until its own
+        # sequence numbers line up with this one's by coincidence.
+        host = InspectionHost()
+        _focus_ax(monkeypatch, host, host.data, batch=False, focused=host.field)
+        host.inspect("Demo")
+    elif kind == "broken-chain":
+        host.inspect("Demo")
+    else:
+        host.identity = host.identity._replace(launched_at=2000.0)
+    after = host.inspect("Demo")
+
+    with pytest.raises(MacOSError, match="one app process|different observation sessions|not consecutive") as failure:
+        MacOS.diff(before, after)
 
     assert failure.value.code == ErrorCode.BAD_REQUEST
