@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -61,6 +62,49 @@ def test_version_flag_prints_version_and_exits_zero(
         cli.main(["--version"])
     assert excinfo.value.code == 0
     assert capsys.readouterr().out.strip() == f"macos-harness {cli.__version__}"
+
+
+def _skill(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
+    status = cli.main(["skill", *args])
+    captured = capsys.readouterr()
+    return status, captured.out, captured.err
+
+
+def test_skill_prints_every_reference_the_card_names(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("DO_NOT_TRACK", "1")
+    _status, card, _err = _skill([], capsys)
+    listed = card.split("## References", 1)[1]
+    names = set(re.findall(r"^- `([a-z-]+)`:", listed, re.MULTILINE))
+    names |= set(re.findall(r"references/([a-z-]+)\.md", card))
+
+    unprintable = [name for name in sorted(names) if _skill([name], capsys)[0] != 0]
+
+    assert len(names) >= 9
+    assert unprintable == []
+
+
+def test_skill_names_the_real_references_for_an_unknown_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("DO_NOT_TRACK", "1")
+    status, out, err = _skill(["native"], capsys)
+
+    assert status == 1
+    assert out == ""
+    assert "no skill reference 'native'" in err
+    assert "native-backend" in err
+
+
+def test_skill_card_stays_within_its_size_budget(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Agents reread the card after every compaction; detail belongs in a reference."""
+    monkeypatch.setenv("DO_NOT_TRACK", "1")
+    _status, card, _err = _skill([], capsys)
+
+    assert len(card.encode("utf-8")) <= 3500
 
 
 def test_stdin_json_errors_preserves_operation_receipt() -> None:

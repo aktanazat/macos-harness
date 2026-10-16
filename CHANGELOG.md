@@ -10,9 +10,17 @@ follows [Semantic Versioning](https://semver.org/).
 - `MACOS_HARNESS_RECEIPT_LOG=1` appends each finished `mac.do` receipt as one
   JSON line to `~/Library/Logs/macos-harness/receipts.jsonl`, without values
   or typed text, rotating at 5 MiB. It is off by default.
+- `macos-harness skill <name>` prints one skill reference, and
+  `scripts/install-skill.sh` copies the card and every reference into an
+  agent skills directory.
 
 ### Changed
 
+- The skill is now a short card (about 3 KB, down from 31 KB) plus
+  references for signatures, receipts, accessibility search, invariants,
+  routes, diagnostics, handoff, credentials, and the native backend. The card
+  shows waiting for the next control after a press, and asks for
+  `macos-harness doctor` only after a permission or connection error.
 - With the default Python backend, an all-apps search, query or press now
   reaches an app that started after the harness first listed apps, such as
   the process behind a permission dialog. Each listing reads the running
