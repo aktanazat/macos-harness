@@ -214,6 +214,16 @@ Path("action-history.json").write_text(
 )
 ```
 
+To keep a record that outlives the process, set `MACOS_HARNESS_RECEIPT_LOG=1`.
+Each finished `mac.do` receipt is then appended as one JSON line to
+`~/Library/Logs/macos-harness/receipts.jsonl`: the UTC time, process id, verb,
+outcome, `acted`, app name, bundle ID, and pid, the target's role and labels,
+duration, `verified`, `changed`, `replayed`, and the error code and message. Values,
+typed text, script source, and output are never written, and a `type` or
+`fill` error keeps only its code. The file is created with mode `0600` and
+rotates to `receipts.jsonl.1` at 5 MiB. A failed write warns and never fails
+the action. The log is off by default.
+
 ### Saved navigation
 
 Use `mac.route` to record a navigation sequence and replay it later through

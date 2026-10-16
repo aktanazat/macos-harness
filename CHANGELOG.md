@@ -5,6 +5,12 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `MACOS_HARNESS_RECEIPT_LOG=1` appends each finished `mac.do` receipt as one
+  JSON line to `~/Library/Logs/macos-harness/receipts.jsonl`, without values
+  or typed text, rotating at 5 MiB. It is off by default.
+
 ### Changed
 
 - With the default Python backend, an all-apps search, query or press now
