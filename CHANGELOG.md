@@ -24,6 +24,13 @@ follows [Semantic Versioning](https://semver.org/).
   `state` read an all-digit app as a pid. The skill card shows reading the
   PNG in the same omp eval cell that captured it, which saves a turn per
   look.
+- `mac.wait_change(app)` returns once a window has changed since its last
+  `see` (or the last wait on it) and held still for half a second, in place
+  of a guessed sleep, with how many looks it took. A blinking caret is no
+  change; `region=` watches a smaller one and `by="ax"` compares the app's
+  text. Nothing changing raises a timeout whose details say `changed` is
+  false. `mac.see(app, after_change=True)` waits the same way and then
+  captures, reporting `changed` instead of raising.
 
 ### Changed
 

@@ -16,8 +16,8 @@ print(mac.see("Spotify"))
 PY
 ```
 
-In omp, run it and `tool.read` the printed PNG path in one eval cell: the
-image returns with the result.
+In omp, `tool.read` the printed PNG path in the same eval cell: the image
+returns with the result.
 
 Bundle reversible steps; verify once at the end. Stop only for unclear
 identity, an irreversible action, or unexpected state.
@@ -32,20 +32,22 @@ identity, an irreversible action, or unexpected state.
 - `mac.script(source)`: AppleScript for an exact, focus-safe command.
 
 `mac.launch(app)` opens an app in the background, returning once a window is up.
+Never `sleep`: `mac.wait_change(app)` returns once the window changed since the
+last `see` or wait and settled; `mac.see(app, after_change=True)` waits so first.
 
 ## Receipts
 
 For a change, use `mac.do.press/set/fill/toggle/key/click/type/run`. Each
 returns a `Receipt` (`outcome`, `acted`, `changed`, `verified`) or raises
 `OperationError` with `exc.receipt`. `postcondition=` proves the effect;
-`once=` guards an action you cannot repeat. Wait for the next control in the
-same program, never with `sleep`:
+`once=` guards an action you cannot repeat. Await the next control in the
+same program:
 
 ```python
 from macos_harness import OperationError
 try:
     mac.do.press("Next", role="button", app="Xcode")
-except OperationError as exc:  # -25204 may still have pressed
+except OperationError as exc:
     print(exc.receipt.error["code"])
 mac.ax.wait("Upload", role="button", app="Xcode", timeout=15)
 print(mac.see("Xcode"))
@@ -65,14 +67,13 @@ print(mac.see("Xcode"))
 At Touch ID, a passkey, a CAPTCHA, a code, or a sign-in approval, print
 `mac.handoff(reason="authentication_required", app=...)` and end
 the turn. Never type secrets into native fields or drive web pages through
-Accessibility: `references/credentials.md`.
+Accessibility: `credentials`.
 
 Run `macos-harness doctor` only after a permission or connection error.
 
 ## References
 
-After a compaction, read only the reference you need; a subagent writing
-Mac-control code reads one, not this card.
+After a compaction, read only the reference you need.
 `macos-harness skill <name>` prints each one from `references/`:
 
 - `signatures`: every exact signature

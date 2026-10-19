@@ -21,7 +21,8 @@ captures one window and prints the same result as `mac.see`.
 ## Primitives
 
 ```text
-mac.see(app=None, *, window_index=0, path=None, max_width=1280, max_height=1280, show_pointer=False)
+mac.see(app=None, *, window_index=0, path=None, max_width=1280, max_height=1280, show_pointer=False, after_change=False, timeout=30.0)
+mac.wait_change(app=None, *, window_index=0, region=None, by="pixels", timeout=30.0, settle=0.5)
 mac.key(key, *, app=None)
 mac.type(text, *, app=None)
 mac.click(x, y, *, app=None, button="left", clicks=1, coordinate_space="screenshot")

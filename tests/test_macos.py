@@ -2410,7 +2410,7 @@ def _fake_window_capture(mac: MacOS, monkeypatch) -> None:
     )
     monkeypatch.setattr(mac._overlay, "_send", lambda payload, *, start=True: None)
 
-    def capture_window(window_id, *, max_width, max_height, timeout=5.0):
+    def capture_window(window_id, *, max_width, max_height, size=None, timeout=5.0):
         return WindowCapture(
             image=_white_image(800, 600),
             width=800,

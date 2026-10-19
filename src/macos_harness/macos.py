@@ -11,6 +11,7 @@ import ctypes
 import errno
 import json
 import math
+import operator
 import os
 import plistlib
 import re
@@ -24,9 +25,17 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, NamedTuple, Self
+from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
 
-from .capture import capture_window, draw_pointer, write_png
+from .capture import (
+    GrayPrint,
+    WindowCapture,
+    capture_window,
+    changed_area,
+    draw_pointer,
+    gray_print,
+    write_png,
+)
 from .errors import (
     AccessibilityPermissionError,
     ApplicationNotFoundError,
@@ -215,6 +224,24 @@ _AX_PROBE_WORKERS = 16
 # and a capture waits for its first window instead of failing at once.
 _LAUNCH_GRACE_SECONDS = 5.0
 _LAUNCH_WINDOW_TIMEOUT = 2.0
+# `wait_change` looks at a window this often, and a look counts as changed
+# once about 64 square points of it moved in brightness -- one short word
+# of body text; a blinking caret is about 20 -- or 2% of a watched region,
+# whichever is less. A whole-window print keeps one pixel per 2 points.
+_CHANGE_POLL_SECONDS = 0.2
+_CHANGE_SETTLE_SECONDS = 0.5
+_CHANGE_AREA = 64.0
+_CHANGE_REGION_SHARE = 0.02
+_CHANGE_BASELINE_SIZE = 640
+_PRINT_POINTS_PER_PIXEL = 2.0
+_PRINT_MAX_WIDTH = 400
+# What `wait_change(by="ax")` compares: what an element says and its
+# state, not where it sits.
+_AX_LOOK_ATTRIBUTES = (
+    "AXSubrole", "AXTitle", "AXDescription", "AXValue", "AXPlaceholderValue",
+    "AXEnabled", "AXSelected",
+)
+_Look = TypeVar("_Look")
 _AX_NODE_MAPPING = {
     "AXSubrole": "subrole",
     "AXMain": "main",
@@ -876,6 +903,10 @@ class MacOS:
         self._last_app: dict[str, Any] | None = None
         self._last_windows: list[dict[str, Any]] = []
         self._last_screenshot: dict[str, Any] | None = None
+        # The last `see` before its pointer was drawn, or the last look of
+        # a wait measured from one, by window id: the baseline the next
+        # `wait_change` of that window compares against.
+        self._last_capture: tuple[int, WindowCapture] | None = None
         self._event_source = AS.CGEventSourceCreate(AS.kCGEventSourceStatePrivate)
         if self._event_source is None:
             raise MacOSError(
@@ -3630,7 +3661,7 @@ class MacOS:
 
     @staticmethod
     def _now() -> float:
-        """The monotonic clock the launch, quit, and window waits read."""
+        """The monotonic clock the launch, quit, window, and change waits read."""
         return time.monotonic()
 
     @staticmethod
@@ -3696,12 +3727,17 @@ class MacOS:
         max_width: int = 1280,
         max_height: int = 1280,
         show_pointer: bool = False,
+        after_change: bool = False,
+        timeout: float = 30.0,
     ) -> dict[str, Any]:
         """Capture a bounded window image; ``show_pointer`` draws the pointer onto it.
 
-        The result's ``on_screen`` is the only freshness signal: an
-        off-screen window (minimized, hidden, or on another Space) still
-        renders, but from whatever the app last drew.
+        ``after_change`` first waits up to ``timeout`` seconds for the
+        window to change from its last `see` and settle (`wait_change`);
+        the result's ``changed`` says whether it did, and no change is no
+        error here. The result's ``on_screen`` is the only freshness
+        signal: an off-screen window (minimized, hidden, or on another
+        Space) still renders, but from whatever the app last drew.
         """
         if max_width <= 0 or max_height <= 0:
             raise MacOSError(
@@ -3709,7 +3745,13 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"max_width": max_width, "max_height": max_height},
             )
-        return self._capture(
+        change = None
+        if after_change:
+            change = self._watch_change(
+                app, window_index=window_index, region=None, by="pixels",
+                timeout=timeout, settle=_CHANGE_SETTLE_SECONDS,
+            )
+        screenshot = self._capture(
             app,
             window_index=window_index,
             path=path,
@@ -3717,6 +3759,9 @@ class MacOS:
             max_height=max_height,
             show_pointer=show_pointer,
         )
+        if change is not None:
+            screenshot["changed"] = change["changed"]
+        return screenshot
 
     def _capture(
         self,
@@ -3731,18 +3776,7 @@ class MacOS:
         self._ensure_screen_recording()
         running, info = self._resolve_app(app)
         windows = self._ready_windows(running, info, timeout=_LAUNCH_WINDOW_TIMEOUT)
-        try:
-            window = windows[window_index]
-        except IndexError as exc:
-            raise MacOSError(
-                f"Window index {window_index} is out of range; found {len(windows)} windows",
-                code=ErrorCode.BAD_REQUEST,
-                details={
-                    "parameter": "window_index",
-                    "value": window_index,
-                    "count": len(windows),
-                },
-            ) from exc
+        window = self._indexed_window(windows, window_index)
 
         if path is None:
             with tempfile.NamedTemporaryFile(
@@ -3753,7 +3787,7 @@ class MacOS:
             output = Path(path).expanduser().resolve()
             output.parent.mkdir(parents=True, exist_ok=True)
 
-        captured = capture_window(
+        captured = self._window_image(
             window["window_id"], max_width=max_width, max_height=max_height
         )
         bounds = captured.bounds
@@ -3799,7 +3833,243 @@ class MacOS:
         self._last_app = info
         self._last_windows = windows
         self._last_screenshot = screenshot
+        self._last_capture = (int(window["window_id"]), captured)
         return screenshot
+
+    @staticmethod
+    def _window_image(
+        window_id: int,
+        *,
+        max_width: int | None,
+        max_height: int | None,
+        size: tuple[int, int] | None = None,
+    ) -> WindowCapture:
+        """Render one window; the one capture `see` and `wait_change` take."""
+        return capture_window(window_id, max_width=max_width, max_height=max_height, size=size)
+
+    @staticmethod
+    def _indexed_window(windows: list[dict[str, Any]], window_index: int) -> dict[str, Any]:
+        try:
+            return windows[window_index]
+        except IndexError as exc:
+            raise MacOSError(
+                f"Window index {window_index} is out of range; found {len(windows)} windows",
+                code=ErrorCode.BAD_REQUEST,
+                details={
+                    "parameter": "window_index",
+                    "value": window_index,
+                    "count": len(windows),
+                },
+            ) from exc
+
+    def wait_change(
+        self,
+        app: str | int | None = None,
+        *,
+        window_index: int = 0,
+        region: tuple[float, float, float, float] | None = None,
+        by: str = "pixels",
+        timeout: float = 30.0,
+        settle: float = _CHANGE_SETTLE_SECONDS,
+    ) -> dict[str, Any]:
+        """Return once ``app``'s window looks different and has then held
+        still for ``settle`` seconds, in place of a guessed sleep.
+
+        The baseline is the last `see` of that window, or the look where
+        the last wait measured from one ended, so a change the last action
+        made before this call still counts; with neither it is the window
+        as it looks now. ``region`` (x, y, width, height in that `see`'s
+        pixels) watches part of the window;
+        ``by="ax"`` compares the app's accessibility text instead of
+        pixels. A blinking caret is no change. Raises TIMEOUT, with
+        ``details["changed"]`` False, when nothing changed in time.
+        """
+        watched = self._watch_change(
+            app, window_index=window_index, region=region, by=by, timeout=timeout, settle=settle,
+        )
+        if not watched["changed"]:
+            raise MacOSError(
+                f"{watched['app']['name']} did not change in {timeout:g}s",
+                code=ErrorCode.TIMEOUT,
+                details={**watched, "timeout": timeout},
+            )
+        return watched
+
+    def _watch_change(
+        self,
+        app: str | int | None,
+        *,
+        window_index: int,
+        region: tuple[float, float, float, float] | None,
+        by: str,
+        timeout: float,
+        settle: float,
+    ) -> dict[str, Any]:
+        if by not in ("pixels", "ax"):
+            raise MacOSError(
+                f"by must be 'pixels' or 'ax', not {by!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "by", "value": by},
+            )
+        if not all(
+            type(value) in (int, float) and math.isfinite(value) and value >= 0
+            for value in (timeout, settle)
+        ):
+            raise MacOSError(
+                "timeout and settle must be seconds, 0 or more",
+                code=ErrorCode.BAD_REQUEST,
+                details={"timeout": timeout, "settle": settle},
+            )
+        if region is not None and by == "ax":
+            raise MacOSError(
+                "region watches pixels; by='ax' compares the whole app's text",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "region"},
+            )
+        started = self._now()
+        deadline = started + timeout
+        running, info = self._resolve_app(app)
+        watched: dict[str, Any] = {"by": by, "app": info}
+        if by == "ax":
+            self._ensure_accessibility()
+            pid = int(info["pid"])
+            changed, settled, polls = self._until_settled(
+                lambda: self._ax_look(pid), self._ax_look(pid), operator.ne,
+                look_now=False, deadline=deadline, settle=settle,
+            )
+            watched["baseline"] = "now"
+        else:
+            self._ensure_screen_recording()
+            windows = self._ready_windows(running, info, timeout=_LAUNCH_WINDOW_TIMEOUT)
+            window_id = int(self._indexed_window(windows, window_index)["window_id"])
+            last = self._last_capture
+            seen = last[1] if last is not None and last[0] == window_id else None
+            look, baseline, threshold = self._pixel_looks(window_id, seen, region)
+            changed, settled, polls = self._until_settled(
+                look, baseline, lambda before, after: changed_area(before, after) >= threshold,
+                look_now=seen is not None, deadline=deadline, settle=settle,
+            )
+            watched.update(baseline="see" if seen else "now", window_id=window_id)
+        watched.update(
+            changed=changed, settled=settled, polls=polls,
+            elapsed_ms=round((self._now() - started) * 1000),
+        )
+        return watched
+
+    def _pixel_looks(
+        self,
+        window_id: int,
+        seen: WindowCapture | None,
+        region: tuple[float, float, float, float] | None,
+    ) -> tuple[Callable[[], GrayPrint], GrayPrint, float]:
+        """How `wait_change` looks at a window: a fresh print, the baseline
+        print, and the square points two prints must differ by to count."""
+        if region is not None and seen is None:
+            raise MacOSError(
+                "region is in the pixels of the last mac.see of this window; see it first",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "region", "window_id": window_id},
+            )
+        first = seen or self._window_image(
+            window_id, max_width=_CHANGE_BASELINE_SIZE, max_height=_CHANGE_BASELINE_SIZE
+        )
+        size, bounds = (first.width, first.height), first.bounds
+        crop = None if region is None else self._print_crop(region, *size)
+        if crop is None:
+            points = (bounds["width"], bounds["height"])
+            width = min(_PRINT_MAX_WIDTH, first.width,
+                        math.ceil(points[0] / _PRINT_POINTS_PER_PIXEL))
+            threshold = _CHANGE_AREA
+        else:
+            points = (crop[2] * bounds["width"] / first.width,
+                      crop[3] * bounds["height"] / first.height)
+            width = min(_PRINT_MAX_WIDTH, math.ceil(crop[2]))
+            threshold = min(_CHANGE_AREA, _CHANGE_REGION_SHARE * points[0] * points[1])
+        height = max(1, round(width * points[1] / points[0]))
+
+        def shrink(image: object) -> GrayPrint:
+            return gray_print(image, width=width, height=height, points=points, crop=crop)
+
+        def look() -> GrayPrint:
+            captured = self._window_image(window_id, max_width=None, max_height=None, size=size)
+            if seen is not None:
+                # The next wait measures from here, not from a change this one saw.
+                self._last_capture = (window_id, captured)
+            return shrink(captured.image)
+
+        return look, shrink(first.image), threshold
+
+    @staticmethod
+    def _print_crop(region: object, width: int, height: int) -> tuple[float, float, float, float]:
+        """``region`` checked against a ``width`` x ``height`` screenshot."""
+        values = tuple(region) if isinstance(region, (tuple, list)) else ()
+        if len(values) != 4 or not all(
+            type(value) in (int, float) and math.isfinite(value) for value in values
+        ):
+            raise MacOSError(
+                "region must be (x, y, width, height) in the last see's pixels",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "region"},
+            )
+        x, y, w, h = (float(value) for value in values)
+        if w < 1 or h < 1 or x < 0 or y < 0 or x + w > width or y + h > height:
+            raise MacOSError(
+                f"region must lie inside the {width}x{height} screenshot",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "region", "width": width, "height": height},
+            )
+        return x, y, w, h
+
+    def _ax_look(self, pid: int) -> tuple[str, ...]:
+        """``pid``'s accessibility text, one entry per element, for
+        `wait_change(by="ax")`; the caller's element indexes stay valid."""
+        held = self._elements
+        try:
+            snapshot = self._snapshot_tree(
+                self._application_element(pid, enhance=False),
+                max_depth=25, max_nodes=2000, include_menu_bar=False,
+                attributes=_AX_LOOK_ATTRIBUTES, include_actions=False,
+                include_settable=False, skip_closed_menus=True,
+            )
+        finally:
+            self._elements = held
+        return tuple(
+            json.dumps({key: value for key, value in node.items() if key != "element_index"},
+                       sort_keys=True, ensure_ascii=False)
+            for node in snapshot.nodes
+        )
+
+    def _until_settled(
+        self,
+        look: Callable[[], _Look],
+        baseline: _Look,
+        differs: Callable[[_Look, _Look], bool],
+        *,
+        look_now: bool,
+        deadline: float,
+        settle: float,
+    ) -> tuple[bool, bool, int]:
+        """Look until a look unlike ``baseline`` has held for ``settle``
+        seconds or ``deadline`` passes: (changed, settled, looks taken).
+        ``look_now`` takes the first look at once, for a baseline taken
+        before the change could have happened."""
+        looks, previous, since = 0, baseline, None
+        while True:
+            if looks or not look_now:
+                remaining = deadline - self._now()
+                if remaining <= 0:
+                    return since is not None, False, looks
+                self._pause(min(_CHANGE_POLL_SECONDS, remaining))
+            current = look()
+            looks += 1
+            now = self._now()
+            if not differs(baseline, current):
+                since = None
+            elif since is None or differs(previous, current):
+                since = now
+            previous = current
+            if since is not None and now - since >= settle:
+                return True, True, looks
 
     # --- direct visual and keyboard input -------------------------------
 

@@ -7,6 +7,7 @@ image is encoded exactly once, by ImageIO, straight into the output file.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -49,6 +50,17 @@ class WindowCapture:
     bounds: dict[str, float]
     on_screen: bool
     captured_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class GrayPrint:
+    """A window's look reduced for comparison: 8-bit gray pixels row by
+    row, and the square points of window each pixel stands for."""
+
+    width: int
+    height: int
+    pixels: bytes
+    point_area: float
 
 
 def _await(
@@ -151,12 +163,15 @@ def capture_window(
     *,
     max_width: int | None,
     max_height: int | None,
+    size: tuple[int, int] | None = None,
     timeout: float = CAPTURE_TIMEOUT,
 ) -> WindowCapture:
     """Render one window at most ``max_width`` x ``max_height`` pixels.
 
     ``None`` for either bound keeps the window's native pixel size on that
-    axis. The window is captured on its own (``desktopIndependentWindow``):
+    axis; ``size`` asks for exactly that many pixels instead, so a later
+    capture compares pixel for pixel with an earlier one. The window is
+    captured on its own (``desktopIndependentWindow``):
     no shadow, no other window, and no clipping at the screen edge. An
     off-screen window still renders, but from whatever the app last drew --
     apps do not repaint hidden content, so ``on_screen`` is the caller's
@@ -182,7 +197,7 @@ def capture_window(
             code=ErrorCode.ELEMENT_UNKNOWN,
             details={"window_id": window_id, "bounds": bounds},
         )
-    width, height = _output_size(natural_width, natural_height, max_width, max_height)
+    width, height = size or _output_size(natural_width, natural_height, max_width, max_height)
 
     config = SCK.SCStreamConfiguration.alloc().init()
     config.setWidth_(width)
@@ -222,6 +237,47 @@ def capture_window(
         on_screen=bool(window.isOnScreen()),
         captured_at=captured_at,
     )
+
+
+def gray_print(
+    image: Any,
+    *,
+    width: int,
+    height: int,
+    points: tuple[float, float],
+    crop: tuple[float, float, float, float] | None = None,
+) -> GrayPrint:
+    """Draw ``image``, or its ``crop`` (x, y, width, height in image pixels
+    from the top left), into a ``width`` x ``height`` gray bitmap.
+
+    ``points`` is the size of the drawn part in screen points. Each pixel
+    averages the area it covers, so a thin line keeps its weight when
+    shrunk instead of vanishing or flickering between captures.
+    """
+    if crop is not None:
+        image = Quartz.CGImageCreateWithImageInRect(image, Quartz.CGRectMake(*crop))
+    context = Quartz.CGBitmapContextCreate(
+        None, width, height, 8, width, Quartz.CGColorSpaceCreateDeviceGray(),
+        Quartz.kCGImageAlphaNone,
+    )
+    Quartz.CGContextSetInterpolationQuality(context, Quartz.kCGInterpolationHigh)
+    Quartz.CGContextDrawImage(context, Quartz.CGRectMake(0, 0, width, height), image)
+    drawn = Quartz.CGBitmapContextCreateImage(context)
+    row = int(Quartz.CGImageGetBytesPerRow(drawn))
+    raw = bytes(Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(drawn)))
+    pixels = raw if row == width else b"".join(
+        raw[top:top + width] for top in range(0, row * height, row)
+    )
+    return GrayPrint(width, height, pixels, points[0] / width * points[1] / height)
+
+
+def changed_area(before: GrayPrint, after: GrayPrint) -> float:
+    """Square points of window that changed, each pixel weighted by how far
+    its gray level moved; prints of different sizes differ everywhere."""
+    if (before.width, before.height) != (after.width, after.height):
+        return math.inf
+    moved = sum(abs(old - new) for old, new in zip(before.pixels, after.pixels, strict=True))
+    return moved / 255 * before.point_area
 
 
 def draw_pointer(image: Any, x: float, y: float, scale: float) -> Any:
