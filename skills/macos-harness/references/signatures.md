@@ -44,6 +44,7 @@ mac.relaunch(app, *, timeout=15.0, window=True)
 mac.frontmost()
 mac.windows(app=None, *, all_layers=False)
 mac.wait_for_window(app=None, *, timeout=2.0)
+mac.place(app=None, *, window_index=0, x=None, y=None, width=None, height=None, display=None)
 mac.list_apps()
 mac.show_pointer()
 mac.hide_pointer()
@@ -64,6 +65,15 @@ screen points captures the screen as it shows, every window composited.
 The result has no `app` or `pid`, and its pixels map a later
 `coordinate_space="screenshot"` click for whichever app owns the window
 there.
+
+`place(app, x=, y=, width=, height=)` moves or resizes window
+`window_index` through Accessibility, without bringing it forward, and
+returns the `frame` the window reports afterwards; an app's own limits can
+make it differ from `requested`. `x` and `y` count from the top-left of
+`display` (0 is the main one). With `display` and no `x` or `y`, a window
+that does not fit on that display, such as one at negative coordinates on
+another, is centered there. A minimized window, or one its app will not
+move or resize, raises `unsupported_op` and nothing changes.
 
 ## Across runs
 

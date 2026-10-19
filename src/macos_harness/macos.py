@@ -3906,6 +3906,145 @@ class MacOS:
             raise _no_window_error(info, surfaces=surfaces)
         return self._wait_for_windows(info, timeout=timeout, deadline=deadline)
 
+    def place(
+        self,
+        app: str | int | None = None,
+        *,
+        window_index: int = 0,
+        x: float | None = None,
+        y: float | None = None,
+        width: float | None = None,
+        height: float | None = None,
+        display: int | None = None,
+    ) -> dict[str, Any]:
+        """Move or resize window ``window_index`` of ``app`` through
+        Accessibility, without bringing it forward, and return the frame
+        the window reports afterwards.
+
+        ``x`` and ``y`` are screen points from the top-left of ``display``
+        (0 is the main one), or of the main display when none is given.
+        Without them, a window that does not fit inside ``display`` is
+        centered on it and any other keeps its place. A minimized window
+        refuses, as does one its app will not let move or resize, before
+        anything is written.
+        """
+        if (x is None) != (y is None):
+            raise MacOSError(
+                "give x and y together",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "x" if x is None else "y"},
+            )
+        self._ensure_accessibility()
+        _, info = self._resolve_app(app)
+        self._last_app = info
+        target = self._indexed_window(self.windows(int(info["pid"])), window_index)
+        window, before, minimized = self._ax_window(info, target, window_index)
+        if minimized:
+            raise MacOSError(
+                f"{info['name']}'s window {window_index} is minimized; restore it "
+                "before placing it",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"window_index": window_index, "window_id": target["window_id"]},
+            )
+        size = (
+            before["width"] if width is None else float(width),
+            before["height"] if height is None else float(height),
+        )
+        area = self._screen_area(0 if display is None else display, None)[2]
+        origin = (before["x"], before["y"])
+        if x is not None and y is not None:
+            origin = (area["x"] + float(x), area["y"] + float(y))
+        elif display is not None and not (
+            area["x"] <= origin[0] and origin[0] + size[0] <= area["x"] + area["width"]
+            and area["y"] <= origin[1] and origin[1] + size[1] <= area["y"] + area["height"]
+        ):
+            origin = (
+                area["x"] + max(0.0, (area["width"] - size[0]) / 2),
+                area["y"] + max(0.0, (area["height"] - size[1]) / 2),
+            )
+        position = None if origin == (before["x"], before["y"]) else origin
+        extent = None if size == (before["width"], before["height"]) else size
+        refused = [
+            verb
+            for attribute, value, verb in (
+                ("AXPosition", position, "moved"),
+                ("AXSize", extent, "resized"),
+            )
+            if value is not None and not self._settable(window, attribute)
+        ]
+        if refused:
+            raise MacOSError(
+                f"{info['name']} does not let window {window_index} be "
+                f"{' or '.join(refused)}",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"window_index": window_index, "window_id": target["window_id"]},
+            )
+        self._write_window(window, position=position, size=extent)
+        after, _ = self._window_geometry(window)
+        return {
+            "app": info,
+            "window_id": target["window_id"],
+            "requested": {"x": origin[0], "y": origin[1], "width": size[0], "height": size[1]},
+            "frame": after,
+        }
+
+    def _ax_window(
+        self, info: dict[str, Any], target: dict[str, Any], window_index: int
+    ) -> tuple[Any, dict[str, float], bool]:
+        """The AX element of ``target``, one of `windows`, with its frame
+        and whether it is minimized. AX names no window id, so the element
+        is the one whose frame matches the window server's bounds."""
+        bounds = target["bounds"]
+        for window in self._ax_windows(int(info["pid"])):
+            frame, minimized = self._window_geometry(window)
+            if frame is not None and all(abs(frame[key] - bounds[key]) < 1 for key in bounds):
+                return window, frame, minimized
+        raise MacOSError(
+            f"{info['name']} shows no Accessibility window where window {window_index} "
+            "is; a window on another Space cannot be placed",
+            code=ErrorCode.UNSUPPORTED_OP,
+            details={"window_index": window_index, "window_id": target["window_id"]},
+        )
+
+    def _ax_windows(self, pid: int) -> list[Any]:
+        """The AX elements of ``pid``'s windows on this Space."""
+        root = self._application_element(pid, enhance=False)
+        return list(self._copy_attribute(root, "AXWindows", checked=True) or ())
+
+    def _window_geometry(self, window: Any) -> tuple[dict[str, float] | None, bool]:
+        """``window``'s frame in screen points, None when it reports none,
+        and whether it is minimized."""
+        values = self._copy_attributes(
+            window, ("AXPosition", "AXSize", "AXMinimized"), checked=True
+        )
+        minimized = bool(values["AXMinimized"])
+        if values["AXPosition"] is None or values["AXSize"] is None:
+            return None, minimized
+        return {
+            **self._jsonable(values["AXPosition"]),
+            **self._jsonable(values["AXSize"]),
+        }, minimized
+
+    @staticmethod
+    def _write_window(
+        window: Any,
+        *,
+        position: tuple[float, float] | None,
+        size: tuple[float, float] | None,
+    ) -> None:
+        """Set ``window``'s AXPosition, then its AXSize, each only when given."""
+        for attribute, kind, value in (
+            ("AXPosition", AS.kAXValueCGPointType, position),
+            ("AXSize", AS.kAXValueCGSizeType, size),
+        ):
+            if value is None:
+                continue
+            error = AS.AXUIElementSetAttributeValue(
+                window, attribute, AS.AXValueCreate(kind, value)
+            )
+            if error != _AX_SUCCESS:
+                raise _ax_error(f"Set the window's {attribute}", error, attribute=attribute)
+
     def capture_screenshot(
         self,
         app: str | None = None,

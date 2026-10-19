@@ -33,6 +33,8 @@ identity, an irreversible action, or unexpected state.
 
 `mac.windows(all_layers=True)` lists menus and panels for `window_id=`;
 `see(display=0)` or `see(region=(x, y, w, h))` replaces `screencapture`.
+`mac.place(app, x=, y=, width=)` moves a window; `display=0` brings it to
+the main one.
 
 `mac.launch(app)` opens an app in the background and waits for a window.
 Never `sleep`: `mac.wait_change(app)` returns once the window changed and
@@ -41,10 +43,9 @@ settled; `see(app, after_change=True)` waits first.
 ## Receipts
 
 For a change, use `mac.do.press/set/fill/toggle/key/click/type/run`. Each
-returns a `Receipt` (`outcome`, `acted`, `changed`, `verified`) or raises
-`OperationError` with `exc.receipt`. `postcondition=` proves the effect;
-`once=` guards an action you cannot repeat. Await the next control in the
-same program:
+returns a `Receipt` or raises `OperationError` with `exc.receipt`.
+`postcondition=` proves the effect; `once=` guards an action you cannot
+repeat. Await the next control in the same program:
 
 ```python
 from macos_harness import OperationError
@@ -61,7 +62,6 @@ print(mac.see("Xcode"))
 - Input goes to a running app's process; only `mac.activate(app)` brings it forward.
 - A target that comes forward itself raises `FocusChangedError`; never move focus back.
 - Never launch a closed app or open a URL scheme when focus is forbidden.
-- AXError -25204 may still have acted: look before retrying.
 - After one verified failure, switch mode or stop; never repeat keys or clicks.
 - Never close or quit windows, documents, apps, or handoffs you did not open: `invariants`.
 
@@ -76,7 +76,7 @@ Run `macos-harness doctor` only after a permission or connection error.
 
 ## References
 
-`macos-harness skill <name>` prints one after a compaction:
+`macos-harness skill <name>` prints one:
 
 - `signatures`: every signature
 - `receipts`: outcomes, errors, once tokens, logs

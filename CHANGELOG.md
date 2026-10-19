@@ -58,6 +58,13 @@ follows [Semantic Versioning](https://semver.org/).
   or label no longer means editing the file. Tracebacks name the file and
   line, and `--json-errors` works before `run` or after the file. A
   malformed `--arg` exits 2 before anything runs.
+- `mac.place(app, x=, y=, width=, height=)` moves or resizes a window
+  through Accessibility without bringing it forward, in place of System
+  Events, and returns the frame the window reports afterwards. `x` and `y`
+  count from the top-left of `display=` (0 is the main one); with `display`
+  and no `x` or `y`, a window that does not fit on that display is centered
+  there. A minimized window, or one its app will not move or resize, raises
+  `unsupported_op` before anything changes.
 
 ### Changed
 
