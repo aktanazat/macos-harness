@@ -198,8 +198,8 @@ _AX_SAFE_ATTRIBUTES = (
     "AXFrame",
 )
 _AX_CROSS_APP_MESSAGING_TIMEOUT = 0.5
-# How many matches a wait with search text reads: enough for the whole-label
-# tiebreak (`MacOS._sole_label_match`) to see every candidate a label search
+# How many matches a wait with search text reads: enough for the tiebreak
+# (`MacOS._settle_tie`) to see every candidate a label search
 # plausibly finds -- "Allow" also finds "Don't Allow". Mirrors
 # `PressCoordinator.labelSearchLimit` in the native agent.
 _AX_LABEL_SEARCH_LIMIT = 20
@@ -640,7 +640,8 @@ def _search_gaps(matches: SearchMatches, max_nodes: int) -> tuple[str, dict[str,
     elif not matches.unanswered and matches.visited >= max_nodes:
         note += f"; the search stopped at max_nodes={max_nodes}, so pass a larger max_nodes"
     if matches.unanswered:
-        note += f"; {matches.unanswered} apps did not answer"
+        apps = "1 app" if matches.unanswered == 1 else f"{matches.unanswered} apps"
+        note += f"; {apps} did not answer"
     return note, {
         "complete": False,
         "visited": matches.visited,
@@ -648,6 +649,46 @@ def _search_gaps(matches: SearchMatches, max_nodes: int) -> tuple[str, dict[str,
         "partial": list(matches.partial),
         "unanswered": matches.unanswered,
     }
+
+
+def _did_not_answer(exc: MacOSError) -> bool:
+    """Whether a search failed only because its app did not answer in time
+    (AXError -25204). An app still launching or busy answers nothing for a
+    while -- Secretive and Activity Monitor for over a second after
+    ``open -a`` -- so a wait polls on (`_unanswered_search`)."""
+    return exc.details.get("ax_error") == AS.kAXErrorCannotComplete
+
+
+def _unanswered_search() -> SearchMatches:
+    """The poll a wait records for a search its app did not answer: one
+    that found nothing and saw nothing, its one app unanswered."""
+    matches = SearchMatches(complete=False, visited=0)
+    matches.unanswered = 1
+    return matches
+
+
+def _no_window_error(
+    info: Mapping[str, object], *, timeout: float | None = None
+) -> MacOSError:
+    """A running app with no window to capture, and the call that opens
+    one. An app such as Secretive keeps running with no window until its
+    Dock icon is clicked; AppleScript's ``reopen`` is that click, and
+    TextEdit answered it without coming forward."""
+    target = (
+        f'id "{info["bundle_id"]}"' if info.get("bundle_id") else f'"{info["name"]}"'
+    )
+    state = (
+        "has no open windows"
+        if timeout is None
+        else f"showed no window within {timeout:g}s"
+    )
+    return MacOSError(
+        f"{info['name']} is running but {state}; "
+        f"mac.script('tell application {target} to reopen') asks it to open "
+        "its window, as clicking its Dock icon would",
+        code=ErrorCode.ELEMENT_UNKNOWN if timeout is None else ErrorCode.TIMEOUT,
+        details={"app": info} if timeout is None else {"app": info, "timeout": timeout},
+    )
 
 
 class _ExactSelector(NamedTuple):
@@ -2971,30 +3012,58 @@ class MacOS:
             or match.get("identifier")
             or "untitled"
         )
-        return f"{app_name}: {role} {label!r}"
+        summary = f"{app_name}: {role} {label!r}"
+        frame = match.get("frame")
+        if isinstance(frame, dict) and all(
+            isinstance(frame.get(key), (int, float)) for key in ("x", "y", "width", "height")
+        ):
+            summary += " at ({x:.0f}, {y:.0f}) {width:.0f}x{height:.0f}".format(**frame)
+        enabled = match.get("enabled")
+        if isinstance(enabled, bool):
+            summary += ", enabled" if enabled else ", disabled"
+        return summary
 
     @staticmethod
-    def _sole_label_match(
-        matches: SearchMatches, *, text: str | None, limit: int, strict: bool
+    def _settle_tie(
+        matches: SearchMatches,
+        *,
+        text: str | None,
+        limit: int,
+        strict: bool,
+        actionable: bool,
     ) -> dict[str, JSONValue] | None:
-        """The one match labelled exactly ``text``, when the search shows
-        no other match can be.
+        """The one match a tie of several settles on, when the search
+        shows no other can be.
 
-        ``text`` is a substring search, so "Allow" also finds "Don't
-        Allow". A title or description equal to ``text`` -- whole and
-        case-sensitive, like ``title=`` -- settles that tie, but only from
-        a search that stopped short of ``limit`` (an unread match could be
-        a second exact label) and, under an exact selector (``strict``),
-        a complete one. Two exact labels, or none, stay ambiguous.
+        Only a search that stopped short of ``limit`` (an unread match
+        could tie too) and, under an exact selector (``strict``), a
+        complete one can settle a tie. ``text`` is a substring search, so
+        "Allow" also finds "Don't Allow": the one title or description
+        equal to ``text`` -- whole and case-sensitive, like ``title=`` --
+        wins first. For an action (``actionable``), the one enabled match
+        among those labelled exactly ``text``, or among all matches when
+        none is, wins next: a sheet can keep disabled twins of its "Done"
+        button, and a press on one does nothing. The label decides first,
+        so a disabled "Allow" is never traded for an enabled "Don't
+        Allow". Anything else stays ambiguous.
         """
-        if not text or len(matches) >= limit or (strict and not matches.complete):
+        if len(matches) >= limit or (strict and not matches.complete):
             return None
-        labelled = [
-            match
-            for match in matches
-            if text in (match.get("title"), match.get("description"))
-        ]
-        return labelled[0] if len(labelled) == 1 else None
+        candidates = list(matches)
+        if text:
+            labelled = [
+                match
+                for match in candidates
+                if text in (match.get("title"), match.get("description"))
+            ]
+            if len(labelled) == 1:
+                return labelled[0]
+            candidates = labelled or candidates
+        if actionable:
+            enabled = [match for match in candidates if match.get("enabled") is not False]
+            if len(enabled) == 1:
+                return enabled[0]
+        return None
 
     def ax_wait(
         self,
@@ -3016,6 +3085,7 @@ class MacOS:
         enhance: bool = True,
         timeout: float = 5.0,
         interval: float = 0.1,
+        actionable: bool = False,
     ) -> dict[str, Any]:
         """Wait for exactly one AX match and fail closed on ambiguity.
 
@@ -3023,7 +3093,10 @@ class MacOS:
         a single match requires a complete search to rule out a twin.
         Substring-only waits retain best-effort uniqueness within the
         returned results. When ``text`` finds several matches, the only
-        one labelled exactly ``text`` wins (see `_sole_label_match`).
+        one labelled exactly ``text`` wins, and for a caller about to act
+        on the match (``actionable``) the only enabled one after that
+        (see `_settle_tie`). A search the app did not answer in time
+        (AXError -25204) is a poll that found nothing yet.
         """
         exact = _ExactSelector.parse(
             title=title, identifier=identifier, description=description
@@ -3050,53 +3123,62 @@ class MacOS:
 
         # Text is a substring search, so a wait for "Allow" also finds
         # "Don't Allow": reading up to _AX_LABEL_SEARCH_LIMIT matches lets
-        # `_sole_label_match` settle that tie from this one search. Without
+        # `_settle_tie` settle that tie from this one search. Without
         # text, a second match already proves ambiguity.
         limit = _AX_LABEL_SEARCH_LIMIT if text else 2
         deadline = time.monotonic() + timeout
         while True:
-            if cross_process:
-                matches = self.ax_search_all(
-                    apps=selectors,
-                    search_key=search_key,
-                    text=text,
-                    title=title,
-                    identifier=identifier,
-                    description=description,
-                    visible_only=visible_only,
-                    limit=limit,
-                    direction=direction,
-                    immediate_descendants_only=immediate_descendants_only,
-                    attributes=attributes,
-                    include_actions=include_actions,
-                    max_nodes=max_nodes,
-                )
-            else:
-                matches = self.ax_search(
-                    app=app,
-                    search_key=search_key,
-                    text=text,
-                    title=title,
-                    identifier=identifier,
-                    description=description,
-                    visible_only=visible_only,
-                    limit=limit,
-                    direction=direction,
-                    immediate_descendants_only=immediate_descendants_only,
-                    attributes=attributes,
-                    include_actions=include_actions,
-                    max_nodes=max_nodes,
-                    enhance=enhance,
-                )
+            try:
+                if cross_process:
+                    matches = self.ax_search_all(
+                        apps=selectors,
+                        search_key=search_key,
+                        text=text,
+                        title=title,
+                        identifier=identifier,
+                        description=description,
+                        visible_only=visible_only,
+                        limit=limit,
+                        direction=direction,
+                        immediate_descendants_only=immediate_descendants_only,
+                        attributes=attributes,
+                        include_actions=include_actions,
+                        max_nodes=max_nodes,
+                    )
+                else:
+                    matches = self.ax_search(
+                        app=app,
+                        search_key=search_key,
+                        text=text,
+                        title=title,
+                        identifier=identifier,
+                        description=description,
+                        visible_only=visible_only,
+                        limit=limit,
+                        direction=direction,
+                        immediate_descendants_only=immediate_descendants_only,
+                        attributes=attributes,
+                        include_actions=include_actions,
+                        max_nodes=max_nodes,
+                        enhance=enhance,
+                    )
+            except MacOSError as exc:
+                if not _did_not_answer(exc):
+                    raise
+                matches = _unanswered_search()
             if len(matches) == 1 and (matches.complete or not exact.active):
                 return matches[0]
             if len(matches) > 1:
-                labelled = self._sole_label_match(
-                    matches, text=text, limit=limit, strict=exact.active
+                settled = self._settle_tie(
+                    matches,
+                    text=text,
+                    limit=limit,
+                    strict=exact.active,
+                    actionable=actionable,
                 )
-                if labelled is not None:
-                    return labelled
-                summary = "; ".join(self._match_summary(match) for match in matches[:4])
+                if settled is not None:
+                    return settled
+                summary = "; ".join(self._match_summary(match) for match in matches)
                 # More than one match is the caller's search criteria being too loose,
                 # not an unknown element -- and not worth retrying, since a second
                 # identical search will not resolve the ambiguity either. Mirrors the
@@ -3111,9 +3193,13 @@ class MacOS:
                             {
                                 "element_index": match.get("element_index"),
                                 "role": match.get("role"),
+                                "title": match.get("title"),
+                                "description": match.get("description"),
+                                "enabled": match.get("enabled"),
+                                "frame": match.get("frame"),
                                 "app": match.get("app"),
                             }
-                            for match in matches[:4]
+                            for match in matches
                         ],
                     },
                 )
@@ -3164,8 +3250,9 @@ class MacOS:
         """Wait for an AX match to be absent in two consecutive polls.
 
         Only a complete empty search counts as an empty poll: a walk that
-        ``max_nodes`` cut short before finding anything says nothing about
-        the part it did not reach, so it resets the count.
+        ``max_nodes`` cut short before finding anything, or a search the
+        app did not answer in time, says nothing about the part it did not
+        reach, so it resets the count.
         """
         exact = _ExactSelector.parse(
             title=title, identifier=identifier, description=description
@@ -3229,6 +3316,10 @@ class MacOS:
                 if app is not None or (selectors is not None and len(selectors) == 1):
                     return
                 raise
+            except MacOSError as exc:
+                if not _did_not_answer(exc):
+                    raise
+                matches = _unanswered_search()
 
             empty_polls = empty_polls + 1 if not matches and matches.complete else 0
             if empty_polls >= 2:
@@ -3355,6 +3446,7 @@ class MacOS:
             max_nodes=max_nodes,
             timeout=deadline.remaining(),
             interval=interval,
+            actionable=True,
         )
         owner = match.get("app")
         target_pid = int(owner["pid"]) if isinstance(owner, dict) else self._pid(app)
@@ -3423,20 +3515,45 @@ class MacOS:
                 },
             )
         error = AS.AXUIElementPerformAction(element, normalized)
-        if error != _AX_SUCCESS:
-            raise _ax_error(
-                f"Perform {normalized} on element {element_index}",
-                error,
-                hint=(
-                    "an app often stops answering while the action opens a "
-                    "menu or dialog, so it may have taken effect: look before "
-                    "you retry"
-                    if error == AS.kAXErrorCannotComplete
-                    else None
-                ),
-                element_index=element_index,
-                action=normalized,
-            )
+        if error == _AX_SUCCESS or self._gone_after_action(element, error):
+            return
+        raise _ax_error(
+            f"Perform {normalized} on element {element_index}",
+            error,
+            hint=(
+                "an app often stops answering while the action opens a "
+                "menu or dialog, so it may have taken effect: look before "
+                "you retry"
+                if error == AS.kAXErrorCannotComplete
+                else None
+            ),
+            element_index=element_index,
+            action=normalized,
+        )
+
+    @staticmethod
+    def _gone_after_action(element: object, error: int) -> bool:
+        """Whether an action that answered ``error`` took its own element
+        away, which only an action the app ran can do.
+
+        An app that tears a control down while handling its action may
+        answer for an element that no longer exists: Secretive's sheet
+        Delete button deleted the key and closed the sheet, yet answered
+        AXPress with -25205. When the element's ``AXRole`` -- which every
+        live element has -- then reads as gone (-25202) or missing
+        (-25205), the action ran. An element still there, or an app that
+        does not answer the read, keeps the error. An action refused up
+        front (the element was already gone, the action is unsupported,
+        Accessibility is off) never qualifies.
+        """
+        if error not in (
+            AS.kAXErrorFailure,
+            AS.kAXErrorCannotComplete,
+            AS.kAXErrorAttributeUnsupported,
+        ):
+            return False
+        read, _value = AS.AXUIElementCopyAttributeValue(element, "AXRole", None)
+        return read in (AS.kAXErrorInvalidUIElement, AS.kAXErrorAttributeUnsupported)
 
     # --- windows and screenshots ----------------------------------------
 
@@ -3512,11 +3629,7 @@ class MacOS:
                 return windows
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise MacOSError(
-                    f"{info['name']} showed no window within {timeout:g}s",
-                    code=ErrorCode.TIMEOUT,
-                    details={"app": info, "timeout": timeout},
-                )
+                raise _no_window_error(info, timeout=timeout)
             time.sleep(min(0.05, remaining))
 
     def capture_screenshot(
@@ -3584,14 +3697,9 @@ class MacOS:
             # An app this young is most likely still drawing its first
             # window; wait for it rather than report an empty app.
             age = self._launched_seconds_ago(running)
-            if age is not None and age < _LAUNCH_GRACE_SECONDS:
-                windows = self._wait_for_windows(info, timeout=_LAUNCH_WINDOW_TIMEOUT)
-            else:
-                raise MacOSError(
-                    f"No capturable windows found for {app or self._last_app}",
-                    code=ErrorCode.ELEMENT_UNKNOWN,
-                    details={"app": info},
-                )
+            if age is None or age >= _LAUNCH_GRACE_SECONDS:
+                raise _no_window_error(info)
+            windows = self._wait_for_windows(info, timeout=_LAUNCH_WINDOW_TIMEOUT)
         try:
             window = windows[window_index]
         except IndexError as exc:

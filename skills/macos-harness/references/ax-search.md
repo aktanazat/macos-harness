@@ -12,7 +12,8 @@ mac.ax.press("Not Now", role="button", all_apps=True)
 `query`, `query_all`, `wait`, `wait_gone`, and `press` take the search text as
 the first positional argument. Use `role=` for common targets: `any`, `button`,
 `checkbox`, `combo box`, `image`, `link`, `list`, `menu`, `menu item`,
-`radio button`, `static text`, `table`, `text area`, and `text field`. An
+`radio button`, `static text`, `table`, `text area`, and `text field`, or the
+same role by the AX name a match reports (`AXButton`, `AXTextField`). An
 unknown role raises `MacOSError`. For a window, row, group, scroll bar, or any
 other kind, pass `role="any"` and read each match's `role`; `mac.windows(app)`
 lists an app's windows. Do not pass both `role` and `search_key`. A search for
@@ -33,8 +34,14 @@ them; `apps="Safari"` is one selector, not an iterable of characters.
 
 `text` is a substring filter, so `"Allow"` also finds `"Don't Allow"`. When it
 finds several matches and exactly one has a title or description equal to
-`text`, case included, `wait`, `press`, and `mac.do` take that one. Two exact
-labels, none, or a search that filled its limit still fail closed.
+`text`, case included, `wait`, `press`, and `mac.do` take that one. A press,
+`mac.do.set`, `toggle`, or `fill` then takes the one enabled match among the
+exact labels, or among all matches when none is exact: a sheet that keeps
+disabled twins of its "Done" button still gets the working one pressed. The
+label decides first, so a disabled "Allow" is never swapped for an enabled
+"Don't Allow". The optional native backend's press still treats such a tie as
+ambiguous. Anything else, or a search that filled its limit, fails closed and
+lists every match with its frame and whether it is enabled.
 
 `title=`, `identifier=`, and `description=` match whole attributes, case
 included; all supplied fields must match. Exact waits and presses need a
@@ -55,16 +62,19 @@ asks every app at once whether it can answer and skips the ones that cannot,
 which leaves it incomplete; it counts a skipped app against completeness only
 while that app has a window on screen. If a limit, failed read, or skipped
 process leaves a search incomplete, narrow the scope. A wait that times out on
-an incomplete search names the apps it searched only in part.
+an incomplete search names the apps it searched only in part, or says the app
+did not answer.
 
 ## Waits and presses
 
 `wait` returns the one match; zero matches keep polling; several fail closed and
-report owner, role, and title. `wait_gone` needs two consecutive complete, empty
-searches; a named app that exits counts as gone. `press` waits for one match,
-needs `AXPress`, and returns the match. It never requests activation; if the
-target makes itself frontmost, it raises `FocusChangedError` and cannot undo
-that.
+report owner, role, title, frame, and enabled state. An app that does not
+answer in time (AXError -25204), as one still launching does for a second or
+more after `open -a`, also keeps the wait polling until its timeout.
+`wait_gone` needs two consecutive complete, empty searches; a named app that
+exits counts as gone. `press` waits for one match, needs `AXPress`, and returns
+the match. It never requests activation; if the target makes itself frontmost,
+it raises `FocusChangedError` and cannot undo that.
 
 ## Handles
 
@@ -74,7 +84,9 @@ run must query again, or call `mac.see()` earlier in the same program.
 
 An action that fails with AXError -25204 (the app did not answer in time) may
 still have taken effect, because apps often stop answering while the action
-opens a menu or dialog. Look before you retry.
+opens a menu or dialog. Look before you retry. An action whose element is gone
+right afterward, such as a sheet's Delete button that closes the sheet, counts
+as done even when the app answered it with an error.
 
 These calls act only on UI macOS already rendered. They cannot make secure UI
 appear in an inactive app or get past Touch ID, passkeys, CAPTCHA, account

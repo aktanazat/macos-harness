@@ -1206,6 +1206,24 @@ def test_ax_role_aliases_and_app_selectors_fail_closed(monkeypatch) -> None:
         mac._normalize_apps([])
 
 
+@pytest.mark.parametrize("search_key", sorted(macos_module._AX_SEARCH_ROLES))
+def test_ax_role_accepts_the_ax_role_name_a_match_reports(search_key) -> None:
+    """A match reports its role as "AXButton", so an agent passes that
+    straight back: every role the friendly names cover answers to its AX
+    name too."""
+    arguments = {}
+
+    def sweep(**kwargs):
+        arguments.update(kwargs)
+        return _found()
+
+    mac = _ScriptedAX(sweep=sweep)
+
+    mac.ax.query_all("Done", role=macos_module._AX_SEARCH_ROLES[search_key])
+
+    assert arguments["search_key"] == search_key
+
+
 def test_ax_app_resolution_deduplicates_pids(monkeypatch) -> None:
     mac = MacOS()
     info = {"name": "Safari", "bundle_id": "com.apple.Safari", "pid": 42}
@@ -1246,6 +1264,49 @@ def test_ax_wait_fails_closed_on_ambiguity_and_timeout(monkeypatch) -> None:
 
     with pytest.raises(MacOSError, match="requires non-empty text"):
         mac.ax.wait(all_apps=True)
+
+
+def _unanswered(**kwargs) -> Never:
+    """A search the app did not answer in time, as a just-launched app
+    answers one."""
+    raise macos_module._ax_error(
+        "AXUIElementsForSearchPredicate", macos_module.AS.kAXErrorCannotComplete
+    )
+
+
+def test_ax_wait_keeps_polling_while_a_launching_app_does_not_answer() -> None:
+    """Secretive and Activity Monitor answer no search for over a second
+    after ``open -a``: a wait reads that as not ready yet and polls on."""
+    responses = iter([_unanswered, _unanswered, lambda **kwargs: _found({"element_index": 7})])
+    mac = _ScriptedAX(
+        apps={"Secretive": 9}, search=lambda **kwargs: next(responses)(**kwargs)
+    )
+
+    match = mac.ax.wait("Secretive", app="Secretive", timeout=15, interval=0.001)
+
+    assert match["element_index"] == 7
+
+
+def test_ax_wait_times_out_saying_the_app_never_answered() -> None:
+    mac = _ScriptedAX(apps={"Secretive": 9}, search=_unanswered)
+
+    with pytest.raises(MacOSError, match="1 app did not answer") as caught:
+        mac.ax.wait("Secretive", app="Secretive", timeout=0)
+
+    assert caught.value.code == ErrorCode.TIMEOUT
+    assert caught.value.details["unanswered"] == 1
+
+
+def test_ax_wait_gone_never_counts_an_unanswered_poll_as_empty() -> None:
+    """A poll the app did not answer saw nothing, which is not the same as
+    seeing the match gone: it neither fails the wait nor counts toward the
+    two empty polls."""
+    polls = iter([_found, _unanswered, _found, _found])
+    mac = _ScriptedAX(apps={"Secretive": 9}, search=lambda **kwargs: next(polls)())
+
+    mac.ax.wait_gone("Delete", app="Secretive", timeout=15, interval=0.001)
+
+    assert len(mac.reads) == 4
 
 
 _SCOPED_AX_CALLS = (
@@ -1307,15 +1368,19 @@ class _ScriptedAX(MacOS):
     """A Mac whose AX boundary is scripted instead of read from real apps.
 
     Each of ``apps`` (name to pid) runs and shows one "Allow" button to the
-    per-app search. ``sweep``, when given, answers the cross-app search in
-    place of searching each app. Records the attributes every per-app
-    search read and every action performed.
+    per-app search. ``search``, when given, answers the per-app search
+    instead, and ``sweep`` the cross-app search in place of searching each
+    app. Records the attributes every per-app search read and every action
+    performed.
     """
 
-    def __init__(self, *, apps: dict[str, int] | None = None, sweep=None) -> None:
+    def __init__(
+        self, *, apps: dict[str, int] | None = None, sweep=None, search=None
+    ) -> None:
         super().__init__()
         self.apps = apps or {}
         self.sweep = sweep
+        self.search = search
         self.reads: list[tuple[str, ...]] = []
         self.pressed: list[tuple[int, str]] = []
 
@@ -1333,6 +1398,8 @@ class _ScriptedAX(MacOS):
 
     def ax_search(self, *, attributes, app=None, app_pid=None, **kwargs) -> SearchMatches:
         self.reads.append(tuple(attributes))
+        if self.search is not None:
+            return self.search(app=app, app_pid=app_pid, **kwargs)
         pid = app_pid if app_pid is not None else self.apps[app]
         return _found({"element_index": pid, "role": "AXButton", "title": "Allow"})
 
@@ -1495,6 +1562,65 @@ def test_ax_press_stays_ambiguous_unless_one_exact_label_is_proven(sweep, select
     assert mac.pressed == []
 
 
+def _done_button(element_index: int, *, enabled: bool, x: float) -> dict[str, object]:
+    return {
+        "element_index": element_index,
+        "role": "AXButton",
+        "title": "Done",
+        "enabled": enabled,
+        "frame": {"x": x, "y": 40.0, "width": 60.0, "height": 24.0},
+        "actions": ["AXPress"],
+    }
+
+
+def test_ax_press_takes_the_one_enabled_match_among_identical_labels() -> None:
+    """Secretive's sheet answers a search for "Done" with three buttons,
+    two of them disabled: a press can only mean the one that works."""
+    buttons = (
+        _done_button(1, enabled=False, x=10.0),
+        _done_button(2, enabled=True, x=80.0),
+        _done_button(3, enabled=False, x=150.0),
+    )
+    mac = _ScriptedAX(apps={"Secretive": 9}, search=lambda **kwargs: _found(*buttons))
+
+    mac.ax.press("Done", role="button", app="Secretive")
+
+    assert mac.pressed == [(2, "AXPress")]
+
+
+def test_ax_press_never_trades_an_exact_label_for_an_enabled_lookalike() -> None:
+    """With "Allow" disabled and "Don't Allow" enabled, the only enabled
+    match is the opposite of what was asked: the exact label decides
+    before enabled state does."""
+    allow = {**_dialog_button(1, "title", "Allow"), "enabled": False}
+    refuse = {**_dialog_button(2, "title", "Don't Allow"), "enabled": True}
+    mac = _ScriptedAX(apps={"Demo": 9}, search=lambda **kwargs: _found(allow, refuse))
+
+    mac.ax.press("Allow", role="button", app="Demo")
+
+    assert mac.pressed == [(1, "AXPress")]
+
+
+def test_ax_press_tie_lists_every_match_with_its_frame_and_enabled_state() -> None:
+    """Two enabled "Done" buttons stay a tie; the error shows where each
+    match is and whether it works, for all of them, so the caller can
+    narrow the search in one step."""
+    buttons = [_done_button(index, enabled=index <= 2, x=70.0 * index) for index in range(1, 6)]
+    mac = _ScriptedAX(apps={"Secretive": 9}, search=lambda **kwargs: _found(*buttons))
+
+    with pytest.raises(MacOSError, match=r"AX wait found 5 matches") as caught:
+        mac.ax.press("Done", role="button", app="Secretive")
+
+    assert caught.value.code == ErrorCode.BAD_REQUEST
+    assert "AXButton 'Done' at (140, 40) 60x24, enabled" in str(caught.value)
+    assert "AXButton 'Done' at (350, 40) 60x24, disabled" in str(caught.value)
+    assert [
+        (match["element_index"], match["enabled"], match["frame"]["x"])
+        for match in caught.value.details["matches"]
+    ] == [(index, index <= 2, 70.0 * index) for index in range(1, 6)]
+    assert mac.pressed == []
+
+
 def test_ax_press_supports_one_line_cross_app_use(monkeypatch) -> None:
     mac = MacOS()
     match = {
@@ -1588,6 +1714,42 @@ def test_ax_press_keeps_a_failed_action_error_when_the_target_activates(monkeypa
 
     assert raised.value.code == ErrorCode.AX_ERROR
     assert next(frontmost) == {"name": "Chrome", "pid": 42}
+
+
+def _press_that_reports_attribute_unsupported(monkeypatch, mac: MacOS, *, role_read) -> int:
+    """Register a real AX element whose ``AXPress`` answers -25205, as
+    Secretive's sheet Delete button did, and whose ``AXRole`` read
+    afterwards answers ``role_read``. Returns its element index."""
+    AS = macos_module.AS
+    index = mac._remember_element(AS.AXUIElementCreateApplication(os.getpid()))
+    monkeypatch.setattr(AS, "AXUIElementCopyActionNames", lambda element, _out: (0, ["AXPress"]))
+    monkeypatch.setattr(
+        AS, "AXUIElementPerformAction", lambda element, action: AS.kAXErrorAttributeUnsupported
+    )
+    monkeypatch.setattr(AS, "AXUIElementCopyAttributeValue", lambda element, name, _out: role_read)
+    return index
+
+
+def test_perform_reports_an_action_that_took_its_element_away_as_done(monkeypatch) -> None:
+    """Secretive's Delete deleted the key and closed its sheet, yet AXPress
+    answered -25205. An element that is gone right after its own action
+    shows the action reached the app."""
+    mac = MacOS()
+    index = _press_that_reports_attribute_unsupported(
+        monkeypatch, mac, role_read=(macos_module.AS.kAXErrorInvalidUIElement, None)
+    )
+
+    assert mac.ax.perform(index, "AXPress") is None
+
+
+def test_perform_still_fails_when_the_element_outlives_a_failed_action(monkeypatch) -> None:
+    mac = MacOS()
+    index = _press_that_reports_attribute_unsupported(monkeypatch, mac, role_read=(0, "AXButton"))
+
+    with pytest.raises(MacOSError, match="AXError -25205") as caught:
+        mac.ax.perform(index, "AXPress")
+
+    assert caught.value.details["ax_error"] == -25205
 
 
 def test_ax_wait_gone_requires_two_empty_polls(monkeypatch) -> None:
@@ -2461,7 +2623,7 @@ def test_wait_for_window_times_out_at_the_deadline_with_the_app_in_details(
     monkeypatch.setattr(macos_module.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
 
-    with pytest.raises(MacOSError, match="TextEdit showed no window within 1s") as exc_info:
+    with pytest.raises(MacOSError, match="TextEdit is running but showed no window within 1s") as exc_info:
         mac.wait_for_window("TextEdit", timeout=1.0)
 
     assert exc_info.value.code == ErrorCode.TIMEOUT
@@ -2469,6 +2631,51 @@ def test_wait_for_window_times_out_at_the_deadline_with_the_app_in_details(
     # The clock reads 0.0 at the start and 1.0 after the second poll, which
     # is the deadline; a third poll would mean the wait overshot it.
     assert polls == [42, 42]
+
+
+class _WindowlessApp(MacOS):
+    """Secretive running with no window, launched ``launched_seconds_ago``."""
+
+    def __init__(self, launched_seconds_ago: float) -> None:
+        super().__init__()
+        self.running = _FakeRunningApp(
+            9, name="Secretive", launched_seconds_ago=launched_seconds_ago
+        )
+
+    def _ensure_screen_recording(self) -> None:
+        pass
+
+    def _resolve_app(self, app):
+        return self.running, {
+            "name": "Secretive",
+            "bundle_id": "com.maxgoedjen.Secretive.Host",
+            "pid": 9,
+        }
+
+    def windows(self, app=None) -> list[dict[str, object]]:
+        return []
+
+
+@pytest.mark.parametrize("launched_seconds_ago", [1.0, 600.0], ids=["just-launched", "long-running"])
+def test_see_names_the_call_that_opens_a_window_for_a_running_app_with_none(
+    monkeypatch, launched_seconds_ago
+) -> None:
+    """Secretive runs with no window until asked: an agent that reads the
+    error learns the app is running and the one call that opens a window
+    without bringing the app forward."""
+    mac = _WindowlessApp(launched_seconds_ago)
+    clock = iter(float(tick) for tick in range(100))
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(MacOSError) as caught:
+        mac.see("Secretive")
+
+    assert "Secretive is running but" in str(caught.value)
+    assert (
+        """mac.script('tell application id "com.maxgoedjen.Secretive.Host" to reopen')"""
+        in str(caught.value)
+    )
 
 
 def test_ax_wait_ambiguous_and_timeout_carry_machine_readable_codes(monkeypatch) -> None:

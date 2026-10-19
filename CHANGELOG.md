@@ -71,6 +71,25 @@ follows [Semantic Versioning](https://semver.org/).
 - The errors for an unknown role, an element index from an earlier search
   or run, and screenshot coordinates with no screenshot in the run say what
   to do instead.
+- An AX wait, and the search inside a Python-backend press, keeps polling
+  while the app does not answer in time (AXError -25204), as Secretive and
+  Activity Monitor do for a second or more after `open -a`; before, the
+  first such poll failed the wait. A wait that times out this way says the
+  app did not answer.
+- `role=` accepts the AX name a match reports, such as `"AXButton"`, for
+  every role it accepts a friendly name for.
+- A press, `mac.do.set`, `toggle` or `fill` on the Python backend whose
+  search finds several matches takes the only enabled one among the exact
+  labels, or among all matches when none is exact; the exact label still
+  decides first. A tie that remains lists every match, not the first four,
+  with its frame and whether it is enabled.
+- An action whose element is gone right afterward counts as done even when
+  the app answered it with AXError -25200, -25204 or -25205: Secretive's
+  sheet Delete button deleted the key and closed the sheet but answered
+  -25205.
+- `mac.see` on an app that runs with no window says so and names
+  `mac.script('tell application id "…" to reopen')`, which opens the window
+  the way a Dock click does.
 
 - A substring AX search that finds several matches now takes the one whose
   whole title or description equals the search text, so

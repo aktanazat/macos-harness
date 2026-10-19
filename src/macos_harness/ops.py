@@ -1148,6 +1148,7 @@ class _Host(Protocol):
         enhance: bool = True,
         timeout: float = 5.0,
         interval: float = 0.1,
+        actionable: bool = False,
     ) -> dict[str, JSONValue]: ...
     def ax_wait_gone(
         self,
@@ -2688,7 +2689,7 @@ class Operations:
             match = host.ax_wait(
                 app=pid, search_key=search_key, text=text, title=title,
                 identifier=identifier, description=description,
-                timeout=deadline.remaining(), interval=interval,
+                timeout=deadline.remaining(), interval=interval, actionable=True,
             )
             element_index = int(match["element_index"])
             if (
@@ -3193,6 +3194,7 @@ class Operations:
             max_nodes=max_nodes,
             timeout=deadline.remaining(),
             interval=interval,
+            actionable=True,
         )
         element_index = int(match["element_index"])
         owner = match.get("app")

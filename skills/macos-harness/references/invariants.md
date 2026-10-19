@@ -90,5 +90,10 @@ with repeated keys, clicks, deletion loops, or bulk input.
 - An app launched under five seconds ago with no window yet makes `mac.see()`
   wait up to two seconds for its first window. Elsewhere, call
   `mac.wait_for_window(app)` before the first capture of a fresh launch.
+- Some apps keep running with no window until their Dock icon is clicked.
+  `mac.see()` then says the app is running with no windows and names
+  `mac.script('tell application id "<bundle id>" to reopen')`, which opens the
+  window the way a Dock click does; TextEdit answered it without coming to the
+  front. `mac.activate()` alone does not open one.
 - An ambiguous app name raises with the matches ranked (frontmost, then
   on-screen windows, then newest) and their pids; pass the pid you mean.

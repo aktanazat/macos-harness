@@ -10,10 +10,19 @@ from typing import TYPE_CHECKING, Any
 import ApplicationServices as AS
 
 from .errors import ErrorCode, MacOSError
-from .macos import _AX_SAFE_ATTRIBUTES, SearchMatches
+from .macos import _AX_SAFE_ATTRIBUTES, _AX_SEARCH_ROLES, SearchMatches
 
 if TYPE_CHECKING:
     from .macos import MacOS
+
+# Each role a search can target, by its friendly name ("text field" ->
+# "textfield") and by the AX name a match reports ("AXTextField" ->
+# "axtextfield"), so a role read off one match can find the next.
+_ROLE_SEARCH_KEYS = {"any": "AXAnyTypeSearchKey"} | {
+    alias: search_key
+    for search_key, ax_role in _AX_SEARCH_ROLES.items()
+    for alias in (ax_role.casefold(), ax_role[2:].casefold())
+}
 
 
 class Accessibility:
@@ -97,35 +106,20 @@ class Accessibility:
             )
         if role is None:
             return search_key or "AXAnyTypeSearchKey"
-        aliases = {
-            "any": "AXAnyTypeSearchKey",
-            "button": "AXButtonSearchKey",
-            "checkbox": "AXCheckBoxSearchKey",
-            "combobox": "AXComboBoxSearchKey",
-            "image": "AXImageSearchKey",
-            "link": "AXLinkSearchKey",
-            "list": "AXListSearchKey",
-            "menu": "AXMenuSearchKey",
-            "menuitem": "AXMenuItemSearchKey",
-            "radiobutton": "AXRadioButtonSearchKey",
-            "statictext": "AXStaticTextSearchKey",
-            "table": "AXTableSearchKey",
-            "textarea": "AXTextAreaSearchKey",
-            "textfield": "AXTextFieldSearchKey",
-        }
         normalized = re.sub(r"[^a-z0-9]", "", role.casefold())
         try:
-            return aliases[normalized]
+            return _ROLE_SEARCH_KEYS[normalized]
         except KeyError as exc:
             valid = (
                 "any, button, checkbox, combo box, image, link, list, menu, "
                 "menu item, radio button, static text, table, text area, text field"
             )
             raise MacOSError(
-                f"Unknown AX role {role!r}; choose one of: {valid}. For any "
-                "other kind (window, row, group, scroll bar, ...) pass "
-                "role='any' and read each match's 'role'; mac.windows(app) "
-                "lists an app's windows",
+                f"Unknown AX role {role!r}; choose one of: {valid}, or the "
+                "same role by its AX name ('AXButton'). For any other kind "
+                "(window, row, group, scroll bar, ...) pass role='any' and "
+                "read each match's 'role'; mac.windows(app) lists an app's "
+                "windows",
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "role", "value": role},
             ) from exc
