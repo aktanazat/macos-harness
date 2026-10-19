@@ -28,6 +28,8 @@ identity, an irreversible action, or unexpected state.
 - `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, or press a control.
 - `mac.script(source)`: AppleScript for an exact, focus-safe command.
 
+`mac.launch(app)` opens an app in the background, returning once a window is up.
+
 ## Receipts
 
 For a change, use `mac.do.press/set/fill/toggle/key/click/type/run`. Each
@@ -53,7 +55,7 @@ print(mac.see("Xcode"))
 - Never launch a closed app or open a URL scheme when focus is forbidden.
 - AXError -25204 (no answer in time) may still have acted: look before retrying.
 - After one verified failure, switch mode or stop; never repeat keys or clicks.
-- Never close windows, documents, or handoffs you did not open: `invariants`.
+- Never close or quit windows, documents, apps, or handoffs you did not open: `invariants`.
 
 ## Handoff and credentials
 
@@ -62,13 +64,12 @@ At Touch ID, a passkey, a CAPTCHA, a code, or a sign-in approval, print
 the turn. Never type secrets into native fields or drive web pages through
 Accessibility: `references/credentials.md`.
 
-Permissions are granted. Run `macos-harness doctor` only after a call fails
-with a permission or connection error, never as a first step.
+Run `macos-harness doctor` only after a permission or connection error.
 
 ## References
 
-After a compaction, read only the reference you need, never the whole skill.
-A subagent writing Mac-control code reads one reference, not this card.
+After a compaction, read only the reference you need; a subagent writing
+Mac-control code reads one, not this card.
 `macos-harness skill <name>` prints each one from `references/`:
 
 - `signatures`: every exact signature

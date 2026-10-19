@@ -51,16 +51,20 @@ try:
     import ApplicationServices as AS
     import objc
     from AppKit import (
+        NSURL,
         NSApplicationActivateIgnoringOtherApps,
         NSRunningApplication,
         NSWorkspace,
+        NSWorkspaceOpenConfiguration,
     )
 except ImportError as exc:  # pragma: no cover - exercised on non-macOS hosts
     AS = None  # type: ignore[assignment]
     objc = None  # type: ignore[assignment]
+    NSURL = None  # type: ignore[assignment]
     NSApplicationActivateIgnoringOtherApps = 0
     NSRunningApplication = None  # type: ignore[assignment]
     NSWorkspace = None  # type: ignore[assignment]
+    NSWorkspaceOpenConfiguration = None  # type: ignore[assignment]
     _IMPORT_ERROR: ImportError | None = exc
 else:
     _IMPORT_ERROR = None
@@ -3619,18 +3623,47 @@ class MacOS:
         _, info = self._resolve_app(app)
         return self._wait_for_windows(info, timeout=timeout)
 
+    @staticmethod
+    def _now() -> float:
+        """The monotonic clock the launch, quit, and window waits read."""
+        return time.monotonic()
+
+    @staticmethod
+    def _pause(seconds: float) -> None:
+        """The one sleep those waits take between looks."""
+        time.sleep(seconds)
+
     def _wait_for_windows(
-        self, info: dict[str, Any], *, timeout: float
+        self, info: dict[str, Any], *, timeout: float, deadline: float | None = None
     ) -> list[dict[str, Any]]:
-        deadline = time.monotonic() + max(0.0, timeout)
+        if deadline is None:
+            deadline = self._now() + max(0.0, timeout)
         while True:
             windows = self.windows(int(info["pid"]))
             if windows:
                 return windows
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self._now()
             if remaining <= 0:
                 raise _no_window_error(info, timeout=timeout)
-            time.sleep(min(0.05, remaining))
+            self._pause(min(0.05, remaining))
+
+    def _ready_windows(
+        self,
+        running: Any,
+        info: dict[str, Any],
+        *,
+        timeout: float,
+        deadline: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """``info``'s windows, waiting only for an app young enough to
+        still be drawing its first; an older app with none never will."""
+        windows = self.windows(int(info["pid"]))
+        if windows:
+            return windows
+        age = self._launched_seconds_ago(running)
+        if age is None or age >= _LAUNCH_GRACE_SECONDS:
+            raise _no_window_error(info)
+        return self._wait_for_windows(info, timeout=timeout, deadline=deadline)
 
     def capture_screenshot(
         self,
@@ -3692,14 +3725,7 @@ class MacOS:
     ) -> dict[str, Any]:
         self._ensure_screen_recording()
         running, info = self._resolve_app(app)
-        windows = self.windows(int(info["pid"]))
-        if not windows:
-            # An app this young is most likely still drawing its first
-            # window; wait for it rather than report an empty app.
-            age = self._launched_seconds_ago(running)
-            if age is None or age >= _LAUNCH_GRACE_SECONDS:
-                raise _no_window_error(info)
-            windows = self._wait_for_windows(info, timeout=_LAUNCH_WINDOW_TIMEOUT)
+        windows = self._ready_windows(running, info, timeout=_LAUNCH_WINDOW_TIMEOUT)
         try:
             window = windows[window_index]
         except IndexError as exc:
@@ -4060,6 +4086,203 @@ class MacOS:
             "frontmost": frontmost,
             "elapsed_ms": round((time.monotonic() - started) * 1000),
         }
+
+    def frontmost(self) -> dict[str, Any] | None:
+        """The app in front now: its name, bundle ID, pid, and path."""
+        return self._frontmost_app()
+
+    def launch(
+        self, app: str, *, timeout: float = 15.0, window: bool = True
+    ) -> dict[str, Any]:
+        """Start ``app`` without bringing it forward; return once it shows a window.
+
+        ``app`` is a name, bundle ID, or ``.app`` path. A copy already
+        running from that bundle is used, not started again.
+        ``window=False`` returns once the process runs, for an app that
+        never shows a window. Only `activate` brings an app forward.
+        """
+        started = self._now()
+        deadline = started + max(0.0, timeout)
+        url = self._application_url(app)
+        running = self._running_copy(url)
+        launched = running is None
+        if running is None:
+            running = self._open_application(url, timeout=timeout)
+        info = self._app_info(running)
+        windows: list[dict[str, Any]] = []
+        if window and launched:
+            windows = self._wait_for_windows(info, timeout=timeout, deadline=deadline)
+        elif window:
+            windows = self._ready_windows(running, info, timeout=timeout, deadline=deadline)
+        self._last_app = info
+        return {
+            "app": info,
+            "launched": launched,
+            "windows": windows,
+            "frontmost": self._frontmost_app(),
+            "elapsed_ms": round((self._now() - started) * 1000),
+        }
+
+    def quit(
+        self, app: str | int, *, timeout: float = 10.0, force: bool = False
+    ) -> dict[str, Any]:
+        """Ask ``app`` to quit, as its Quit menu item would; return once it exited.
+
+        Quit only an app this task opened. ``force=True`` ends it at once
+        and loses unsaved work.
+        """
+        running, info = self._resolve_exact(app, verb="quit")
+        started = self._now()
+        if not (running.forceTerminate() if force else running.terminate()):
+            raise MacOSError(
+                f"{info['name']} refused the request to quit",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"app": info, "forced": force},
+            )
+        deadline = started + max(0.0, timeout)
+        while not self._exited(int(info["pid"])):
+            remaining = deadline - self._now()
+            if remaining <= 0:
+                raise MacOSError(
+                    f"{info['name']} did not quit within {timeout:g}s; it may be "
+                    f"asking to save: mac.see({info['pid']}) shows it. force=True "
+                    "quits without saving",
+                    code=ErrorCode.TIMEOUT,
+                    details={"app": info, "timeout": timeout, "forced": force},
+                )
+            self._pause(min(0.05, remaining))
+        if self._last_app is not None and self._last_app["pid"] == info["pid"]:
+            self._last_app = None
+        return {
+            "app": info,
+            "forced": force,
+            "elapsed_ms": round((self._now() - started) * 1000),
+        }
+
+    def relaunch(
+        self, app: str | int, *, timeout: float = 15.0, window: bool = True
+    ) -> dict[str, Any]:
+        """Quit ``app`` and start the same bundle again, or start it if closed.
+
+        The copy that was running is the one started again, so a fresh
+        build relaunches from its own path, not from /Applications.
+        """
+        try:
+            _, info = self._resolve_exact(app, verb="relaunch")
+        except ApplicationNotFoundError:
+            if not isinstance(app, str):
+                raise
+            return {**self.launch(app, timeout=timeout, window=window), "previous_pid": None}
+        if not info["path"]:
+            raise MacOSError(
+                f"{info['name']} has no app bundle to start again",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"app": info},
+            )
+        self.quit(int(info["pid"]), timeout=timeout)
+        result = self.launch(info["path"], timeout=timeout, window=window)
+        return {**result, "previous_pid": info["pid"]}
+
+    def _resolve_exact(self, app: str | int, *, verb: str) -> tuple[Any, dict[str, Any]]:
+        """`_resolve_app`, refusing a partial name match: quitting "Notes"
+        must never end "NotesHelper" because Notes itself is closed."""
+        running, info = self._resolve_app(app)
+        if isinstance(app, str):
+            identities = (info["pid"], info["name"], info["bundle_id"], info["path"])
+            if app.casefold() not in {str(value).casefold() for value in identities if value}:
+                raise ApplicationNotFoundError(
+                    f"No running application is named exactly {app!r}; the nearest "
+                    f"is {info['name']} (pid {info['pid']}). Pass its pid to {verb} it",
+                    details={"query": app, "nearest": info},
+                )
+        return running, info
+
+    @staticmethod
+    def _application_url(app: str) -> Any:
+        """The installed bundle ``app`` names: a ``.app`` path, a bundle ID,
+        or a name as Launch Services knows it."""
+        if not isinstance(app, str) or not app.strip():
+            raise MacOSError(
+                "launch takes an app name, bundle ID, or .app path",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "app", "value": repr(app)},
+            )
+        path = Path(app).expanduser()
+        if path.suffix == ".app" and path.is_dir():
+            return NSURL.fileURLWithPath_(str(path.resolve()))
+        workspace = NSWorkspace.sharedWorkspace()
+        url = workspace.URLForApplicationWithBundleIdentifier_(app)
+        if url is None:
+            found = workspace.fullPathForApplication_(app)
+            url = NSURL.fileURLWithPath_(found) if found else None
+        if url is None:
+            raise ApplicationNotFoundError(
+                f"No installed application matches {app!r}; pass its name, "
+                "bundle ID, or .app path",
+                details={"query": app},
+            )
+        return url
+
+    @classmethod
+    def _running_copy(cls, url: Any) -> Any | None:
+        """The running process started from the bundle at ``url``, if any."""
+        bundle = str(url.path())
+        copies = [
+            running
+            for running in cls._running_applications()
+            if not running.isTerminated()
+            and running.bundleURL() is not None
+            and str(running.bundleURL().path()) == bundle
+        ]
+        if len(copies) > 1:
+            pids = [int(running.processIdentifier()) for running in copies]
+            raise MacOSError(
+                f"{len(copies)} copies of {bundle} are running (pids "
+                f"{', '.join(map(str, pids))}); pass one pid to the next call",
+                code=ErrorCode.APP_AMBIGUOUS,
+                details={"query": bundle, "pids": pids},
+            )
+        return copies[0] if copies else None
+
+    @staticmethod
+    def _open_application(url: Any, *, timeout: float) -> Any:
+        """Ask Launch Services to start the bundle at ``url`` without
+        bringing it forward, and return its running process. Launch
+        Services answers on its own queue, so no run loop turn is needed."""
+        opened = threading.Event()
+        outcome: list[tuple[Any, Any]] = []
+
+        def finished(running: Any, error: Any) -> None:
+            outcome.append((running, error))
+            opened.set()
+
+        configuration = NSWorkspaceOpenConfiguration.configuration()
+        configuration.setActivates_(False)
+        NSWorkspace.sharedWorkspace().openApplicationAtURL_configuration_completionHandler_(
+            url, configuration, finished
+        )
+        bundle = str(url.path())
+        if not opened.wait(max(0.0, timeout)):
+            raise MacOSError(
+                f"macOS did not start {bundle} within {timeout:g}s",
+                code=ErrorCode.TIMEOUT,
+                details={"path": bundle, "timeout": timeout},
+            )
+        running, error = outcome[0]
+        if running is None:
+            reason = str(error.localizedDescription()) if error is not None else "no reason given"
+            raise MacOSError(
+                f"macOS could not open {bundle}: {reason}",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"path": bundle},
+            )
+        return running
+
+    @staticmethod
+    def _exited(pid: int) -> bool:
+        """Whether ``pid`` has left the process table, read fresh."""
+        running = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        return running is None or bool(running.isTerminated())
 
     @staticmethod
     def _validate_button(button: str) -> str:

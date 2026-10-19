@@ -13,6 +13,13 @@ follows [Semantic Versioning](https://semver.org/).
 - `macos-harness skill <name>` prints one skill reference, and
   `scripts/install-skill.sh` copies the card and every reference into an
   agent skills directory.
+- `mac.launch(app)` starts an app without bringing it forward and returns
+  once its first window is up, instead of `open -a` and a fixed sleep. It
+  takes a name, bundle ID, or `.app` path and reuses a running copy.
+  `mac.quit(app)` asks an app to quit and returns once it has exited; it
+  never forces unless `force=True`, and refuses a partial name match.
+  `mac.relaunch(app)` restarts the same bundle, and `mac.frontmost()` names
+  the app in front.
 
 ### Changed
 

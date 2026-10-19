@@ -15,6 +15,10 @@ Reopening a saved document does not restore unsaved edits. Retain only safe
 task context and observe the app again when resuming; never save credentials
 or unsent form values.
 
+Quit only an app the task launched. `mac.quit(app)` waits until it exits; an
+app still open at the timeout is usually showing a save prompt, which
+`force=True` would discard.
+
 ## Choose the lowest useful mode
 
 0. For a change, try a `mac.do` verb (`press`, `set`, `toggle`, `fill`, `run`,
@@ -87,9 +91,12 @@ with repeated keys, clicks, deletion loops, or bulk input.
 - `mac.see()` renders one window on its own, even behind other windows or on
   another Space, and reports `on_screen`. An off-screen window shows what the
   app last drew, so treat `on_screen=False` as possibly stale.
-- An app launched under five seconds ago with no window yet makes `mac.see()`
-  wait up to two seconds for its first window. Elsewhere, call
-  `mac.wait_for_window(app)` before the first capture of a fresh launch.
+- `mac.launch(app)` starts an app (name, bundle ID, or `.app` path) without
+  bringing it forward, reuses a copy already running, and returns once its
+  first window is up; `window=False` is for an app that never shows one.
+  `mac.relaunch(app)` restarts the same bundle, so a fresh build relaunches
+  from its own path. An app launched some other way under five seconds ago
+  makes `mac.see()` wait up to two seconds for its first window.
 - Some apps keep running with no window until their Dock icon is clicked.
   `mac.see()` then says the app is running with no windows and names
   `mac.script('tell application id "<bundle id>" to reopen')`, which opens the
