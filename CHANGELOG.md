@@ -82,6 +82,14 @@ follows [Semantic Versioning](https://semver.org/).
   launched; a miss now falls back to the running-apps list. Receipts no
   longer report such an app as exited, and `mac.quit` reads the exit from
   the kernel's process table.
+- An app given by pid keeps that pid when AppKit hands back a record whose
+  pid reads -1, as Device Hub's did every time; every later call used to
+  fail on "No running application matches -1". A name whose app has no
+  process yet now says it is still launching, and `mac.launch` waits for
+  the pid. Of processes with exactly the asked name, the only one with an
+  on-screen window is picked instead of raising `app.ambiguous`, unless a
+  windowless one is frontmost; two windowed copies, or names that match
+  only helpers, still raise.
 - The frontmost app is read afresh on both backends. `mac.activate` now sees
   its request take, and the focus guard after a press catches a target that
   brings itself to the front; before, a process kept seeing whichever app was

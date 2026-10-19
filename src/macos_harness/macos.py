@@ -1589,7 +1589,12 @@ class MacOS:
                     f"No running application matches {query!r}",
                     details={"query": query},
                 )
-            return app, self._app_info(app)
+            info = self._app_info(app)
+            if info["pid"] == -1:
+                # AppKit can hand back an app it has not tied to a process
+                # yet (Device Hub, every time): the pid asked for is it.
+                info["pid"] = query
+            return app, info
 
         needle = str(query).casefold()
         candidates: list[tuple[Any, dict[str, Any]]] = []
@@ -1629,8 +1634,23 @@ class MacOS:
                 f"No running application matches {query!r}",
                 details={"query": query},
             )
+        ready = [match for match in matches if match[1]["pid"] != -1]
+        if not ready:
+            name = matches[0][1]["name"]
+            raise ApplicationNotFoundError(
+                f"{name} is still launching: macOS lists it without a process "
+                f"yet. mac.launch({name!r}) waits until it has one",
+                details={"query": query, "launching": [info for _, info in matches]},
+            )
+        matches = ready
         if len(matches) > 1:
             ranked = self._rank_matches(matches)
+            windowed = [item["pid"] for item in ranked if item["on_screen_windows"]]
+            if exact and len(windowed) == 1 and ranked[0]["pid"] == windowed[0]:
+                # A twin without a window is a copy still quitting or one
+                # nobody sees: the one with a window is the app meant,
+                # unless a windowless twin is in front.
+                return next(match for match in matches if match[1]["pid"] == windowed[0])
             names = ", ".join(self._describe_match(info) for info in ranked[:8])
             # Only partial matches usually means the app itself is not
             # running and the name hit its helpers ("Passwords" finding
@@ -1664,8 +1684,9 @@ class MacOS:
         Two processes with one name are common: a relaunch that has not
         exited yet, or a helper beside its parent. The frontmost one, then
         the one with on-screen windows, then the newest, is almost always
-        the one meant -- but the choice stays with the caller, so this
-        only ranks and reports, never picks.
+        the one meant. An exact name whose only windowed process also ranks
+        first is picked for the caller (`_resolve_app`); otherwise this
+        ranks the choices the error reports.
         """
         frontmost = self._frontmost_app()
         frontmost_pid = None if frontmost is None else int(frontmost["pid"])
@@ -4821,6 +4842,18 @@ class MacOS:
         if running is None:
             running = self._open_application(url, timeout=timeout)
         info = self._app_info(running)
+        while info["pid"] == -1:
+            # macOS can list an app before it has a process (Device Hub).
+            remaining = deadline - self._now()
+            if remaining <= 0:
+                raise MacOSError(
+                    f"{info['name']} was still launching after {timeout:g}s",
+                    code=ErrorCode.TIMEOUT,
+                    details={"app": info, "timeout": timeout},
+                )
+            self._pause(min(0.05, remaining))
+            running = self._running_copy(url) or running
+            info = self._app_info(running)
         windows: list[dict[str, Any]] = []
         if window and launched:
             windows = self._wait_for_windows(info, timeout=timeout, deadline=deadline)

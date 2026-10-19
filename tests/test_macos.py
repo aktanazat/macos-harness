@@ -324,11 +324,17 @@ def test_windows_app_name_ignores_nested_extension_but_explicit_identity_does_no
         "/Applications/Other.app/Contents/PlugIns/Messages.appex",
     ],
 )
-def test_windows_app_name_keeps_distinct_apps_and_unrelated_extensions_ambiguous(
-    messages_apps, other_path,
+def test_windows_app_name_keeps_distinct_windowed_apps_and_unrelated_extensions_ambiguous(
+    messages_apps, other_path, monkeypatch,
 ) -> None:
     mac, apps = messages_apps
     apps.append(_FakeRunningApp(43, name="Messages", path=other_path))
+    _on_screen_windows(
+        monkeypatch,
+        (41, 101, 0, 0, 200, 200),
+        (42, 102, 0, 0, 400, 400),
+        (43, 103, 0, 0, 300, 300),
+    )
     with pytest.raises(MacOSError) as error:
         mac.windows("Messages")
     assert error.value.code == ErrorCode.APP_AMBIGUOUS

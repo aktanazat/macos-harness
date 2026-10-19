@@ -113,3 +113,7 @@ with repeated keys, clicks, deletion loops, or bulk input.
   front. `mac.activate()` alone does not open one.
 - An ambiguous app name raises with the matches ranked (frontmost, then
   on-screen windows, then newest) and their pids; pass the pid you mean.
+  Of processes with exactly that name, the only one with an on-screen
+  window is picked for you unless a windowless one is frontmost. An app
+  macOS lists without a process yet says it is still launching;
+  `mac.launch(app)` waits until it has one.

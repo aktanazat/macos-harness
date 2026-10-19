@@ -16,6 +16,8 @@ from macos_harness.macos import ApplicationNotFoundError, MacOS, MacOSError
 
 _CALCULATOR = "/System/Applications/Calculator.app"
 _TEXTEDIT = "/System/Applications/TextEdit.app"
+_DEVICE_HUB = "/Applications/Xcode.app/Contents/Applications/Device Hub.app"
+_MESSAGES = "/System/Applications/Messages.app"
 _WINDOW = {"window_id": 7, "title": "Untitled", "on_screen": True}
 
 
@@ -54,6 +56,21 @@ class _Process:
     def forceTerminate(self) -> bool:
         self.requests.append("forceTerminate")
         return True
+
+
+class _Launching(_Process):
+    """A process macOS lists before it has one: its first ``unborn``
+    reads of the pid say -1."""
+
+    def __init__(self, pid: int, *, name: str, path: str, unborn: int) -> None:
+        super().__init__(pid, name=name, path=path, exits_after=None)
+        self.unborn = unborn
+
+    def processIdentifier(self) -> int:
+        if self.unborn:
+            self.unborn -= 1
+            return -1
+        return self.pid
 
 
 class _Url:
@@ -294,3 +311,112 @@ def test_quit_keeps_waiting_while_the_kernel_still_runs_the_process() -> None:
 
     assert caught.value.code == ErrorCode.TIMEOUT
     assert alive.requests == ["terminate"]
+
+
+def test_launch_waits_while_macos_lists_the_app_without_a_process() -> None:
+    """Device Hub showed up with pid -1, and every call after it failed on
+    "No running application matches -1"; launch waits for the real pid."""
+    mac = _ScriptedOS(running=_Launching(11, name="TextEdit", path=_TEXTEDIT, unborn=2))
+
+    result = mac.launch("TextEdit")
+
+    assert (result["app"]["pid"], mac.pauses) == (11, [0.05, 0.05])
+
+
+def test_launch_gives_up_on_an_app_that_never_gets_a_process() -> None:
+    mac = _ScriptedOS(running=_Launching(11, name="TextEdit", path=_TEXTEDIT, unborn=10**6))
+
+    with pytest.raises(MacOSError, match="TextEdit was still launching after 0.2s") as caught:
+        mac.launch("TextEdit", timeout=0.2)
+
+    assert caught.value.code == ErrorCode.TIMEOUT
+
+
+class _Workspace(MacOS):
+    """`MacOS` over the apps AppKit lists, ``direct`` answers for AppKit's
+    own pid lookup, and one on-screen window for each pid in ``windowed``."""
+
+    def __init__(
+        self,
+        *processes: _Process,
+        direct: dict[int, _Process] | None = None,
+        windowed: tuple[int, ...] = (),
+    ) -> None:
+        super().__init__()
+        self.processes = processes
+        self.direct = direct or {}
+        self.windowed = windowed
+
+    def _application_with_pid(self, pid: int) -> _Process | None:
+        listed = (process for process in self.processes if process.pid == pid)
+        return self.direct.get(pid) or next(listed, None)
+
+    def _running_applications(self) -> tuple[_Process, ...]:
+        return self.processes
+
+    def _window_list(self, *, on_screen_only: bool) -> list[dict[str, Any]]:
+        return [
+            {
+                "kCGWindowNumber": pid,
+                "kCGWindowOwnerPID": pid,
+                "kCGWindowName": "",
+                "kCGWindowLayer": 0,
+                "kCGWindowBounds": {"X": 0, "Y": 0, "Width": 800, "Height": 600},
+                "kCGWindowIsOnscreen": True,
+            }
+            for pid in self.windowed
+        ]
+
+    def _frontmost_app(self) -> dict[str, Any]:
+        return {"name": "Ghostty", "bundle_id": "com.mitchellh.ghostty", "pid": 1, "path": None}
+
+
+def test_a_pid_query_keeps_its_pid_when_appkit_reports_none() -> None:
+    """AppKit answered Device Hub's real pid with an app whose pid read
+    -1, so the windows of pid -1 were looked for, and none found."""
+    hub = _Process(-1, name="Device Hub", path=_DEVICE_HUB, exits_after=None)
+
+    windows = _Workspace(hub, direct={42107: hub}, windowed=(42107,)).windows(42107)
+
+    assert [window["pid"] for window in windows] == [42107]
+
+
+def test_a_name_without_a_process_yet_says_it_is_still_launching() -> None:
+    hub = _Process(-1, name="Device Hub", path=_DEVICE_HUB, exits_after=None)
+
+    with pytest.raises(ApplicationNotFoundError, match=r"Device Hub is still launching"):
+        _Workspace(hub).windows("Device Hub")
+
+
+@pytest.mark.parametrize("windowed_first", [True, False], ids=["listed-first", "listed-last"])
+def test_exact_name_twins_resolve_to_the_only_one_with_a_window(windowed_first) -> None:
+    """Two Messages processes, one with a window, raised APP_AMBIGUOUS."""
+    shown = _Process(300, name="Messages", path=_MESSAGES, exits_after=None)
+    hidden = _Process(301, name="Messages", path=_MESSAGES, exits_after=None)
+    processes = (shown, hidden) if windowed_first else (hidden, shown)
+
+    windows = _Workspace(*processes, windowed=(300,)).windows("Messages")
+
+    assert [window["pid"] for window in windows] == [300]
+
+
+@pytest.mark.parametrize(
+    ("query", "names", "windowed"),
+    [
+        ("Safari", ("Safari", "Safari"), (400, 401)),
+        ("Passwords", ("PasswordsMenuBarExtra", "PasswordsAgent"), (400,)),
+    ],
+    ids=["both-twins-windowed", "partial-names-one-windowed"],
+)
+def test_a_name_stays_ambiguous_without_one_windowed_exact_match(query, names, windowed) -> None:
+    """Guard: the caller still picks between two windowed Safaris, and a
+    name that matches only helpers never picks one of them."""
+    processes = [
+        _Process(400 + index, name=name, path=f"/Applications/{name}.app", exits_after=None)
+        for index, name in enumerate(names)
+    ]
+
+    with pytest.raises(MacOSError) as caught:
+        _Workspace(*processes, windowed=windowed).windows(query)
+
+    assert caught.value.code == ErrorCode.APP_AMBIGUOUS
