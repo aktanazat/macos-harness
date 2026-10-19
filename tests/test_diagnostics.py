@@ -109,6 +109,46 @@ def test_partial_inspection_does_not_claim_that_no_dialog_blocks_the_app(inspect
     assert complete["blocked"] is True
 
 
+def _hang_labels(host: InspectionHost, count: int) -> None:
+    """``count`` more labels side by side under the app."""
+    labels = [object() for _ in range(count)]
+    host.data[host.root]["AXChildren"] = [*host.data[host.root]["AXChildren"], *labels]
+    host.data.update({label: {"AXRole": "AXStaticText"} for label in labels})
+
+
+def _hang_groups(host: InspectionHost, count: int) -> None:
+    """Groups nested ``count`` levels deep under the app."""
+    groups = [object() for _ in range(count)]
+    host.data[host.root]["AXChildren"] = [*host.data[host.root]["AXChildren"], groups[0]]
+    host.data.update(
+        {group: {"AXRole": "AXGroup", "AXChildren": groups[index + 1 : index + 2]}
+         for index, group in enumerate(groups)}
+    )
+
+
+@pytest.mark.parametrize(
+    ("option", "asked", "cap", "grow", "cut"),
+    [
+        ("max_nodes", 6000, 5000, lambda host: _hang_labels(host, 5001), "node_cut"),
+        ("max_depth", 40, 25, lambda host: _hang_groups(host, 30), "depth_cut"),
+    ],
+    ids=["nodes", "depth"],
+)
+def test_inspection_past_a_cap_walks_the_cap_and_says_so(inspection, option, asked, cap, grow, cut) -> None:
+    """Asking past the 5000-node or 25-level cap used to fail the call; it
+    now walks the cap, says what it used, and a tree bigger than the cap
+    is reported incomplete."""
+    host, _requested = inspection
+    grow(host)
+
+    state = host.inspect("Demo", **{option: asked})
+
+    assert state["capped"] == {option: {"asked": asked, "used": cap}}
+    assert state["coverage"][cut] is True
+    assert state["coverage"]["complete"] is False
+
+
+
 def test_failed_search_inspection_shows_current_controls_without_retrying_the_action(inspection) -> None:
     host, _requested = inspection
     host.press_results.append(MacOSError("No matching control", code=ErrorCode.TIMEOUT))

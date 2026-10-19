@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import code
+import difflib
 import inspect
 import json
 import re
 import subprocess
 import sys
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
@@ -41,35 +42,105 @@ def _namespace() -> Iterator[dict[str, object]]:
 # A call with the wrong arguments raises before its body runs, naming the
 # method by qualified name: "MacOS.scroll() got an unexpected keyword ...".
 _BAD_CALL = re.compile(r"(\w+)\.(\w+)\(\) ")
+# Its unknown keyword, and the hint Python 3.13+ appends by spelling alone.
+_UNKNOWN_KEYWORD = re.compile(r"unexpected keyword argument '(\w+)'(?:\. Did you mean '\w+'\?)?$")
 
 
-def _signature_note(exc: TypeError, namespace: Mapping[str, object]) -> str | None:
-    """The real signature of the preloaded harness method ``exc`` names."""
+def _mac_surfaces(namespace: Mapping[str, object]) -> dict[str, object]:
+    """The preloaded `mac` and the two namespaces programs call through it."""
     from .macos import MacOS
 
-    call = _BAD_CALL.match(str(exc))
-    if call is None or call[2].startswith("_"):
-        return None
     mac = namespace.get("mac")
-    surfaces: dict[str, object] = {"mac": mac, "browser": namespace.get("browser")}
-    if isinstance(mac, MacOS):
-        surfaces.update({"mac.ax": mac.ax, "mac.do": mac.do})
-    for label, surface in surfaces.items():
-        if type(surface).__name__ != call[1]:
-            continue
-        method = getattr(surface, call[2], None)
-        if not callable(method):
-            return None
-        signature = inspect.signature(method)
-        plain = signature.replace(
+    if not isinstance(mac, MacOS):
+        return {}
+    return {"mac": mac, "mac.ax": mac.ax, "mac.do": mac.do}
+
+
+def _plain_signature(method: Callable[..., object]) -> str:
+    """``method``'s parameters as a call spells them, unannotated."""
+    signature = inspect.signature(method)
+    return str(
+        signature.replace(
             parameters=[
                 parameter.replace(annotation=parameter.empty)
                 for parameter in signature.parameters.values()
             ],
             return_annotation=signature.empty,
         )
-        return f"Signature: {label}.{call[2]}{plain}"
-    return None
+    )
+
+
+def _abbreviated(keyword: str, parameters: Iterable[str]) -> str | None:
+    """The one parameter whose words' initials spell ``keyword``, as
+    ``delta_y`` does ``dy``; Python's own hint goes by spelling and offers
+    ``y``."""
+    found = [
+        name for name in parameters
+        if "_" in name and "".join(word[:1] for word in name.split("_")) == keyword
+    ]
+    return found[0] if len(found) == 1 else None
+
+
+def _explain_bad_call(exc: TypeError, namespace: Mapping[str, object]) -> None:
+    """End a misused harness call's error with the method's real signature,
+    and point an abbreviated keyword at the parameter it stands for."""
+    call = _BAD_CALL.match(str(exc))
+    if call is None or call[2].startswith("_"):
+        return
+    surfaces = {**_mac_surfaces(namespace), "browser": namespace.get("browser")}
+    for label, surface in surfaces.items():
+        if type(surface).__name__ != call[1]:
+            continue
+        method = getattr(surface, call[2], None)
+        if not callable(method):
+            return
+        unknown = _UNKNOWN_KEYWORD.search(str(exc))
+        if unknown is not None:
+            meant = _abbreviated(unknown[1], inspect.signature(method).parameters)
+            if meant is not None:
+                exc.args = (f"{str(exc)[: unknown.end(1) + 1]}. Did you mean '{meant}'?",)
+        exc.add_note(f"Signature: {label}.{call[2]}{_plain_signature(method)}")
+        return
+
+
+def _nearness(missing: str, name: str) -> float:
+    """How likely ``name`` is the call ``missing`` meant: a name one word
+    apart from it ranks just below the same name, and any other by how
+    alike the two are spelled."""
+    if missing.startswith(f"{name}_") or name.startswith(f"{missing}_"):
+        return 0.95
+    return difflib.SequenceMatcher(None, missing, name).ratio()
+
+
+def _call_text(label: str, surface: object, name: str) -> str:
+    """``label.name``, with its parameters when it is a method; a property
+    is named without being read."""
+    raw = inspect.getattr_static(surface, name)
+    if inspect.isfunction(raw) or isinstance(raw, (staticmethod, classmethod)):
+        return f"{label}.{name}{_plain_signature(getattr(surface, name))}"
+    return f"{label}.{name}"
+
+
+def _point_at_nearest(exc: AttributeError, namespace: Mapping[str, object]) -> None:
+    """End an error for a name `mac`, `mac.ax` or `mac.do` lacks with the
+    nearest calls across all three, as they are called."""
+    surfaces = _mac_surfaces(namespace)
+    owner = next((label for label, surface in surfaces.items() if exc.obj is surface), None)
+    if owner is None or not exc.name:
+        return
+    ranked = sorted(
+        (-_nearness(exc.name, name), label != owner, label, name)
+        for label, surface in surfaces.items()
+        for name in dir(surface)
+        if not name.startswith("_")
+    )
+    nearest = [
+        _call_text(label, surfaces[label], name)
+        for score, _elsewhere, label, name in ranked[:3]
+        if -score >= 0.6
+    ]
+    if nearest:
+        exc.add_note("Nearest calls:\n" + "\n".join(f"  {call}" for call in nearest))
 
 
 def _execute(code: str) -> int:
@@ -80,9 +151,10 @@ def _execute(code: str) -> int:
         try:
             exec(compile(code, "<macos-harness>", "exec"), namespace, namespace)  # noqa: S102
         except TypeError as exc:
-            note = _signature_note(exc, namespace)
-            if note is not None:
-                exc.add_note(note)
+            _explain_bad_call(exc, namespace)
+            raise
+        except AttributeError as exc:
+            _point_at_nearest(exc, namespace)
             raise
     return 0
 

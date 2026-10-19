@@ -226,6 +226,9 @@ _AX_PROBE_WORKERS = 16
 # and a capture waits for its first window instead of failing at once.
 _LAUNCH_GRACE_SECONDS = 5.0
 _LAUNCH_WINDOW_TIMEOUT = 2.0
+# The most an `inspect` walks; a larger ask walks this much and says so.
+_INSPECT_MAX_NODES = 5000
+_INSPECT_MAX_DEPTH = 25
 # `wait_change` looks at a window this often, and a look counts as changed
 # once about 64 square points of it moved in brightness -- one short word
 # of body text; a blinking caret is about 20 -- or 2% of a watched region,
@@ -1063,14 +1066,27 @@ class MacOS:
         self, app: str | int | Receipt, *, max_depth: int = 12, max_nodes: int = 300,
         include_values: bool = False, screenshot: bool = False,
     ) -> dict[str, JSONValue]:
-        """Collect a bounded, non-enhancing snapshot; values and capture are opt-in."""
+        """Collect a bounded, non-enhancing snapshot; values and capture are opt-in.
+
+        ``max_nodes`` above 5000 or ``max_depth`` above 25 walks the cap
+        instead, and the result's ``capped`` says what was asked and used."""
         from .diagnostics import inspection_findings
 
         self.do._check_owner()
-        if type(max_nodes) is not int or not 1 <= max_nodes <= 5000:
-            raise MacOSError("max_nodes must be between 1 and 5000", code=ErrorCode.BAD_REQUEST)
-        if type(max_depth) is not int or not 0 <= max_depth <= 25:
-            raise MacOSError("max_depth must be between 0 and 25", code=ErrorCode.BAD_REQUEST)
+        if isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or max_nodes < 1:
+            raise MacOSError("max_nodes must be a positive integer", code=ErrorCode.BAD_REQUEST)
+        if isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 0:
+            raise MacOSError("max_depth must be a non-negative integer", code=ErrorCode.BAD_REQUEST)
+        capped: dict[str, JSONValue] = {
+            name: {"asked": asked, "used": cap}
+            for name, asked, cap in (
+                ("max_nodes", max_nodes, _INSPECT_MAX_NODES),
+                ("max_depth", max_depth, _INSPECT_MAX_DEPTH),
+            )
+            if asked > cap
+        }
+        max_nodes = min(max_nodes, _INSPECT_MAX_NODES)
+        max_depth = min(max_depth, _INSPECT_MAX_DEPTH)
         if not isinstance(include_values, bool) or not isinstance(screenshot, bool):
             raise MacOSError("include_values and screenshot must be booleans", code=ErrorCode.BAD_REQUEST)
         with self.do._dispatch_lock:
@@ -1097,6 +1113,8 @@ class MacOS:
             state["observed_at"] = _utc_timestamp(time.time())
             self._identify_observation(state)
             state.update(inspection_findings(state, app if isinstance(app, Receipt) else None))
+            if capped:
+                state["capped"] = capped
             return state
 
     def _identify_observation(self, state: dict[str, JSONValue]) -> None:
@@ -4198,13 +4216,20 @@ class MacOS:
         try:
             return windows[window_index]
         except IndexError as exc:
+            count = len(windows)
+            held = (
+                "no windows" if count == 0
+                else "1 window (index 0)" if count == 1
+                else f"{count} windows (indexes 0-{count - 1})"
+            )
             raise MacOSError(
-                f"Window index {window_index} is out of range; found {len(windows)} windows",
+                f"No window at window_index {window_index}: window_index starts "
+                f"at 0, and this app has {held}",
                 code=ErrorCode.BAD_REQUEST,
                 details={
                     "parameter": "window_index",
                     "value": window_index,
-                    "count": len(windows),
+                    "count": count,
                 },
             ) from exc
 

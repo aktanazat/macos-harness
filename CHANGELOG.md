@@ -116,6 +116,13 @@ follows [Semantic Versioning](https://semver.org/).
 - The errors for an unknown role, an element index from an earlier search
   or run, and screenshot coordinates with no screenshot in the run say what
   to do instead.
+- A stdin program that calls a name `mac`, `mac.ax`, or `mac.do` lacks,
+  such as `mac.ax.get_attributes`, now gets the nearest calls across all
+  three as they are called. A keyword that abbreviates a parameter, such as
+  `dy` for `delta_y`, is pointed at it; Python's own hint said `y`.
+  `mac.inspect` past 5000 nodes or 25 levels walks the cap instead of
+  failing and reports `capped`, and a `window_index` past an app's windows
+  says the index starts at 0 and which indexes the app has.
 - An AX wait, and the search inside a Python-backend press, keeps polling
   while the app does not answer in time (AXError -25204), as Secretive and
   Activity Monitor do for a second or more after `open -a`; before, the

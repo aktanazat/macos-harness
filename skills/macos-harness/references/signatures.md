@@ -1,7 +1,8 @@
 # Signatures
 
 Parameters after `*` are keyword-only. When a stdin program passes a wrong
-keyword, its `TypeError` ends with the method's real signature.
+keyword, its `TypeError` ends with the method's real signature; a name
+`mac`, `mac.ax`, or `mac.do` lacks lists the nearest calls.
 
 ```python
 frame = mac.see("Spotify")
@@ -133,6 +134,9 @@ mac.crashes(receipt_or_time_pair, *, app=None, limit=3, max_files=128)
 mac.sample(app_or_receipt, *, duration=1, timeout=5.0, max_bytes=1048576)
 mac.explain(receipt, *evidence)
 ```
+
+`inspect` walks at most 5000 nodes and 25 levels; a larger ask walks the
+cap, and the result's `capped` says what was asked and used.
 
 ## Scrolling
 

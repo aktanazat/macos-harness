@@ -183,6 +183,18 @@ raise OperationError.from_receipt(Receipt(
     assert receipt["error"] == error
 
 
+def _stdin_stderr_lines(program: str) -> list[str]:
+    """Run ``program`` as a harness stdin program that fails, and return
+    the lines of its error output."""
+    result = subprocess.run(
+        [sys.executable, "-m", "macos_harness.cli"],
+        input=program, text=True, capture_output=True, timeout=10, check=False,
+        env={**os.environ, "DO_NOT_TRACK": "1", "MACOS_HARNESS_BACKEND": "python"},
+    )
+    assert result.returncode == 1
+    return result.stderr.splitlines()
+
+
 @pytest.mark.parametrize(
     ("program", "error", "signature"),
     (
@@ -204,17 +216,66 @@ raise OperationError.from_receipt(Receipt(
 def test_stdin_misused_call_shows_the_real_signature(program, error, signature) -> None:
     """A call with a wrong keyword fails before it does anything; the error
     ends with the method's real signature so the retry can be right."""
-    result = subprocess.run(
-        [sys.executable, "-m", "macos_harness.cli"],
-        input=program, text=True, capture_output=True, timeout=10, check=False,
-        env={**os.environ, "DO_NOT_TRACK": "1", "MACOS_HARNESS_BACKEND": "python"},
-    )
-
-    assert result.returncode == 1
-    *_, raised, shown = result.stderr.splitlines()
+    *_, raised, shown = _stdin_stderr_lines(program)
     # Python 3.13 adds a "Did you mean ...?" hint to the TypeError.
     assert raised.startswith(error)
     assert shown == signature
+
+
+@pytest.mark.parametrize(
+    ("program", "error"),
+    (
+        pytest.param(
+            'mac.scroll(dy=-300, app="Finder")\n',
+            "TypeError: MacOS.scroll() got an unexpected keyword argument 'dy'. "
+            "Did you mean 'delta_y'?",
+            id="one-parameter-matches",
+        ),
+        pytest.param(
+            "mac.see(wi=1)\n",
+            "TypeError: MacOS.see() got an unexpected keyword argument 'wi'",
+            id="window_index-and-window_id-tie",
+        ),
+    ),
+)
+def test_stdin_abbreviated_keyword_is_pointed_at_the_parameter_it_means(program, error) -> None:
+    """Python hints a wrong keyword by spelling, so ``dy`` was told ``y``;
+    the hint now names the one parameter whose initials the keyword spells,
+    and guesses nothing when two parameters share them."""
+    *_, raised, _signature = _stdin_stderr_lines(program)
+
+    assert raised == error
+
+
+@pytest.mark.parametrize(
+    ("program", "nearest"),
+    (
+        pytest.param(
+            'mac.ax.get_attributes(3, ["AXTitle"])\n',
+            [
+                "mac.get_attributes(element_index, attributes)",
+                "mac.ax.get(element_index, attributes='AXValue')",
+                "mac.get(element_index, attribute='AXValue', *, missing_ok=False)",
+            ],
+            id="same-name-then-own-namespace",
+        ),
+        pytest.param(
+            'mac.ax.windows("Finder")\n',
+            ["mac.windows(app=None, *, all_layers=False)", "mac.diff_windows(before, after)"],
+            id="other-namespace",
+        ),
+        pytest.param('mac.ax.route.list(app="Finder")\n', ["mac.route"], id="not-a-method"),
+    ),
+)
+def test_stdin_unknown_name_lists_the_nearest_calls(program, nearest) -> None:
+    """A name `mac.ax` lacks used to end the run on a bare AttributeError;
+    the error now lists the nearest calls across `mac`, `mac.ax`, and
+    `mac.do`, as they are called, so the retry can be right."""
+    lines = _stdin_stderr_lines(program)
+    listed = lines.index("Nearest calls:")
+
+    assert lines[listed - 1].startswith("AttributeError: 'Accessibility' object has no attribute")
+    assert [line.strip() for line in lines[listed + 1 :]] == nearest
 
 
 @pytest.mark.parametrize(

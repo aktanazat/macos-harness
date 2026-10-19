@@ -241,6 +241,26 @@ def test_see_of_an_app_showing_only_a_panel_names_its_window_id() -> None:
 
 
 @pytest.mark.parametrize(
+    ("app", "held"),
+    [("Notes", "1 window (index 0)"), ("Finder", "2 windows (indexes 0-1)")],
+)
+def test_see_past_an_apps_windows_says_where_window_index_starts(app, held) -> None:
+    """``window_index=1`` on a one-window app reads as an off-by-one; the
+    error says the index starts at 0 and which indexes the app has."""
+    mac = _Desk()
+
+    with pytest.raises(MacOSError) as caught:
+        mac.see(app, window_index=2)
+
+    assert (
+        f"No window at window_index 2: window_index starts at 0, and this app has {held}"
+        in str(caught.value)
+    )
+    assert mac.window_captures == []
+
+
+
+@pytest.mark.parametrize(
     ("surface", "display_id", "origin"),
     [({"display": 1}, 3, (1000.0, 0.0)), ({"region": (100, 50, 200, 100)}, 1, (100.0, 50.0))],
     ids=["display", "region"],
