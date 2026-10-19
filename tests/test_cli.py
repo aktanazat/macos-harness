@@ -42,6 +42,27 @@ def test_every_other_subcommand_still_parses(monkeypatch: pytest.MonkeyPatch) ->
     assert parser.parse_args(["state", "Finder"]).command == "state"
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["see", "TextEdit"], {"app": "TextEdit", "path": None, "window_index": 0}),
+        (
+            ["see", "4242", "--path", "/tmp/shot.png", "--window-index", "1"],
+            {"app": 4242, "path": "/tmp/shot.png", "window_index": 1},
+        ),
+        (["see", "1Password"], {"app": "1Password"}),
+        (["state", "4242"], {"app": 4242}),
+    ],
+    ids=["name", "pid-path-window", "name-with-digits", "state-pid"],
+)
+def test_see_and_state_read_a_pid_and_capture_options(argv, expected) -> None:
+    """A shell caller often has only a pid, and wants the PNG where it can
+    read it next; both used to need a stdin program."""
+    args = vars(cli._build_parser().parse_args(argv))
+
+    assert {key: args[key] for key in expected} == expected
+
+
 def test_main_exits_with_argparse_error_for_a_stale_agent_invocation(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

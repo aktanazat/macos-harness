@@ -16,6 +16,9 @@ print(mac.see("Spotify"))
 PY
 ```
 
+In omp, run it and `tool.read` the printed PNG path in one eval cell: the
+image returns with the result.
+
 Bundle reversible steps; verify once at the end. Stop only for unclear
 identity, an irreversible action, or unexpected state.
 
@@ -73,11 +76,11 @@ Mac-control code reads one, not this card.
 `macos-harness skill <name>` prints each one from `references/`:
 
 - `signatures`: every exact signature
-- `receipts`: outcomes, errors, once tokens, timeouts, history, the log
-- `ax-search`: roles, scopes, exact labels, cross-app search, waits
-- `invariants`: cleanup, focus, pointer, screenshot, input; choosing a mode
-- `routes`: recording and replaying saved navigation
+- `receipts`: outcomes, errors, once tokens, history, the log
+- `ax-search`: roles, scopes, exact labels, waits
+- `invariants`: cleanup, focus, input, windows; choosing a mode
+- `routes`: saved navigation
 - `diagnostics`: inspecting a failure before more input
 - `handoff`: the handoff call and what follows it
-- `credentials`: browser and login boundaries, permissions
+- `credentials`: login boundaries, permissions
 - `native-backend`: the optional native backend

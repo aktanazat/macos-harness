@@ -20,6 +20,10 @@ follows [Semantic Versioning](https://semver.org/).
   never forces unless `force=True`, and refuses a partial name match.
   `mac.relaunch(app)` restarts the same bundle, and `mac.frontmost()` names
   the app in front.
+- `macos-harness see` takes `--path` and `--window-index`, and `see` and
+  `state` read an all-digit app as a pid. The skill card shows reading the
+  PNG in the same omp eval cell that captured it, which saves a turn per
+  look.
 
 ### Changed
 

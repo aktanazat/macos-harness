@@ -104,6 +104,11 @@ def _skill_text(reference: str | None) -> str:
     return page.read_text(encoding="utf-8")
 
 
+def _app_query(value: str) -> str | int:
+    """An app argument as `MacOS` reads it: all digits is a pid."""
+    return int(value) if value.isascii() and value.isdigit() else value
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="macos-harness",
@@ -135,7 +140,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     telemetry.add_argument("action", nargs="?", choices=("status", "enable", "disable"))
     see = subparsers.add_parser("see", help="capture a bounded application window")
-    see.add_argument("app")
+    see.add_argument("app", type=_app_query, help="an app name, bundle ID, path, or pid")
+    see.add_argument("--path", help="write the PNG here instead of a temporary file")
+    see.add_argument("--window-index", type=int, default=0)
     see.add_argument("--max-width", type=int, default=1280)
     see.add_argument("--max-height", type=int, default=1280)
     see.add_argument(
@@ -144,7 +151,7 @@ def _build_parser() -> argparse.ArgumentParser:
     state = subparsers.add_parser(
         "state", help="print an application's AX state as JSON"
     )
-    state.add_argument("app")
+    state.add_argument("app", type=_app_query)
     state.add_argument("--screenshot", action="store_true")
     state.add_argument("--max-depth", type=int, default=25)
     state.add_argument("--max-nodes", type=int, default=5000)
@@ -203,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
             with MacOS() as mac:
                 result = mac.see(
                     args.app,
+                    window_index=args.window_index,
+                    path=args.path,
                     max_width=args.max_width,
                     max_height=args.max_height,
                     show_pointer=args.pointer,

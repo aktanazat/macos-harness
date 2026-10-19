@@ -15,6 +15,9 @@ mac.ax.perform(item["element_index"], "AXPress")
 mac.script('tell application "Spotify" to play')
 ```
 
+Without a program, `macos-harness see APP_OR_PID --path out.png --window-index 0`
+captures one window and prints the same result as `mac.see`.
+
 ## Primitives
 
 ```text
