@@ -91,11 +91,17 @@ class LivePointerOverlay:
 
     @property
     def running(self) -> bool:
+        return self.pid is not None
+
+    @property
+    def pid(self) -> int | None:
+        """The helper's pid while it runs, so a screen capture can leave
+        its pointer window out."""
         if os.getpid() != self._creator_pid:
-            return False
+            return None
         with self._lock:
             process = self._process_box[0]
-            return process is not None and process.poll() is None
+            return process.pid if process is not None and process.poll() is None else None
 
     def move(self, x: float, y: float, *, duration: float = 0.16) -> None:
         self._check_owner()

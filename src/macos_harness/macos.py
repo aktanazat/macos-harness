@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
@@ -30,8 +30,10 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
 from .capture import (
     GrayPrint,
     WindowCapture,
+    capture_screen,
     capture_window,
     changed_area,
+    displays,
     draw_pointer,
     gray_print,
     write_png,
@@ -699,15 +701,25 @@ def _unanswered_search() -> SearchMatches:
 
 
 def _no_window_error(
-    info: Mapping[str, object], *, timeout: float | None = None
+    info: Mapping[str, object], *, timeout: float | None = None, surfaces: Sequence[int] = ()
 ) -> MacOSError:
     """A running app with no window to capture, and the call that opens
     one. An app such as Secretive keeps running with no window until its
     Dock icon is clicked; AppleScript's ``reopen`` is that click, and
-    TextEdit answered it without coming forward."""
+    TextEdit answered it without coming forward. An app that shows only
+    a panel or prompt off the normal layer names those by window id."""
     target = (
         f'id "{info["bundle_id"]}"' if info.get("bundle_id") else f'"{info["name"]}"'
     )
+    if surfaces:
+        return MacOSError(
+            f"{info['name']} has no normal window but shows "
+            f"{len(surfaces)} other surface(s), such as a panel or prompt: "
+            f"mac.see(window_id={surfaces[0]}) captures one, and "
+            f"mac.windows({info['pid']}, all_layers=True) lists them",
+            code=ErrorCode.ELEMENT_UNKNOWN,
+            details={"app": info, "window_ids": list(surfaces)},
+        )
     state = (
         "has no open windows"
         if timeout is None
@@ -720,6 +732,18 @@ def _no_window_error(
         code=ErrorCode.ELEMENT_UNKNOWN if timeout is None else ErrorCode.TIMEOUT,
         details={"app": info} if timeout is None else {"app": info, "timeout": timeout},
     )
+
+
+def _png_output(path: str | Path | None) -> Path:
+    """Where `see` writes its PNG: ``path``, or a fresh temporary file."""
+    if path is None:
+        with tempfile.NamedTemporaryFile(
+            prefix="macos-harness-", suffix=".png", delete=False
+        ) as handle:
+            return Path(handle.name)
+    output = Path(path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return output
 
 
 class _ExactSelector(NamedTuple):
@@ -3612,32 +3636,69 @@ class MacOS:
         bounds = value.get(AS.kCGWindowBounds) or {}
         return float(bounds.get("Width", 0)) >= 40 and float(bounds.get("Height", 0)) >= 40
 
-    def windows(self, app: str | int | None = None) -> list[dict[str, Any]]:
-        _, info = self._resolve_app(app)
-        values = AS.CGWindowListCopyWindowInfo(
-            AS.kCGWindowListOptionAll, AS.kCGNullWindowID
+    @staticmethod
+    def _window_list(*, on_screen_only: bool) -> Sequence[Mapping[str, Any]]:
+        """The window server's list, front to back: every window, or only
+        those on screen now."""
+        option = (
+            AS.kCGWindowListOptionOnScreenOnly if on_screen_only else AS.kCGWindowListOptionAll
         )
-        windows: list[dict[str, Any]] = []
-        for value in values or []:
-            if not self._is_content_window(int(info["pid"]), value):
-                continue
-            bounds = value.get(AS.kCGWindowBounds) or {}
-            width = float(bounds.get("Width", 0))
-            height = float(bounds.get("Height", 0))
-            windows.append(
-                {
-                    "window_id": int(value[AS.kCGWindowNumber]),
-                    "title": str(value.get(AS.kCGWindowName) or ""),
-                    "bounds": {
-                        "x": float(bounds.get("X", 0)),
-                        "y": float(bounds.get("Y", 0)),
-                        "width": width,
-                        "height": height,
-                    },
-                    "on_screen": bool(value.get(AS.kCGWindowIsOnscreen, False)),
-                    "alpha": float(value.get(AS.kCGWindowAlpha, 1.0)),
-                }
+        return AS.CGWindowListCopyWindowInfo(option, AS.kCGNullWindowID) or ()
+
+    @staticmethod
+    def _window_description(window_id: int) -> Mapping[str, Any] | None:
+        """The window server's entry for one window, or None once it is gone."""
+        return next(iter(AS.CGWindowListCreateDescriptionFromArray([window_id]) or ()), None)
+
+    @staticmethod
+    def _window_entry(value: Mapping[str, Any]) -> dict[str, Any]:
+        """One window as `windows` lists it, from its window server entry."""
+        bounds = value.get(AS.kCGWindowBounds) or {}
+        return {
+            "window_id": int(value[AS.kCGWindowNumber]),
+            "title": str(value.get(AS.kCGWindowName) or ""),
+            "pid": int(value.get(AS.kCGWindowOwnerPID, -1)),
+            "owner": str(value.get(AS.kCGWindowOwnerName) or ""),
+            "layer": int(value.get(AS.kCGWindowLayer, 0)),
+            "bounds": {
+                "x": float(bounds.get("X", 0)),
+                "y": float(bounds.get("Y", 0)),
+                "width": float(bounds.get("Width", 0)),
+                "height": float(bounds.get("Height", 0)),
+            },
+            "on_screen": bool(value.get(AS.kCGWindowIsOnscreen, False)),
+            "alpha": float(value.get(AS.kCGWindowAlpha, 1.0)),
+        }
+
+    def windows(
+        self, app: str | int | None = None, *, all_layers: bool = False
+    ) -> list[dict[str, Any]]:
+        """``app``'s windows, on screen and largest first; with no ``app``,
+        every app's windows on screen now, front to back.
+
+        Only a normal window of at least 40pt counts, the kind `see` and
+        pointer input pick by themselves; ``all_layers`` adds menus,
+        panels, the menu bar's items, and every other surface, any size,
+        which `see` and pointer input reach through ``window_id``.
+        """
+        if app is None:
+            return [
+                self._window_entry(value)
+                for value in self._window_list(on_screen_only=True)
+                if all_layers
+                or self._is_content_window(int(value.get(AS.kCGWindowOwnerPID, -1)), value)
+            ]
+        _, info = self._resolve_app(app)
+        pid = int(info["pid"])
+        windows = [
+            self._window_entry(value)
+            for value in self._window_list(on_screen_only=False)
+            if (
+                int(value.get(AS.kCGWindowOwnerPID, -1)) == pid
+                if all_layers
+                else self._is_content_window(pid, value)
             )
+        ]
         return sorted(
             windows,
             key=lambda window: (
@@ -3698,7 +3759,12 @@ class MacOS:
             return windows
         age = self._launched_seconds_ago(running)
         if age is None or age >= _LAUNCH_GRACE_SECONDS:
-            raise _no_window_error(info)
+            surfaces = [
+                window["window_id"]
+                for window in self.windows(int(info["pid"]), all_layers=True)
+                if window["on_screen"]
+            ]
+            raise _no_window_error(info, surfaces=surfaces)
         return self._wait_for_windows(info, timeout=timeout, deadline=deadline)
 
     def capture_screenshot(
@@ -3720,9 +3786,12 @@ class MacOS:
 
     def see(
         self,
-        app: str | None = None,
+        app: str | int | None = None,
         *,
         window_index: int = 0,
+        window_id: int | None = None,
+        display: int | None = None,
+        region: tuple[float, float, float, float] | None = None,
         path: str | Path | None = None,
         max_width: int = 1280,
         max_height: int = 1280,
@@ -3732,12 +3801,18 @@ class MacOS:
     ) -> dict[str, Any]:
         """Capture a bounded window image; ``show_pointer`` draws the pointer onto it.
 
-        ``after_change`` first waits up to ``timeout`` seconds for the
-        window to change from its last `see` and settle (`wait_change`);
-        the result's ``changed`` says whether it did, and no change is no
-        error here. The result's ``on_screen`` is the only freshness
-        signal: an off-screen window (minimized, hidden, or on another
-        Space) still renders, but from whatever the app last drew.
+        The window is ``app``'s by ``window_index``, or any window, of any
+        layer or owner, by ``window_id``. ``display`` (0 is the main one)
+        or ``region`` (x, y, width, height in screen points) captures the
+        screen there as it shows instead, every window composited; its
+        ``bounds`` map ``coordinate_space="screenshot"`` input as a
+        window's do. ``after_change`` first waits up to ``timeout``
+        seconds for the window to change from its last `see` and settle
+        (`wait_change`); the result's ``changed`` says whether it did,
+        and no change is no error here. The result's ``on_screen`` is the
+        only freshness signal: an off-screen window (minimized, hidden, or
+        on another Space) still renders, but from whatever the app last
+        drew.
         """
         if max_width <= 0 or max_height <= 0:
             raise MacOSError(
@@ -3745,15 +3820,22 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"max_width": max_width, "max_height": max_height},
             )
+        self._check_surface(
+            app=app, window_index=window_index, window_id=window_id, display=display,
+            region=region, after_change=after_change,
+        )
         change = None
         if after_change:
             change = self._watch_change(
-                app, window_index=window_index, region=None, by="pixels",
-                timeout=timeout, settle=_CHANGE_SETTLE_SECONDS,
+                app, window_index=window_index, window_id=window_id, region=None,
+                by="pixels", timeout=timeout, settle=_CHANGE_SETTLE_SECONDS,
             )
         screenshot = self._capture(
             app,
             window_index=window_index,
+            window_id=window_id,
+            display=display,
+            region=region,
             path=path,
             max_width=max_width,
             max_height=max_height,
@@ -3763,56 +3845,102 @@ class MacOS:
             screenshot["changed"] = change["changed"]
         return screenshot
 
+    @staticmethod
+    def _check_surface(
+        *,
+        app: str | int | None,
+        window_index: int,
+        window_id: int | None,
+        display: int | None,
+        region: tuple[float, float, float, float] | None,
+        after_change: bool,
+    ) -> None:
+        """Refuse a `see` that names more than one thing to capture."""
+        if display is not None and region is not None:
+            problem = "pass display or region, not both: a region finds its own display"
+            parameter = "region"
+        elif (display is not None or region is not None) and (
+            app is not None or window_id is not None or window_index != 0
+        ):
+            problem = (
+                "display and region capture the screen as it shows, not one app's "
+                "window; drop app, window_index, and window_id"
+            )
+            parameter = "display" if region is None else "region"
+        elif (display is not None or region is not None) and after_change:
+            problem = "after_change waits on one window; capture a display or region without it"
+            parameter = "after_change"
+        elif window_id is not None and window_index != 0:
+            problem = "window_id names one window and window_index picks among an app's; pass one"
+            parameter = "window_index"
+        else:
+            return
+        raise MacOSError(problem, code=ErrorCode.BAD_REQUEST, details={"parameter": parameter})
+
     def _capture(
         self,
-        app: str | None,
+        app: str | int | None,
         *,
         window_index: int,
         path: str | Path | None,
         max_width: int | None,
         max_height: int | None,
         show_pointer: bool,
+        window_id: int | None = None,
+        display: int | None = None,
+        region: tuple[float, float, float, float] | None = None,
     ) -> dict[str, Any]:
         self._ensure_screen_recording()
-        running, info = self._resolve_app(app)
-        windows = self._ready_windows(running, info, timeout=_LAUNCH_WINDOW_TIMEOUT)
-        window = self._indexed_window(windows, window_index)
-
-        if path is None:
-            with tempfile.NamedTemporaryFile(
-                prefix="macos-harness-", suffix=".png", delete=False
-            ) as handle:
-                output = Path(handle.name)
+        window: dict[str, Any] | None = None
+        running: Any = None
+        info: dict[str, Any] | None = None
+        if display is not None or region is not None:
+            index, display_id, frame, area = self._screen_area(display, region)
+            output = _png_output(path)
+            captured = self._screen_image(
+                display_id, area, frame, max_width=max_width, max_height=max_height
+            )
+            screenshot: dict[str, Any] = {
+                "path": str(output), "app": None, "pid": None, "window_id": None,
+                "display": index,
+            }
         else:
-            output = Path(path).expanduser().resolve()
-            output.parent.mkdir(parents=True, exist_ok=True)
-
-        captured = self._window_image(
-            window["window_id"], max_width=max_width, max_height=max_height
-        )
+            if window_id is None:
+                running, info = self._resolve_app(app)
+                windows = self._ready_windows(running, info, timeout=_LAUNCH_WINDOW_TIMEOUT)
+                window = self._indexed_window(windows, window_index)
+            else:
+                window, running, info = self._named_window(app, window_id)
+            output = _png_output(path)
+            captured = self._window_image(
+                window["window_id"], max_width=max_width, max_height=max_height
+            )
+            screenshot = {
+                "path": str(output),
+                "app": info,
+                "pid": info["pid"],
+                "window_id": window["window_id"],
+                "title": window["title"],
+                "layer": window["layer"],
+            }
         bounds = captured.bounds
         frontmost = self._frontmost_app()
-        screenshot: dict[str, Any] = {
-            "path": str(output),
-            "app": info,
-            "pid": info["pid"],
-            "window_id": window["window_id"],
-            "title": window["title"],
-            "width": captured.width,
-            "height": captured.height,
-            "bounds": bounds,
-            "scale_x": captured.width / bounds["width"],
-            "scale_y": captured.height / bounds["height"],
-            "on_screen": captured.on_screen,
-            "captured_at": captured.captured_at,
-            "virtual_pointer": None,
-            "focus": {
-                "frontmost": frontmost,
-                "target_is_frontmost": (
-                    frontmost is not None and int(frontmost["pid"]) == int(info["pid"])
-                ),
-            },
-        }
+        focus: dict[str, Any] = {"frontmost": frontmost}
+        if info is not None:
+            focus["target_is_frontmost"] = (
+                frontmost is not None and int(frontmost["pid"]) == int(info["pid"])
+            )
+        screenshot.update(
+            width=captured.width,
+            height=captured.height,
+            bounds=bounds,
+            scale_x=captured.width / bounds["width"],
+            scale_y=captured.height / bounds["height"],
+            on_screen=captured.on_screen,
+            captured_at=captured.captured_at,
+            virtual_pointer=None,
+            focus=focus,
+        )
 
         image = captured.image
         if self._pointer_position is not None:
@@ -3830,11 +3958,126 @@ class MacOS:
                 image = draw_pointer(image, image_x, image_y, scale)
         write_png(image, output)
 
-        self._last_app = info
-        self._last_windows = windows
+        if window is not None:
+            if running is not None:
+                self._last_app = info
+            self._last_capture = (int(window["window_id"]), captured)
         self._last_screenshot = screenshot
-        self._last_capture = (int(window["window_id"]), captured)
         return screenshot
+
+    def _named_window(
+        self, app: str | int | None, window_id: int
+    ) -> tuple[dict[str, Any], Any, dict[str, Any]]:
+        """The window ``window_id`` names, whatever its layer, with the
+        running app that owns it and that app's record; ``app``, when
+        given, must be that owner."""
+        window = self._described_window(window_id)
+        if app is not None:
+            running, info = self._resolve_app(app)
+            self._require_owner(window, int(info["pid"]), str(info["name"]))
+            return window, running, info
+        try:
+            running, info = self._resolve_app(window["pid"])
+        except ApplicationNotFoundError:
+            # The window server and other daemons own surfaces with no app record.
+            owner = {"name": window["owner"], "bundle_id": None, "pid": window["pid"], "path": None}
+            return window, None, owner
+        return window, running, info
+
+    def _described_window(self, window_id: int) -> dict[str, Any]:
+        """`windows`' entry for the window ``window_id`` names."""
+        if type(window_id) is not int:
+            raise MacOSError(
+                f"window_id must be a window number from mac.windows(), not {window_id!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "window_id"},
+            )
+        value = self._window_description(window_id)
+        if value is None:
+            raise MacOSError(
+                f"Window {window_id} does not exist; it may have closed. "
+                "mac.windows(all_layers=True) lists what is on screen",
+                code=ErrorCode.ELEMENT_UNKNOWN,
+                details={"window_id": window_id},
+            )
+        return self._window_entry(value)
+
+    @staticmethod
+    def _require_owner(window: Mapping[str, Any], pid: int, name: str | None = None) -> None:
+        """Refuse a window that ``pid``, the app the call targets, does not own."""
+        if window["pid"] != pid:
+            target = f"{name} (pid {pid})" if name else f"pid {pid}"
+            raise MacOSError(
+                f"Window {window['window_id']} belongs to {window['owner']} "
+                f"(pid {window['pid']}), not {target}",
+                code=ErrorCode.BAD_REQUEST,
+                details={
+                    "parameter": "window_id",
+                    "window_id": window["window_id"],
+                    "owner_pid": window["pid"],
+                    "pid": pid,
+                },
+            )
+
+    def _screen_area(
+        self, display: int | None, region: tuple[float, float, float, float] | None
+    ) -> tuple[int, int, dict[str, float], dict[str, float]]:
+        """For `see(display=)` or `see(region=)`: the display's index, its
+        id, its frame in screen points, and the area to capture."""
+        screens = self._displays()
+        frames = [frame for _, frame in screens]
+        if region is None:
+            if type(display) is not int or not 0 <= display < len(screens):
+                raise MacOSError(
+                    f"display must be 0 to {len(screens) - 1} on this Mac "
+                    f"(0 is the main one), not {display!r}",
+                    code=ErrorCode.BAD_REQUEST,
+                    details={"parameter": "display", "value": display, "displays": frames},
+                )
+            display_id, frame = screens[display]
+            return display, display_id, frame, frame
+        if len(region) != 4 or not all(
+            type(value) in (int, float) and math.isfinite(value) for value in region
+        ) or region[2] <= 0 or region[3] <= 0:
+            raise MacOSError(
+                "region is (x, y, width, height) in screen points, with width and height above 0",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "region", "value": list(region)},
+            )
+        x, y, width, height = (float(value) for value in region)
+        for index, (display_id, frame) in enumerate(screens):
+            if (
+                frame["x"] <= x and x + width <= frame["x"] + frame["width"]
+                and frame["y"] <= y and y + height <= frame["y"] + frame["height"]
+            ):
+                area = {"x": x, "y": y, "width": width, "height": height}
+                return index, display_id, frame, area
+        raise MacOSError(
+            "region must lie inside one display; their frames in screen points are in "
+            "details['displays']",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": "region", "value": list(region), "displays": frames},
+        )
+
+    @staticmethod
+    def _displays() -> list[tuple[int, dict[str, float]]]:
+        """Every active display, the main one first, with its frame."""
+        return displays()
+
+    def _screen_image(
+        self,
+        display_id: int,
+        area: dict[str, float],
+        frame: dict[str, float],
+        *,
+        max_width: int | None,
+        max_height: int | None,
+    ) -> WindowCapture:
+        """Render ``area`` of a display as it shows, without the virtual pointer."""
+        return capture_screen(
+            display_id, area, frame, max_width=max_width, max_height=max_height,
+            hide_pid=self._overlay.pid,
+        )
 
     @staticmethod
     def _window_image(
@@ -3867,13 +4110,15 @@ class MacOS:
         app: str | int | None = None,
         *,
         window_index: int = 0,
+        window_id: int | None = None,
         region: tuple[float, float, float, float] | None = None,
         by: str = "pixels",
         timeout: float = 30.0,
         settle: float = _CHANGE_SETTLE_SECONDS,
     ) -> dict[str, Any]:
-        """Return once ``app``'s window looks different and has then held
-        still for ``settle`` seconds, in place of a guessed sleep.
+        """Return once ``app``'s window, or the one ``window_id`` names,
+        looks different and has then held still for ``settle`` seconds,
+        in place of a guessed sleep.
 
         The baseline is the last `see` of that window, or the look where
         the last wait measured from one ended, so a change the last action
@@ -3884,8 +4129,13 @@ class MacOS:
         pixels. A blinking caret is no change. Raises TIMEOUT, with
         ``details["changed"]`` False, when nothing changed in time.
         """
+        self._check_surface(
+            app=app, window_index=window_index, window_id=window_id, display=None,
+            region=None, after_change=True,
+        )
         watched = self._watch_change(
-            app, window_index=window_index, region=region, by=by, timeout=timeout, settle=settle,
+            app, window_index=window_index, window_id=window_id, region=region, by=by,
+            timeout=timeout, settle=settle,
         )
         if not watched["changed"]:
             raise MacOSError(
@@ -3900,6 +4150,7 @@ class MacOS:
         app: str | int | None,
         *,
         window_index: int,
+        window_id: int | None,
         region: tuple[float, float, float, float] | None,
         by: str,
         timeout: float,
@@ -3928,7 +4179,10 @@ class MacOS:
             )
         started = self._now()
         deadline = started + timeout
-        running, info = self._resolve_app(app)
+        if window_id is None:
+            running, info = self._resolve_app(app)
+        else:
+            _window, running, info = self._named_window(app, window_id)
         watched: dict[str, Any] = {"by": by, "app": info}
         if by == "ax":
             self._ensure_accessibility()
@@ -3940,8 +4194,9 @@ class MacOS:
             watched["baseline"] = "now"
         else:
             self._ensure_screen_recording()
-            windows = self._ready_windows(running, info, timeout=_LAUNCH_WINDOW_TIMEOUT)
-            window_id = int(self._indexed_window(windows, window_index)["window_id"])
+            if window_id is None:
+                windows = self._ready_windows(running, info, timeout=_LAUNCH_WINDOW_TIMEOUT)
+                window_id = int(self._indexed_window(windows, window_index)["window_id"])
             last = self._last_capture
             seen = last[1] if last is not None and last[0] == window_id else None
             look, baseline, threshold = self._pixel_looks(window_id, seen, region)
@@ -4080,6 +4335,20 @@ class MacOS:
         self._last_app = info
         return int(info["pid"])
 
+    def _input_pid(self, app: str | int | None, window_id: int | None, what: str) -> int:
+        """The pid pointer input goes to: ``app``'s, else the owner's of
+        the window ``window_id`` names, else the last app's."""
+        if app is None and window_id is not None:
+            app = self._described_window(window_id)["pid"]
+        pid = self._pid(app)
+        if pid is None:
+            raise MacOSError(
+                f"{what} requires an app or prior app snapshot",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "app"},
+            )
+        return pid
+
     @staticmethod
     def _post(event: Any, pid: int | None) -> None:
         if pid is None:
@@ -4090,17 +4359,21 @@ class MacOS:
             )
         AS.CGEventPostToPid(pid, event)
 
-    @classmethod
-    def _target_window(cls, pid: int, point: tuple[float, float]) -> _TargetWindow:
-        """Find the frontmost on-screen window of ``pid`` under ``point``.
+    def _target_window(
+        self, pid: int, point: tuple[float, float], window_id: int | None = None
+    ) -> _TargetWindow:
+        """Find the frontmost on-screen window of ``pid`` under ``point``,
+        or check the one ``window_id`` names.
 
-        Only a window `windows` would list counts, so input routes to a
-        window `see` can capture and never to a same-app tooltip or
-        helper surface over it. ``origin`` is the window's top-left
-        screen point, which ``_route_to_window`` needs to express each
-        event in window coordinates. Other apps' windows over the point
-        do not matter: input posted to a pid only ever reaches that pid,
-        so the covered window is still the one the event lands in.
+        Only a window `windows` would list counts by itself, so input
+        routes to a window `see` can capture and never to a same-app
+        tooltip or helper surface over it; a menu, popover, or panel
+        takes input only when ``window_id`` names it. ``origin`` is the
+        window's top-left screen point, which ``_route_to_window`` needs
+        to express each event in window coordinates. Other apps' windows
+        over the point do not matter: input posted to a pid only ever
+        reaches that pid, so the covered window is still the one the
+        event lands in.
         """
         if _set_window_location is None:
             raise MacOSError(
@@ -4110,11 +4383,30 @@ class MacOS:
                 details={"symbol": "CGEventSetWindowLocation"},
             )
         x, y = point
-        values = AS.CGWindowListCopyWindowInfo(
-            AS.kCGWindowListOptionOnScreenOnly, AS.kCGNullWindowID
-        )
-        for value in values or ():
-            if not cls._is_content_window(pid, value):
+        if window_id is not None:
+            window = self._described_window(window_id)
+            self._require_owner(window, pid)
+            bounds = window["bounds"]
+            if not window["on_screen"]:
+                raise MacOSError(
+                    f"Window {window_id} is not on screen (minimized, hidden, or on "
+                    "another Space); input there cannot land",
+                    code=ErrorCode.WINDOW_CHANGED,
+                    details={"window_id": window_id, "reason": "off_screen"},
+                )
+            if not (
+                bounds["x"] <= x < bounds["x"] + bounds["width"]
+                and bounds["y"] <= y < bounds["y"] + bounds["height"]
+            ):
+                raise MacOSError(
+                    f"Screen point ({x:.0f}, {y:.0f}) is outside window {window_id}; "
+                    "input there cannot land",
+                    code=ErrorCode.BAD_REQUEST,
+                    details={"window_id": window_id, "point": {"x": x, "y": y}, "bounds": bounds},
+                )
+            return _TargetWindow(window_id, (bounds["x"], bounds["y"]))
+        for value in self._window_list(on_screen_only=True):
+            if not self._is_content_window(pid, value):
                 continue
             bounds = value.get(AS.kCGWindowBounds) or {}
             left = float(bounds.get("X", 0))
@@ -4126,7 +4418,9 @@ class MacOS:
                 return _TargetWindow(int(value[AS.kCGWindowNumber]), (left, top))
         raise MacOSError(
             f"No on-screen window of pid {pid} contains screen point "
-            f"({x:.0f}, {y:.0f}); pointer input there cannot land",
+            f"({x:.0f}, {y:.0f}); pointer input there cannot land. A menu or "
+            f"panel there takes it once window_id names it: mac.windows({pid}, "
+            "all_layers=True) lists them",
             code=ErrorCode.BAD_REQUEST,
             details={"pid": pid, "point": {"x": x, "y": y}},
         )
@@ -4152,7 +4446,9 @@ class MacOS:
         an AX hit test) simply skip the binding check below. Callers that
         *do* dispatch to a pid (``click``, ``drag``, ``scroll``) must pass
         it, so a window/screenshot-relative coordinate computed from a
-        screenshot of one app can never be silently posted to another.
+        screenshot of one app can never be silently posted to another. A
+        display or region screenshot belongs to no app: it maps any app's
+        coordinates, and it has no window that could move.
         """
         if coordinate_space == "screen":
             return float(x), float(y)
@@ -4166,7 +4462,7 @@ class MacOS:
                 details={"parameter": "coordinate_space", "value": coordinate_space},
             )
         shot = self._last_screenshot
-        if pid is not None and int(shot["pid"]) != int(pid):
+        if pid is not None and shot["pid"] is not None and int(shot["pid"]) != int(pid):
             raise MacOSError(
                 f"Last screenshot targets pid {shot['pid']}, not the pid {pid} "
                 "this action targets; take a fresh screenshot for this app or "
@@ -4178,7 +4474,7 @@ class MacOS:
                     "target_pid": int(pid),
                 },
             )
-        if pid is not None:
+        if pid is not None and shot["window_id"] is not None:
             self._require_window_unchanged(shot)
         bounds = shot["bounds"]
         if coordinate_space == "screenshot":
@@ -4192,8 +4488,7 @@ class MacOS:
             )
         return bounds["x"] + float(x), bounds["y"] + float(y)
 
-    @staticmethod
-    def _require_window_unchanged(shot: dict[str, Any]) -> None:
+    def _require_window_unchanged(self, shot: dict[str, Any]) -> None:
         """Refuse screenshot coordinates once their window moved or left the screen.
 
         A coordinate taken from a screenshot is only meaningful while the
@@ -4202,8 +4497,7 @@ class MacOS:
         instead of a click that lands somewhere else or nowhere.
         """
         window_id = int(shot["window_id"])
-        values = AS.CGWindowListCreateDescriptionFromArray([window_id])
-        current = next(iter(values or ()), None)
+        current = self._window_description(window_id)
         if current is None:
             raise MacOSError(
                 f"Window {window_id} from the last screenshot is gone; "
@@ -4271,7 +4565,9 @@ class MacOS:
         screen_x, screen_y = self._pointer_position
         result: dict[str, object] = {"screen": {"x": screen_x, "y": screen_y}}
         shot = self._last_screenshot
-        if shot is not None and (pid is None or int(shot["pid"]) == int(pid)):
+        if shot is not None and (
+            pid is None or shot["pid"] is None or int(shot["pid"]) == int(pid)
+        ):
             image_x, image_y, inside = self._image_point(shot, screen_x, screen_y)
             result["image"] = {"x": image_x, "y": image_y}
             result["inside"] = inside
@@ -4600,6 +4896,7 @@ class MacOS:
         y: float,
         *,
         app: str | int | None = None,
+        window_id: int | None = None,
         button: str = "left",
         clicks: int = 1,
         coordinate_space: str = "screenshot",
@@ -4607,24 +4904,19 @@ class MacOS:
         """Send one raw coordinate click to an app PID; never guess an AX action.
 
         The result carries ``window_id``: the window of ``app`` the click
-        was routed to. The click still reaches that window when another
-        app is frontmost, but AppKit passes a plain first click on an
-        inactive app's view only where that view accepts first mouse;
+        was routed to. A menu, popover, or panel takes the click only when
+        ``window_id`` names it. The click still reaches that window when
+        another app is frontmost, but AppKit passes a plain first click on
+        an inactive app's view only where that view accepts first mouse;
         elsewhere it is dropped, and ``activate`` first is the cure.
         """
         self._ensure_accessibility()
         self._ensure_post_events()
         button = self._validate_button(button)
         clicks = self._validate_clicks(clicks)
-        pid = self._pid(app)
-        if pid is None:
-            raise MacOSError(
-                "Pointer input requires an app or prior app snapshot",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "app"},
-            )
+        pid = self._input_pid(app, window_id, "Pointer input")
         point = self._screen_point(x, y, coordinate_space, pid=pid)
-        window = self._target_window(pid, point)
+        window = self._target_window(pid, point, window_id)
         self._post_click(pid, point, window, button=button, clicks=clicks)
         pointer = self._pointer_info(pid=pid)
         assert pointer is not None
@@ -4686,6 +4978,7 @@ class MacOS:
         to_y: float,
         *,
         app: str | int | None = None,
+        window_id: int | None = None,
         button: str = "left",
         coordinate_space: str = "screenshot",
         duration: float = 0.25,
@@ -4694,18 +4987,12 @@ class MacOS:
         self._ensure_accessibility()
         self._ensure_post_events()
         button = self._validate_button(button)
-        pid = self._pid(app)
-        if pid is None:
-            raise MacOSError(
-                "Pointer input requires an app or prior app snapshot",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "app"},
-            )
+        pid = self._input_pid(app, window_id, "Pointer input")
         start = self._screen_point(from_x, from_y, coordinate_space, pid=pid)
         end = self._screen_point(to_x, to_y, coordinate_space, pid=pid)
         # AppKit keeps a drag on the window that took the mouse-down, so
         # every event is routed there even once the point leaves it.
-        window = self._target_window(pid, start)
+        window = self._target_window(pid, start, window_id)
         focus_before = self._frontmost_app()
         self._pointer_position = start
         self._overlay.move(*start, duration=0)
@@ -4736,13 +5023,14 @@ class MacOS:
         delta_x: int = 0,
         *,
         app: str | int | None = None,
+        window_id: int | None = None,
         unit: str = "pixel",
         x: float | None = None,
         y: float | None = None,
         coordinate_space: str = "screenshot",
     ) -> None:
         """Scroll ``app`` at ``x``/``y``; with no point, at the center of the
-        window the last screenshot of ``app`` shows.
+        window ``window_id`` names or the last screenshot of ``app`` shows.
 
         A scroll event only lands in the window it is routed to, so the
         point decides which window scrolls; there is no app-wide scroll.
@@ -4767,16 +5055,14 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "x/y"},
             )
-        pid = self._pid(app)
-        if pid is None:
-            raise MacOSError(
-                "Scroll input requires an app or prior app snapshot",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "app"},
-            )
-        if x is None or y is None:
+        pid = self._input_pid(app, window_id, "Scroll input")
+        if (x is None or y is None) and window_id is not None:
+            bounds = self._described_window(window_id)["bounds"]
+            x, y = bounds["x"] + bounds["width"] / 2, bounds["y"] + bounds["height"] / 2
+            coordinate_space = "screen"
+        elif x is None or y is None:
             shot = self._last_screenshot
-            if shot is None or int(shot["pid"]) != pid:
+            if shot is None or shot["pid"] != pid:
                 raise MacOSError(
                     "Scroll needs x/y, or a prior screenshot of this app to "
                     "scroll at the center of",
@@ -4787,7 +5073,7 @@ class MacOS:
             x, y = bounds["width"] / 2, bounds["height"] / 2
             coordinate_space = "window"
         point = self._screen_point(x, y, coordinate_space, pid=pid)
-        window = self._target_window(pid, point)
+        window = self._target_window(pid, point, window_id)
         self._pointer_position = point
         self._overlay.move(*point)
 

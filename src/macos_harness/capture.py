@@ -1,8 +1,9 @@
-"""One-shot window capture through ScreenCaptureKit.
+"""One-shot window, display, and screen-region capture through
+ScreenCaptureKit.
 
-``SCScreenshotManager`` renders one window at the requested output size, so
-a bounded ``see()`` never decodes a full Retina PNG only to shrink it. The
-image is encoded exactly once, by ImageIO, straight into the output file.
+``SCScreenshotManager`` renders at the requested output size, so a bounded
+``see()`` never decodes a full Retina PNG only to shrink it. The image is
+encoded exactly once, by ImageIO, straight into the output file.
 """
 
 from __future__ import annotations
@@ -42,7 +43,8 @@ _PIXEL_FORMAT_BGRA = 1111970369  # kCVPixelFormatType_32BGRA ('BGRA')
 
 @dataclass(frozen=True, slots=True)
 class WindowCapture:
-    """One rendered window: the ``CGImage`` plus the state it was taken in."""
+    """One rendered window or screen area: the ``CGImage`` plus the state
+    it was taken in. ``bounds`` is the captured area in screen points."""
 
     image: Any
     width: int
@@ -113,8 +115,9 @@ def _require_screencapturekit() -> None:
         ) from _IMPORT_ERROR
 
 
-def shareable_window(window_id: int, *, timeout: float = CAPTURE_TIMEOUT) -> Any:
-    """Return the ``SCWindow`` for a Core Graphics window number."""
+def _shareable_content(timeout: float) -> Any:
+    """What ScreenCaptureKit can capture now: every display, and every
+    window except the desktop's own, on screen or not."""
     _require_screencapturekit()
     content, error = _await(
         lambda handler: (
@@ -127,7 +130,12 @@ def shareable_window(window_id: int, *, timeout: float = CAPTURE_TIMEOUT) -> Any
     )
     if error is not None:
         raise _sck_error("Window enumeration", error)
-    for window in content.windows():
+    return content
+
+
+def shareable_window(window_id: int, *, timeout: float = CAPTURE_TIMEOUT) -> Any:
+    """Return the ``SCWindow`` for a Core Graphics window number."""
+    for window in _shareable_content(timeout).windows():
         if int(window.windowID()) == window_id:
             return window
     raise MacOSError(
@@ -135,6 +143,29 @@ def shareable_window(window_id: int, *, timeout: float = CAPTURE_TIMEOUT) -> Any
         code=ErrorCode.ELEMENT_UNKNOWN,
         details={"window_id": window_id},
     )
+
+
+def displays() -> list[tuple[int, dict[str, float]]]:
+    """Every active display, the main one first: its id and its frame in
+    global screen points, top-left origin like window bounds."""
+    error, ids, count = Quartz.CGGetActiveDisplayList(32, None, None)
+    if error:
+        raise MacOSError(
+            f"Could not list displays (Core Graphics error {error})",
+            code=ErrorCode.AX_ERROR,
+            details={"error": int(error)},
+        )
+    return [(int(display_id), _points(Quartz.CGDisplayBounds(display_id)))
+            for display_id in ids[:count]]
+
+
+def _points(rect: Any) -> dict[str, float]:
+    return {
+        "x": float(rect.origin.x),
+        "y": float(rect.origin.y),
+        "width": float(rect.size.width),
+        "height": float(rect.size.height),
+    }
 
 
 def _output_size(
@@ -182,13 +213,7 @@ def capture_window(
         window
     )
     scale = float(content_filter.pointPixelScale())
-    rect = content_filter.contentRect()
-    bounds = {
-        "x": float(rect.origin.x),
-        "y": float(rect.origin.y),
-        "width": float(rect.size.width),
-        "height": float(rect.size.height),
-    }
+    bounds = _points(content_filter.contentRect())
     natural_width = bounds["width"] * scale
     natural_height = bounds["height"] * scale
     if natural_width < 1 or natural_height < 1:
@@ -235,6 +260,81 @@ def capture_window(
         height=int(Quartz.CGImageGetHeight(image)),
         bounds=bounds,
         on_screen=bool(window.isOnScreen()),
+        captured_at=captured_at,
+    )
+
+
+def capture_screen(
+    display_id: int,
+    area: dict[str, float],
+    display_bounds: dict[str, float],
+    *,
+    max_width: int | None,
+    max_height: int | None,
+    hide_pid: int | None,
+    timeout: float = CAPTURE_TIMEOUT,
+) -> WindowCapture:
+    """Render ``area`` (screen points inside the display at
+    ``display_bounds``) as it shows on screen: every window there,
+    composited, except those of ``hide_pid``."""
+    content = _shareable_content(timeout)
+    display = next(
+        (item for item in content.displays() if int(item.displayID()) == display_id), None
+    )
+    if display is None:
+        raise MacOSError(
+            f"Display {display_id} is not capturable; it may have been disconnected",
+            code=ErrorCode.ELEMENT_UNKNOWN,
+            details={"display_id": display_id},
+        )
+    hidden = [
+        window for window in content.windows()
+        if hide_pid is not None
+        and window.owningApplication() is not None
+        and int(window.owningApplication().processID()) == hide_pid
+    ]
+    content_filter = SCK.SCContentFilter.alloc().initWithDisplay_excludingWindows_(
+        display, hidden
+    )
+    scale = float(content_filter.pointPixelScale())
+    width, height = _output_size(
+        area["width"] * scale, area["height"] * scale, max_width, max_height
+    )
+    config = SCK.SCStreamConfiguration.alloc().init()
+    config.setSourceRect_(Quartz.CGRectMake(
+        area["x"] - display_bounds["x"], area["y"] - display_bounds["y"],
+        area["width"], area["height"],
+    ))
+    config.setWidth_(width)
+    config.setHeight_(height)
+    config.setPixelFormat_(_PIXEL_FORMAT_BGRA)
+    config.setCaptureResolution_(SCK.SCCaptureResolutionBest)
+    config.setShowsCursor_(False)
+
+    image, error = _await(
+        lambda handler: (
+            SCK.SCScreenshotManager.captureImageWithFilter_configuration_completionHandler_(
+                content_filter, config, handler
+            )
+        ),
+        operation="Screen capture",
+        timeout=timeout,
+    )
+    captured_at = time.time()
+    if error is not None:
+        raise _sck_error("Screen capture", error, display_id=display_id)
+    if image is None:
+        raise MacOSError(
+            f"Screen capture returned no image for display {display_id}",
+            code=ErrorCode.AX_ERROR,
+            details={"display_id": display_id},
+        )
+    return WindowCapture(
+        image=image,
+        width=int(Quartz.CGImageGetWidth(image)),
+        height=int(Quartz.CGImageGetHeight(image)),
+        bounds=dict(area),
+        on_screen=True,
         captured_at=captured_at,
     )
 

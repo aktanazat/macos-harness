@@ -1200,7 +1200,9 @@ class _Host(Protocol):
     def _screen_point(
         self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
     ) -> tuple[float, float]: ...
-    def _target_window(self, pid: int, point: tuple[float, float]) -> _RoutedWindow: ...
+    def _target_window(
+        self, pid: int, point: tuple[float, float], window_id: int | None = None
+    ) -> _RoutedWindow: ...
     def _post_click(
         self,
         pid: int,
@@ -2557,6 +2559,7 @@ class Operations:
         y: float,
         *,
         app: str | int,
+        window_id: int | None = None,
         button: str = "left",
         clicks: int = 1,
         coordinate_space: str = "screenshot",
@@ -2575,7 +2578,8 @@ class Operations:
         and the resolved screen point and ``window_id`` show up in
         ``target`` even on a dry run. The dispatch then posts to that
         very window, so the id the receipt records is the one the
-        events were bound to.
+        events were bound to. A menu, popover, or panel takes the click
+        only when ``window_id`` names it.
         """
         resolved: tuple[str, int, tuple[float, float], _RoutedWindow] | None = None
 
@@ -2585,7 +2589,7 @@ class Operations:
             normalized_button = host._validate_button(button)
             normalized_clicks = host._validate_clicks(clicks)
             screen = host._screen_point(x, y, coordinate_space, pid=pid)
-            window = host._target_window(pid, screen)
+            window = host._target_window(pid, screen, window_id)
             resolved = (normalized_button, normalized_clicks, screen, window)
             return {
                 "point": {"x": screen[0], "y": screen[1]},
@@ -2606,6 +2610,7 @@ class Operations:
             request={
                 "x": x, "y": y, "button": button, "clicks": clicks,
                 "coordinate_space": coordinate_space,
+                **({} if window_id is None else {"window_id": window_id}),
             },
             timeout=timeout,
             postcondition=postcondition,

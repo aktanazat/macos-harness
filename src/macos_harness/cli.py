@@ -139,10 +139,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "telemetry", help="inspect or change telemetry (off by default)"
     )
     telemetry.add_argument("action", nargs="?", choices=("status", "enable", "disable"))
-    see = subparsers.add_parser("see", help="capture a bounded application window")
-    see.add_argument("app", type=_app_query, help="an app name, bundle ID, path, or pid")
+    see = subparsers.add_parser(
+        "see", help="capture an app's window, or any window by --window-id"
+    )
+    see.add_argument(
+        "app", nargs="?", type=_app_query, help="an app name, bundle ID, path, or pid"
+    )
     see.add_argument("--path", help="write the PNG here instead of a temporary file")
     see.add_argument("--window-index", type=int, default=0)
+    see.add_argument(
+        "--window-id", type=int, help="any window, panel, or menu from mac.windows()"
+    )
     see.add_argument("--max-width", type=int, default=1280)
     see.add_argument("--max-height", type=int, default=1280)
     see.add_argument(
@@ -211,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = mac.see(
                     args.app,
                     window_index=args.window_index,
+                    window_id=args.window_id,
                     path=args.path,
                     max_width=args.max_width,
                     max_height=args.max_height,

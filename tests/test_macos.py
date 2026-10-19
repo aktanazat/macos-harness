@@ -2401,7 +2401,7 @@ def _fake_window_capture(mac: MacOS, monkeypatch) -> None:
         mac, "_resolve_app", lambda app: (object(), {"name": "Test", "pid": 42})
     )
     monkeypatch.setattr(
-        mac, "windows", lambda app: [{"window_id": 7, "title": "Doc", "pid": 42}]
+        mac, "windows", lambda app: [{"window_id": 7, "title": "Doc", "pid": 42, "layer": 0}]
     )
     monkeypatch.setattr(
         mac,
@@ -2602,7 +2602,7 @@ class _WindowlessApp(MacOS):
             "pid": 9,
         }
 
-    def windows(self, app=None) -> list[dict[str, object]]:
+    def windows(self, app=None, *, all_layers=False) -> list[dict[str, object]]:
         return []
 
 

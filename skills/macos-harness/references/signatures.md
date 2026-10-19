@@ -16,18 +16,19 @@ mac.script('tell application "Spotify" to play')
 ```
 
 Without a program, `macos-harness see APP_OR_PID --path out.png --window-index 0`
-captures one window and prints the same result as `mac.see`.
+captures one window and prints the same result as `mac.see`;
+`macos-harness see --window-id N` captures any window.
 
 ## Primitives
 
 ```text
-mac.see(app=None, *, window_index=0, path=None, max_width=1280, max_height=1280, show_pointer=False, after_change=False, timeout=30.0)
-mac.wait_change(app=None, *, window_index=0, region=None, by="pixels", timeout=30.0, settle=0.5)
+mac.see(app=None, *, window_index=0, window_id=None, display=None, region=None, path=None, max_width=1280, max_height=1280, show_pointer=False, after_change=False, timeout=30.0)
+mac.wait_change(app=None, *, window_index=0, window_id=None, region=None, by="pixels", timeout=30.0, settle=0.5)
 mac.key(key, *, app=None)
 mac.type(text, *, app=None)
-mac.click(x, y, *, app=None, button="left", clicks=1, coordinate_space="screenshot")
-mac.scroll(delta_y, delta_x=0, *, app=None, unit="pixel", x=None, y=None, coordinate_space="screenshot")
-mac.drag(from_x, from_y, to_x, to_y, *, app=None, button="left", coordinate_space="screenshot", duration=0.25, steps=12)
+mac.click(x, y, *, app=None, window_id=None, button="left", clicks=1, coordinate_space="screenshot")
+mac.scroll(delta_y, delta_x=0, *, app=None, window_id=None, unit="pixel", x=None, y=None, coordinate_space="screenshot")
+mac.drag(from_x, from_y, to_x, to_y, *, app=None, window_id=None, button="left", coordinate_space="screenshot", duration=0.25, steps=12)
 mac.move(x, y, *, app=None, coordinate_space="screenshot", duration=0.16)
 mac.script(source, *, language="AppleScript")
 mac.activate(app=None, *, timeout=0.5)
@@ -35,13 +36,28 @@ mac.launch(app, *, timeout=15.0, window=True)
 mac.quit(app, *, timeout=10.0, force=False)
 mac.relaunch(app, *, timeout=15.0, window=True)
 mac.frontmost()
-mac.windows(app=None)
+mac.windows(app=None, *, all_layers=False)
 mac.wait_for_window(app=None, *, timeout=2.0)
 mac.list_apps()
 mac.show_pointer()
 mac.hide_pointer()
 mac.handoff(*, reason, app)
 ```
+
+## Menus, panels, and the screen
+
+`mac.windows()` lists every app's normal windows on screen, front to back;
+`all_layers=True` adds menus, popovers, panels, prompts, and the menu bar.
+Each entry has `window_id`, `pid`, `owner`, and `layer`. `see(window_id=N)`
+captures any of them and reports its `layer` and owner `pid`. Pointer input
+picks only a normal window under the point unless `window_id=N` names the
+surface, so a click meant for a panel never lands in the window behind it.
+
+`see(display=0)` (0 is the main display) or `see(region=(x, y, w, h))` in
+screen points captures the screen as it shows, every window composited.
+The result has no `app` or `pid`, and its pixels map a later
+`coordinate_space="screenshot"` click for whichever app owns the window
+there.
 
 ## Accessibility
 
@@ -70,7 +86,7 @@ mac.do.toggle(desired, *, app=None, all_apps=False, apps=None, role=None, text=N
 mac.do.fill(value, *, app, role="text field", text=None, title=None, identifier=None, description=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.key(key, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.type(text, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
-mac.do.click(x, y, *, app, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.click(x, y, *, app, window_id=None, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.run(source, *, language="AppleScript", args=(), timeout=5.0, postcondition=None, once=None, dry_run=False, capture_output=False)
 mac.do.expect(condition)
 mac.do.expect_any(outcomes, *, timeout=5.0, interval=0.1)

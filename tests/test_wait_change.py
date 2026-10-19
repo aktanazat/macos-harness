@@ -73,8 +73,10 @@ class _Screen(MacOS):
     def _resolve_app(self, query: str | int | None) -> tuple[None, dict[str, Any]]:
         return None, {"name": "Test", "pid": 42, "bundle_id": "test", "path": None}
 
-    def windows(self, app: str | int | None = None) -> list[dict[str, Any]]:
-        return [{"window_id": 7, "title": "Doc", "on_screen": True}]
+    def windows(
+        self, app: str | int | None = None, *, all_layers: bool = False
+    ) -> list[dict[str, Any]]:
+        return [{"window_id": 7, "title": "Doc", "on_screen": True, "layer": 0}]
 
     @classmethod
     def _frontmost_app(cls) -> dict[str, Any]:

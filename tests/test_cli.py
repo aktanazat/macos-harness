@@ -51,9 +51,10 @@ def test_every_other_subcommand_still_parses(monkeypatch: pytest.MonkeyPatch) ->
             {"app": 4242, "path": "/tmp/shot.png", "window_index": 1},
         ),
         (["see", "1Password"], {"app": "1Password"}),
+        (["see", "--window-id", "77"], {"app": None, "window_id": 77}),
         (["state", "4242"], {"app": 4242}),
     ],
-    ids=["name", "pid-path-window", "name-with-digits", "state-pid"],
+    ids=["name", "pid-path-window", "name-with-digits", "window-id", "state-pid"],
 )
 def test_see_and_state_read_a_pid_and_capture_options(argv, expected) -> None:
     """A shell caller often has only a pid, and wants the PNG where it can
@@ -188,8 +189,8 @@ raise OperationError.from_receipt(Receipt(
         pytest.param(
             'mac.scroll(dy=-300, app="Finder")\n',
             "TypeError: MacOS.scroll() got an unexpected keyword argument 'dy'",
-            "Signature: mac.scroll(delta_y, delta_x=0, *, app=None, unit='pixel', "
-            "x=None, y=None, coordinate_space='screenshot')",
+            "Signature: mac.scroll(delta_y, delta_x=0, *, app=None, window_id=None, "
+            "unit='pixel', x=None, y=None, coordinate_space='screenshot')",
             id="mac",
         ),
         pytest.param(

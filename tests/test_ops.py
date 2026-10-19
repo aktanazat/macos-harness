@@ -130,7 +130,7 @@ class FakeHost:
         self.screen_point_error: MacOSError | None = None
         self.screen_point_calls: list[dict[str, object]] = []
         self.target_window_error: MacOSError | None = None
-        self.target_window_calls: list[tuple[int, tuple[float, float]]] = []
+        self.target_window_calls: list[tuple[int, tuple[float, float], int | None]] = []
 
     def _resolve_app(self, query: str | int | None) -> tuple[object, dict[str, object]]:
         if query is None:
@@ -194,11 +194,14 @@ class FakeHost:
             return float(x), float(y)
         return float(x) + 100.0, float(y) + 200.0
 
-    def _target_window(self, pid: int, point: tuple[float, float]) -> _Window:
-        self.target_window_calls.append((pid, point))
+    def _target_window(
+        self, pid: int, point: tuple[float, float], window_id: int | None = None
+    ) -> _Window:
+        """The app's window under ``point``, or the one ``window_id`` names."""
+        self.target_window_calls.append((pid, point, window_id))
         if self.target_window_error is not None:
             raise self.target_window_error
-        return _Window(7, (100.0, 200.0))
+        return _Window(7 if window_id is None else window_id, (100.0, 200.0))
 
     def _focus_sample(self, pid: int) -> dict[str, object]:
         assert pid == 41
@@ -1988,7 +1991,19 @@ def test_click_resolves_the_point_before_dispatch_and_posts_to_that_window() -> 
         {"pid": 41, "point": (110.0, 220.0), "window_id": 7, "button": "right", "clicks": 2}
     ]
     assert host.screen_point_calls[-1] == {"x": 10, "y": 20, "coordinate_space": "screenshot", "pid": 41}
-    assert host.target_window_calls[-1] == (41, (110.0, 220.0))
+    assert host.target_window_calls[-1] == (41, (110.0, 220.0), None)
+
+
+def test_click_with_window_id_posts_to_the_named_menu_or_panel() -> None:
+    """A menu or panel takes a click only when the caller names it."""
+    host, operations = _ops()
+
+    done = operations.click(10, 20, app="Demo", window_id=25)
+
+    assert host.target_window_calls == [(41, (110.0, 220.0), 25)]
+    assert done.target["window_id"] == 25
+    assert host.click_calls[0]["window_id"] == 25
+
 
 
 def test_click_rejects_more_than_a_triple_click_before_reserving_the_token() -> None:

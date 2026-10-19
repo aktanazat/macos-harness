@@ -31,6 +31,17 @@ follows [Semantic Versioning](https://semver.org/).
   text. Nothing changing raises a timeout whose details say `changed` is
   false. `mac.see(app, after_change=True)` waits the same way and then
   captures, reporting `changed` instead of raising.
+- `mac.see(window_id=N)` captures any window, panel, menu, prompt, or the
+  menu bar, whoever owns it, and reports its `layer` and owner `pid`;
+  `macos-harness see --window-id N` does the same. `mac.see(display=0)` and
+  `mac.see(region=(x, y, w, h))` capture the screen as it shows, in screen
+  points, and their pixels map later clicks like a window's.
+  `mac.windows()` with no app lists every app's windows on screen, and
+  `all_layers=True` adds the menus and panels, each with its owner and
+  layer. `click`, `drag`, `scroll`, `mac.do.click`, and `wait_change` take
+  `window_id=` too; without it, pointer input still lands only in a normal
+  window. An app showing only a panel now names the panel's window id
+  instead of reporting no window.
 
 ### Changed
 

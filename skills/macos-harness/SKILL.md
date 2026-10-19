@@ -16,24 +16,26 @@ print(mac.see("Spotify"))
 PY
 ```
 
-In omp, `tool.read` the printed PNG path in the same eval cell: the image
-returns with the result.
+In omp, `tool.read` the PNG path in the same eval cell.
 
 Bundle reversible steps; verify once at the end. Stop only for unclear
 identity, an irreversible action, or unexpected state.
 
 ## Six verbs
 
-- `mac.see(app)`: capture a window; click coordinates come from the latest one.
+- `mac.see(app)`: capture a window; clicks map through the latest one.
 - `mac.key("cmd+k", app=...)`: a key or combo.
 - `mac.type(text, app=...)`: typed text.
 - `mac.click(x, y, app=...)`: a raw click at screenshot coordinates.
 - `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, or press a control.
 - `mac.script(source)`: AppleScript for an exact, focus-safe command.
 
-`mac.launch(app)` opens an app in the background, returning once a window is up.
+`mac.windows(all_layers=True)` lists menus and panels for `window_id=`;
+`see(display=0)` or `see(region=(x, y, w, h))` replaces `screencapture`.
+
+`mac.launch(app)` opens an app in the background and waits for a window.
 Never `sleep`: `mac.wait_change(app)` returns once the window changed since the
-last `see` or wait and settled; `mac.see(app, after_change=True)` waits so first.
+last `see` or wait and settled; `see(app, after_change=True)` waits first.
 
 ## Receipts
 
@@ -73,15 +75,14 @@ Run `macos-harness doctor` only after a permission or connection error.
 
 ## References
 
-After a compaction, read only the reference you need.
-`macos-harness skill <name>` prints each one from `references/`:
+After a compaction, `macos-harness skill <name>` prints the one you need:
 
 - `signatures`: every exact signature
-- `receipts`: outcomes, errors, once tokens, history, the log
+- `receipts`: outcomes, errors, once tokens, history, logs
 - `ax-search`: roles, scopes, exact labels, waits
-- `invariants`: cleanup, focus, input, windows; choosing a mode
+- `invariants`: cleanup, focus, input, windows, modes
 - `routes`: saved navigation
-- `diagnostics`: inspecting a failure before more input
-- `handoff`: the handoff call and what follows it
+- `diagnostics`: inspect a failure before acting
+- `handoff`: the call and what follows
 - `credentials`: login boundaries, permissions
-- `native-backend`: the optional native backend
+- `native-backend`: the optional backend
