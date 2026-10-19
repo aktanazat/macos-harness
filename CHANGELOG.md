@@ -42,6 +42,17 @@ follows [Semantic Versioning](https://semver.org/).
   `window_id=` too; without it, pointer input still lands only in a normal
   window. An app showing only a panel now names the panel's window id
   instead of reporting no window.
+- A later run can aim through an earlier run's screenshot: `see` keeps a
+  record beside each PNG, and `click`, `drag`, `scroll`, `move`, `ax.at`,
+  and `mac.do.click` take `screenshot="<png>"`, which maps that image's
+  pixels and targets its app without a new `see`. A window that has moved
+  or closed since still refuses. The error for screenshot pixels with no
+  `see` in the run now names `screenshot=`.
+- `mac.ax.get`, `set`, `perform`, and the other element calls take the
+  match a search returned in place of its index. An index lasts until the
+  next search in one run; a match, which now carries its app's `pid`, is
+  found again by role, labels, and frame in any later run, and raises
+  `element.unknown` when that finds no element or more than one.
 
 ### Changed
 

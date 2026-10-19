@@ -631,6 +631,7 @@ def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
             "element_index": 3,
             "role": "AXStaticText",
             "value": "Alessia playlist",
+            "pid": 42,
         }
     ]
     # max_nodes stopped the walk one node short, so the fifth element was

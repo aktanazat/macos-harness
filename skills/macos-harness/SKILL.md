@@ -16,26 +16,26 @@ print(mac.see("Spotify"))
 PY
 ```
 
-In omp, `tool.read` the PNG path in the same eval cell.
+In omp, `tool.read` the PNG in the same eval cell.
 
 Bundle reversible steps; verify once at the end. Stop only for unclear
 identity, an irreversible action, or unexpected state.
 
 ## Six verbs
 
-- `mac.see(app)`: capture a window; clicks map through the latest one.
+- `mac.see(app)`: capture a window; clicks map through the latest or `screenshot=<png>`.
 - `mac.key("cmd+k", app=...)`: a key or combo.
 - `mac.type(text, app=...)`: typed text.
 - `mac.click(x, y, app=...)`: a raw click at screenshot coordinates.
-- `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, or press a control.
+- `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, or press a control; a match outlives its run, an index does not.
 - `mac.script(source)`: AppleScript for an exact, focus-safe command.
 
 `mac.windows(all_layers=True)` lists menus and panels for `window_id=`;
 `see(display=0)` or `see(region=(x, y, w, h))` replaces `screencapture`.
 
 `mac.launch(app)` opens an app in the background and waits for a window.
-Never `sleep`: `mac.wait_change(app)` returns once the window changed since the
-last `see` or wait and settled; `see(app, after_change=True)` waits first.
+Never `sleep`: `mac.wait_change(app)` returns once the window changed and
+settled; `see(app, after_change=True)` waits first.
 
 ## Receipts
 
@@ -75,14 +75,14 @@ Run `macos-harness doctor` only after a permission or connection error.
 
 ## References
 
-After a compaction, `macos-harness skill <name>` prints the one you need:
+`macos-harness skill <name>` prints one after a compaction:
 
 - `signatures`: every exact signature
 - `receipts`: outcomes, errors, once tokens, history, logs
 - `ax-search`: roles, scopes, exact labels, waits
 - `invariants`: cleanup, focus, input, windows, modes
 - `routes`: saved navigation
-- `diagnostics`: inspect a failure before acting
+- `diagnostics`: inspect a failure first
 - `handoff`: the call and what follows
 - `credentials`: login boundaries, permissions
 - `native-backend`: the optional backend

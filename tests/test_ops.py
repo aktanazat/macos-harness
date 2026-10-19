@@ -131,6 +131,7 @@ class FakeHost:
         self.screen_point_calls: list[dict[str, object]] = []
         self.target_window_error: MacOSError | None = None
         self.target_window_calls: list[tuple[int, tuple[float, float], int | None]] = []
+        self.screenshots_used: list[object] = []
 
     def _resolve_app(self, query: str | int | None) -> tuple[object, dict[str, object]]:
         if query is None:
@@ -181,6 +182,9 @@ class FakeHost:
                 details={"parameter": "clicks", "value": clicks, "limit": 3},
             )
         return clicks
+
+    def _use_screenshot(self, screenshot: object) -> None:
+        self.screenshots_used.append(screenshot)
 
     def _screen_point(
         self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
@@ -2004,6 +2008,16 @@ def test_click_with_window_id_posts_to_the_named_menu_or_panel() -> None:
     assert done.target["window_id"] == 25
     assert host.click_calls[0]["window_id"] == 25
 
+
+def test_click_maps_through_the_screenshot_it_names() -> None:
+    """A PNG from an earlier `see` reaches the host before the point maps,
+    and the receipt records which image the coordinates came from."""
+    host, operations = _ops()
+
+    done = operations.click(10, 20, app="Demo", screenshot="/tmp/earlier.png")
+
+    assert host.screenshots_used == ["/tmp/earlier.png"]
+    assert done.request["screenshot"] == "/tmp/earlier.png"
 
 
 def test_click_rejects_more_than_a_triple_click_before_reserving_the_token() -> None:

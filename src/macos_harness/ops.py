@@ -1197,6 +1197,7 @@ class _Host(Protocol):
     def _validate_button(self, button: str) -> str: ...
     def _validate_clicks(self, clicks: int) -> int: ...
     def _focus_sample(self, pid: int) -> dict[str, JSONValue]: ...
+    def _use_screenshot(self, screenshot: str | Path | None) -> None: ...
     def _screen_point(
         self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
     ) -> tuple[float, float]: ...
@@ -2560,6 +2561,7 @@ class Operations:
         *,
         app: str | int,
         window_id: int | None = None,
+        screenshot: str | Path | None = None,
         button: str = "left",
         clicks: int = 1,
         coordinate_space: str = "screenshot",
@@ -2579,7 +2581,9 @@ class Operations:
         ``target`` even on a dry run. The dispatch then posts to that
         very window, so the id the receipt records is the one the
         events were bound to. A menu, popover, or panel takes the click
-        only when ``window_id`` names it.
+        only when ``window_id`` names it. ``screenshot`` names the PNG of
+        an earlier `see`, maybe from an earlier run, whose pixels ``x``
+        and ``y`` are.
         """
         resolved: tuple[str, int, tuple[float, float], _RoutedWindow] | None = None
 
@@ -2588,6 +2592,7 @@ class Operations:
             del deadline
             normalized_button = host._validate_button(button)
             normalized_clicks = host._validate_clicks(clicks)
+            host._use_screenshot(screenshot)
             screen = host._screen_point(x, y, coordinate_space, pid=pid)
             window = host._target_window(pid, screen, window_id)
             resolved = (normalized_button, normalized_clicks, screen, window)
@@ -2604,14 +2609,18 @@ class Operations:
                 pid, screen, window, button=normalized_button, clicks=normalized_clicks
             )
 
+        request: dict[str, JSONValue] = {
+            "x": x, "y": y, "button": button, "clicks": clicks,
+            "coordinate_space": coordinate_space,
+        }
+        if window_id is not None:
+            request["window_id"] = window_id
+        if screenshot is not None:
+            request["screenshot"] = str(screenshot)
         return self._input_verb(
             op="click",
             app=app,
-            request={
-                "x": x, "y": y, "button": button, "clicks": clicks,
-                "coordinate_space": coordinate_space,
-                **({} if window_id is None else {"window_id": window_id}),
-            },
+            request=request,
             timeout=timeout,
             postcondition=postcondition,
             once=once,

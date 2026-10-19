@@ -10,9 +10,11 @@ from typing import TYPE_CHECKING, Any
 import ApplicationServices as AS
 
 from .errors import ErrorCode, MacOSError
-from .macos import _AX_SAFE_ATTRIBUTES, _AX_SEARCH_ROLES, SearchMatches
+from .macos import _AX_SAFE_ATTRIBUTES, _AX_SEARCH_ROLES, ElementRef, SearchMatches
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .macos import MacOS
 
 # Each role a search can target, by its friendly name ("text field" ->
@@ -67,13 +69,20 @@ class Accessibility:
         y: float,
         *,
         app: str | None = None,
+        screenshot: str | Path | None = None,
         coordinate_space: str = "screenshot",
         attributes: Iterable[str] = _COMPACT_ATTRIBUTES,
         include_actions: bool = True,
     ) -> dict[str, Any]:
+        """The element of ``app`` at ``x``, ``y``, or of any app without one.
+
+        A screenshot point maps through the last `see`, or the PNG
+        ``screenshot`` names, which must still show ``app``'s window where
+        it is now."""
         self._host._ensure_accessibility()
-        point = self._host._screen_point(x, y, coordinate_space)
+        self._host._use_screenshot(screenshot)
         pid = self._host._pid(app)
+        point = self._host._screen_point(x, y, coordinate_space, pid=pid)
         root = (
             self._host._application_element(pid)
             if pid is not None
@@ -329,23 +338,23 @@ class Accessibility:
         )
 
     def get(
-        self, element_index: int, attributes: str | Iterable[str] = "AXValue"
+        self, element_index: ElementRef, attributes: str | Iterable[str] = "AXValue"
     ) -> Any:
         if isinstance(attributes, str):
             return self._host.get(element_index, attributes)
         return self._host.get_attributes(element_index, attributes)
 
-    def set(self, element_index: int, attribute: str, value: Any) -> None:
+    def set(self, element_index: ElementRef, attribute: str, value: Any) -> None:
         self._host.set(element_index, value, attribute)
 
-    def actions(self, element_index: int) -> list[str]:
+    def actions(self, element_index: ElementRef) -> list[str]:
         element = self._host._local_element(element_index)
         return self._host._actions(element)
 
-    def perform(self, element_index: int, action: str = "AXPress") -> None:
+    def perform(self, element_index: ElementRef, action: str = "AXPress") -> None:
         self._host.perform_action(element_index, action)
 
-    def parameterized(self, element_index: int, attribute: str, parameter: Any) -> Any:
+    def parameterized(self, element_index: ElementRef, attribute: str, parameter: Any) -> Any:
         error, value = AS.AXUIElementCopyParameterizedAttributeValue(
             self._host._local_element(element_index), attribute, parameter, None
         )
@@ -361,7 +370,7 @@ class Accessibility:
             )
         return self._host._jsonable(value)
 
-    def raw(self, element_index: int) -> Any:
+    def raw(self, element_index: ElementRef) -> Any:
         return self._host._local_element(element_index)
 
     def dump(self, app: str, **kwargs: Any) -> dict[str, Any]:

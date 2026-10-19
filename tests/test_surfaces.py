@@ -1,8 +1,9 @@
 """`see`, `windows`, and pointer input on surfaces off the normal window
 layer: a layer-25 panel, the menu bar the window server owns, and whole
-displays or screen regions. The window server is a fake list in its own
-front-to-back order; captures are real images the fake records, so each
-test asserts what was captured and where input was routed, never a
+displays or screen regions; and input a later run aims through the PNG
+an earlier run's `see` wrote. The window server is a fake list in its
+own front-to-back order; captures are real images the fake records, so
+each test asserts what was captured and where input was routed, never a
 sleep."""
 
 from __future__ import annotations
@@ -91,7 +92,7 @@ class _Running:
 
 class _Desk(MacOS):
     """`MacOS` over the fake window server ``entries`` and two displays,
-    recording every capture and every click it would post."""
+    recording every capture, click, and event it would post."""
 
     def __init__(self, *entries: dict[str, Any]) -> None:
         super().__init__()
@@ -99,7 +100,10 @@ class _Desk(MacOS):
         self.window_captures: list[int] = []
         self.screen_requests: list[tuple[int, dict[str, float]]] = []
         self.clicks: list[tuple[int, tuple[float, float], int, tuple[float, float]]] = []
+        self.posted: list[tuple[int | None, tuple[float, float]]] = []
         self.clock = 0.0
+        # Hidden, the virtual pointer never starts its helper window.
+        self.hide_pointer()
 
     def _now(self) -> float:
         return self.clock
@@ -171,6 +175,10 @@ class _Desk(MacOS):
     ) -> None:
         self._pointer_position = point
         self.clicks.append((pid, point, window.window_id, window.origin))
+
+    def _post(self, event: object, pid: int | None) -> None:
+        location = Quartz.CGEventGetLocation(event)
+        self.posted.append((pid, (location.x, location.y)))
 
 
 @pytest.mark.parametrize(
@@ -344,3 +352,80 @@ def test_see_after_change_watches_the_window_window_id_names(tmp_path: Path) -> 
 
     assert shot["changed"] is False
     assert set(mac.window_captures) == {_PANEL}
+
+
+# Each way to aim at screenshot pixels, none naming the app: through the
+# run's own last `see`, or through the PNG ``screenshot`` names.
+_AIMS = {
+    "click": lambda mac, **shot: mac.click(400, 300, **shot),
+    "drag": lambda mac, **shot: mac.drag(400, 300, 600, 500, duration=0, **shot),
+    "scroll": lambda mac, **shot: mac.scroll(-50, **shot),
+    "move": lambda mac, **shot: mac.move(400, 300, **shot),
+}
+_FINDER_MOVED = (
+    _MENU_BAR, _FINDER_PANEL, _entry(_NOTES, _NOTE, 0, (600, 300, 400, 400)),
+    _entry(_FINDER, _DOC, 0, (100, 0, 2000, 800)),
+)
+_FINDER_CLOSED = (_MENU_BAR, _FINDER_PANEL, _entry(_NOTES, _NOTE, 0, (600, 300, 400, 400)))
+
+
+@pytest.mark.parametrize("aim", list(_AIMS.values()), ids=list(_AIMS))
+def test_a_later_run_aims_through_the_png_an_earlier_see_wrote(tmp_path: Path, aim) -> None:
+    """The record `see` keeps beside its PNG maps the pixels, and names
+    the app, in a run that never saw it: input lands where the run that
+    took it aimed."""
+    png = tmp_path / "finder.png"
+    earlier = _Desk()
+    earlier.see("Finder", path=png)
+    aimed = (aim(earlier), earlier.clicks, earlier.posted)
+
+    later = _Desk()
+
+    assert (aim(later, screenshot=png), later.clicks, later.posted) == aimed
+
+
+@pytest.mark.parametrize(
+    "aim",
+    [*_AIMS.values(), lambda mac, **shot: mac.ax.at(400, 300, **shot)],
+    ids=[*_AIMS, "ax.at"],
+)
+@pytest.mark.parametrize("desk", [_FINDER_MOVED, _FINDER_CLOSED], ids=["moved", "closed"])
+def test_a_later_run_refuses_a_png_of_a_window_that_has_since_moved(
+    tmp_path: Path, aim, desk
+) -> None:
+    png = tmp_path / "finder.png"
+    _Desk().see("Finder", path=png)
+    later = _Desk(*desk)
+
+    with pytest.raises(MacOSError) as caught:
+        aim(later, screenshot=png)
+
+    assert caught.value.code == ErrorCode.WINDOW_CHANGED
+    assert (later.clicks, later.posted) == ([], [])
+
+
+@pytest.mark.parametrize(
+    "record", [None, "not json", '{"pid": 42}'], ids=["missing", "garbage", "partial"]
+)
+def test_a_png_without_its_capture_record_is_refused(tmp_path: Path, record) -> None:
+    png = tmp_path / "other.png"
+    if record is not None:
+        Path(f"{png}.json").write_text(record, encoding="utf-8")
+    mac = _Desk()
+
+    with pytest.raises(MacOSError) as caught:
+        mac.click(10, 10, app="Finder", screenshot=png)
+
+    assert (caught.value.code, caught.value.details["parameter"]) == (
+        ErrorCode.BAD_REQUEST, "screenshot",
+    )
+    assert mac.clicks == []
+
+
+def test_screenshot_pixels_with_no_see_in_the_run_name_screenshot() -> None:
+    """The refusal names the argument that reuses an earlier run's PNG."""
+    with pytest.raises(MacOSError) as caught:
+        _Desk().click(10, 10, app="Finder")
+
+    assert "screenshot=" in str(caught.value)
+    assert caught.value.details["parameter"] == "screenshot"

@@ -190,7 +190,7 @@ raise OperationError.from_receipt(Receipt(
             'mac.scroll(dy=-300, app="Finder")\n',
             "TypeError: MacOS.scroll() got an unexpected keyword argument 'dy'",
             "Signature: mac.scroll(delta_y, delta_x=0, *, app=None, window_id=None, "
-            "unit='pixel', x=None, y=None, coordinate_space='screenshot')",
+            "screenshot=None, unit='pixel', x=None, y=None, coordinate_space='screenshot')",
             id="mac",
         ),
         pytest.param(

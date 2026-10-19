@@ -370,6 +370,9 @@ _AX_SEARCH_ROLES = {
 # The searches for menus or their items, which a closed menu holds too: a
 # closed menu's command still answers a press.
 _AX_MENU_SEARCH_KEYS = frozenset({"AXMenuSearchKey", "AXMenuItemSearchKey"})
+# The role each role search key finds, the other way round, so a match's
+# role names the search that finds it again (`MacOS._find_again`).
+_SEARCH_KEY_OF_ROLE = {role: key for key, role in _AX_SEARCH_ROLES.items()}
 
 
 def _on_screen_only(visible_only: bool, search_key: str) -> bool:
@@ -657,6 +660,21 @@ class SearchMatches(list[dict[str, JSONValue]]):
         self.unanswered = 0
 
 
+# An element: an index this run's last search or snapshot handed out, or
+# a match a search returned, in this run or an earlier one, which
+# `MacOS._find_again` finds again by its pid, role, labels, and frame.
+ElementRef = int | Mapping[str, JSONValue]
+
+
+def _with_pid(matches: SearchMatches, pid: int | None) -> SearchMatches:
+    """``matches``, each naming the process its one searched app runs as,
+    so that a later run can find it again (`MacOS._find_again`)."""
+    if pid is not None:
+        for match in matches:
+            match["pid"] = pid
+    return matches
+
+
 def _search_gaps(matches: SearchMatches, max_nodes: int) -> tuple[str, dict[str, JSONValue]]:
     """What an incomplete search left out, for a timeout to say: the apps
     a sweep searched only in part, the apps that did not answer, or the
@@ -744,6 +762,36 @@ def _png_output(path: str | Path | None) -> Path:
     output = Path(path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     return output
+
+
+# What `see` records beside each PNG, so a later run can map that
+# image's pixels to the screen and check its window has not moved.
+_CAPTURE_RECORD_KEYS = (
+    "app", "pid", "window_id", "bounds", "width", "height", "scale_x", "scale_y",
+    "captured_at",
+)
+
+
+def _record_path(png: str | Path) -> Path:
+    """The capture record of the PNG ``png``: beside it, ``.json`` appended."""
+    return Path(f"{Path(png).expanduser().resolve()}.json")
+
+
+def _capture_record(png: str | Path) -> dict[str, JSONValue]:
+    """The screenshot `see` recorded beside ``png``, in this run or an
+    earlier one, as `_screen_point` maps coordinates through it."""
+    try:
+        record = json.loads(_record_path(png).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        record = None
+    if not isinstance(record, dict) or not record.keys() >= set(_CAPTURE_RECORD_KEYS):
+        raise MacOSError(
+            f"{png} has no capture record beside it; pass a PNG that mac.see() "
+            "wrote, or see again",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": "screenshot", "value": str(png)},
+        )
+    return record
 
 
 class _ExactSelector(NamedTuple):
@@ -2130,17 +2178,66 @@ class MacOS:
 
     # --- AX actions ------------------------------------------------------
 
-    def _element(self, element_index: int) -> Any:
+    def _element(self, element_index: ElementRef) -> Any:
+        """The element an index from this run names, or that a match
+        describes (`_find_again`)."""
+        if isinstance(element_index, Mapping):
+            return self._find_again(element_index)
         try:
             return self._elements[int(element_index)]
         except (KeyError, ValueError) as exc:
             raise MacOSError(
                 f"Unknown element index {element_index!r}; an index lasts only "
                 "until the next search or snapshot in the same macos-harness "
-                "run, so query the element again first",
+                "run. Pass the match itself, which finds the element again in "
+                "any run, or query again",
                 code=ErrorCode.ELEMENT_UNKNOWN,
                 details={"element_index": element_index},
             ) from exc
+
+    def _find_again(self, match: Mapping[str, JSONValue]) -> object:
+        """The element ``match`` describes -- a match a search returned, in
+        this run or an earlier one -- searched for again in its app: the
+        one element of its role and labels or, among several, the one at
+        its frame. An index cannot outlive its run; a match can."""
+        pid, role = match.get("pid"), match.get("role")
+        if not isinstance(pid, int) or not isinstance(role, str):
+            raise MacOSError(
+                "An element passed as a match needs the pid and role its "
+                "search returned",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "element_index"},
+            )
+        title, identifier, description = (
+            value if isinstance(value, str) and value else None
+            for value in (
+                match.get("title"), match.get("identifier"), match.get("description")
+            )
+        )
+        found = self.ax_search(
+            app_pid=pid,
+            search_key=_SEARCH_KEY_OF_ROLE.get(role, "AXAnyTypeSearchKey"),
+            title=title,
+            identifier=identifier,
+            description=description,
+            limit=-1,
+            attributes=("AXRole", "AXFrame"),
+            include_actions=False,
+            reset_elements=False,
+        )
+        same = [candidate for candidate in found if candidate.get("role") == role]
+        frame = match.get("frame")
+        if frame is not None and (len(same) > 1 or not found.complete):
+            same = [candidate for candidate in same if candidate.get("frame") == frame]
+        if len(same) != 1:
+            label = title or identifier or description or "untitled"
+            raise MacOSError(
+                f"Found {len(same)} {role} {label!r} in process {pid} where the "
+                "match needs exactly one; query it again",
+                code=ErrorCode.ELEMENT_UNKNOWN,
+                details={"pid": pid, "role": role, "found": len(same)},
+            )
+        return self._elements[int(same[0]["element_index"])]
 
     def _remember_element(self, element: Any) -> int:
         index = self._element_seq
@@ -2148,7 +2245,7 @@ class MacOS:
         self._elements[index] = element
         return index
 
-    def _local_element(self, element_index: int) -> Any:
+    def _local_element(self, element_index: ElementRef) -> Any:
         """Resolve element_index to a local AXUIElement; never a native handle."""
         element = self._element(element_index)
         if not self._is_ax_element(element):
@@ -2435,7 +2532,7 @@ class MacOS:
         return node
 
     def get(
-        self, element_index: int, attribute: str = "AXValue", *, missing_ok: bool = False
+        self, element_index: ElementRef, attribute: str = "AXValue", *, missing_ok: bool = False
     ) -> Any:
         """Read one attribute; missing_ok permits absence, never a failed read."""
         element = self._element(element_index)
@@ -2460,7 +2557,7 @@ class MacOS:
         return self._jsonable(value)
 
     def get_attributes(
-        self, element_index: int, attributes: Iterable[str]
+        self, element_index: ElementRef, attributes: Iterable[str]
     ) -> dict[str, Any | None]:
         """Read multiple raw AX attributes with Apple's batch API."""
         element = self._element(element_index)
@@ -2541,7 +2638,7 @@ class MacOS:
                         code=ErrorCode.BAD_REQUEST,
                         details={"parameter": "direction", "value": direction},
                     )
-                return self._native_query(
+                return _with_pid(self._native_query(
                     client,
                     pid=native_pid,
                     search_key=search_key,
@@ -2557,7 +2654,7 @@ class MacOS:
                     reset_elements=reset_elements,
                     messaging_timeout=messaging_timeout,
                     enhance=enhance,
-                )
+                ), native_pid)
 
         self._ensure_accessibility()
         if element_index is None:
@@ -2574,6 +2671,7 @@ class MacOS:
                 enhance=enhance,
             )
         else:
+            pid = None
             root = self._local_element(element_index)
         if reset_elements:
             self._elements = {}
@@ -2607,7 +2705,7 @@ class MacOS:
             root, "AXUIElementsForSearchPredicate", predicate, None
         )
         if error == AS.kAXErrorParameterizedAttributeUnsupported:
-            return self._bounded_ax_search(
+            return _with_pid(self._bounded_ax_search(
                 root,
                 search_key=search_key,
                 text=text,
@@ -2620,7 +2718,7 @@ class MacOS:
                 include_actions=include_actions,
                 max_nodes=max_nodes,
                 reset_elements=False,
-            )
+            ), pid)
         if error != _AX_SUCCESS:
             raise _ax_error("AXUIElementsForSearchPredicate", error, element_index=element_index)
 
@@ -2658,7 +2756,9 @@ class MacOS:
         complete = (
             requested_limit < 0 or len(candidates) < requested_limit
         ) and not cut and read_complete
-        return SearchMatches(matches, complete=complete, visited=len(candidates))
+        return _with_pid(
+            SearchMatches(matches, complete=complete, visited=len(candidates)), pid
+        )
 
     def _bounded_ax_search(
         self,
@@ -3531,7 +3631,7 @@ class MacOS:
         self._guard_focus(before, target_pid, "AX press")
         return match
 
-    def set(self, element_index: int, value: Any, attribute: str = "AXValue") -> None:
+    def set(self, element_index: ElementRef, value: Any, attribute: str = "AXValue") -> None:
         if attribute == "AXSelectedTextRange" and isinstance(value, Mapping):
             location, length = value.get("location"), value.get("length")
             if (
@@ -3561,7 +3661,7 @@ class MacOS:
 
     set_value = set
 
-    def perform_action(self, element_index: int, action: str = "AXPress") -> None:
+    def perform_action(self, element_index: ElementRef, action: str = "AXPress") -> None:
         element = self._element(element_index)
         normalized = _ACTION_ALIASES.get(action.casefold(), action)
         if not self._is_ax_element(element):
@@ -3957,6 +4057,9 @@ class MacOS:
                 scale = (screenshot["scale_x"] + screenshot["scale_y"]) / 2
                 image = draw_pointer(image, image_x, image_y, scale)
         write_png(image, output)
+        _record_path(output).write_text(
+            json.dumps({key: screenshot[key] for key in _CAPTURE_RECORD_KEYS}), encoding="utf-8"
+        )
 
         if window is not None:
             if running is not None:
@@ -4436,30 +4539,40 @@ class MacOS:
             objc.pyobjc_id(event), _CGPoint(point[0] - left, point[1] - top)
         )
 
+    def _use_screenshot(self, screenshot: str | Path | None) -> None:
+        """Map this call's screenshot coordinates through the PNG
+        ``screenshot`` names, as if `see` had just taken it: its app
+        becomes the one a call without ``app`` targets."""
+        if screenshot is None:
+            return
+        record = _capture_record(screenshot)
+        self._last_screenshot = record
+        if record["app"] is not None:
+            self._last_app = record["app"]
+
     def _screen_point(
         self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
     ) -> tuple[float, float]:
         """Resolve a coordinate to a screen point, bound to ``pid`` when given.
 
-        ``pid`` -- the already-resolved target of the action this point is
-        for -- is optional: callers with no dispatch target at all (``move``,
-        an AX hit test) simply skip the binding check below. Callers that
-        *do* dispatch to a pid (``click``, ``drag``, ``scroll``) must pass
-        it, so a window/screenshot-relative coordinate computed from a
-        screenshot of one app can never be silently posted to another. A
-        display or region screenshot belongs to no app: it maps any app's
-        coordinates, and it has no window that could move.
+        Every caller aiming at an app (``click``, ``drag``, ``scroll``,
+        ``move``, an AX hit test in one app) passes its ``pid``, so a
+        window/screenshot-relative coordinate computed from a screenshot of
+        one app is never applied to another, nor to a window that has moved
+        since. A hit test across all apps has no ``pid`` and skips both
+        checks. A display or region screenshot belongs to no app: it maps
+        any app's coordinates, and it has no window that could move.
         """
         if coordinate_space == "screen":
             return float(x), float(y)
         if self._last_screenshot is None:
             raise MacOSError(
                 "No screenshot in this run to map window or screenshot "
-                "coordinates through: a screenshot does not carry over between "
-                "macos-harness runs, so call mac.see() earlier in the same "
-                "script, or pass coordinate_space='screen'",
+                "coordinates through: pass screenshot= the PNG path an earlier "
+                "mac.see() printed, call mac.see() first, or pass "
+                "coordinate_space='screen'",
                 code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "coordinate_space", "value": coordinate_space},
+                details={"parameter": "screenshot", "coordinate_space": coordinate_space},
             )
         shot = self._last_screenshot
         if pid is not None and shot["pid"] is not None and int(shot["pid"]) != int(pid):
@@ -4579,6 +4692,7 @@ class MacOS:
         y: float,
         *,
         app: str | None = None,
+        screenshot: str | Path | None = None,
         coordinate_space: str = "screenshot",
         duration: float = 0.16,
     ) -> dict[str, Any]:
@@ -4591,8 +4705,10 @@ class MacOS:
         snapshot, exactly like ``click``/``drag``/``scroll``) to bind the
         conversion to, rather than silently reusing whatever screenshot
         ``self._last_screenshot`` last happened to hold regardless of
-        which app it actually came from.
+        which app it actually came from. ``screenshot`` names an earlier
+        `see`'s PNG to convert through instead.
         """
+        self._use_screenshot(screenshot)
         pid = None
         if coordinate_space != "screen":
             pid = self._pid(app)
@@ -4897,6 +5013,7 @@ class MacOS:
         *,
         app: str | int | None = None,
         window_id: int | None = None,
+        screenshot: str | Path | None = None,
         button: str = "left",
         clicks: int = 1,
         coordinate_space: str = "screenshot",
@@ -4909,11 +5026,14 @@ class MacOS:
         another app is frontmost, but AppKit passes a plain first click on
         an inactive app's view only where that view accepts first mouse;
         elsewhere it is dropped, and ``activate`` first is the cure.
+        ``screenshot`` names the PNG of an earlier `see`, maybe from an
+        earlier run, whose pixels ``x`` and ``y`` are.
         """
         self._ensure_accessibility()
         self._ensure_post_events()
         button = self._validate_button(button)
         clicks = self._validate_clicks(clicks)
+        self._use_screenshot(screenshot)
         pid = self._input_pid(app, window_id, "Pointer input")
         point = self._screen_point(x, y, coordinate_space, pid=pid)
         window = self._target_window(pid, point, window_id)
@@ -4979,6 +5099,7 @@ class MacOS:
         *,
         app: str | int | None = None,
         window_id: int | None = None,
+        screenshot: str | Path | None = None,
         button: str = "left",
         coordinate_space: str = "screenshot",
         duration: float = 0.25,
@@ -4987,6 +5108,7 @@ class MacOS:
         self._ensure_accessibility()
         self._ensure_post_events()
         button = self._validate_button(button)
+        self._use_screenshot(screenshot)
         pid = self._input_pid(app, window_id, "Pointer input")
         start = self._screen_point(from_x, from_y, coordinate_space, pid=pid)
         end = self._screen_point(to_x, to_y, coordinate_space, pid=pid)
@@ -5024,13 +5146,15 @@ class MacOS:
         *,
         app: str | int | None = None,
         window_id: int | None = None,
+        screenshot: str | Path | None = None,
         unit: str = "pixel",
         x: float | None = None,
         y: float | None = None,
         coordinate_space: str = "screenshot",
     ) -> None:
         """Scroll ``app`` at ``x``/``y``; with no point, at the center of the
-        window ``window_id`` names or the last screenshot of ``app`` shows.
+        window ``window_id`` names or the last screenshot of ``app`` shows,
+        or the one ``screenshot`` names.
 
         A scroll event only lands in the window it is routed to, so the
         point decides which window scrolls; there is no app-wide scroll.
@@ -5055,6 +5179,7 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "x/y"},
             )
+        self._use_screenshot(screenshot)
         pid = self._input_pid(app, window_id, "Scroll input")
         if (x is None or y is None) and window_id is not None:
             bounds = self._described_window(window_id)["bounds"]

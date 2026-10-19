@@ -26,10 +26,10 @@ mac.see(app=None, *, window_index=0, window_id=None, display=None, region=None, 
 mac.wait_change(app=None, *, window_index=0, window_id=None, region=None, by="pixels", timeout=30.0, settle=0.5)
 mac.key(key, *, app=None)
 mac.type(text, *, app=None)
-mac.click(x, y, *, app=None, window_id=None, button="left", clicks=1, coordinate_space="screenshot")
-mac.scroll(delta_y, delta_x=0, *, app=None, window_id=None, unit="pixel", x=None, y=None, coordinate_space="screenshot")
-mac.drag(from_x, from_y, to_x, to_y, *, app=None, window_id=None, button="left", coordinate_space="screenshot", duration=0.25, steps=12)
-mac.move(x, y, *, app=None, coordinate_space="screenshot", duration=0.16)
+mac.click(x, y, *, app=None, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot")
+mac.scroll(delta_y, delta_x=0, *, app=None, window_id=None, screenshot=None, unit="pixel", x=None, y=None, coordinate_space="screenshot")
+mac.drag(from_x, from_y, to_x, to_y, *, app=None, window_id=None, screenshot=None, button="left", coordinate_space="screenshot", duration=0.25, steps=12)
+mac.move(x, y, *, app=None, screenshot=None, coordinate_space="screenshot", duration=0.16)
 mac.script(source, *, language="AppleScript")
 mac.activate(app=None, *, timeout=0.5)
 mac.launch(app, *, timeout=15.0, window=True)
@@ -59,10 +59,29 @@ The result has no `app` or `pid`, and its pixels map a later
 `coordinate_space="screenshot"` click for whichever app owns the window
 there.
 
+## Across runs
+
+`see` keeps a record beside each PNG (`<png>.json`). In a later run,
+`screenshot="<png>"` on `click`, `drag`, `scroll`, `move`, `ax.at`, or
+`do.click` maps that PNG's pixels and targets its app, with no new `see`.
+If the window has moved or closed since, the call raises `window.changed`
+instead.
+
+An element index lasts until the next search in the same run. A match
+lasts longer: pass the match itself (a `query`, `query_all`, or `wait`
+result) as `element_index`. It is found again in its app by role,
+labels, and frame. If it finds no element, or more than one, the call
+raises `element.unknown`.
+
+```python
+match = {"pid": 4512, "role": "AXButton", "title": "Save"}  # printed by a query
+mac.ax.perform(match, "AXPress")
+```
+
 ## Accessibility
 
 ```text
-mac.ax.at(x, y, *, app=None, coordinate_space="screenshot")
+mac.ax.at(x, y, *, app=None, screenshot=None, coordinate_space="screenshot")
 mac.ax.get(element_index, attributes="AXValue")
 mac.ax.set(element_index, attribute, value)
 mac.ax.perform(element_index, action="AXPress")
@@ -86,7 +105,7 @@ mac.do.toggle(desired, *, app=None, all_apps=False, apps=None, role=None, text=N
 mac.do.fill(value, *, app, role="text field", text=None, title=None, identifier=None, description=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.key(key, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.type(text, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
-mac.do.click(x, y, *, app, window_id=None, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.click(x, y, *, app, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.run(source, *, language="AppleScript", args=(), timeout=5.0, postcondition=None, once=None, dry_run=False, capture_output=False)
 mac.do.expect(condition)
 mac.do.expect_any(outcomes, *, timeout=5.0, interval=0.1)
