@@ -115,7 +115,7 @@ def _require_screencapturekit() -> None:
         ) from _IMPORT_ERROR
 
 
-def _shareable_content(timeout: float) -> Any:
+def _shareable_content(timeout: float) -> object:
     """What ScreenCaptureKit can capture now: every display, and every
     window except the desktop's own, on screen or not."""
     _require_screencapturekit()
@@ -159,7 +159,7 @@ def displays() -> list[tuple[int, dict[str, float]]]:
             for display_id in ids[:count]]
 
 
-def _points(rect: Any) -> dict[str, float]:
+def _points(rect: object) -> dict[str, float]:
     return {
         "x": float(rect.origin.x),
         "y": float(rect.origin.y),
@@ -340,7 +340,7 @@ def capture_screen(
 
 
 def gray_print(
-    image: Any,
+    image: object,
     *,
     width: int,
     height: int,

@@ -6,9 +6,8 @@ comparison under test is the one a live window gets."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
 
 import pytest
 import Quartz
@@ -23,7 +22,7 @@ _SRGB = Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB)
 _BOUNDS = {"x": 100.0, "y": 200.0, "width": 400.0, "height": 300.0}
 
 
-def _frame(*blocks: tuple[float, float, float, float]) -> Any:
+def _frame(*blocks: tuple[float, float, float, float]) -> object:
     """The white window with black ``blocks`` (x, y, width, height in
     points from its top left)."""
     context = Quartz.CGBitmapContextCreate(
@@ -48,7 +47,7 @@ _DOT = _frame((200, 140, 6, 6))
 class _Screen(MacOS):
     """`MacOS` over one window whose captures follow ``frames``."""
 
-    def __init__(self, *frames: Any, texts: tuple[str, ...] = ()) -> None:
+    def __init__(self, *frames: object, texts: tuple[str, ...] = ()) -> None:
         super().__init__()
         self.frames = frames
         self.sizes: list[tuple[int, int] | None] = []
@@ -70,16 +69,16 @@ class _Screen(MacOS):
     def _ensure_accessibility(self) -> None:
         return None
 
-    def _resolve_app(self, query: str | int | None) -> tuple[None, dict[str, Any]]:
+    def _resolve_app(self, query: str | int | None) -> tuple[None, dict[str, object]]:
         return None, {"name": "Test", "pid": 42, "bundle_id": "test", "path": None}
 
     def windows(
         self, app: str | int | None = None, *, all_layers: bool = False
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, object]]:
         return [{"window_id": 7, "title": "Doc", "on_screen": True, "layer": 0}]
 
     @classmethod
-    def _frontmost_app(cls) -> dict[str, Any]:
+    def _frontmost_app(cls) -> dict[str, object]:
         return {"name": "Test", "bundle_id": "test", "pid": 42, "path": None}
 
     def _window_image(
@@ -107,7 +106,7 @@ class _Screen(MacOS):
         return _TreeSnapshot([node], False, False, False)
 
 
-def _outcome(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+def _outcome(call: Callable[[], Mapping[str, object]]) -> Mapping[str, object]:
     """What the wait reports, whether it returned or timed out."""
     try:
         return call()
@@ -206,7 +205,7 @@ def test_a_small_change_counts_inside_a_watched_region(
     ids=["no-change", "change"],
 )
 def test_see_after_change_captures_once_the_wait_ends(
-    tmp_path: Path, after: Any, changed: bool, gray: int
+    tmp_path: Path, after: object, changed: bool, gray: int
 ) -> None:
     """No change is no error here: the capture still comes, after the
     wait, and says whether the window changed."""
@@ -243,7 +242,7 @@ def test_wait_change_by_ax_compares_text_and_keeps_element_indexes() -> None:
     ids=["unknown-by", "negative-timeout", "region-with-ax", "region-before-see", "region-outside"],
 )
 def test_wait_change_refuses_bad_requests_before_waiting(
-    tmp_path: Path, seen: bool, options: dict[str, Any]
+    tmp_path: Path, seen: bool, options: dict[str, object]
 ) -> None:
     mac = _Screen(_BLANK)
     if seen:

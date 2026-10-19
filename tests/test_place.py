@@ -5,8 +5,6 @@ the frame it read back, never a sleep."""
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from macos_harness.errors import ErrorCode
@@ -55,13 +53,13 @@ class _Desk(MacOS):
     def _ensure_accessibility(self) -> None:
         return None
 
-    def _resolve_app(self, query: str | int | None) -> tuple[None, dict[str, Any]]:
+    def _resolve_app(self, query: str | int | None) -> tuple[None, dict[str, object]]:
         return None, {"name": "Archives", "bundle_id": None, "pid": _PID, "path": None}
 
     def _displays(self) -> list[tuple[int, dict[str, float]]]:
         return [(1, _MAIN), (2, _ABOVE)]
 
-    def _window_list(self, *, on_screen_only: bool) -> list[dict[str, Any]]:
+    def _server_windows(self, *, on_screen_only: bool) -> list[dict[str, object]]:
         return [
             {
                 "kCGWindowNumber": 100 + index,

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import Any
 
 import pytest
 
@@ -37,7 +36,7 @@ class _Process:
     def bundleIdentifier(self) -> str:
         return f"com.example.{self.name}"
 
-    def bundleURL(self) -> Any:
+    def bundleURL(self) -> _Url:
         return _Url(self.path)
 
     def processIdentifier(self) -> int:
@@ -114,12 +113,12 @@ class _ScriptedOS(MacOS):
         self.pauses.append(seconds)
         self.clock += seconds
 
-    def _running_copy(self, url: Any) -> _Process | None:
+    def _running_copy(self, url: _Url) -> _Process | None:
         if self.running is not None and self.running.path == str(url.path()):
             return self.running
         return None
 
-    def _open_application(self, url: Any, *, timeout: float) -> _Process:
+    def _open_application(self, url: _Url, *, timeout: float) -> _Process:
         self.opened.append(str(url.path()))
         self.running = _Process(
             4242, name="TextEdit", path=str(url.path()), exits_after=self.exits_after
@@ -127,13 +126,13 @@ class _ScriptedOS(MacOS):
         self.looks = 0
         return self.running
 
-    def _resolve_app(self, query: str | int | None) -> tuple[_Process, dict[str, Any]]:
+    def _resolve_app(self, query: str | int | None) -> tuple[_Process, dict[str, object]]:
         process = self.resolved or self.running
         if process is None:
             raise ApplicationNotFoundError(f"No running application matches {query!r}")
         return process, self._app_info(process)
 
-    def windows(self, app: str | int | None = None) -> list[dict[str, Any]]:
+    def windows(self, app: str | int | None = None) -> list[dict[str, object]]:
         self.looks += 1
         if self.window_on is not None and self.looks >= self.window_on:
             return [_WINDOW]
@@ -150,7 +149,7 @@ class _ScriptedOS(MacOS):
         return True
 
     @classmethod
-    def _frontmost_app(cls) -> dict[str, Any]:
+    def _frontmost_app(cls) -> dict[str, object]:
         return {"name": "Ghostty", "bundle_id": "com.mitchellh.ghostty", "pid": 1, "path": None}
 
 
@@ -354,7 +353,7 @@ class _Workspace(MacOS):
     def _running_applications(self) -> tuple[_Process, ...]:
         return self.processes
 
-    def _window_list(self, *, on_screen_only: bool) -> list[dict[str, Any]]:
+    def _server_windows(self, *, on_screen_only: bool) -> list[dict[str, object]]:
         return [
             {
                 "kCGWindowNumber": pid,
@@ -367,7 +366,7 @@ class _Workspace(MacOS):
             for pid in self.windowed
         ]
 
-    def _frontmost_app(self) -> dict[str, Any]:
+    def _frontmost_app(self) -> dict[str, object]:
         return {"name": "Ghostty", "bundle_id": "com.mitchellh.ghostty", "pid": 1, "path": None}
 
 

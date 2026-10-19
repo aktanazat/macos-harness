@@ -9,14 +9,13 @@ sleep."""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 import Quartz
 
 from macos_harness.capture import WindowCapture
 from macos_harness.errors import ApplicationNotFoundError, ErrorCode
-from macos_harness.macos import MacOS, MacOSError
+from macos_harness.macos import MacOS, MacOSError, _TargetWindow
 
 _FINDER, _NOTES, _SERVER = 42, 50, 99
 _BAR, _PANEL, _NOTE, _DOC, _HIDDEN = 3, 25, 11, 7, 8
@@ -34,7 +33,7 @@ _DISPLAYS = [
 def _entry(
     pid: int, window_id: int, layer: int, frame: tuple[float, float, float, float],
     *, on_screen: bool = True,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     owner = _APPS[pid]["name"] if pid in _APPS else "Window Server"
     x, y, width, height = frame
     return {
@@ -63,7 +62,7 @@ _DESKTOP = (
 )
 
 
-def _white(width: int, height: int) -> Any:
+def _white(width: int, height: int) -> object:
     context = Quartz.CGBitmapContextCreate(
         None, width, height, 8, 0,
         Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB),
@@ -94,7 +93,7 @@ class _Desk(MacOS):
     """`MacOS` over the fake window server ``entries`` and two displays,
     recording every capture, click, and event it would post."""
 
-    def __init__(self, *entries: dict[str, Any]) -> None:
+    def __init__(self, *entries: dict[str, object]) -> None:
         super().__init__()
         self.entries = entries or _DESKTOP
         self.window_captures: list[int] = []
@@ -120,10 +119,10 @@ class _Desk(MacOS):
     def _ensure_post_events(self) -> None:
         return None
 
-    def _frontmost_app(self) -> dict[str, Any]:
+    def _frontmost_app(self) -> dict[str, object]:
         return _APPS[_NOTES]
 
-    def _resolve_app(self, query: str | int | None) -> tuple[_Running, dict[str, Any]]:
+    def _resolve_app(self, query: str | int | None) -> tuple[_Running, dict[str, object]]:
         """Each app by name or pid; no query is the last app a call named."""
         if query is None and self._last_app is not None:
             query = self._last_app["pid"]
@@ -132,13 +131,13 @@ class _Desk(MacOS):
                 return _Running(), info
         raise ApplicationNotFoundError(f"No running app matches {query!r}")
 
-    def _window_list(self, *, on_screen_only: bool) -> tuple[dict[str, Any], ...]:
+    def _server_windows(self, *, on_screen_only: bool) -> tuple[dict[str, object], ...]:
         return tuple(
             entry for entry in self.entries
             if entry["kCGWindowIsOnscreen"] or not on_screen_only
         )
 
-    def _window_description(self, window_id: int) -> dict[str, Any] | None:
+    def _window_description(self, window_id: int) -> dict[str, object] | None:
         return next(
             (entry for entry in self.entries if entry["kCGWindowNumber"] == window_id), None
         )
@@ -171,7 +170,13 @@ class _Desk(MacOS):
         return _capture(area)
 
     def _post_click(
-        self, pid: int, point: tuple[float, float], window: Any, *, button: str, clicks: int
+        self,
+        pid: int,
+        point: tuple[float, float],
+        window: _TargetWindow,
+        *,
+        button: str,
+        clicks: int,
     ) -> None:
         self._pointer_position = point
         self.clicks.append((pid, point, window.window_id, window.origin))

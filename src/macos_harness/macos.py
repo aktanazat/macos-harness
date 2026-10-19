@@ -3796,7 +3796,7 @@ class MacOS:
 
     def _menu_item(
         self, pid: int, steps: Sequence[str | None], *, bar: str
-    ) -> dict[str, Any]:
+    ) -> dict[str, JSONValue]:
         """The item ``steps`` lead to in ``pid``'s ``bar`` -- its
         ``AXMenuBar``, or ``AXExtrasMenuBar`` for its status items -- as
         a search match. Each step must name exactly one item, by title or
@@ -3824,12 +3824,12 @@ class MacOS:
             include_actions=False,
         )
 
-    def _menu_labels(self, item: Any) -> set[str]:
+    def _menu_labels(self, item: object) -> set[str]:
         """``item``'s title and description as `_menu_label` compares them."""
         names = self._copy_attributes(item, ("AXTitle", "AXDescription")).values()
         return {_menu_label(name) for name in names if isinstance(name, str)}
 
-    def _menu_entries(self, node: Any) -> list[Any]:
+    def _menu_entries(self, node: object) -> list[object]:
         """The items one level below ``node``: a menu bar's own, or those
         of the menu a menu bar item or menu item opens. An app without
         the bar asked for, ``None``, has none."""
@@ -3862,7 +3862,7 @@ class MacOS:
         return float(bounds.get("Width", 0)) >= 40 and float(bounds.get("Height", 0)) >= 40
 
     @staticmethod
-    def _window_list(*, on_screen_only: bool) -> Sequence[Mapping[str, Any]]:
+    def _server_windows(*, on_screen_only: bool) -> Sequence[Mapping[str, object]]:
         """The window server's list, front to back: every window, or only
         those on screen now."""
         option = (
@@ -3871,12 +3871,12 @@ class MacOS:
         return AS.CGWindowListCopyWindowInfo(option, AS.kCGNullWindowID) or ()
 
     @staticmethod
-    def _window_description(window_id: int) -> Mapping[str, Any] | None:
+    def _window_description(window_id: int) -> Mapping[str, object] | None:
         """The window server's entry for one window, or None once it is gone."""
         return next(iter(AS.CGWindowListCreateDescriptionFromArray([window_id]) or ()), None)
 
     @staticmethod
-    def _window_entry(value: Mapping[str, Any]) -> dict[str, Any]:
+    def _window_entry(value: Mapping[str, object]) -> dict[str, JSONValue]:
         """One window as `windows` lists it, from its window server entry."""
         bounds = value.get(AS.kCGWindowBounds) or {}
         return {
@@ -3909,7 +3909,7 @@ class MacOS:
         if app is None:
             return [
                 self._window_entry(value)
-                for value in self._window_list(on_screen_only=True)
+                for value in self._server_windows(on_screen_only=True)
                 if all_layers
                 or self._is_content_window(int(value.get(AS.kCGWindowOwnerPID, -1)), value)
             ]
@@ -3917,7 +3917,7 @@ class MacOS:
         pid = int(info["pid"])
         windows = [
             self._window_entry(value)
-            for value in self._window_list(on_screen_only=False)
+            for value in self._server_windows(on_screen_only=False)
             if (
                 int(value.get(AS.kCGWindowOwnerPID, -1)) == pid
                 if all_layers
@@ -3956,7 +3956,7 @@ class MacOS:
         time.sleep(seconds)
 
     def _wait_for_windows(
-        self, info: dict[str, Any], *, timeout: float, deadline: float | None = None
+        self, info: dict[str, JSONValue], *, timeout: float, deadline: float | None = None
     ) -> list[dict[str, Any]]:
         if deadline is None:
             deadline = self._now() + max(0.0, timeout)
@@ -3971,12 +3971,12 @@ class MacOS:
 
     def _ready_windows(
         self,
-        running: Any,
-        info: dict[str, Any],
+        running: NSRunningApplication,
+        info: dict[str, JSONValue],
         *,
         timeout: float,
         deadline: float | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, JSONValue]]:
         """``info``'s windows, waiting only for an app young enough to
         still be drawing its first; an older app with none never will."""
         windows = self.windows(int(info["pid"]))
@@ -4002,7 +4002,7 @@ class MacOS:
         width: float | None = None,
         height: float | None = None,
         display: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, JSONValue]:
         """Move or resize window ``window_index`` of ``app`` through
         Accessibility, without bringing it forward, and return the frame
         the window reports afterwards.
@@ -4075,8 +4075,8 @@ class MacOS:
         }
 
     def _ax_window(
-        self, info: dict[str, Any], target: dict[str, Any], window_index: int
-    ) -> tuple[Any, dict[str, float], bool]:
+        self, info: dict[str, JSONValue], target: dict[str, JSONValue], window_index: int
+    ) -> tuple[object, dict[str, float], bool]:
         """The AX element of ``target``, one of `windows`, with its frame
         and whether it is minimized. AX names no window id, so the element
         is the one whose frame matches the window server's bounds."""
@@ -4092,12 +4092,12 @@ class MacOS:
             details={"window_index": window_index, "window_id": target["window_id"]},
         )
 
-    def _ax_windows(self, pid: int) -> list[Any]:
+    def _ax_windows(self, pid: int) -> list[object]:
         """The AX elements of ``pid``'s windows on this Space."""
         root = self._application_element(pid, enhance=False)
         return list(self._copy_attribute(root, "AXWindows", checked=True) or ())
 
-    def _window_geometry(self, window: Any) -> tuple[dict[str, float] | None, bool]:
+    def _window_geometry(self, window: object) -> tuple[dict[str, float] | None, bool]:
         """``window``'s frame in screen points, None when it reports none,
         and whether it is minimized."""
         values = self._copy_attributes(
@@ -4113,7 +4113,7 @@ class MacOS:
 
     @staticmethod
     def _write_window(
-        window: Any,
+        window: object,
         *,
         position: tuple[float, float] | None,
         size: tuple[float, float] | None,
@@ -4255,9 +4255,9 @@ class MacOS:
         region: tuple[float, float, float, float] | None = None,
     ) -> dict[str, Any]:
         self._ensure_screen_recording()
-        window: dict[str, Any] | None = None
-        running: Any = None
-        info: dict[str, Any] | None = None
+        window: dict[str, JSONValue] | None = None
+        running: NSRunningApplication | None = None
+        info: dict[str, JSONValue] | None = None
         if display is not None or region is not None:
             index, display_id, frame, area = self._screen_area(display, region)
             output = _png_output(path)
@@ -4289,7 +4289,7 @@ class MacOS:
             }
         bounds = captured.bounds
         frontmost = self._frontmost_app()
-        focus: dict[str, Any] = {"frontmost": frontmost}
+        focus: dict[str, JSONValue] = {"frontmost": frontmost}
         if info is not None:
             focus["target_is_frontmost"] = (
                 frontmost is not None and int(frontmost["pid"]) == int(info["pid"])
@@ -4334,7 +4334,7 @@ class MacOS:
 
     def _named_window(
         self, app: str | int | None, window_id: int
-    ) -> tuple[dict[str, Any], Any, dict[str, Any]]:
+    ) -> tuple[dict[str, JSONValue], NSRunningApplication, dict[str, JSONValue]]:
         """The window ``window_id`` names, whatever its layer, with the
         running app that owns it and that app's record; ``app``, when
         given, must be that owner."""
@@ -4351,7 +4351,7 @@ class MacOS:
             return window, None, owner
         return window, running, info
 
-    def _described_window(self, window_id: int) -> dict[str, Any]:
+    def _described_window(self, window_id: int) -> dict[str, JSONValue]:
         """`windows`' entry for the window ``window_id`` names."""
         if type(window_id) is not int:
             raise MacOSError(
@@ -4370,7 +4370,7 @@ class MacOS:
         return self._window_entry(value)
 
     @staticmethod
-    def _require_owner(window: Mapping[str, Any], pid: int, name: str | None = None) -> None:
+    def _require_owner(window: Mapping[str, JSONValue], pid: int, name: str | None = None) -> None:
         """Refuse a window that ``pid``, the app the call targets, does not own."""
         if window["pid"] != pid:
             target = f"{name} (pid {pid})" if name else f"pid {pid}"
@@ -4458,7 +4458,9 @@ class MacOS:
         return capture_window(window_id, max_width=max_width, max_height=max_height, size=size)
 
     @staticmethod
-    def _indexed_window(windows: list[dict[str, Any]], window_index: int) -> dict[str, Any]:
+    def _indexed_window(
+        windows: list[dict[str, JSONValue]], window_index: int
+    ) -> dict[str, JSONValue]:
         try:
             return windows[window_index]
         except IndexError as exc:
@@ -4489,7 +4491,7 @@ class MacOS:
         by: str = "pixels",
         timeout: float = 30.0,
         settle: float = _CHANGE_SETTLE_SECONDS,
-    ) -> dict[str, Any]:
+    ) -> dict[str, JSONValue]:
         """Return once ``app``'s window, or the one ``window_id`` names,
         looks different and has then held still for ``settle`` seconds,
         in place of a guessed sleep.
@@ -4529,7 +4531,7 @@ class MacOS:
         by: str,
         timeout: float,
         settle: float,
-    ) -> dict[str, Any]:
+    ) -> dict[str, JSONValue]:
         if by not in ("pixels", "ax"):
             raise MacOSError(
                 f"by must be 'pixels' or 'ax', not {by!r}",
@@ -4557,7 +4559,7 @@ class MacOS:
             running, info = self._resolve_app(app)
         else:
             _window, running, info = self._named_window(app, window_id)
-        watched: dict[str, Any] = {"by": by, "app": info}
+        watched: dict[str, JSONValue] = {"by": by, "app": info}
         if by == "ax":
             self._ensure_accessibility()
             pid = int(info["pid"])
@@ -4779,7 +4781,7 @@ class MacOS:
                     details={"window_id": window_id, "point": {"x": x, "y": y}, "bounds": bounds},
                 )
             return _TargetWindow(window_id, (bounds["x"], bounds["y"]))
-        for value in self._window_list(on_screen_only=True):
+        for value in self._server_windows(on_screen_only=True):
             if not self._is_content_window(pid, value):
                 continue
             bounds = value.get(AS.kCGWindowBounds) or {}
@@ -5045,13 +5047,13 @@ class MacOS:
             "elapsed_ms": round((time.monotonic() - started) * 1000),
         }
 
-    def frontmost(self) -> dict[str, Any] | None:
+    def frontmost(self) -> dict[str, JSONValue] | None:
         """The app in front now: its name, bundle ID, pid, and path."""
         return self._frontmost_app()
 
     def launch(
         self, app: str, *, timeout: float = 15.0, window: bool = True
-    ) -> dict[str, Any]:
+    ) -> dict[str, JSONValue]:
         """Start ``app`` without bringing it forward; return once it shows a window.
 
         ``app`` is a name, bundle ID, or ``.app`` path. A copy already
@@ -5079,7 +5081,7 @@ class MacOS:
             self._pause(min(0.05, remaining))
             running = self._running_copy(url) or running
             info = self._app_info(running)
-        windows: list[dict[str, Any]] = []
+        windows: list[dict[str, JSONValue]] = []
         if window and launched:
             windows = self._wait_for_windows(info, timeout=timeout, deadline=deadline)
         elif window:
@@ -5095,7 +5097,7 @@ class MacOS:
 
     def quit(
         self, app: str | int, *, timeout: float = 10.0, force: bool = False
-    ) -> dict[str, Any]:
+    ) -> dict[str, JSONValue]:
         """Ask ``app`` to quit, as its Quit menu item would; return once it exited.
 
         Quit only an app this task opened. ``force=True`` ends it at once
@@ -5131,7 +5133,7 @@ class MacOS:
 
     def relaunch(
         self, app: str | int, *, timeout: float = 15.0, window: bool = True
-    ) -> dict[str, Any]:
+    ) -> dict[str, JSONValue]:
         """Quit ``app`` and start the same bundle again, or start it if closed.
 
         The copy that was running is the one started again, so a fresh
@@ -5153,7 +5155,9 @@ class MacOS:
         result = self.launch(info["path"], timeout=timeout, window=window)
         return {**result, "previous_pid": info["pid"]}
 
-    def _resolve_exact(self, app: str | int, *, verb: str) -> tuple[Any, dict[str, Any]]:
+    def _resolve_exact(
+        self, app: str | int, *, verb: str
+    ) -> tuple[NSRunningApplication, dict[str, JSONValue]]:
         """`_resolve_app`, refusing a partial name match: quitting "Notes"
         must never end "NotesHelper" because Notes itself is closed."""
         running, info = self._resolve_app(app)
@@ -5168,7 +5172,7 @@ class MacOS:
         return running, info
 
     @staticmethod
-    def _application_url(app: str) -> Any:
+    def _application_url(app: str) -> NSURL:
         """The installed bundle ``app`` names: a ``.app`` path, a bundle ID,
         or a name as Launch Services knows it."""
         if not isinstance(app, str) or not app.strip():
@@ -5194,7 +5198,7 @@ class MacOS:
         return url
 
     @classmethod
-    def _running_copy(cls, url: Any) -> Any | None:
+    def _running_copy(cls, url: NSURL) -> NSRunningApplication | None:
         """The running process started from the bundle at ``url``, if any."""
         bundle = str(url.path())
         copies = [
@@ -5215,14 +5219,14 @@ class MacOS:
         return copies[0] if copies else None
 
     @staticmethod
-    def _open_application(url: Any, *, timeout: float) -> Any:
+    def _open_application(url: NSURL, *, timeout: float) -> NSRunningApplication:
         """Ask Launch Services to start the bundle at ``url`` without
         bringing it forward, and return its running process. Launch
         Services answers on its own queue, so no run loop turn is needed."""
         opened = threading.Event()
-        outcome: list[tuple[Any, Any]] = []
+        outcome: list[tuple[NSRunningApplication | None, object]] = []
 
-        def finished(running: Any, error: Any) -> None:
+        def finished(running: NSRunningApplication | None, error: object) -> None:
             outcome.append((running, error))
             opened.set()
 

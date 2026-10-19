@@ -7,12 +7,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import NoReturn
 
 import pytest
 
 from macos_harness.errors import ApplicationNotFoundError, ErrorCode
-from macos_harness.macos import MacOS, MacOSError, SearchMatches
+from macos_harness.macos import MacOS, MacOSError, SearchMatches, _TargetWindow
 
 _SONA, _NOTES = 4512, 4600
 _WINDOW = 31
@@ -61,7 +61,7 @@ class _Sona(MacOS):
     def _ensure_post_events(self) -> None:
         return None
 
-    def _resolve_app(self, query: str | int | None) -> tuple[object, dict[str, Any]]:
+    def _resolve_app(self, query: str | int | None) -> tuple[object, dict[str, object]]:
         """Each app by name or pid; no query is the last app a call named."""
         if query is None and self._last_app is not None:
             query = self._last_app["pid"]
@@ -70,7 +70,7 @@ class _Sona(MacOS):
                 return object(), info
         raise ApplicationNotFoundError(f"No running app matches {query!r}")
 
-    def _window_list(self, *, on_screen_only: bool) -> tuple[dict[str, Any], ...]:
+    def _server_windows(self, *, on_screen_only: bool) -> tuple[dict[str, object], ...]:
         return (
             {
                 "kCGWindowNumber": _WINDOW,
@@ -96,11 +96,17 @@ class _Sona(MacOS):
         ]
         return SearchMatches(found, complete=True, visited=len(found))
 
-    def _focus_sample(self, pid: int, *, include_values: bool = True) -> dict[str, Any]:
+    def _focus_sample(self, pid: int, *, include_values: bool = True) -> NoReturn:
         raise MacOSError("Sona's focus is not read here", code=ErrorCode.AX_ERROR)
 
     def _post_click(
-        self, pid: int, point: tuple[float, float], window: Any, *, button: str, clicks: int
+        self,
+        pid: int,
+        point: tuple[float, float],
+        window: _TargetWindow,
+        *,
+        button: str,
+        clicks: int,
     ) -> None:
         self._pointer_position = point
         self.posted.append((pid, point, window.window_id))

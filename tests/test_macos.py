@@ -160,7 +160,7 @@ class _PidTable(MacOS):
         return self.listed
 
 
-def test_resolve_app_exact_pid_hit_never_reads_the_running_apps_list() -> None:
+def test_resolve_app_exact_pid_hit_never_lists_the_running_apps() -> None:
     """A pid AppKit knows resolves directly, without listing every app."""
     mac = _PidTable(direct=_FakeRunningApp(4242, name="HelperApp"))
 
