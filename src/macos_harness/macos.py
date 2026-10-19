@@ -1450,14 +1450,19 @@ class MacOS:
             )
 
         if isinstance(query, int):
-            # An exact pid resolves directly against the process table --
-            # no need to enumerate every running application to find one
-            # match by exact value, and no risk of the notification-cache
-            # staleness `NSWorkspace.runningApplications()` can have in a
-            # process that never pumps its own run loop (a freshly
-            # launched app can otherwise appear to not exist yet, purely
-            # as an artifact of when this process last observed a change).
-            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(query)
+            # The direct pid lookup is quick but no witness of absence: it
+            # missed 2 of 5 Calculators this process had just launched while
+            # the workspace list held each one, live and finished launching.
+            # A miss falls back to that list.
+            app = self._application_with_pid(query)
+            if app is None:
+                app = next(
+                    (
+                        candidate for candidate in self._running_applications()
+                        if int(candidate.processIdentifier()) == query
+                    ),
+                    None,
+                )
             if app is None or app.isTerminated():
                 raise ApplicationNotFoundError(
                     f"No running application matches {query!r}",
@@ -4279,10 +4284,21 @@ class MacOS:
         return running
 
     @staticmethod
+    def _application_with_pid(pid: int) -> Any | None:
+        """AppKit's direct pid lookup, which can miss a live app."""
+        return NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+
+    @staticmethod
     def _exited(pid: int) -> bool:
-        """Whether ``pid`` has left the process table, read fresh."""
-        running = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
-        return running is None or bool(running.isTerminated())
+        """Whether ``pid`` has left the kernel's process table. AppKit's pid
+        lookup is no witness: it can miss an app that is still running."""
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:  # alive, owned by another user
+            return False
+        return False
 
     @staticmethod
     def _validate_button(button: str) -> str:

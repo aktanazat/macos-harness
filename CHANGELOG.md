@@ -43,6 +43,11 @@ follows [Semantic Versioning](https://semver.org/).
   reaches an app that started after the harness first listed apps, such as
   the process behind a permission dialog. Each listing reads the running
   apps afresh; before, the list stayed as it was at the first read.
+- An app given by pid is found even when AppKit's direct pid lookup misses
+  it, which happened to 2 of 5 Calculators the same process had just
+  launched; a miss now falls back to the running-apps list. Receipts no
+  longer report such an app as exited, and `mac.quit` reads the exit from
+  the kernel's process table.
 - The frontmost app is read afresh on both backends. `mac.activate` now sees
   its request take, and the focus guard after a press catches a target that
   brings itself to the front; before, a process kept seeing whichever app was

@@ -5,6 +5,8 @@ the code under test pauses, so every wait is counted, never slept."""
 
 from __future__ import annotations
 
+import os
+import subprocess
 from typing import Any
 
 import pytest
@@ -12,6 +14,7 @@ import pytest
 from macos_harness.errors import ErrorCode
 from macos_harness.macos import ApplicationNotFoundError, MacOS, MacOSError
 
+_CALCULATOR = "/System/Applications/Calculator.app"
 _TEXTEDIT = "/System/Applications/TextEdit.app"
 _WINDOW = {"window_id": 7, "title": "Untitled", "on_screen": True}
 
@@ -245,3 +248,49 @@ def test_relaunch_starts_the_same_bundle_the_running_copy_came_from(tmp_path) ->
     assert running.requests == ["terminate"]
     assert mac.opened == [str(build)]
     assert (result["launched"], result["previous_pid"], result["app"]["pid"]) == (True, 11, 4242)
+
+
+class _AppKitMisses(MacOS):
+    """AppKit's direct pid lookup knows no app while the workspace list
+    holds ``listed``, as 2 of 5 live Calculator launches showed. Exits
+    are read from the real kernel process table."""
+
+    def __init__(self, listed: _Process) -> None:
+        super().__init__()
+        self.listed = listed
+        self.clock = 0.0
+
+    def _now(self) -> float:
+        return self.clock
+
+    def _pause(self, seconds: float) -> None:
+        self.clock += seconds
+
+    @staticmethod
+    def _application_with_pid(pid: int) -> None:
+        return None
+
+    def _running_applications(self) -> list[_Process]:
+        return [self.listed]
+
+
+def test_quit_by_pid_reaches_an_app_only_the_workspace_list_holds() -> None:
+    finished = subprocess.Popen(["/usr/bin/true"])
+    finished.wait()
+    listed = _Process(finished.pid, name="Calculator", path=_CALCULATOR, exits_after=0)
+
+    result = _AppKitMisses(listed).quit(finished.pid)
+
+    assert (listed.requests, result["app"]["pid"]) == (["terminate"], finished.pid)
+
+
+def test_quit_keeps_waiting_while_the_kernel_still_runs_the_process() -> None:
+    """This test's own process is alive and no app to AppKit: quit must
+    not read the missing app as an exit."""
+    alive = _Process(os.getpid(), name="Calculator", path=_CALCULATOR, exits_after=None)
+
+    with pytest.raises(MacOSError, match="did not quit within 0.2s") as caught:
+        _AppKitMisses(alive).quit(os.getpid(), timeout=0.2)
+
+    assert caught.value.code == ErrorCode.TIMEOUT
+    assert alive.requests == ["terminate"]

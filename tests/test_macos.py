@@ -142,84 +142,57 @@ class _FakeRunningApp:
         return _FakeDate(self._launched_seconds_ago)
 
 
-def test_resolve_app_exact_pid_hit_never_enumerates_workspace(monkeypatch) -> None:
-    """An int pid resolves directly by identity -- it must never scan
-    NSWorkspace.runningApplications(), which is not just wasteful but can
-    return stale, notification-cache-backed data in a process that never
-    pumps its own run loop."""
-    mac = MacOS()
-    fake_app = _FakeRunningApp(4242, name="HelperApp")
+class _PidTable(MacOS):
+    """AppKit's direct pid lookup answers ``direct``; the running-apps list
+    holds ``listed`` and counts how often it is read."""
 
-    class _FakeRunningApplication:
-        @staticmethod
-        def runningApplicationWithProcessIdentifier_(pid: int) -> _FakeRunningApp | None:
-            assert pid == 4242
-            return fake_app
+    def __init__(self, *, direct: _FakeRunningApp | None = None, listed=()) -> None:
+        super().__init__()
+        self.direct = direct
+        self.listed = list(listed)
+        self.listings = 0
 
-    class _FakeWorkspace:
-        @staticmethod
-        def sharedWorkspace() -> Never:
-            raise AssertionError(
-                "must not enumerate NSWorkspace.runningApplications() for an int pid"
-            )
+    def _application_with_pid(self, pid: int) -> _FakeRunningApp | None:
+        return self.direct
 
-    monkeypatch.setattr(macos_module, "NSRunningApplication", _FakeRunningApplication)
-    monkeypatch.setattr(macos_module, "NSWorkspace", _FakeWorkspace)
+    def _running_applications(self) -> list[_FakeRunningApp]:
+        self.listings += 1
+        return self.listed
+
+
+def test_resolve_app_exact_pid_hit_never_reads_the_running_apps_list() -> None:
+    """A pid AppKit knows resolves directly, without listing every app."""
+    mac = _PidTable(direct=_FakeRunningApp(4242, name="HelperApp"))
 
     app, info = mac._resolve_app(4242)
 
-    assert app is fake_app
-    assert info["pid"] == 4242
-    assert info["name"] == "HelperApp"
+    assert (app, info["pid"], info["name"], mac.listings) == (mac.direct, 4242, "HelperApp", 0)
 
 
-def test_resolve_app_exact_pid_miss_raises_without_enumerating_workspace(
-    monkeypatch,
-) -> None:
-    mac = MacOS()
+def test_resolve_app_exact_pid_miss_reads_the_running_apps_list_once() -> None:
+    """AppKit's direct lookup missed 2 of 5 live Calculators the workspace
+    listed, so a miss is checked against that list before it is reported."""
+    listed = _FakeRunningApp(4242, name="Calculator")
+    mac = _PidTable(listed=[_FakeRunningApp(7, name="Finder"), listed])
 
-    class _FakeRunningApplication:
-        @staticmethod
-        def runningApplicationWithProcessIdentifier_(pid: int) -> _FakeRunningApp | None:
-            return None
+    app, info = mac._resolve_app(4242)
 
-    class _FakeWorkspace:
-        @staticmethod
-        def sharedWorkspace() -> Never:
-            raise AssertionError(
-                "must not enumerate NSWorkspace.runningApplications() for an int pid"
-            )
-
-    monkeypatch.setattr(macos_module, "NSRunningApplication", _FakeRunningApplication)
-    monkeypatch.setattr(macos_module, "NSWorkspace", _FakeWorkspace)
-
-    with pytest.raises(ApplicationNotFoundError, match="99999"):
-        mac._resolve_app(99999)
+    assert (app, info["name"], mac.listings) == (listed, "Calculator", 1)
 
 
-def test_resolve_app_exact_pid_rejects_a_terminated_process_without_enumerating(
-    monkeypatch,
-) -> None:
-    mac = MacOS()
-    terminated_app = _FakeRunningApp(4242, terminated=True)
+@pytest.mark.parametrize(
+    ("direct", "listings"),
+    [(None, 1), (_FakeRunningApp(4242, terminated=True), 0)],
+    ids=["absent", "terminated"],
+)
+def test_resolve_app_exact_pid_not_running_carries_code_and_query(direct, listings) -> None:
+    mac = _PidTable(direct=direct, listed=[_FakeRunningApp(7, name="Finder")])
 
-    class _FakeRunningApplication:
-        @staticmethod
-        def runningApplicationWithProcessIdentifier_(pid: int) -> _FakeRunningApp | None:
-            return terminated_app
-
-    class _FakeWorkspace:
-        @staticmethod
-        def sharedWorkspace() -> Never:
-            raise AssertionError(
-                "must not enumerate NSWorkspace.runningApplications() for an int pid"
-            )
-
-    monkeypatch.setattr(macos_module, "NSRunningApplication", _FakeRunningApplication)
-    monkeypatch.setattr(macos_module, "NSWorkspace", _FakeWorkspace)
-
-    with pytest.raises(ApplicationNotFoundError, match="4242"):
+    with pytest.raises(ApplicationNotFoundError, match="4242") as caught:
         mac._resolve_app(4242)
+
+    assert (caught.value.code, caught.value.details["query"]) == (ErrorCode.APP_NOT_FOUND, 4242)
+    assert mac.listings == listings
 
 
 def test_resolve_app_string_query_still_enumerates_workspace(monkeypatch) -> None:
@@ -2501,29 +2474,6 @@ def test_unknown_element_index_carries_element_unknown_code() -> None:
         mac._element(999)
     assert exc_info.value.code == ErrorCode.ELEMENT_UNKNOWN
     assert exc_info.value.details["element_index"] == 999
-
-
-def test_resolve_app_not_found_carries_code_and_query_detail(monkeypatch) -> None:
-    mac = MacOS()
-
-    class _FakeRunningApplication:
-        @staticmethod
-        def runningApplicationWithProcessIdentifier_(pid: int) -> _FakeRunningApp | None:
-            return None
-
-    class _FakeWorkspace:
-        @staticmethod
-        def sharedWorkspace() -> Never:
-            raise AssertionError("must not enumerate workspace for an int pid")
-
-    monkeypatch.setattr(macos_module, "NSRunningApplication", _FakeRunningApplication)
-    monkeypatch.setattr(macos_module, "NSWorkspace", _FakeWorkspace)
-
-    with pytest.raises(ApplicationNotFoundError) as exc_info:
-        mac._resolve_app(99999)
-
-    assert exc_info.value.code == ErrorCode.APP_NOT_FOUND
-    assert exc_info.value.details["query"] == 99999
 
 
 def test_resolve_app_ambiguous_carries_code_query_and_matches(monkeypatch) -> None:
