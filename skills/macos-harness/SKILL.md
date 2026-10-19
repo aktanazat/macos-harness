@@ -27,7 +27,7 @@ identity, an irreversible action, or unexpected state.
 - `mac.see(app)`: capture a window; clicks map through the latest or `screenshot=<png>`.
 - `mac.key("cmd+k", app=...)`: a key or combo.
 - `mac.type(text, app=...)`: typed text.
-- `mac.click(x, y, app=...)`: a raw click at screenshot coordinates.
+- `mac.click(x, y, app=...)`: a raw click at screenshot coordinates; `element=match` clicks its center.
 - `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, or press a control; a match outlives its run, an index does not.
 - `mac.script(source)`: AppleScript for an exact, focus-safe command.
 

@@ -65,6 +65,13 @@ follows [Semantic Versioning](https://semver.org/).
   and no `x` or `y`, a window that does not fit on that display is centered
   there. A minimized window, or one its app will not move or resize, raises
   `unsupported_op` before anything changes.
+- `mac.click(element=match)` and `mac.do.click(element=match, app=...)`
+  click the center of an element's frame as it is now, in the element's
+  own process, for a control that ignores `AXPress`, as SwiftUI rows can.
+  The element may be a match from any run or an index from this one. An
+  element of another app, or one with no area on screen, is refused before
+  anything is posted, and the receipt names the element by its role and
+  labels, never its value.
 
 ### Changed
 

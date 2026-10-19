@@ -48,7 +48,13 @@ from .errors import (
 from .handoff import HandoffReason, HumanHandoff
 from .ops import _Deadline, _utc_timestamp
 from .overlay import LivePointerOverlay
-from .receipts import JSONValue, Receipt, validate_exact_selectors, validate_scope
+from .receipts import (
+    JSONValue,
+    Receipt,
+    validate_click_aim,
+    validate_exact_selectors,
+    validate_scope,
+)
 
 if TYPE_CHECKING:
     # Only for annotations -- `native.py` imports from this module at
@@ -5205,9 +5211,10 @@ class MacOS:
 
     def click(
         self,
-        x: float,
-        y: float,
+        x: float | None = None,
+        y: float | None = None,
         *,
+        element: ElementRef | None = None,
         app: str | int | None = None,
         window_id: int | None = None,
         screenshot: str | Path | None = None,
@@ -5225,20 +5232,66 @@ class MacOS:
         elsewhere it is dropped, and ``activate`` first is the cure.
         ``screenshot`` names the PNG of an earlier `see`, maybe from an
         earlier run, whose pixels ``x`` and ``y`` are.
+
+        ``element``, a match or index a search returned, aims the click
+        instead of ``x`` and ``y``: at the center of the element's frame
+        as it is now, in the element's own process -- for a control that
+        ignores ``AXPress``, as a SwiftUI row can.
         """
+        validate_click_aim(x, y, element)
         self._ensure_accessibility()
         self._ensure_post_events()
         button = self._validate_button(button)
         clicks = self._validate_clicks(clicks)
-        self._use_screenshot(screenshot)
-        pid = self._input_pid(app, window_id, "Pointer input")
-        point = self._screen_point(x, y, coordinate_space, pid=pid)
+        if element is None:
+            assert x is not None and y is not None
+            self._use_screenshot(screenshot)
+            pid = self._input_pid(app, window_id, "Pointer input")
+            point = self._screen_point(x, y, coordinate_space, pid=pid)
+        else:
+            owner = self._element_pid(element) if app is None else app
+            pid = self._input_pid(owner, window_id, "Pointer input")
+            point = self._element_point(element, pid)
         window = self._target_window(pid, point, window_id)
         self._post_click(pid, point, window, button=button, clicks=clicks)
         pointer = self._pointer_info(pid=pid)
         assert pointer is not None
         pointer["window_id"] = window.window_id
         return pointer
+
+    def _element_pid(self, element: ElementRef) -> int | None:
+        """The process ``element`` runs in: the pid a match names, or a
+        local element's own. None for an agent's handle, which names no
+        process, so the click goes where any click without one goes."""
+        if isinstance(element, Mapping):
+            named = element.get("pid")
+            return named if isinstance(named, int) else None
+        resolved = self._element(element)
+        if not self._is_ax_element(resolved):
+            return None
+        error, pid = AS.AXUIElementGetPid(resolved, None)
+        return int(pid) if error == _AX_SUCCESS else None
+
+    def _element_point(self, element: ElementRef, pid: int) -> tuple[float, float]:
+        """The center of ``element``'s frame as it is now, in screen
+        points, for a click posted to process ``pid``, which must be the
+        element's own: a click meant for one app never lands in another
+        app's window that happens to lie under the same point."""
+        owner = self._element_pid(element)
+        if owner not in (None, pid):
+            raise MacOSError(
+                f"The element is in process {owner}, not {pid}; aim the click at its own app",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "element", "pid": owner, "target_pid": pid},
+            )
+        frame = self.get(element, "AXFrame")
+        if not frame or frame["width"] <= 0 or frame["height"] <= 0:
+            raise MacOSError(
+                f"The element has no area on screen to click: its frame is {frame}",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"frame": frame},
+            )
+        return frame["x"] + frame["width"] / 2, frame["y"] + frame["height"] / 2
 
     def _post_click(
         self,

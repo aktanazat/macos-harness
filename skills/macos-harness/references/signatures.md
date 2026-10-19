@@ -32,7 +32,7 @@ mac.see(app=None, *, window_index=0, window_id=None, display=None, region=None, 
 mac.wait_change(app=None, *, window_index=0, window_id=None, region=None, by="pixels", timeout=30.0, settle=0.5)
 mac.key(key, *, app=None)
 mac.type(text, *, app=None)
-mac.click(x, y, *, app=None, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot")
+mac.click(x=None, y=None, *, element=None, app=None, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot")
 mac.scroll(delta_y, delta_x=0, *, app=None, window_id=None, screenshot=None, unit="pixel", x=None, y=None, coordinate_space="screenshot")
 mac.drag(from_x, from_y, to_x, to_y, *, app=None, window_id=None, screenshot=None, button="left", coordinate_space="screenshot", duration=0.25, steps=12)
 mac.move(x, y, *, app=None, screenshot=None, coordinate_space="screenshot", duration=0.16)
@@ -94,6 +94,12 @@ match = {"pid": 4512, "role": "AXButton", "title": "Save"}  # printed by a query
 mac.ax.perform(match, "AXPress")
 ```
 
+A control that ignores `AXPress`, as a SwiftUI row can, takes a click:
+`click(element=match)` and `do.click(element=match, app=...)` click the
+center of the element's frame as it is now, in the element's own process,
+in place of `x` and `y`. An element of another app, or one with no area on
+screen, is refused before anything is posted.
+
 ## Accessibility
 
 ```text
@@ -121,7 +127,7 @@ mac.do.toggle(desired, *, app=None, all_apps=False, apps=None, role=None, text=N
 mac.do.fill(value, *, app, role="text field", text=None, title=None, identifier=None, description=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.key(key, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.type(text, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
-mac.do.click(x, y, *, app, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.click(x=None, y=None, *, element=None, app, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.run(source, *, language="AppleScript", args=(), timeout=5.0, postcondition=None, once=None, dry_run=False, capture_output=False)
 mac.do.expect(condition)
 mac.do.expect_any(outcomes, *, timeout=5.0, interval=0.1)

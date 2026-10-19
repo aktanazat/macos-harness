@@ -99,6 +99,7 @@ from .receipts import (
     canonicalize,
     request_fingerprint,
     validate_app_selector,
+    validate_click_aim,
     validate_exact_selectors,
     validate_scope,
 )
@@ -137,6 +138,20 @@ def _args_summary(argv: Sequence[str]) -> list[JSONValue]:
     is redacted.
     """
     return [_source_summary(item) for item in argv]
+
+
+#: What finds a match again (`MacOS._find_again`), and all a receipt keeps
+#: of an element a click aimed at.
+_ELEMENT_IDENTITY = ("pid", "role", "title", "identifier", "description", "frame")
+
+
+def _element_request(element: int | Mapping[str, JSONValue]) -> JSONValue:
+    """The element a click aimed at, as its receipt records it: an index
+    as given, a match by what finds it again -- never its value, which
+    for a text field is what the user wrote."""
+    if isinstance(element, Mapping):
+        return {key: element.get(key) for key in _ELEMENT_IDENTITY}
+    return element
 
 
 def _validate_interval(interval: float) -> None:
@@ -1213,6 +1228,9 @@ class _Host(Protocol):
         button: str,
         clicks: int,
     ) -> None: ...
+    def _element_point(
+        self, element: int | Mapping[str, JSONValue], pid: int
+    ) -> tuple[float, float]: ...
 
 
 # --- receipt construction ---------------------------------------------
@@ -2556,9 +2574,10 @@ class Operations:
 
     def click(
         self,
-        x: float,
-        y: float,
+        x: float | None = None,
+        y: float | None = None,
         *,
+        element: int | Mapping[str, JSONValue] | None = None,
         app: str | int,
         window_id: int | None = None,
         screenshot: str | Path | None = None,
@@ -2584,7 +2603,12 @@ class Operations:
         only when ``window_id`` names it. ``screenshot`` names the PNG of
         an earlier `see`, maybe from an earlier run, whose pixels ``x``
         and ``y`` are.
+
+        ``element``, a match or index a search returned, aims the click
+        instead of ``x`` and ``y``: at the center of its frame as it is
+        now, and only when it is ``app``'s own element.
         """
+        validate_click_aim(x, y, element)
         resolved: tuple[str, int, tuple[float, float], _RoutedWindow] | None = None
 
         def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
@@ -2592,8 +2616,12 @@ class Operations:
             del deadline
             normalized_button = host._validate_button(button)
             normalized_clicks = host._validate_clicks(clicks)
-            host._use_screenshot(screenshot)
-            screen = host._screen_point(x, y, coordinate_space, pid=pid)
+            if element is None:
+                assert x is not None and y is not None
+                host._use_screenshot(screenshot)
+                screen = host._screen_point(x, y, coordinate_space, pid=pid)
+            else:
+                screen = host._element_point(element, pid)
             window = host._target_window(pid, screen, window_id)
             resolved = (normalized_button, normalized_clicks, screen, window)
             return {
@@ -2613,6 +2641,8 @@ class Operations:
             "x": x, "y": y, "button": button, "clicks": clicks,
             "coordinate_space": coordinate_space,
         }
+        if element is not None:
+            request["element"] = _element_request(element)
         if window_id is not None:
             request["window_id"] = window_id
         if screenshot is not None:

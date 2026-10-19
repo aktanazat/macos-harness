@@ -365,6 +365,22 @@ def validate_exact_selectors(**selectors: str | None) -> None:
             )
 
 
+def validate_click_aim(
+    x: float | None, y: float | None, element: int | Mapping[str, JSONValue] | None
+) -> None:
+    """Reject a click aimed at both or neither of a point (``x`` and
+    ``y``) and an ``element``, before anything resolves or is reserved.
+    Shared by `MacOS.click` and its ``mac.do`` counterpart, so one rule
+    decides what a click aims at."""
+    aimed = element is not None
+    if (x is None) != aimed or (y is None) != aimed:
+        raise MacOSError(
+            "A click aims at x and y, or at element: give one of them",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": "element"},
+        )
+
+
 def _validate_postcondition(
     *,
     app: str | int | None,
