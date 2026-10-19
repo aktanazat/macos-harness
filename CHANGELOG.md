@@ -123,6 +123,10 @@ follows [Semantic Versioning](https://semver.org/).
   `mac.inspect` past 5000 nodes or 25 levels walks the cap instead of
   failing and reports `capped`, and a `window_index` past an app's windows
   says the index starts at 0 and which indexes the app has.
+- `print(receipt)` shows one line, such as
+  `press done acted=yes changed=yes verified=yes 0.31s`, with `error=<code>`
+  on a failure, instead of the whole record (a median of 1,096 characters).
+  `repr(receipt)` and `receipt.to_json()` keep the record.
 - An AX wait, and the search inside a Python-backend press, keeps polling
   while the app does not answer in time (AXError -25204), as Secretive and
   Activity Monitor do for a second or more after `open -a`; before, the

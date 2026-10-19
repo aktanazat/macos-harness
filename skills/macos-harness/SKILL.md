@@ -50,7 +50,7 @@ from macos_harness import OperationError
 try:
     mac.do.press("Next", role="button", app="Xcode")
 except OperationError as exc:
-    print(exc.receipt.error["code"])
+    print(exc.receipt)
 mac.ax.wait("Upload", role="button", app="Xcode", timeout=15)
 print(mac.see("Xcode"))
 ```

@@ -334,6 +334,42 @@ def test_receipt_changed_accepts_none_for_an_unconfirmed_effect() -> None:
     assert receipt.to_json()["changed"] is None
 
 
+@pytest.mark.parametrize(
+    ("overrides", "line"),
+    [
+        pytest.param({}, "press done acted=yes changed=yes verified=yes 0.12s", id="done"),
+        pytest.param(
+            {"outcome": Outcome.PLANNED, "acted": Acted.NO, "changed": False,
+             "verified": False, "duration_s": 0.004},
+            "press planned acted=no changed=no verified=no 0.00s",
+            id="dry-run",
+        ),
+        pytest.param(
+            {"outcome": Outcome.FAILED, "acted": Acted.UNKNOWN, "changed": None,
+             "verified": False,
+             "error": {"code": "element.unknown", "message": "stale element",
+                       "details": {"element_index": 4}}},
+            "press failed acted=unknown changed=unknown verified=no 0.12s "
+            "error=element.unknown",
+            id="failed",
+        ),
+        pytest.param(
+            {"replayed": True},
+            "press done acted=yes changed=yes verified=yes 0.12s replayed",
+            id="replayed",
+        ),
+    ],
+)
+def test_printed_receipt_is_one_line_of_what_happened(overrides, line) -> None:
+    """`print(receipt)` dumped the whole record, a median of 1,096
+    characters an agent read to learn four facts; it now prints one line
+    of them, and the repr keeps the record."""
+    receipt = _make_receipt(**overrides)
+
+    assert str(receipt) == line
+    assert repr(receipt).startswith("Receipt(op='press', outcome=")
+
+
 def test_receipt_canonicalizes_request_target_observed_on_construction() -> None:
     receipt = _make_receipt(observed=["a", "b"])
     assert isinstance(receipt.request, MappingProxyType)

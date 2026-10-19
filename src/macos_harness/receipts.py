@@ -688,6 +688,10 @@ def _freeze_error(error: ErrorPayload | None) -> Mapping[str, JSONValue] | None:
     return canonicalize(error)
 
 
+# How one printed line says `Receipt.changed`.
+_CHANGED_WORD = {True: "yes", False: "no", None: "unknown"}
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Receipt:
     """An immutable, JSON-safe record of exactly one ``mac.do`` operation:
@@ -781,6 +785,22 @@ class Receipt:
         from another.
         """
         return dataclasses.replace(self, replayed=True)
+
+    def __str__(self) -> str:
+        """One line for ``print(receipt)``: the verb, its outcome, whether
+        it acted, changed, and verified, its seconds, and a failure's code,
+        such as ``press done acted=yes changed=yes verified=yes 0.31s``.
+        ``repr`` and `to_json` keep the whole record."""
+        line = (
+            f"{self.op} {self.outcome.value} acted={self.acted.value} "
+            f"changed={_CHANGED_WORD[self.changed]} "
+            f"verified={'yes' if self.verified else 'no'} {self.duration_s:.2f}s"
+        )
+        if self.replayed:
+            line += " replayed"
+        if self.error is not None:
+            line += f" error={self.error['code']}"
+        return line
 
     def to_json(self) -> dict[str, JSONValue]:
         """A JSON-safe snapshot of this receipt.

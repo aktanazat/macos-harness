@@ -4,6 +4,9 @@ For anything that changes state, try a `mac.do` verb before its raw-primitive
 equivalent. It performs the same action but returns a `Receipt`: `outcome`
 (`planned`/`done`/`already`/`failed`), `acted` (`no`/`yes`/`unknown`), whether
 anything changed, and whether a postcondition verified the effect.
+`print(receipt)` shows those in one line, such as
+`press done acted=yes changed=yes verified=yes 0.31s`, with `error=<code>`
+on a failure; `receipt.to_json()` holds the whole record.
 
 ```python
 from macos_harness.receipts import equals, gone
