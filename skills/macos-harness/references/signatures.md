@@ -128,6 +128,8 @@ mac.do.fill(value, *, app, role="text field", text=None, title=None, identifier=
 mac.do.key(key, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.type(text, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.click(x=None, y=None, *, element=None, app, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.menu(path, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.status_item(path=None, *, app, name=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.run(source, *, language="AppleScript", args=(), timeout=5.0, postcondition=None, once=None, dry_run=False, capture_output=False)
 mac.do.expect(condition)
 mac.do.expect_any(outcomes, *, timeout=5.0, interval=0.1)

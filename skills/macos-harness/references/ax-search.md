@@ -19,6 +19,11 @@ other kind, pass `role="any"` and read each match's `role`; `mac.windows(app)`
 lists an app's windows. Do not pass both `role` and `search_key`. A search for
 what is on screen, the default, leaves out the items of closed menus; pass
 `role="menu item"` to reach a command in a menu that is not open.
+When two menus hold an item of the same name, as File and Window both hold
+Close, `mac.do.menu("Window > Close", app=...)` follows the path instead.
+`mac.do.status_item("Quit", app=...)` does the same in the menu of an app's
+menu bar icon, and with no path opens it; `name=` picks the icon by its title
+or description when the app has several.
 
 ## Scope
 

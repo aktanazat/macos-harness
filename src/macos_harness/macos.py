@@ -390,6 +390,36 @@ def _on_screen_only(visible_only: bool, search_key: str) -> bool:
     return visible_only and search_key not in _AX_MENU_SEARCH_KEYS
 
 
+# Where a menu path's first step is looked for, by the bar it starts in.
+_MENU_BAR_PLACES = {"AXMenuBar": "in its menu bar", "AXExtrasMenuBar": "among its status items"}
+
+
+def _menu_label(text: str) -> str:
+    """``text`` as a menu path step compares it: case and runs of spaces
+    ignored, and "..." read as the "…" menus use."""
+    return " ".join(text.replace("...", "…").split()).casefold()
+
+
+def _menu_miss(
+    pid: int, before: Sequence[str | None], step: str | None, found: int, bar: str
+) -> str:
+    """Why a menu path stops at ``step``, which ``found`` items answer
+    after the steps ``before``."""
+    if step is None:
+        return (
+            f"Process {pid} has {found} status items, not one; "
+            "with several, name= picks one by its title or description"
+        )
+    place = (
+        f"under {' > '.join(name or 'its status item' for name in before)}"
+        if before else _MENU_BAR_PLACES[bar]
+    )
+    return (
+        f"Process {pid} has {found} items named {step!r} {place}; "
+        "a menu path needs exactly one at each step"
+    )
+
+
 _KEYCODES = {
     "a": 0,
     "s": 1,
@@ -3763,6 +3793,56 @@ class MacOS:
             return False
         read, _value = AS.AXUIElementCopyAttributeValue(element, "AXRole", None)
         return read in (AS.kAXErrorInvalidUIElement, AS.kAXErrorAttributeUnsupported)
+
+    def _menu_item(
+        self, pid: int, steps: Sequence[str | None], *, bar: str
+    ) -> dict[str, Any]:
+        """The item ``steps`` lead to in ``pid``'s ``bar`` -- its
+        ``AXMenuBar``, or ``AXExtrasMenuBar`` for its status items -- as
+        a search match. Each step must name exactly one item, by title or
+        description (`_menu_label`), among the items under the step
+        before; a ``None`` step takes the only item there.
+        """
+        root = self._application_element(pid, enhance=False)
+        node = self._copy_attributes(root, (bar,), checked=True).get(bar)
+        for depth, step in enumerate(steps):
+            entries = self._menu_entries(node)
+            found = entries if step is None else [
+                entry for entry in entries if _menu_label(step) in self._menu_labels(entry)
+            ]
+            if len(found) != 1:
+                raise MacOSError(
+                    _menu_miss(pid, steps[:depth], step, len(found), bar),
+                    code=ErrorCode.ELEMENT_UNKNOWN,
+                    details={"pid": pid, "step": depth, "found": len(found)},
+                )
+            node = found[0]
+        return self._describe_element(
+            node,
+            self._remember_element(node),
+            attributes=("AXTitle", "AXDescription", "AXEnabled"),
+            include_actions=False,
+        )
+
+    def _menu_labels(self, item: Any) -> set[str]:
+        """``item``'s title and description as `_menu_label` compares them."""
+        names = self._copy_attributes(item, ("AXTitle", "AXDescription")).values()
+        return {_menu_label(name) for name in names if isinstance(name, str)}
+
+    def _menu_entries(self, node: Any) -> list[Any]:
+        """The items one level below ``node``: a menu bar's own, or those
+        of the menu a menu bar item or menu item opens. An app without
+        the bar asked for, ``None``, has none."""
+        if node is None:
+            return []
+        children = list(
+            self._copy_attributes(node, ("AXChildren",), checked=True).get("AXChildren") or ()
+        )
+        if len(children) == 1 and (
+            self._copy_attributes(children[0], ("AXRole",)).get("AXRole") == "AXMenu"
+        ):
+            return self._menu_entries(children[0])
+        return children
 
     # --- windows and screenshots ----------------------------------------
 

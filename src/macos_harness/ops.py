@@ -154,6 +154,22 @@ def _element_request(element: int | Mapping[str, JSONValue]) -> JSONValue:
     return element
 
 
+def _menu_steps(path: str, *, least: int) -> list[str]:
+    """The steps of a menu path, ``"View > Reload Page"`` read as
+    ``["View", "Reload Page"]``. An empty step, or fewer than ``least``
+    of them, is refused: a menu bar path ends at an item of a menu, never
+    at the menu itself."""
+    steps = [step.strip() for step in path.split(">")]
+    if len(steps) < least or not all(steps):
+        raise MacOSError(
+            f"{path!r} is not a menu path: name each step down to the item "
+            "to press, '>' between them, as in 'View > Reload Page'",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": "path"},
+        )
+    return steps
+
+
 def _validate_interval(interval: float) -> None:
     """Reject a non-finite or non-positive operation ``interval`` before
     any resolution, dispatch, or ``once``-token reservation.
@@ -1231,6 +1247,9 @@ class _Host(Protocol):
     def _element_point(
         self, element: int | Mapping[str, JSONValue], pid: int
     ) -> tuple[float, float]: ...
+    def _menu_item(
+        self, pid: int, steps: Sequence[str | None], *, bar: str
+    ) -> dict[str, JSONValue]: ...
 
 
 # --- receipt construction ---------------------------------------------
@@ -2800,6 +2819,110 @@ class Operations:
             prepare=prepare, dispatch=dispatch,
         )
 
+    def menu(
+        self,
+        path: str,
+        *,
+        app: str | int,
+        timeout: float = 5.0,
+        postcondition: Postcondition | None = None,
+        once: str | None = None,
+        dry_run: bool = False,
+    ) -> Receipt:
+        """Choose the item ``path`` names in ``app``'s menu bar, as in
+        ``"View > Reload Page"``, by pressing it through Accessibility
+        with its menu closed and ``app`` left where it is.
+
+        Each step is found only among the items under the step before,
+        so File's Close is never Window's. A step matches an item's title
+        or description, ignoring case, with "..." for "…". A disabled
+        item is refused before anything is pressed.
+        """
+        return self._menu_verb(
+            "menu", _menu_steps(path, least=2), "AXMenuBar", {"path": path}, app=app,
+            timeout=timeout, postcondition=postcondition, once=once, dry_run=dry_run,
+        )
+
+    def status_item(
+        self,
+        path: str | None = None,
+        *,
+        app: str | int,
+        name: str | None = None,
+        timeout: float = 5.0,
+        postcondition: Postcondition | None = None,
+        once: str | None = None,
+        dry_run: bool = False,
+    ) -> Receipt:
+        """Press ``app``'s status item, its icon in the menu bar, which
+        opens it; with ``path``, press the item that path names in its
+        menu instead, as `menu` does. ``name`` picks the status item by
+        its title or description when the app has more than one; many
+        status items have neither.
+        """
+        if name is not None and not name.strip():
+            raise MacOSError(
+                "name= is a status item's title or description; leave it out "
+                "when the app has only one status item",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "name"},
+            )
+        inside = () if path is None else _menu_steps(path, least=1)
+        return self._menu_verb(
+            "status_item", [name, *inside], "AXExtrasMenuBar", {"path": path, "name": name},
+            app=app, timeout=timeout, postcondition=postcondition, once=once, dry_run=dry_run,
+        )
+
+    def _menu_verb(
+        self,
+        op: str,
+        steps: Sequence[str | None],
+        bar: str,
+        request: dict[str, JSONValue],
+        *,
+        app: str | int,
+        timeout: float,
+        postcondition: Postcondition | None,
+        once: str | None,
+        dry_run: bool,
+    ) -> Receipt:
+        """`menu` and `status_item`: find the item ``steps`` lead to under
+        ``app``'s ``bar``, then press it."""
+        element_index: int | None = None
+
+        def prepare(host: _Host, pid: int, deadline: _Deadline) -> JSONValue:
+            nonlocal element_index
+            del deadline
+            match = host._menu_item(pid, steps, bar=bar)
+            if match.get("enabled") is False:
+                raise MacOSError(
+                    "That menu item is disabled, so pressing it would do nothing",
+                    code=ErrorCode.UNSUPPORTED_OP,
+                    details={"parameter": "path"},
+                )
+            element_index = int(match["element_index"])
+            return self._match_summary_payload(match)
+
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            del deadline
+            assert element_index is not None
+            _perform_guarded(
+                host, element_index, "AXPress", pid, f"mac.do.{op}", host._frontmost_app()
+            )
+
+        return self._input_verb(
+            op=op,
+            app=app,
+            request=request,
+            timeout=timeout,
+            postcondition=postcondition,
+            once=once,
+            dry_run=dry_run,
+            prepare=prepare,
+            dispatch=dispatch,
+            executor=Executor.PYTHON,
+        )
+
     def _input_verb(
         self,
         *,
@@ -2812,16 +2935,19 @@ class Operations:
         dry_run: bool,
         prepare: Callable[[_Host, int, _Deadline], JSONValue],
         dispatch: Callable[[_Host, int, _Deadline], dict[str, JSONValue] | None],
+        executor: Executor = Executor.INPUT,
     ) -> Receipt:
-        """The pipeline every raw-input verb (``key``, ``click``, ``type``)
-        shares: one exact ``app``, no AX target to resolve, an `Executor.INPUT`
-        receipt, and ``acted`` judged from whether the posted events raised.
+        """The pipeline every verb aimed at one exact ``app`` shares: the
+        input verbs (``key``, ``click``, ``type``, ``fill``) and the menu
+        verbs, which press the item a path leads to. The receipt names
+        ``executor``, and ``acted`` is judged from whether ``dispatch``
+        raised.
 
         ``prepare`` runs once the app is resolved and before anything is
         reserved or dispatched: it validates what is about to be sent and
         may return extra ``target`` fields (a click's resolved screen
-        point), so a dry run reports them too. ``dispatch`` posts the
-        input to ``pid``.
+        point), so a dry run reports them too. ``dispatch`` acts on
+        ``pid``.
         """
         self._check_owner()
         host = self._host
@@ -2843,7 +2969,7 @@ class Operations:
             op=op,
             host=host,
             backend=backend,
-            executor=Executor.INPUT,
+            executor=executor,
             request=request,
             once=once,
             deadline=deadline,

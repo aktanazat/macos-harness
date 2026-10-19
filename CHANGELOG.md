@@ -72,6 +72,16 @@ follows [Semantic Versioning](https://semver.org/).
   element of another app, or one with no area on screen, is refused before
   anything is posted, and the receipt names the element by its role and
   labels, never its value.
+- `mac.do.menu("View > Reload Page", app=...)` chooses a menu command by its
+  path, each step found only under the one before, so an item two menus
+  share, such as Close under File and under Window, is never ambiguous.
+  `mac.do.status_item(path, app=...)` does the same in the menu of the app's
+  menu bar icon, or with no path opens it; `name=` picks the icon when the
+  app has several, since many have no title or description. Both press
+  through Accessibility without bringing the app forward, match names
+  ignoring case and with "..." for "…", and refuse a disabled item, or a
+  path that leads to no item or to more than one, before anything is
+  pressed.
 
 ### Changed
 

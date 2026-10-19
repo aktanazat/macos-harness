@@ -42,7 +42,8 @@ settled; `see(app, after_change=True)` waits first.
 
 ## Receipts
 
-For a change, use `mac.do.press/set/fill/toggle/key/click/type/run`. Each
+For a change, use
+`mac.do.press/set/fill/toggle/key/click/type/run/menu/status_item`. Each
 returns a `Receipt` or raises `OperationError` with `exc.receipt`.
 `postcondition=` proves the effect; `once=` guards an action you cannot
 repeat. Await the next control in the same program:
@@ -50,11 +51,10 @@ repeat. Await the next control in the same program:
 ```python
 from macos_harness import OperationError
 try:
-    mac.do.press("Next", role="button", app="Xcode")
+    mac.do.menu("Product > Archive", app="Xcode")
 except OperationError as exc:
     print(exc.receipt)
-mac.ax.wait("Upload", role="button", app="Xcode", timeout=15)
-print(mac.see("Xcode"))
+mac.ax.wait("Distribute App", role="button", app="Xcode", timeout=600)
 ```
 
 ## Focus invariants
