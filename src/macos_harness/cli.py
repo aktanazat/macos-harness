@@ -26,12 +26,13 @@ from .telemetry import run_cli as run_telemetry_cli
 
 
 @contextmanager
-def _namespace() -> Iterator[dict[str, object]]:
+def _namespace(program_args: Mapping[str, str] | None = None) -> Iterator[dict[str, object]]:
     from .macos import MacOS
 
     with MacOS() as mac:
         yield {
             "__name__": "__macos_harness__",
+            "args": dict(program_args or {}),
             "browser": BrowserHarness(),
             "mac": mac,
             "Path": Path,
@@ -143,13 +144,18 @@ def _point_at_nearest(exc: AttributeError, namespace: Mapping[str, object]) -> N
         exc.add_note("Nearest calls:\n" + "\n".join(f"  {call}" for call in nearest))
 
 
-def _execute(code: str) -> int:
+def _execute(
+    code: str,
+    *,
+    filename: str = "<macos-harness>",
+    program_args: Mapping[str, str] | None = None,
+) -> int:
     if not code.strip():
         print("No Python code received on stdin", file=sys.stderr)
         return 2
-    with _namespace() as namespace:
+    with _namespace(program_args) as namespace:
         try:
-            exec(compile(code, "<macos-harness>", "exec"), namespace, namespace)  # noqa: S102
+            exec(compile(code, filename, "exec"), namespace, namespace)  # noqa: S102
         except TypeError as exc:
             _explain_bad_call(exc, namespace)
             raise
@@ -179,6 +185,31 @@ def _skill_text(reference: str | None) -> str:
 def _app_query(value: str) -> str | int:
     """An app argument as `MacOS` reads it: all digits is a pid."""
     return int(value) if value.isascii() and value.isdigit() else value
+
+
+def _program_arg(value: str) -> tuple[str, str]:
+    """One ``--arg NAME=VALUE`` of `run`; the value may hold ``=`` too."""
+    name, separator, text = value.partition("=")
+    if not separator or not name:
+        raise argparse.ArgumentTypeError(f"expected NAME=VALUE, got {value!r}")
+    return name, text
+
+
+def _saved_program(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> tuple[str, dict[str, str]]:
+    """`run`'s program and its ``args``; a bad invocation exits 2 before
+    anything runs."""
+    program_args = dict(args.program_args)
+    if len(program_args) < len(args.program_args):
+        parser.error("give each --arg name once")
+    try:
+        program = args.file.read_text(encoding="utf-8")
+    except OSError as exc:
+        parser.error(f"cannot read {args.file}: {exc.strerror or exc}")
+    if not program.strip():
+        parser.error(f"{args.file} holds no Python code")
+    return program, program_args
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -235,6 +266,25 @@ def _build_parser() -> argparse.ArgumentParser:
     state.add_argument("--max-depth", type=int, default=25)
     state.add_argument("--max-nodes", type=int, default=5000)
     state.add_argument("--include-menu-bar", action="store_true")
+    run = subparsers.add_parser(
+        "run", help="run a saved program; each --arg NAME=VALUE lands in its `args` dict"
+    )
+    run.add_argument("file", type=Path, help="a Python program, run like one on stdin")
+    run.add_argument(
+        "--arg",
+        action="append",
+        default=[],
+        type=_program_arg,
+        dest="program_args",
+        metavar="NAME=VALUE",
+        help="a string the program reads as args[NAME]; repeat for more",
+    )
+    run.add_argument(
+        "--json-errors",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="write execution errors as JSON to stderr",
+    )
     return parser
 
 
@@ -247,10 +297,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "telemetry":
         return run_telemetry_cli([args.action] if args.action else [])
+    saved = _saved_program(parser, args) if args.command == "run" else None
 
     started = time.monotonic()
     result: int | None = None
     try:
+        if saved is not None:
+            program, program_args = saved
+            result = _execute(program, filename=str(args.file), program_args=program_args)
+            return result
         if args.command == "doctor":
             from .macos import MacOS
 
@@ -322,7 +377,7 @@ def main(argv: list[str] | None = None) -> int:
             return result
         parser.error(f"unknown command: {args.command}")
     except (MacOSError, RuntimeError) as exc:
-        if args.command is None and args.json_errors and isinstance(exc, MacOSError):
+        if args.command in (None, "run") and args.json_errors and isinstance(exc, MacOSError):
             payload = exc.to_json()
             if isinstance(exc, OperationError):
                 payload["receipt"] = exc.receipt.to_json()

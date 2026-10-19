@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -276,6 +277,85 @@ def test_stdin_unknown_name_lists_the_nearest_calls(program, nearest) -> None:
 
     assert lines[listed - 1].startswith("AttributeError: 'Accessibility' object has no attribute")
     assert [line.strip() for line in lines[listed + 1 :]] == nearest
+
+
+def _harness(*argv: str) -> subprocess.CompletedProcess[str]:
+    """``macos-harness`` with ``argv``, in its own process."""
+    return subprocess.run(
+        [sys.executable, "-m", "macos_harness.cli", *argv],
+        text=True, capture_output=True, timeout=10, check=False,
+        env={**os.environ, "DO_NOT_TRACK": "1", "MACOS_HARNESS_BACKEND": "python"},
+    )
+
+
+def test_run_gives_a_saved_program_its_args(tmp_path: Path) -> None:
+    """Agents edited saved programs 77 times to change a pid or a label
+    between runs; `run` hands each `--arg` to the program as a string."""
+    flow = tmp_path / "flow.py"
+    flow.write_text("import json\nprint(json.dumps(args, sort_keys=True))\n", encoding="utf-8")
+
+    result = _harness(
+        "run", str(flow),
+        "--arg", "pid=123", "--arg", "label=Save as", "--arg", "query=a=b", "--arg", "note=",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "label": "Save as", "note": "", "pid": "123", "query": "a=b",
+    }
+
+
+@pytest.mark.parametrize(
+    ("program", "arguments", "complaint"),
+    [
+        ("print('ran')\n", ["--arg", "pid"], "expected NAME=VALUE, got 'pid'"),
+        ("print('ran')\n", ["--arg", "=123"], "expected NAME=VALUE, got '=123'"),
+        ("print('ran')\n", ["--arg", "pid=1", "--arg", "pid=2"], "give each --arg name once"),
+        (None, [], "cannot read"),
+        ("\n", [], "holds no Python code"),
+    ],
+    ids=["no-equals", "no-name", "name-twice", "missing-file", "empty-file"],
+)
+def test_run_refuses_a_bad_invocation_before_running(tmp_path: Path, program, arguments, complaint) -> None:
+    flow = tmp_path / "flow.py"
+    if program is not None:
+        flow.write_text(program, encoding="utf-8")
+
+    result = _harness("run", str(flow), *arguments)
+
+    assert result.returncode == 2
+    assert complaint in result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["--json-errors", "run", "FLOW"], ["run", "FLOW", "--json-errors"]],
+    ids=["before-run", "after-the-file"],
+)
+def test_run_writes_json_errors_wherever_the_flag_goes(tmp_path: Path, argv) -> None:
+    flow = tmp_path / "flow.py"
+    flow.write_text(
+        "from macos_harness import ErrorCode, MacOSError\n"
+        "raise MacOSError('stop', code=ErrorCode.TIMEOUT)\n",
+        encoding="utf-8",
+    )
+
+    result = _harness(*[str(flow) if part == "FLOW" else part for part in argv])
+
+    assert result.returncode == 1
+    error = json.loads(result.stderr.splitlines()[-1])
+    assert (error["code"], error["message"]) == ("timeout", "stop")
+
+
+def test_run_traceback_names_the_saved_file_and_line(tmp_path: Path) -> None:
+    flow = tmp_path / "flow.py"
+    flow.write_text("x = 1\nraise ValueError('stop')\n", encoding="utf-8")
+
+    result = _harness("run", str(flow))
+
+    assert result.returncode == 1
+    assert f'File "{flow}", line 2' in result.stderr
 
 
 @pytest.mark.parametrize(

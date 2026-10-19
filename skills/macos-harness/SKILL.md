@@ -6,7 +6,8 @@ description: "Read when a task has to drive a native or Electron macOS app: a wi
 # macOS Harness
 
 One CLI call per decision point, not per primitive. `mac`, `Path`, and
-`subprocess` are preloaded; `--json-errors` prints failures as JSON.
+`subprocess` are preloaded; `--json-errors` prints failures as JSON;
+`macos-harness run flow.py --arg pid=42` reruns a saved program with `args`.
 
 ```bash
 macos-harness <<'PY'
@@ -16,7 +17,7 @@ print(mac.see("Spotify"))
 PY
 ```
 
-In omp, `tool.read` the PNG in the same eval cell.
+In omp, `tool.read` the PNG in the same cell.
 
 Bundle reversible steps; verify once at the end. Stop only for unclear
 identity, an irreversible action, or unexpected state.
@@ -60,7 +61,7 @@ print(mac.see("Xcode"))
 - Input goes to a running app's process; only `mac.activate(app)` brings it forward.
 - A target that comes forward itself raises `FocusChangedError`; never move focus back.
 - Never launch a closed app or open a URL scheme when focus is forbidden.
-- AXError -25204 (no answer in time) may still have acted: look before retrying.
+- AXError -25204 may still have acted: look before retrying.
 - After one verified failure, switch mode or stop; never repeat keys or clicks.
 - Never close or quit windows, documents, apps, or handoffs you did not open: `invariants`.
 
@@ -77,12 +78,12 @@ Run `macos-harness doctor` only after a permission or connection error.
 
 `macos-harness skill <name>` prints one after a compaction:
 
-- `signatures`: every exact signature
-- `receipts`: outcomes, errors, once tokens, history, logs
-- `ax-search`: roles, scopes, exact labels, waits
-- `invariants`: cleanup, focus, input, windows, modes
+- `signatures`: every signature
+- `receipts`: outcomes, errors, once tokens, logs
+- `ax-search`: roles, scopes, labels, waits
+- `invariants`: cleanup, focus, input, windows
 - `routes`: saved navigation
 - `diagnostics`: inspect a failure first
 - `handoff`: the call and what follows
-- `credentials`: login boundaries, permissions
+- `credentials`: logins, permissions
 - `native-backend`: the optional backend

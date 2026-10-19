@@ -20,6 +20,11 @@ Without a program, `macos-harness see APP_OR_PID --path out.png --window-index 0
 captures one window and prints the same result as `mac.see`;
 `macos-harness see --window-id N` captures any window.
 
+`macos-harness run FILE.py [--arg NAME=VALUE ...] [--json-errors]` runs a
+saved program the way stdin runs one, with each `--arg` as a string in the
+`args` dict: `pid = int(args["pid"])`. A malformed `--arg`, a name given
+twice, or an unreadable or empty file exits 2 before anything runs.
+
 ## Primitives
 
 ```text

@@ -53,6 +53,11 @@ follows [Semantic Versioning](https://semver.org/).
   next search in one run; a match, which now carries its app's `pid`, is
   found again by role, labels, and frame in any later run, and raises
   `element.unknown` when that finds no element or more than one.
+- `macos-harness run FILE.py --arg NAME=VALUE` runs a saved program with
+  each `--arg` as a string in its `args` dict, so a rerun with another pid
+  or label no longer means editing the file. Tracebacks name the file and
+  line, and `--json-errors` works before `run` or after the file. A
+  malformed `--arg` exits 2 before anything runs.
 
 ### Changed
 
