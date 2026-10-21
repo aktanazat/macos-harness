@@ -157,6 +157,46 @@ class _Slide(_Screen):
         )
 
 
+_RETURN = 36  # kVK_Return
+_TYPED = (150, 60, 100, 20)
+_ANSWER = (150, 160, 100, 40)
+
+
+class _Form(_Screen):
+    """`_Screen` over a form whose typed text shows at once and whose
+    answer to Return shows 0.3 seconds after it, as a server's does."""
+
+    def __init__(self) -> None:
+        super().__init__(_BLANK)
+        self.typed = False
+        self.returned_at: float | None = None
+
+    def _ensure_post_events(self) -> None:
+        return None
+
+    def _post(self, event: object, pid: int | None) -> None:
+        if Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode) != _RETURN:
+            self.typed = True
+        elif self.returned_at is None:
+            self.returned_at = self.clock
+
+    def _window_image(
+        self,
+        window_id: int,
+        *,
+        max_width: int | None,
+        max_height: int | None,
+        size: tuple[int, int] | None = None,
+    ) -> WindowCapture:
+        blocks = [_TYPED] if self.typed else []
+        if self.returned_at is not None and self.clock >= self.returned_at + 0.3:
+            blocks.append(_ANSWER)
+        return WindowCapture(
+            image=_frame(*blocks), width=800, height=600, bounds=_BOUNDS,
+            on_screen=True, captured_at=0.0,
+        )
+
+
 def _outcome(call: Callable[[], Mapping[str, object]]) -> Mapping[str, object]:
     """What the wait reports, whether it returned or timed out."""
     try:
@@ -255,6 +295,22 @@ def test_a_new_session_sees_the_change_its_own_key_made(
 
     assert changed is True
     assert mac.captured_after.count(0) == 1
+
+
+def test_a_wait_after_typing_and_return_measures_from_just_before_return(
+    tmp_path: Path,
+) -> None:
+    """The typing showed at once and Return's answer comes 0.3 seconds
+    later: Return pictures the window again, so the wait measures from
+    the typed text and captures the answer instead of returning on the
+    typing."""
+    mac = _Form()
+
+    mac.type("hello", app="Test")
+    mac.key("Return", app="Test")
+    shot = mac.see("Test", path=tmp_path / "after.png", after_change=True, timeout=2.0)
+
+    assert _png_gray(shot["path"], 400, 360) == 0
 
 
 def test_a_blinking_caret_is_no_change() -> None:

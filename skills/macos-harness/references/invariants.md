@@ -45,16 +45,16 @@ with repeated keys, clicks, deletion loops, or bulk input.
   before typing; the final screenshot verifies the whole sequence.
 - Poll inside the same program instead of sleeping or asking again in another
   call: `mac.ax.wait` and `mac.do.expect` for AX or Apple Events state,
-  `mac.wait_change(app)` for how a window looks. It measures against the last
-  `see` of that window, else the window just before the program's first input
-  to it, or where the last wait on it settled, so a change the action already
-  made counts (with none of these, against the window when called), and
-  returns once the new look has held still `settle` seconds. About one
-  changed word of text counts; a blinking caret does not. `region=(x, y, w, h)`
-  in that `see`'s pixels watches a smaller change, and `by="ax"` the app's
-  text. Nothing changing by `timeout` raises `timeout` with `details["changed"]`
-  False; `mac.see(app, after_change=True)` reports `changed` instead and
-  captures.
+  `mac.wait_change(app)` for how a window looks. It measures from just before
+  the program's latest input to that window, or from its last `see` or wait
+  when no input came after that, so a change the action already made counts
+  and an earlier action's does not (with none of these, against the window
+  when called), and returns once the new look has held still `settle` seconds.
+  About one changed word of text counts; a blinking caret does not.
+  `region=(x, y, w, h)` in that `see`'s pixels watches a smaller change, and
+  `by="ax"` the app's text. Nothing changing by `timeout` raises `timeout` with
+  `details["changed"]` False; `mac.see(app, after_change=True)` reports
+  `changed` instead and captures.
 - Use the cheapest strong end-state check: one screenshot for visible state or
   one exact AX query for semantic state; both only when they prove different
   things.
