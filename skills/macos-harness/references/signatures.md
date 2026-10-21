@@ -56,9 +56,10 @@ mac.handoff(*, reason, app)
 `mac.windows()` lists every app's normal windows on screen, front to back;
 `all_layers=True` adds menus, popovers, panels, prompts, and the menu bar.
 Each entry has `window_id`, `pid`, `owner`, and `layer`. `see(window_id=N)`
-captures any of them and reports its `layer` and owner `pid`. From macOS
-14.2 a window is pictured on its own: a sheet, popover, or tip attached
-to it is a window of its own, so look at it with `see(window_id=N)`.
+captures any of them and reports its `layer` and owner `pid`. A window's
+picture shows the sheets, popovers, and tips attached to it where they
+cover it; what hangs past the window's edge is cut off there, and
+`see(window_id=N)` pictures that window whole.
 Pointer input picks only a normal window under the point unless
 `window_id=N` names the surface, so a click meant for a panel never lands
 in the window behind it.

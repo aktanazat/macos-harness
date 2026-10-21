@@ -434,14 +434,15 @@ follows [Semantic Versioning](https://semver.org/).
   `mac.ax.get_attributes` is unchanged: a bulk sample where an unreadable
   attribute is `None`.
 - `mac.see` and `mac.wait_change` pictured a window together with every
-  sheet, popover, or tip attached to it, the group squeezed into the
-  window's own pixel size, so the picture no longer matched its `bounds`.
-  Calculator's mode tip, hanging over the window's top edge, drew the
-  window at half size, so a key press changed too few pixels to count and
-  `wait_change` ran its full 30 seconds. From macOS 14.2 a window is now
-  pictured on its own at full size; whatever is attached to it is a window
-  of its own that `mac.windows()` lists and `see(window_id=N)` pictures.
-  Earlier systems have no setting for this and capture as before.
+  sheet, popover, or tip attached to it, and when one hung past the
+  window's edge the group was squeezed into the window's own pixel size,
+  so the picture no longer matched its `bounds`. Calculator's mode tip,
+  hanging over the window's top edge, drew the window at half size, so a
+  key press changed too few pixels to count and `wait_change` ran its full
+  30 seconds. Such a window is now cut out of the display it sits on: full
+  size, with whatever is attached drawn where it covers the window. A
+  window partly off screen or across two displays still renders the old
+  way.
 
 ### Removed
 
