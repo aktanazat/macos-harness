@@ -195,6 +195,21 @@ def test_resolve_app_exact_pid_not_running_carries_code_and_query(direct, listin
     assert mac.listings == listings
 
 
+def test_resolve_app_string_pid_matches_only_that_exact_pid() -> None:
+    mac = _PidTable(
+        listed=[_FakeRunningApp(15012, name="Notes"), _FakeRunningApp(907, name="Terminal")]
+    )
+
+    # 501 is not running, and must not resolve to 15012 because "501" happens
+    # to appear inside it.
+    with pytest.raises(ApplicationNotFoundError, match="No running application matches"):
+        mac._resolve_app("501")
+
+    assert mac._resolve_app("907")[1]["pid"] == 907
+    assert mac._resolve_app("note")[1]["pid"] == 15012
+
+
+
 def test_resolve_app_string_query_still_enumerates_workspace(monkeypatch) -> None:
     """A name/bundle-id/path/stringified-pid query is unchanged: it still
     scans NSWorkspace.runningApplications(), never the exact-pid fast
