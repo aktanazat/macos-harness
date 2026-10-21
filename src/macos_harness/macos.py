@@ -2815,7 +2815,6 @@ class MacOS:
                 attributes=attributes,
                 include_actions=include_actions,
                 max_nodes=max_nodes,
-                reset_elements=False,
             ), pid)
         if error != _AX_SUCCESS:
             raise _ax_error("AXUIElementsForSearchPredicate", error, element_index=element_index)
@@ -2872,7 +2871,6 @@ class MacOS:
         attributes: Iterable[str],
         include_actions: bool,
         max_nodes: int,
-        reset_elements: bool,
     ) -> SearchMatches:
         """Search a small ordinary AX tree when optimized search is unavailable.
 
@@ -2880,7 +2878,10 @@ class MacOS:
         it is hidden, and the requested attributes a match can rest on --
         and describes each match afresh, so the rest of ``attributes``
         costs nothing per node. A search for what is on screen
-        (`_on_screen_only`) leaves out what closed menus hold.
+        (`_on_screen_only`) leaves out what closed menus hold. The walk
+        numbers nodes into a table of its own; only the matches get
+        handles, as on the optimized path, so a search that keeps earlier
+        handles grows the registry by what it returns.
         """
         if max_nodes <= 0:
             raise MacOSError(
@@ -2911,18 +2912,22 @@ class MacOS:
                 )
             )
         )
-        snapshot = self._snapshot_tree(
-            root,
-            # Chromium trees run deeper than native ones: Slack's reaches 28.
-            max_depth=1 if immediate_descendants_only else 50,
-            max_nodes=max_nodes,
-            include_menu_bar=True,
-            attributes=traversal_attributes,
-            include_actions=False,
-            include_settable=False,
-            reset_elements=reset_elements,
-            skip_closed_menus=_on_screen_only(visible_only, search_key),
-        )
+        held = self._elements
+        try:
+            snapshot = self._snapshot_tree(
+                root,
+                # Chromium trees run deeper than native ones: Slack's reaches 28.
+                max_depth=1 if immediate_descendants_only else 50,
+                max_nodes=max_nodes,
+                include_menu_bar=True,
+                attributes=traversal_attributes,
+                include_actions=False,
+                include_settable=False,
+                skip_closed_menus=_on_screen_only(visible_only, search_key),
+            )
+            walked = self._elements
+        finally:
+            self._elements = held
         nodes = snapshot.nodes[1:]
         if direction.casefold() == "previous":
             nodes.reverse()
@@ -2945,11 +2950,11 @@ class MacOS:
                 if len(matches) >= result_limit:
                     cut = True
                     break
-                index = int(node["element_index"])
+                element = walked[int(node["element_index"])]
                 matches.append(
                     self._describe_element(
-                        self._element(index),
-                        index,
+                        element,
+                        self._remember_element(element),
                         attributes=described,
                         include_actions=include_actions,
                     )

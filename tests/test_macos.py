@@ -649,7 +649,7 @@ def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
 
     assert results == [
         {
-            "element_index": 3,
+            "element_index": 4,
             "role": "AXStaticText",
             "value": "Alessia playlist",
             "pid": 42,
@@ -659,6 +659,23 @@ def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
     # never examined and this list may not be every match.
     assert results.complete is False
     assert results.visited == 4
+
+
+def test_ax_search_fallback_keeping_handles_registers_only_its_matches(monkeypatch) -> None:
+    """Fallback searches that keep earlier handles grow the registry by their matches only."""
+    mac = MacOS()
+    root, button, match = (object() for _ in range(3))
+    children = {root: [button, match]}
+    data = {
+        button: {"AXRole": "AXButton", "AXTitle": "Save"},
+        match: {"AXRole": "AXStaticText", "AXValue": "Alessia playlist"},
+    }
+    _bounded_tree(monkeypatch, mac, root, children, data)
+
+    for _ in range(3):
+        mac.ax_search(app="Spotify", text="Alessia", include_actions=False, reset_elements=False)
+
+    assert list(mac._elements.values()) == [match, match, match]
 
 
 @pytest.mark.parametrize(
