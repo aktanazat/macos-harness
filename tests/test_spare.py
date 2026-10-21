@@ -88,6 +88,15 @@ def _child(pid: int) -> int:
     raise AssertionError(f"process {pid} started no spare")
 
 
+def _appears(path: Path) -> bool:
+    """Whether ``path`` exists within a second."""
+    for _ in range(20):
+        if path.exists():
+            return True
+        time.sleep(0.05)
+    return False
+
+
 class _Shell:
     def __init__(self, env: dict[str, str]) -> None:
         requests_end, self.requests = os.pipe()
@@ -546,6 +555,39 @@ def test_a_spare_that_loaded_during_a_change_is_replaced_unasked(
 
     assert loading_gone
     assert replacement != loading
+
+
+def test_a_step_that_loads_another_copy_of_the_package_leaves_no_spare_restarting(
+    shell: _Shell, tmp_path: Path
+) -> None:
+    """The spare loaded for it takes that copy, finds it is not the
+    broker's, and exits; the broker then waits for the next step instead of
+    loading the same copy again and again."""
+    package = tmp_path / "macos_harness"
+    shutil.copytree(
+        Path(macos_harness.__file__).parent,
+        package,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    loads = tmp_path / "loads"
+    spare = package / "spare.py"
+    spare.write_text(
+        spare.read_text() + f"\nif sys.argv[0] == '-c':\n    open({str(loads)!r}, 'a').write('.')\n"
+    )
+    shell.served(_PID)
+    for _ in range(20):
+        # Long enough for the next spare to be ready for the step.
+        time.sleep(0.5)
+        shell.step(_PID, env={"PYTHONPATH": str(tmp_path)})
+        if _appears(loads):
+            break
+    # Room for several more loads of the copy, had the broker restarted it.
+    time.sleep(2)
+    loaded = loads.read_text()
+    after, out, _err = shell.served(_PID)
+
+    assert loaded == "."
+    assert int(out.split()[0]) != after.pid
 
 
 def test_a_step_with_other_load_time_settings_never_gets_a_spare_loaded_without_them(

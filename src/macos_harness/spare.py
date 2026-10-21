@@ -374,10 +374,17 @@ class _Spare:
     """One spare child, and the broker's ends of its four pipes."""
 
     def __init__(
-        self, popen: subprocess.Popen[bytes], control: int, requests: int, out: int, err: int
+        self,
+        popen: subprocess.Popen[bytes],
+        digest: str,
+        control: int,
+        requests: int,
+        out: int,
+        err: int,
     ) -> None:
         self.popen = popen
         self.pid = popen.pid
+        self.digest = digest
         self.control = _Frames(control)
         self.requests = requests
         self.outputs = {out: b"o", err: b"e"}
@@ -449,6 +456,7 @@ class _Broker:
             self._abandon()
 
     def _spawn(self) -> None:
+        digest = _code_digest()
         control, control_end = os.pipe()
         requests_end, requests = os.pipe()
         out, out_end = os.pipe()
@@ -463,7 +471,7 @@ class _Broker:
                     _SPARE,
                     *map(str, ends),
                     str(os.getpid()),
-                    _code_digest(),
+                    digest,
                 ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -479,7 +487,7 @@ class _Broker:
         finally:
             for fd in ends:
                 os.close(fd)
-        spare = _Spare(popen, control, requests, out, err)
+        spare = _Spare(popen, digest, control, requests, out, err)
         exit_event = select.kevent(
             popen.pid,
             select.KQ_FILTER_PROC,
@@ -525,7 +533,9 @@ class _Broker:
             return
         self._spare = None
         if not self._serving:
-            if spare.close() == _STALE:
+            # A spare also exits stale when the step's environment loads
+            # another copy of the package; loading that again would loop.
+            if spare.close() == _STALE and _code_digest() != spare.digest:
                 self._renew()
                 self._spawn()
             return
