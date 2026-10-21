@@ -191,8 +191,8 @@ def _output_size(
 
 def _window_configuration(width: int, height: int) -> object:
     """How one window renders: into exactly ``width`` x ``height`` pixels,
-    shrunk to fit but never enlarged, with no shadow, no cursor, and no
-    window but that one."""
+    shrunk to fit but never enlarged, with no shadow, no cursor, and, from
+    macOS 14.2, no window but that one."""
     config = SCK.SCStreamConfiguration.alloc().init()
     config.setWidth_(width)
     config.setHeight_(height)
@@ -206,8 +206,9 @@ def _window_configuration(width: int, height: int) -> object:
     config.setShouldBeOpaque_(False)
     # ScreenCaptureKit otherwise draws the windows attached to this one too
     # and shrinks the group into this window's pixels: an overhanging tip
-    # halved Calculator.
-    config.setIncludeChildWindows_(False)
+    # halved Calculator. The switch arrived in macOS 14.2.
+    if config.respondsToSelector_("setIncludeChildWindows:"):
+        config.setIncludeChildWindows_(False)
     return config
 
 
@@ -225,8 +226,8 @@ def capture_window(
     axis; ``size`` asks for exactly that many pixels instead, so a later
     capture compares pixel for pixel with an earlier one. The window is
     captured on its own (``desktopIndependentWindow``): no shadow, no other
-    window, not even a sheet, popover, or tip attached to it, and no
-    clipping at the screen edge. An
+    window (from macOS 14.2 not even a sheet, popover, or tip attached to
+    it), and no clipping at the screen edge. An
     off-screen window still renders, but from whatever the app last drew --
     apps do not repaint hidden content, so ``on_screen`` is the caller's
     only freshness signal.

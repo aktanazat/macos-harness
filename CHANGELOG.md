@@ -438,10 +438,10 @@ follows [Semantic Versioning](https://semver.org/).
   window's own pixel size, so the picture no longer matched its `bounds`.
   Calculator's mode tip, hanging over the window's top edge, drew the
   window at half size, so a key press changed too few pixels to count and
-  `wait_change` ran its full 30 seconds. A window is now pictured on its
-  own at full size; whatever is attached to it is a window of its own that
-  `mac.windows()` lists and `see(window_id=N)` pictures. Window capture now
-  needs macOS 14.2 or later.
+  `wait_change` ran its full 30 seconds. From macOS 14.2 a window is now
+  pictured on its own at full size; whatever is attached to it is a window
+  of its own that `mac.windows()` lists and `see(window_id=N)` pictures.
+  Earlier systems have no setting for this and capture as before.
 
 ### Removed
 
