@@ -83,6 +83,18 @@ follows [Semantic Versioning](https://semver.org/).
   ignoring case and with "..." for "…", and refuse a disabled item, or a
   path that leads to no item or to more than one, before anything is
   pressed.
+- `macos-harness spare`, started once as a shell's coprocess, keeps one
+  process with the harness loaded for that shell's next step: a program on
+  stdin, or `run` with stdin from `/dev/null`. Each spare runs one step and
+  exits while the next one loads. On Calculator an empty step took 58ms
+  instead of 133ms, a window picture 200ms instead of 272ms, and a key
+  226ms instead of 297ms (15 runs each, alternating). A step runs in its
+  own process as before when its output is a terminal, it uses other
+  Python flags or load-time settings, another step from the shell is
+  running, no spare is ready, or the installed code changed since the
+  spare loaded. The spare exits with its shell, even after `kill -9`, and
+  with the step it serves; only commands the shell starts hold its pipes.
+  `macos-harness skill spare` prints the setup lines.
 
 ### Changed
 

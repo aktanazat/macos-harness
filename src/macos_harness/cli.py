@@ -285,6 +285,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="write execution errors as JSON to stderr",
     )
+    subparsers.add_parser(
+        "spare",
+        help="as this shell's coprocess, keep a loaded process ready for its next step",
+    )
     return parser
 
 
@@ -293,10 +297,20 @@ def _print_json_line(payload: Mapping[str, object], *, file: TextIO) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        from .spare import run_in_spare
+
+        status = run_in_spare(sys.argv[1:])
+        if status is not None:
+            return status
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "telemetry":
         return run_telemetry_cli([args.action] if args.action else [])
+    if args.command == "spare":
+        from .spare import serve_shell
+
+        return serve_shell()
     saved = _saved_program(parser, args) if args.command == "run" else None
 
     started = time.monotonic()

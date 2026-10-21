@@ -1,0 +1,444 @@
+"""A shell's spare runs exactly one step for that shell, then exits.
+
+The test process plays the agent's shell: it starts ``macos-harness spare``
+as its coprocess and keeps the other ends of both pipes, as ``coproc`` does,
+and every step is a real ``macos-harness`` process started from it.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+import macos_harness
+from macos_harness.spare import ENV
+
+_PID = "import os\nprint(os.getpid(), flush=True)\n"
+_STAND_IN_SHELL = """\
+import os, subprocess, sys, time
+requests_end, requests = os.pipe()
+replies, replies_end = os.pipe()
+broker = subprocess.Popen(
+    [sys.executable, "-m", "macos_harness.cli", "spare"], stdin=requests_end, stdout=replies_end
+)
+os.close(requests_end)
+os.close(replies_end)
+server = subprocess.Popen(["sleep", "600"], pass_fds=(replies, requests))
+print(broker.pid, server.pid, flush=True)
+time.sleep(600)
+"""
+_CLIENT_LOADS = """\
+import atexit, sys
+atexit.register(lambda: open({path!r}, "w").write("\\n".join(sys.modules)))
+from macos_harness.cli import main
+raise SystemExit(main())
+"""
+
+
+def _env(**extra: str) -> dict[str, str]:
+    inherited = {name: value for name, value in os.environ.items() if name != ENV}
+    return {**inherited, "DO_NOT_TRACK": "1", **extra}
+
+
+def _cli(*args: str) -> list[str]:
+    return [sys.executable, "-m", "macos_harness.cli", *args]
+
+
+def _gone(pid: int) -> bool:
+    """Whether ``pid`` is gone within ten seconds."""
+    for _ in range(200):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _child(pid: int) -> int:
+    """The child ``pid`` started, once there is one."""
+    for _ in range(200):
+        found = subprocess.run(
+            ["pgrep", "-P", str(pid)], capture_output=True, text=True, check=False
+        ).stdout.split()
+        if found:
+            return int(found[0])
+        time.sleep(0.05)
+    raise AssertionError(f"process {pid} started no spare")
+
+
+class _Shell:
+    def __init__(self, env: dict[str, str]) -> None:
+        requests_end, self.requests = os.pipe()
+        self.replies, replies_end = os.pipe()
+        self.broker = subprocess.Popen(
+            _cli("spare"), stdin=requests_end, stdout=replies_end, env=env
+        )
+        os.close(requests_end)
+        os.close(replies_end)
+        self.env = {**env, ENV: f"{self.replies},{self.requests}"}
+        self._steps: list[subprocess.Popen[bytes]] = []
+
+    def start(
+        self,
+        command: list[str],
+        *,
+        stdin: int = subprocess.PIPE,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.Popen[bytes]:
+        step = subprocess.Popen(
+            command,
+            stdin=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            env={**self.env, **(env or {})},
+            pass_fds=(self.replies, self.requests),
+        )
+        self._steps.append(step)
+        return step
+
+    def step(
+        self,
+        program: str | None,
+        command: list[str] | None = None,
+        *,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+    ) -> tuple[subprocess.Popen[bytes], str, str]:
+        """Run one step to its end; a None program leaves stdin empty."""
+        step = self.start(
+            command or _cli(),
+            stdin=subprocess.DEVNULL if program is None else subprocess.PIPE,
+            cwd=cwd,
+            env=env,
+        )
+        out, err = step.communicate(None if program is None else program.encode(), timeout=60)
+        return step, out.decode(), err.decode()
+
+    def served(
+        self,
+        program: str | None,
+        command: list[str] | None = None,
+        *,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+    ) -> tuple[subprocess.Popen[bytes], str, str]:
+        """Run a step that prints its pid first until a spare runs it."""
+        for _ in range(100):
+            step, out, err = self.step(program, command, cwd=cwd, env=env)
+            if int(out.split()[0]) != step.pid:
+                return step, out, err
+            time.sleep(0.05)
+        raise AssertionError("no spare ran a step")
+
+    def held(self, program: str) -> tuple[subprocess.Popen[bytes], int]:
+        """Start a step that prints its pid and keeps going until a spare runs it."""
+        for _ in range(100):
+            step = self.start(_cli())
+            assert step.stdin is not None and step.stdout is not None
+            step.stdin.write(program.encode())
+            step.stdin.close()
+            pid = int(step.stdout.readline())
+            if pid != step.pid:
+                return step, pid
+            step.kill()
+            step.wait()
+            time.sleep(0.05)
+        raise AssertionError("no spare ran a step")
+
+    def close(self) -> None:
+        for step in self._steps:
+            if step.poll() is None:
+                step.kill()
+            step.wait()
+            for pipe in (step.stdin, step.stdout, step.stderr):
+                if pipe is not None:
+                    pipe.close()
+        os.close(self.requests)
+        os.close(self.replies)
+        self.broker.wait(timeout=10)
+
+
+@pytest.fixture
+def shell() -> Iterator[_Shell]:
+    started = _Shell(_env())
+    yield started
+    started.close()
+
+
+def test_each_step_gets_a_fresh_spare_that_exits_after_it(shell: _Shell) -> None:
+    first, out, _err = shell.served(
+        "import builtins, os\nprint(os.getpid())\nbuiltins.left_behind = True\n"
+    )
+    first_spare = int(out)
+    second, out, _err = shell.served(
+        "import builtins, os\nprint(os.getpid(), hasattr(builtins, 'left_behind'))\n"
+    )
+    second_spare, left_behind = out.split()
+
+    assert first_spare != first.pid
+    assert int(second_spare) not in (second.pid, first_spare)
+    assert left_behind == "False"
+    assert _gone(first_spare)
+
+
+def test_a_served_step_keeps_its_output_status_directory_and_environment(
+    shell: _Shell, tmp_path: Path
+) -> None:
+    program = (
+        "import os, sys\n"
+        "print(os.getpid())\n"
+        "print(os.getcwd())\n"
+        f"print(os.environ['STEP_NOTE'], os.environ.get({ENV!r}))\n"
+        "print('on stderr', file=sys.stderr)\n"
+        "raise SystemExit(3)\n"
+    )
+
+    step, out, err = shell.served(program, cwd=tmp_path, env={"STEP_NOTE": "kept"})
+
+    pid, directory, note = out.splitlines()
+    assert int(pid) != step.pid
+    assert directory == os.path.realpath(tmp_path)
+    assert note == "kept None"
+    assert err == "on stderr\n"
+    assert step.returncode == 3
+
+
+def test_a_saved_program_is_served_with_its_arguments(shell: _Shell, tmp_path: Path) -> None:
+    flow = tmp_path / "flow.py"
+    flow.write_text("import os\nprint(os.getpid(), args['note'])\n")
+
+    step, out, _err = shell.served(None, _cli("run", str(flow), "--arg", "note=kept"))
+
+    pid, note = out.split()
+    assert int(pid) != step.pid
+    assert note == "kept"
+    assert step.returncode == 0
+
+
+def test_a_step_runs_in_its_own_process_while_no_spare_is_ready() -> None:
+    requests_end, requests = os.pipe()
+    replies, replies_end = os.pipe()
+    step = subprocess.Popen(
+        _cli(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_env(**{ENV: f"{replies},{requests}"}),
+        pass_fds=(replies, requests),
+    )
+    broker = subprocess.Popen(
+        _cli("spare"), stdin=requests_end, stdout=replies_end, env=_env()
+    )
+    for fd in (requests_end, replies_end):
+        os.close(fd)
+
+    out, err = step.communicate(_PID.encode(), timeout=60)
+    for fd in (requests, replies):
+        os.close(fd)
+    broker.wait(timeout=10)
+
+    assert int(out) == step.pid
+    assert err == b""
+    assert step.returncode == 0
+
+
+def test_a_second_step_at_once_runs_in_its_own_process_and_takes_no_output(
+    shell: _Shell, tmp_path: Path
+) -> None:
+    release = tmp_path / "release"
+    first, spare = shell.held(
+        "import os, time\n"
+        "from pathlib import Path\n"
+        "print(os.getpid(), flush=True)\n"
+        "count = 0\n"
+        f"while not Path({str(release)!r}).exists():\n"
+        "    print(count, flush=True)\n"
+        "    count += 1\n"
+        "    time.sleep(0.001)\n"
+        "print('done', flush=True)\n"
+    )
+
+    second, out, _err = shell.step(_PID)
+    release.touch()
+    assert first.stdout is not None
+    lines = first.stdout.read().decode().split()
+    first.wait(timeout=60)
+
+    assert spare != first.pid
+    assert int(out) == second.pid
+    assert lines[-1] == "done"
+    assert lines[:-1] == [str(count) for count in range(len(lines) - 1)]
+    assert first.returncode == 0
+
+
+def test_a_killed_step_takes_its_spare_with_it(shell: _Shell) -> None:
+    step, spare = shell.held("import os, time\nprint(os.getpid(), flush=True)\ntime.sleep(600)\n")
+
+    step.kill()
+    step.wait()
+
+    assert _gone(spare)
+    after, out, _err = shell.served(_PID)
+    assert int(out) != after.pid
+
+
+def test_the_broker_and_its_spare_die_with_the_shell() -> None:
+    """Even while something the shell started, such as a server, still
+    holds the shell's ends of the pipes."""
+    stand_in = subprocess.Popen(
+        [sys.executable, "-c", _STAND_IN_SHELL], stdout=subprocess.PIPE, env=_env()
+    )
+    assert stand_in.stdout is not None
+    broker, server = map(int, stand_in.stdout.readline().split())
+    try:
+        spare = _child(broker)
+        stand_in.kill()
+        stand_in.wait()
+        broker_gone, spare_gone = _gone(broker), _gone(spare)
+    finally:
+        os.kill(server, signal.SIGKILL)
+        stand_in.stdout.close()
+
+    assert broker_gone
+    assert spare_gone
+
+
+def test_a_spare_dies_with_its_broker_even_mid_step(shell: _Shell) -> None:
+    """Even while the step it serves is stopped and cannot notice."""
+    step, spare = shell.held("import os, time\nprint(os.getpid(), flush=True)\ntime.sleep(600)\n")
+
+    os.kill(step.pid, signal.SIGSTOP)
+    shell.broker.kill()
+    shell.broker.wait()
+    spare_gone = _gone(spare)
+    os.kill(step.pid, signal.SIGCONT)
+    assert step.stderr is not None
+    held_err = step.stderr.read().decode()
+    after, out, err = shell.step(_PID)
+
+    assert spare_gone
+    assert step.wait(timeout=60) == 1
+    assert held_err == (
+        "macos-harness: the spare running this step went away before it finished\n"
+    )
+    assert int(out) == after.pid
+    assert err == ""
+    assert after.returncode == 0
+
+
+@pytest.mark.parametrize("module", ["_version", "ops"])
+def test_a_step_after_a_source_change_runs_the_changed_code(
+    module: str, tmp_path: Path
+) -> None:
+    package = tmp_path / "macos_harness"
+    shutil.copytree(
+        Path(macos_harness.__file__).parent,
+        package,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    source = package / f"{module}.py"
+    program = (
+        "import importlib, os\n"
+        f"changed = importlib.import_module('macos_harness.{module}')\n"
+        "print(os.getpid(), getattr(changed, 'CHANGED', 'never'))\n"
+    )
+    shell = _Shell(_env(PYTHONPATH=str(tmp_path)))
+    try:
+        shell.served(program)
+        seen = []
+        for change in range(3):
+            # Long enough for the next spare to load the code about to change.
+            time.sleep(0.5)
+            source.write_text(source.read_text() + f"\nCHANGED = 'change{change}'\n")
+            _step, out, _err = shell.step(program)
+            seen.append(out.split()[1])
+        _step, out, _err = shell.served(program)
+    finally:
+        shell.close()
+
+    assert seen == ["change0", "change1", "change2"]
+    assert out.split()[1] == "change2"
+
+
+@pytest.mark.parametrize("module", ["ops", "_version"])
+def test_a_spare_that_loaded_during_a_change_is_replaced_unasked(
+    module: str, tmp_path: Path
+) -> None:
+    package = tmp_path / "macos_harness"
+    shutil.copytree(
+        Path(macos_harness.__file__).parent,
+        package,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    ops = package / "ops.py"
+    # Every spare loads ops; half a second there leaves room for the change below.
+    ops.write_text(ops.read_text() + "\nimport time\ntime.sleep(0.5)\n")
+    source = package / f"{module}.py"
+    shell = _Shell(_env(PYTHONPATH=str(tmp_path)))
+    try:
+        shell.served(_PID)
+        loading = _child(shell.broker.pid)
+        source.write_text(source.read_text() + "\nCHANGED = True\n")
+        loading_gone = _gone(loading)
+        replacement = _child(shell.broker.pid)
+    finally:
+        shell.close()
+
+    assert loading_gone
+    assert replacement != loading
+
+
+def test_a_step_with_other_load_time_settings_never_gets_a_spare_loaded_without_them(
+    shell: _Shell,
+) -> None:
+    shell.served(_PID)
+    zone = {"TZ": "Asia/Tokyo"}
+
+    step, out, _err = shell.served(
+        "import os, time\nprint(os.getpid(), time.tzname[0])\n", env=zone
+    )
+
+    assert out.split()[1] == "JST"
+    assert step.returncode == 0
+
+
+def test_a_step_with_other_interpreter_flags_runs_in_its_own_process(shell: _Shell) -> None:
+    shell.served(_PID)
+    command = [sys.executable, "-X", "utf8", "-m", "macos_harness.cli"]
+    seen = []
+    for _ in range(3):
+        # Long enough for the next spare to be ready for the step.
+        time.sleep(0.5)
+        step, out, _err = shell.step("import os, sys\nprint(os.getpid(), sys.flags.utf8_mode)\n", command)
+        seen.append(out.split() == [str(step.pid), "1"])
+
+    assert seen == [True, True, True]
+
+
+def test_a_served_step_leaves_the_frameworks_to_its_spare(
+    shell: _Shell, tmp_path: Path
+) -> None:
+    loaded = tmp_path / "loaded"
+    command = [sys.executable, "-c", _CLIENT_LOADS.format(path=str(loaded))]
+
+    shell.served(_PID, command)
+
+    modules = loaded.read_text().split()
+    assert "macos_harness.spare" in modules
+    assert [
+        name
+        for name in modules
+        if name.split(".")[0] in {"AppKit", "Quartz", "objc", "ApplicationServices"}
+        or name == "macos_harness.macos"
+    ] == []
