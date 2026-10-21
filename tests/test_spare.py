@@ -41,10 +41,17 @@ atexit.register(lambda: open({path!r}, "w").write("\\n".join(sys.modules)))
 from macos_harness.cli import main
 raise SystemExit(main())
 """
+_SCRIPT = "import sys\nfrom macos_harness.cli import main\nsys.exit(main())\n"
 
 
 def _env(**extra: str) -> dict[str, str]:
-    inherited = {name: value for name, value in os.environ.items() if name != ENV}
+    """A step's environment: no spare yet, no telemetry, and Python's own
+    output buffering whatever the test runner's shell sets."""
+    inherited = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in (ENV, "PYTHONUNBUFFERED")
+    }
     return {**inherited, "DO_NOT_TRACK": "1", **extra}
 
 
@@ -92,6 +99,7 @@ class _Shell:
         command: list[str],
         *,
         stdin: int = subprocess.PIPE,
+        stderr: int = subprocess.PIPE,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
     ) -> subprocess.Popen[bytes]:
@@ -99,7 +107,7 @@ class _Shell:
             command,
             stdin=stdin,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=stderr,
             cwd=cwd,
             env={**self.env, **(env or {})},
             pass_fds=(self.replies, self.requests),
@@ -112,6 +120,7 @@ class _Shell:
         program: str | None,
         command: list[str] | None = None,
         *,
+        stderr: int = subprocess.PIPE,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
     ) -> tuple[subprocess.Popen[bytes], str, str]:
@@ -119,23 +128,25 @@ class _Shell:
         step = self.start(
             command or _cli(),
             stdin=subprocess.DEVNULL if program is None else subprocess.PIPE,
+            stderr=stderr,
             cwd=cwd,
             env=env,
         )
         out, err = step.communicate(None if program is None else program.encode(), timeout=60)
-        return step, out.decode(), err.decode()
+        return step, out.decode(), (err or b"").decode()
 
     def served(
         self,
         program: str | None,
         command: list[str] | None = None,
         *,
+        stderr: int = subprocess.PIPE,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
     ) -> tuple[subprocess.Popen[bytes], str, str]:
         """Run a step that prints its pid first until a spare runs it."""
         for _ in range(100):
-            step, out, err = self.step(program, command, cwd=cwd, env=env)
+            step, out, err = self.step(program, command, stderr=stderr, cwd=cwd, env=env)
             if int(out.split()[0]) != step.pid:
                 return step, out, err
             time.sleep(0.05)
@@ -224,6 +235,53 @@ def test_a_saved_program_is_served_with_its_arguments(shell: _Shell, tmp_path: P
     assert int(pid) != step.pid
     assert note == "kept"
     assert step.returncode == 0
+
+
+def test_a_served_step_keeps_the_order_of_output_and_errors_sent_to_one_place(
+    shell: _Shell,
+) -> None:
+    program = (
+        "import os, sys\n"
+        "print(os.getpid(), flush=True)\n"
+        "for line in range(100):\n"
+        "    print('out', line, flush=True)\n"
+        "    print('err', line, file=sys.stderr, flush=True)\n"
+    )
+
+    _step, out, _err = shell.served(program, stderr=subprocess.STDOUT)
+
+    assert out.splitlines()[1:] == [
+        f"{stream} {line}" for line in range(100) for stream in ("out", "err")
+    ]
+
+
+@pytest.mark.parametrize("started_as", ["script", "module"])
+def test_a_served_step_ends_its_output_as_its_own_process_would(
+    started_as: str, shell: _Shell, tmp_path: Path
+) -> None:
+    """Python flushes a script's buffered output before it prints how the
+    script ended, as for the installed command, and a module's after."""
+    command = _cli()
+    if started_as == "script":
+        script = tmp_path / "macos-harness"
+        script.write_text(_SCRIPT)
+        command = [sys.executable, str(script)]
+    program = (
+        "import os\nprint(os.getpid(), flush=True)\nprint('printed')\nraise SystemExit('ended')\n"
+    )
+    alone = subprocess.run(
+        command,
+        input=program.encode(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=_env(),
+        check=False,
+    )
+
+    step, out, _err = shell.served(program, command, stderr=subprocess.STDOUT)
+
+    assert out.splitlines()[1:] == alone.stdout.decode().splitlines()[1:]
+    assert step.returncode == alone.returncode == 1
 
 
 def test_a_step_runs_in_its_own_process_while_no_spare_is_ready() -> None:

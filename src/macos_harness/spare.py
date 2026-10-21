@@ -300,6 +300,8 @@ class _Request(TypedDict):
     path: list[str]
     interpreter: dict[str, object]
     umask: int
+    merged: bool
+    script: bool
 
 
 def _request(nonce: str) -> _Request:
@@ -314,6 +316,8 @@ def _request(nonce: str) -> _Request:
         "path": sys.path,
         "interpreter": _interpreter(),
         "umask": mask,
+        "merged": os.path.samestat(os.fstat(1), os.fstat(2)),
+        "script": sys.modules["__main__"].__spec__ is None and sys.argv[0] != "-c",
     }
 
 
@@ -614,7 +618,20 @@ def serve_one_step(argv: list[str]) -> NoReturn:
     _become(request, frame[1], out, err)
     from .cli import main
 
-    sys.exit(main(request["argv"][1:]))
+    try:
+        sys.exit(main(request["argv"][1:]))
+    finally:
+        if request["script"]:
+            _flush_io()
+
+
+def _flush_io() -> None:
+    """What Python does after running a script file and before printing
+    how it ended, which ``-c`` skips: without it a traceback would come out
+    ahead of the script's buffered output."""
+    for stream in (sys.stderr, sys.stdout):
+        with contextlib.suppress(Exception):
+            stream.flush()
 
 
 def _fits(request: _Request, sources: Mapping[str, tuple[int, int]]) -> bool:
@@ -639,7 +656,7 @@ def _become(request: _Request, stdin: bytes, out: int, err: int) -> None:
         os.lseek(held.fileno(), 0, os.SEEK_SET)
         os.dup2(held.fileno(), 0)
     os.dup2(out, 1)
-    os.dup2(err, 2)
+    os.dup2(out if request["merged"] else err, 2)
     os.close(out)
     os.close(err)
     env = dict(request["env"])
