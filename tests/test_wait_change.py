@@ -106,6 +106,37 @@ class _Screen(MacOS):
         return _TreeSnapshot([node], False, False, False)
 
 
+class _Keypad(_Screen):
+    """`_Screen` whose window shows the result once a key reaches its app,
+    as Calculator's does; each capture notes how many events had reached
+    it by then."""
+
+    def __init__(self) -> None:
+        super().__init__(_BLANK)
+        self.posted = 0
+        self.captured_after: list[int] = []
+
+    def _ensure_post_events(self) -> None:
+        return None
+
+    def _post(self, event: object, pid: int | None) -> None:
+        self.posted += 1
+
+    def _window_image(
+        self,
+        window_id: int,
+        *,
+        max_width: int | None,
+        max_height: int | None,
+        size: tuple[int, int] | None = None,
+    ) -> WindowCapture:
+        self.captured_after.append(self.posted)
+        return WindowCapture(
+            image=_RESULT if self.posted else _BLANK, width=800, height=600, bounds=_BOUNDS,
+            on_screen=True, captured_at=0.0,
+        )
+
+
 def _outcome(call: Callable[[], Mapping[str, object]]) -> Mapping[str, object]:
     """What the wait reports, whether it returned or timed out."""
     try:
@@ -169,6 +200,29 @@ def test_a_second_wait_measures_from_where_the_first_one_settled(tmp_path: Path)
         mac.wait_change("Test", timeout=1.0)
 
     assert (raised.value.code, raised.value.details["changed"]) == (ErrorCode.TIMEOUT, False)
+
+
+@pytest.mark.parametrize(
+    "wait",
+    [
+        lambda mac, path: _outcome(lambda: mac.wait_change("Test", timeout=1.0))["changed"],
+        lambda mac, path: mac.see("Test", path=path, after_change=True, timeout=1.0)["changed"],
+    ],
+    ids=["wait_change", "see-after-change"],
+)
+def test_a_new_session_sees_the_change_its_own_key_made(
+    tmp_path: Path, wait: Callable[[MacOS, Path], object]
+) -> None:
+    """No picture of the window is held yet, so the key takes one just
+    before it goes out: the wait measures from there instead of from
+    after the result already showed, for the cost of that one capture."""
+    mac = _Keypad()
+
+    mac.key("5", app="Test")
+    changed = wait(mac, tmp_path / "after.png")
+
+    assert changed is True
+    assert mac.captured_after.count(0) == 1
 
 
 def test_a_blinking_caret_is_no_change() -> None:

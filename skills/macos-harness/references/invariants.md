@@ -46,9 +46,10 @@ with repeated keys, clicks, deletion loops, or bulk input.
 - Poll inside the same program instead of sleeping or asking again in another
   call: `mac.ax.wait` and `mac.do.expect` for AX or Apple Events state,
   `mac.wait_change(app)` for how a window looks. It measures against the last
-  `see` of that window or where the last wait on it settled, so a change the
-  action already made counts (with neither, against the window when called),
-  and returns once the new look has held still `settle` seconds. About one
+  `see` of that window, else the window just before the program's first input
+  to it, or where the last wait on it settled, so a change the action already
+  made counts (with none of these, against the window when called), and
+  returns once the new look has held still `settle` seconds. About one
   changed word of text counts; a blinking caret does not. `region=(x, y, w, h)`
   in that `see`'s pixels watches a smaller change, and `by="ax"` the app's
   text. Nothing changing by `timeout` raises `timeout` with `details["changed"]`
