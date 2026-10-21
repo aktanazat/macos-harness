@@ -4181,6 +4181,7 @@ class MacOS:
         show_pointer: bool = False,
         after_change: bool = False,
         timeout: float = 30.0,
+        settle: float = _CHANGE_SETTLE_SECONDS,
     ) -> dict[str, Any]:
         """Capture a bounded window image; ``show_pointer`` draws the pointer onto it.
 
@@ -4191,11 +4192,11 @@ class MacOS:
         ``bounds`` map ``coordinate_space="screenshot"`` input as a
         window's do. ``after_change`` first waits up to ``timeout``
         seconds for the window to change from where `wait_change` would
-        measure and settle; the result's ``changed`` says whether it did,
-        and no change is no error here. The result's ``on_screen`` is the
-        only freshness signal: an off-screen window (minimized, hidden, or
-        on another Space) still renders, but from whatever the app last
-        drew.
+        measure and hold still ``settle`` seconds; the result's
+        ``changed`` says whether it did, and no change is no error here.
+        The result's ``on_screen`` is the only freshness signal: an
+        off-screen window (minimized, hidden, or on another Space) still
+        renders, but from whatever the app last drew.
         """
         if max_width <= 0 or max_height <= 0:
             raise MacOSError(
@@ -4211,7 +4212,7 @@ class MacOS:
         if after_change:
             change = self._watch_change(
                 app, window_index=window_index, window_id=window_id, region=None,
-                by="pixels", timeout=timeout, settle=_CHANGE_SETTLE_SECONDS,
+                by="pixels", timeout=timeout, settle=settle,
             )
         screenshot = self._capture(
             app,

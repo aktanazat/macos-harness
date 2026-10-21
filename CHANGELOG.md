@@ -30,8 +30,8 @@ follows [Semantic Versioning](https://semver.org/).
   guessed sleep, with how many looks it took. A blinking caret is no
   change; `region=` watches a smaller one and `by="ax"` compares the app's
   text. Nothing changing raises a timeout whose details say `changed` is
-  false. `mac.see(app, after_change=True)` waits the same way and then
-  captures, reporting `changed` instead of raising.
+  false. `mac.see(app, after_change=True)` waits the same way, `settle=`
+  included, and then captures, reporting `changed` instead of raising.
 - `mac.see(window_id=N)` captures any window, panel, menu, prompt, or the
   menu bar, whoever owns it, and reports its `layer` and owner `pid`;
   `macos-harness see --window-id N` does the same. `mac.see(display=0)` and

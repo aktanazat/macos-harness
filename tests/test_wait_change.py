@@ -167,14 +167,17 @@ class _Slide(_Screen):
 _RETURN = 36  # kVK_Return
 _TYPED = (150, 60, 100, 20)
 _ANSWER = (150, 160, 100, 40)
+_PRESSED = (150, 240, 100, 20)
 
 
 class _Form(_Screen):
     """`_Screen` over a form whose typed text shows at once and whose
-    answer to Return shows 0.3 seconds after it, as a server's does."""
+    answer to Return shows 0.3 seconds after it, as a server's does;
+    with ``pressed``, Return's button also looks pressed at once."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, pressed: bool = False) -> None:
         super().__init__(_BLANK)
+        self.pressed = pressed
         self.typed = False
         self.returned_at: float | None = None
 
@@ -196,6 +199,8 @@ class _Form(_Screen):
         size: tuple[int, int] | None = None,
     ) -> WindowCapture:
         blocks = [_TYPED] if self.typed else []
+        if self.pressed and self.returned_at is not None:
+            blocks.append(_PRESSED)
         if self.returned_at is not None and self.clock >= self.returned_at + 0.3:
             blocks.append(_ANSWER)
         return WindowCapture(
@@ -316,6 +321,20 @@ def test_a_wait_after_typing_and_return_measures_from_just_before_return(
     mac.type("hello", app="Test")
     mac.key("Return", app="Test")
     shot = mac.see("Test", path=tmp_path / "after.png", after_change=True, timeout=2.0)
+
+    assert _png_gray(shot["path"], 400, 360) == 0
+
+
+def test_see_after_change_holds_its_settle_past_quick_feedback(tmp_path: Path) -> None:
+    """Return's button looks pressed at once and its answer comes 0.3
+    seconds later: a settle longer than that gap carries `see` past the
+    pressed look to the answer."""
+    mac = _Form(pressed=True)
+
+    mac.key("Return", app="Test")
+    shot = mac.see(
+        "Test", path=tmp_path / "after.png", after_change=True, settle=0.5, timeout=2.0
+    )
 
     assert _png_gray(shot["path"], 400, 360) == 0
 
