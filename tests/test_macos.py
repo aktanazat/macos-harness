@@ -209,7 +209,6 @@ def test_resolve_app_string_pid_matches_only_that_exact_pid() -> None:
     assert mac._resolve_app("note")[1]["pid"] == 15012
 
 
-
 def test_resolve_app_string_query_still_enumerates_workspace(monkeypatch) -> None:
     """A name/bundle-id/path/stringified-pid query is unchanged: it still
     scans NSWorkspace.runningApplications(), never the exact-pid fast
@@ -662,20 +661,37 @@ def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
 
 
 def test_ax_search_fallback_keeping_handles_registers_only_its_matches(monkeypatch) -> None:
-    """Fallback searches that keep earlier handles grow the registry by their matches only."""
+    """After fallback searches that keep earlier handles, the handles that
+    resolve are exactly the ones the searches returned, each naming its match."""
     mac = MacOS()
     root, button, match = (object() for _ in range(3))
     children = {root: [button, match]}
     data = {
+        root: {"AXRole": "AXWindow"},
         button: {"AXRole": "AXButton", "AXTitle": "Save"},
         match: {"AXRole": "AXStaticText", "AXValue": "Alessia playlist"},
     }
     _bounded_tree(monkeypatch, mac, root, children, data)
 
-    for _ in range(3):
-        mac.ax_search(app="Spotify", text="Alessia", include_actions=False, reset_elements=False)
+    returned = [
+        found["element_index"]
+        for _ in range(3)
+        for found in mac.ax_search(
+            app="Spotify", text="Alessia", include_actions=False, reset_elements=False
+        )
+    ]
 
-    assert list(mac._elements.values()) == [match, match, match]
+    def resolves(index: int) -> bool:
+        try:
+            mac.ax.raw(index)
+        except MacOSError as error:
+            if error.code != ErrorCode.ELEMENT_UNKNOWN:
+                raise
+            return False
+        return True
+
+    assert [mac.ax.raw(index) for index in returned] == [match, match, match]
+    assert [index for index in range(max(returned) + 1) if resolves(index)] == returned
 
 
 @pytest.mark.parametrize(
