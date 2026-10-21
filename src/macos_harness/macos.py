@@ -109,11 +109,13 @@ class _AppIdentity(NamedTuple):
 @dataclass(slots=True)
 class _Picture:
     """A window as this process last pictured it, where the next
-    `wait_change` of it measures from; ``acted`` says an input has
-    reached the window since."""
+    `wait_change` of it measures from. ``first_of`` is the pid whose
+    first window it was then, the one input naming only that app
+    reaches; ``acted`` says an input has reached the window since."""
 
     window_id: int
     capture: WindowCapture
+    first_of: int | None = None
     acted: bool = False
 
 
@@ -4346,7 +4348,8 @@ class MacOS:
             if running is not None:
                 self._last_app = info
             seen = int(window["window_id"])
-            self._last_capture = _Picture(seen, captured)
+            first_of = int(info["pid"]) if window_id is None and window_index == 0 else None
+            self._last_capture = _Picture(seen, captured, first_of)
             if self._before_input is not None and self._before_input.window_id == seen:
                 self._before_input = None
         self._last_screenshot = screenshot
@@ -4751,17 +4754,30 @@ class MacOS:
         then measures from just before it, not from after it already
         showed or from before an earlier input. A held picture is retaken
         at its own size, keeping a `see`'s in the pixels ``region``
-        names; a capture costs about 40ms. Without Screen Recording, a
-        window, or a capture it keeps what it held, and the input goes
-        out regardless."""
+        names; a capture costs about 40ms. An input right after a `see`
+        or a wait costs nothing, and one naming only the app skips even
+        the window listing when that look was of the app's first window.
+        Without Screen Recording, a window, or a capture it keeps what it
+        held, and the input goes out regardless."""
         if pid is None:
             return
         try:
+            first_of = None
             if window_id is None:
+                covered = next(
+                    (
+                        picture for picture in (self._last_capture, self._before_input)
+                        if picture is not None and picture.first_of == pid and not picture.acted
+                    ),
+                    None,
+                )
+                if covered is not None:
+                    covered.acted = True
+                    return
                 windows = self.windows(pid)
                 if not windows:
                     return
-                window_id = int(windows[0]["window_id"])
+                window_id, first_of = int(windows[0]["window_id"]), pid
             picture = self._held_picture(window_id)
             if picture is not None and not picture.acted:
                 picture.acted = True
@@ -4770,7 +4786,7 @@ class MacOS:
             if picture is None:
                 self._before_input = _Picture(window_id, self._window_image(
                     window_id, max_width=_CHANGE_BASELINE_SIZE, max_height=_CHANGE_BASELINE_SIZE
-                ), acted=True)
+                ), first_of, acted=True)
             else:
                 picture.capture = self._window_image(
                     window_id, max_width=None, max_height=None,

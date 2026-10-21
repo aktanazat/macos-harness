@@ -109,18 +109,25 @@ class _Screen(MacOS):
 class _Keypad(_Screen):
     """`_Screen` whose window shows the result once a key reaches its app,
     as Calculator's does; each capture notes how many events had reached
-    it by then."""
+    it by then, and ``listings`` counts the window listings."""
 
     def __init__(self) -> None:
         super().__init__(_BLANK)
         self.posted = 0
         self.captured_after: list[int] = []
+        self.listings = 0
 
     def _ensure_post_events(self) -> None:
         return None
 
     def _post(self, event: object, pid: int | None) -> None:
         self.posted += 1
+
+    def windows(
+        self, app: str | int | None = None, *, all_layers: bool = False
+    ) -> list[dict[str, object]]:
+        self.listings += 1
+        return super().windows(app, all_layers=all_layers)
 
     def _window_image(
         self,
@@ -311,6 +318,30 @@ def test_a_wait_after_typing_and_return_measures_from_just_before_return(
     shot = mac.see("Test", path=tmp_path / "after.png", after_change=True, timeout=2.0)
 
     assert _png_gray(shot["path"], 400, 360) == 0
+
+
+def _see(mac: MacOS, path: Path) -> None:
+    mac.see("Test", path=path)
+
+
+def _key_and_wait(mac: MacOS, path: Path) -> None:
+    mac.key("5", app="Test")
+    mac.wait_change("Test")
+
+
+@pytest.mark.parametrize("look", [_see, _key_and_wait], ids=["after-see", "after-wait"])
+def test_a_key_right_after_a_look_lists_no_windows_and_takes_no_picture(
+    tmp_path: Path, look: Callable[[MacOS, Path], None]
+) -> None:
+    """The look pictured the app's first window after every earlier
+    input, so the key adds neither a window listing nor a capture."""
+    mac = _Keypad()
+    look(mac, tmp_path / "before.png")
+    spent = (mac.listings, len(mac.captured_after))
+
+    mac.key("5", app="Test")
+
+    assert (mac.listings, len(mac.captured_after)) == spent
 
 
 def test_a_blinking_caret_is_no_change() -> None:
