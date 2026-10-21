@@ -204,9 +204,18 @@ def test_postcondition_rejects_more_than_one_scope_selector(
 def test_postcondition_accepts_a_single_scope_selector(
     postcondition_class: Callable[..., Postcondition],
 ) -> None:
-    assert postcondition_class(app="Notes").app == "Notes"
-    assert postcondition_class(all_apps=True).all_apps is True
-    assert postcondition_class(apps=["Notes"]).apps == ("Notes",)
+    by_app = postcondition_class(app="Notes")
+    assert (by_app.app, by_app.all_apps, by_app.apps) == ("Notes", False, None)
+
+    by_all_apps = postcondition_class(all_apps=True)
+    assert (by_all_apps.app, by_all_apps.all_apps, by_all_apps.apps) == (
+        None,
+        True,
+        None,
+    )
+
+    by_apps = postcondition_class(apps=["Notes"])
+    assert (by_apps.app, by_apps.all_apps, by_apps.apps) == (None, False, ("Notes",))
 
 
 @pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
