@@ -14,6 +14,7 @@ import contextlib
 import fcntl
 import hashlib
 import importlib
+import io
 import json
 import os
 import select
@@ -27,7 +28,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping
-from typing import NoReturn, TypedDict
+from typing import NoReturn, TextIO, TypedDict
 
 ENV = "MACOS_HARNESS_SPARE"
 
@@ -301,12 +302,14 @@ class _Request(TypedDict):
     interpreter: dict[str, object]
     umask: int
     merged: bool
+    blksize: list[int]
     script: bool
 
 
 def _request(nonce: str) -> _Request:
     mask = os.umask(0)
     os.umask(mask)
+    stdout, stderr = os.fstat(1), os.fstat(2)
     return {
         "nonce": nonce,
         "pid": os.getpid(),
@@ -316,7 +319,8 @@ def _request(nonce: str) -> _Request:
         "path": sys.path,
         "interpreter": _interpreter(),
         "umask": mask,
-        "merged": os.path.samestat(os.fstat(1), os.fstat(2)),
+        "merged": os.path.samestat(stdout, stderr),
+        "blksize": [stdout.st_blksize, stderr.st_blksize],
         "script": sys.modules["__main__"].__spec__ is None and sys.argv[0] != "-c",
     }
 
@@ -659,6 +663,10 @@ def _become(request: _Request, stdin: bytes, out: int, err: int) -> None:
     os.dup2(out if request["merged"] else err, 2)
     os.close(out)
     os.close(err)
+    if not sys.stdout.write_through:
+        out_size, err_size = request["blksize"]
+        sys.stdout = sys.__stdout__ = _rebuffered(sys.stdout, out_size)
+        sys.stderr = sys.__stderr__ = _rebuffered(sys.stderr, err_size)
     env = dict(request["env"])
     env.pop(ENV, None)
     os.environ.clear()
@@ -666,3 +674,20 @@ def _become(request: _Request, stdin: bytes, out: int, err: int) -> None:
     os.umask(int(request["umask"]))
     sys.argv = list(request["argv"])
     sys.path[:] = request["path"]
+
+
+def _rebuffered(old: TextIO, blksize: int) -> io.TextIOWrapper:
+    """Python sizes an output buffer by where the output goes when the
+    process starts, which for a spare is nowhere; this builds the stream
+    as Python would have for the step's own output."""
+    raw = io.FileIO(old.fileno(), "w", closefd=False)
+    raw.name = old.name
+    stream = io.TextIOWrapper(
+        io.BufferedWriter(raw, blksize if blksize > 1 else io.DEFAULT_BUFFER_SIZE),
+        encoding=old.encoding,
+        errors=old.errors,
+        newline="\n",
+        line_buffering=old.line_buffering,
+    )
+    stream.mode = "w"
+    return stream

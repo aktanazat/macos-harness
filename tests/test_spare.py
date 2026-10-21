@@ -284,6 +284,54 @@ def test_a_served_step_ends_its_output_as_its_own_process_would(
     assert step.returncode == alone.returncode == 1
 
 
+@pytest.mark.parametrize(
+    "sends", ['"$@" 2>&1 | cat', '"$@" > output 2>&1; cat output'], ids=["pipe", "file"]
+)
+def test_a_served_step_lets_out_its_output_when_its_own_process_would(
+    sends: str, shell: _Shell, tmp_path: Path
+) -> None:
+    """Python sizes a process's output buffers by where its output goes when
+    it starts, and a spare starts with its output going nowhere."""
+    command = ["/bin/sh", "-c", sends, "sh", *_cli()]
+    program = (
+        "import os, sys\n"
+        "print(os.getppid(), flush=True)\n"
+        "print('a' * 10000)\n"
+        "print(1, file=sys.stderr)\n"
+        "print('b' * 20000)\n"
+        "print(2, file=sys.stderr)\n"
+    )
+    alone = subprocess.run(
+        command,
+        input=program.encode(),
+        stdout=subprocess.PIPE,
+        cwd=tmp_path,
+        env=_env(),
+        check=True,
+    )
+
+    _step, out, _err = shell.served(program, command, cwd=tmp_path)
+
+    assert out.splitlines()[1:] == alone.stdout.decode().splitlines()[1:]
+
+
+def test_a_served_step_has_the_output_streams_its_own_process_would(shell: _Shell) -> None:
+    program = (
+        "import os, sys\n"
+        "print(os.getpid())\n"
+        "for stream, first in ((sys.stdout, sys.__stdout__), (sys.stderr, sys.__stderr__)):\n"
+        "    print(stream is first, stream.name, stream.mode, stream.encoding, stream.errors,\n"
+        "          stream.line_buffering, stream.write_through)\n"
+    )
+    alone = subprocess.run(
+        _cli(), input=program.encode(), capture_output=True, env=_env(), check=True
+    )
+
+    _step, out, _err = shell.served(program)
+
+    assert out.splitlines()[1:] == alone.stdout.decode().splitlines()[1:]
+
+
 def test_a_step_runs_in_its_own_process_while_no_spare_is_ready() -> None:
     requests_end, requests = os.pipe()
     replies, replies_end = os.pipe()
