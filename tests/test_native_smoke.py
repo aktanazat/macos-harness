@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Mapping, Sequence
-from typing import Any
+import time
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Concatenate, ParamSpec
 
 import pytest
 
@@ -17,8 +19,10 @@ from macos_harness.macos import (
     FocusChangedError,
     MacOS,
     MacOSError,
+    SearchMatches,
 )
-from macos_harness.receipts import Acted, Executor, Outcome, gone
+from macos_harness.native import NativeQueryResult
+from macos_harness.receipts import Acted, Executor, JSONValue, Outcome, gone
 
 
 class _FakeNativeClient:
@@ -46,6 +50,9 @@ class _FakeNativeClient:
             {"role": "AXButton", "title": "Not Now"}
         ]
         self.press_result: dict[str, Any] = {"role": "AXButton", "title": "Not Now"}
+        # Whether the fake's answer stands for every match in scope; a test
+        # that models a search cut short by ``max_nodes`` flips this.
+        self.query_complete = True
         # Queue of exceptions `press()` raises (in order) before falling through
         # to `press_result`; empty by default, so every existing test that never
         # sets this keeps seeing a single unconditional success.
@@ -60,9 +67,10 @@ class _FakeNativeClient:
         self.calls.append(("list_apps", None))
         return [dict(app) for app in self.apps]
 
-    def query(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+    def query(self, params: dict[str, JSONValue]) -> NativeQueryResult:
         self.calls.append(("query", params))
-        return [{**match, "handle": self._mint()} for match in self.query_result]
+        matches = [{**match, "handle": self._mint()} for match in self.query_result]
+        return NativeQueryResult(matches, self.query_complete, len(matches))
 
     def press(self, params: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(("press", params))
@@ -155,13 +163,18 @@ def _native_agent_status() -> dict[str, Any] | None:
         session.close()
 
 
-def _require_trusted_native_agent() -> None:
+def _require_native_agent() -> bool:
+    """Skip unless the native agent runs here; say whether it is trusted."""
     if os.environ.get("MACOS_HARNESS_RUN_NATIVE_SMOKE") != "1":
         pytest.skip("set MACOS_HARNESS_RUN_NATIVE_SMOKE=1 to run native smoke tests")
     status = _native_agent_status()
     if status is None:
         pytest.skip("native agent toolchain/runtime is unavailable")
-    if not status.get("trusted"):
+    return bool(status.get("trusted"))
+
+
+def _require_trusted_native_agent() -> None:
+    if not _require_native_agent():
         pytest.skip("native agent lacks Accessibility trust")
 
 
@@ -379,7 +392,9 @@ def test_acquire_native_closes_a_session_orphaned_by_baseexception_during_storag
 def test_macos_close_is_idempotent_and_safe_when_never_launched() -> None:
     mac = MacOS(backend="python")
     mac.close()
-    mac.close()  # idempotent, no error
+    mac.close()
+    assert mac._native_client is None
+    assert mac._native_session_box[0] is None
 
 
 def test_macos_close_tears_down_the_launched_session(monkeypatch) -> None:
@@ -730,14 +745,19 @@ def test_auto_backend_falls_back_to_python_when_native_client_is_none(
     monkeypatch.setattr(
         mac,
         "_snapshot_tree",
-        lambda *args, **kwargs: [
-            {"element_index": 0, "depth": 0, "role": "AXApplication"}
-        ],
+        lambda *args, **kwargs: macos_module._TreeSnapshot(
+            [{"element_index": 0, "depth": 0, "role": "AXApplication"}],
+            node_cut=False,
+            depth_cut=False,
+            read_cut=False,
+        ),
     )
 
     matches = mac.ax_search(app="Finder", text="whatever")
 
     assert matches == []
+    assert matches.complete is True
+    assert matches.visited == 1
     assert client.calls == []
 
 
@@ -746,7 +766,7 @@ def test_auto_backend_never_falls_back_after_a_request_is_dispatched(
 ) -> None:
     client = _FakeNativeClient()
 
-    def _boom(params: dict[str, Any]) -> list[dict[str, Any]]:
+    def _boom(params: dict[str, JSONValue]) -> NativeQueryResult:
         raise MacOSError("agent-side failure")
 
     client.query = _boom  # type: ignore[method-assign]
@@ -860,24 +880,26 @@ def test_query_parity_on_finder_bounded_fallback() -> None:
 
 
 # A small, real AppKit target app -- not an osascript dialog, which is not
-# reliably a running NSApplication `_resolve_app` can bind to. Accessory
-# activation policy keeps it out of the Dock/Cmd+Tab and off the frontmost
-# app without making it any less real: it is a genuine NSApplication with a
-# genuine NSWindow and NSButton, discoverable and pressable through the
-# exact same Accessibility APIs as any regular app. `orderFrontRegardless`
-# shows the window without ever activating (and so never focus-stealing)
-# the helper app itself. The button's target-action really flips its own
-# title on press, so a round trip through AXPress is verified by an actual
-# state change, not just a non-error return -- and it counts its own
-# presses, encoding every press past the first into a distinct title
-# ("harness-pressed-2", ...), so a second dispatch is something a test can
-# observe rather than merely assume never happened.
+# reliably a running NSApplication `_resolve_app` can bind to. It launches
+# unable to come to the front, since an app that may takes the front at
+# launch whenever the terminal that started it is in front; once launched
+# it turns accessory, out of the Dock and Cmd+Tab, and is a genuine
+# NSApplication with a genuine NSWindow and NSButton, discoverable and
+# pressable through the same Accessibility APIs as any regular app.
+# `orderFrontRegardless` shows the window without activating the helper.
+# The button's target-action really flips its own title on press, so a
+# round trip through AXPress is verified by an actual state change, not
+# just a non-error return -- and it counts its own presses, encoding every
+# press past the first into a distinct title ("harness-pressed-2", ...), so
+# a second dispatch is something a test can observe rather than merely
+# assume never happened.
 _HARNESS_PROBE_HELPER = r'''
 import os
 
 from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
+    NSApplicationActivationPolicyProhibited,
     NSBackingStoreBuffered,
     NSBezelStyleRounded,
     NSButton,
@@ -895,6 +917,11 @@ _presses = 0
 
 
 class _Target(NSObject):
+    def applicationDidFinishLaunching_(self, notification):
+        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        _window.orderFrontRegardless()
+        print(f"READY {os.getpid()}", flush=True)
+
     def pressed_(self, sender):
         global _presses
         _presses += 1
@@ -905,7 +932,7 @@ class _Target(NSObject):
 
 def main():
     app = NSApplication.sharedApplication()
-    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
 
     style = (
         NSWindowStyleMaskTitled
@@ -928,7 +955,6 @@ def main():
     button.setAction_("pressed:")
 
     window.contentView().addSubview_(button)
-    window.orderFrontRegardless()
 
     # Keep strong references alive for the whole run -- not merely
     # implied by the still-active `main()` frame while `app.run()`
@@ -936,8 +962,7 @@ def main():
     global _window, _button, _target_ref
     _window, _button, _target_ref = window, button, target
 
-    print(f"READY {os.getpid()}", flush=True)
-
+    app.setDelegate_(target)
     app.run()
 
 
@@ -1064,6 +1089,324 @@ def test_native_press_round_trip_without_activation() -> None:
                 proc.kill()
 
 
+# An AppKit app with no window, Dock icon, or activation: says "ready" once
+# it has finished launching and stays up until killed.
+_LATE_APP_SCRIPT = """\
+from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
+from Foundation import NSDate, NSRunLoop
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+app.finishLaunching()
+print("ready", flush=True)
+NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(30))
+"""
+
+
+@pytest.mark.native
+@pytest.mark.smoke
+def test_native_list_apps_sees_an_app_launched_after_the_first_read() -> None:
+    """An app that starts after the agent first listed apps -- the process
+    behind a permission dialog, say -- must appear in later native lists,
+    or no all-apps sweep through the agent can ever reach it."""
+    _require_native_agent()
+
+    with MacOS(backend="native") as mac:
+        mac.list_apps()
+        late = subprocess.Popen(
+            [sys.executable, "-c", _LATE_APP_SCRIPT], stdout=subprocess.PIPE, text=True
+        )
+        try:
+            assert _read_ready_line(late) == "ready"
+            deadline = time.monotonic() + 5
+            while late.pid not in {app["pid"] for app in mac.list_apps()}:
+                assert time.monotonic() < deadline, (
+                    "an app launched after the agent's first list never appeared"
+                )
+                time.sleep(0.05)
+        finally:
+            late.kill()
+            late.wait()
+
+
+# A background AppKit app whose one button brings the app itself to the
+# front, as an app that answers a press by activating does. It launches
+# unable to come to the front, as `_HARNESS_PROBE_HELPER` does, so the
+# press finds it behind another app and the focus guard has a change to
+# report.
+_SELF_ACTIVATING_HELPER = r'''
+import os
+
+from AppKit import (
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+    NSApplicationActivationPolicyProhibited,
+    NSBackingStoreBuffered,
+    NSButton,
+    NSMakeRect,
+    NSObject,
+    NSWindow,
+    NSWindowStyleMaskTitled,
+)
+
+
+class _Target(NSObject):
+    def applicationDidFinishLaunching_(self, notification):
+        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        window.orderFrontRegardless()
+        print(f"READY {os.getpid()}", flush=True)
+
+    def pressed_(self, sender):
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+    NSMakeRect(100.0, 100.0, 240.0, 120.0), NSWindowStyleMaskTitled, NSBackingStoreBuffered, False
+)
+button = NSButton.alloc().initWithFrame_(NSMakeRect(40.0, 40.0, 160.0, 32.0))
+button.setTitle_("harness-activate")
+target = _Target.alloc().init()
+button.setTarget_(target)
+button.setAction_("pressed:")
+window.contentView().addSubview_(button)
+app.setDelegate_(target)
+app.run()
+'''
+
+
+def _require_live_ax(backend: str) -> None:
+    """Skip unless live smoke tests are on and ``backend`` holds trust."""
+    if backend == "native":
+        _require_trusted_native_agent()
+    elif os.environ.get("MACOS_HARNESS_RUN_NATIVE_SMOKE") != "1":
+        pytest.skip("set MACOS_HARNESS_RUN_NATIVE_SMOKE=1 to run live smoke tests")
+    elif not macos_module.AS.AXIsProcessTrusted():
+        pytest.skip("this process lacks Accessibility trust")
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("backend", ["python", pytest.param("native", marks=pytest.mark.native)])
+def test_press_reports_a_target_that_makes_itself_frontmost(backend: str) -> None:
+    """A press whose target answers by coming to the front raises
+    `FocusChangedError`, even as the first thing a fresh process does:
+    the guard must compare the frontmost app before and after the press,
+    not one reading taken at the process's first look."""
+    _require_live_ax(backend)
+
+    helper = subprocess.Popen(
+        [sys.executable, "-c", _SELF_ACTIVATING_HELPER],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        helper_pid = int(_read_ready_line(helper).split(" ", 1)[1])
+        with MacOS(backend=backend) as mac, pytest.raises(FocusChangedError, match="became frontmost"):
+            mac.ax.press("harness-activate", app=helper_pid, role="button", timeout=10.0)
+    finally:
+        helper.kill()
+        helper.wait()
+
+
+_P = ParamSpec("_P")
+
+
+def _recording_app_pids(
+    search: Callable[Concatenate[MacOS, _P], SearchMatches],
+) -> Callable[Concatenate[_SearchRecordingMac, _P], SearchMatches]:
+    """Wrap ``MacOS.ax_search`` so the Mac lists every app it searches one by one."""
+
+    def record(mac: _SearchRecordingMac, /, *args: _P.args, **kwargs: _P.kwargs) -> SearchMatches:
+        pid = kwargs.get("app_pid")
+        if isinstance(pid, int):
+            mac.searched.append(pid)
+        return search(mac, *args, **kwargs)
+
+    return record
+
+
+class _SearchRecordingMac(MacOS):
+    """A real Mac that lists every app its sweeps search one by one."""
+
+    def __init__(self, *, backend: str) -> None:
+        super().__init__(backend=backend)
+        self.searched: list[int] = []
+
+    ax_search = _recording_app_pids(MacOS.ax_search)
+
+
+# A background AppKit app whose one window is on screen. Unlike the
+# helpers above it may take the front at launch: an app that launches
+# unable to come to the front never gets its window on screen.
+_WINDOW_HELPER = r'''
+import os
+
+from AppKit import (
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+    NSBackingStoreBuffered,
+    NSMakeRect,
+    NSWindow,
+    NSWindowStyleMaskTitled,
+)
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+    NSMakeRect(100.0, 100.0, 240.0, 120.0), NSWindowStyleMaskTitled, NSBackingStoreBuffered, False
+)
+window.orderFrontRegardless()
+print(f"READY {os.getpid()}", flush=True)
+app.run()
+'''
+
+
+def _wait_for_a_window_on_screen(pid: int) -> None:
+    """Block until ``pid`` owns a window on screen: an app frozen before
+    its run loop draws its window shows nothing."""
+    deadline = time.monotonic() + 5
+    with MacOS(backend="python") as mac:
+        while not any(window["on_screen"] for window in mac.windows(pid)):
+            assert time.monotonic() < deadline, f"pid {pid} never put a window on screen"
+            time.sleep(0.05)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("backend", ["python", pytest.param("native", marks=pytest.mark.native)])
+def test_all_apps_sweep_skips_a_frozen_app_and_still_finds_an_answering_one(backend: str) -> None:
+    """An all-apps search finds the button of an app that answers. An app
+    that cannot answer while it shows a window -- here one stopped
+    mid-run -- is never searched on its own, so it costs the sweep no
+    timeout of its own, and the sweep says it is incomplete rather than
+    passing it for searched."""
+    _require_live_ax(backend)
+
+    helpers = [
+        subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        for script in (_SELF_ACTIVATING_HELPER, _WINDOW_HELPER)
+    ]
+    try:
+        answering, frozen = (int(_read_ready_line(helper).split(" ", 1)[1]) for helper in helpers)
+        _wait_for_a_window_on_screen(frozen)
+        os.kill(frozen, signal.SIGSTOP)
+        with _SearchRecordingMac(backend=backend) as mac:
+            found = mac.ax.query_all("harness-activate", role="button", limit=10)
+        assert [match["app"]["pid"] for match in found] == [answering]
+        assert found.complete is False
+        assert found.unanswered >= 1
+        assert answering in mac.searched
+        assert frozen not in mac.searched
+    finally:
+        for helper in helpers:
+            helper.kill()
+            helper.wait()
+
+
+class _HelperScopedMac(MacOS):
+    """A real Mac whose all-apps sweeps reach only the given apps, so what
+    a sweep reports rests on those apps alone."""
+
+    def __init__(self, *, backend: str, pids: set[int]) -> None:
+        super().__init__(backend=backend)
+        self.pids = pids
+
+    def _resolve_apps(self, selectors: tuple[str, ...] | None) -> list[dict[str, object]]:
+        return [info for info in super()._resolve_apps(selectors) if info["pid"] in self.pids]
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("backend", ["python", pytest.param("native", marks=pytest.mark.native)])
+def test_on_screen_sweep_stays_complete_past_a_frozen_app_that_shows_nothing(backend: str) -> None:
+    """A sweep of what is on screen loses nothing to an app that cannot
+    answer but has no window on screen -- a stopped background process --
+    so it still reports itself complete."""
+    _require_live_ax(backend)
+
+    answering = subprocess.Popen(
+        [sys.executable, "-c", _SELF_ACTIVATING_HELPER],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    hidden = subprocess.Popen(
+        [sys.executable, "-c", _LATE_APP_SCRIPT],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        answering_pid = int(_read_ready_line(answering).split(" ", 1)[1])
+        assert _read_ready_line(hidden) == "ready"
+        os.kill(hidden.pid, signal.SIGSTOP)
+        with _HelperScopedMac(backend=backend, pids={answering_pid, hidden.pid}) as mac:
+            found = mac.ax.query_all("harness-activate", role="button", limit=10)
+        assert [match["app"]["pid"] for match in found] == [answering_pid]
+        assert found.complete is True
+        assert found.unanswered == 0
+    finally:
+        for helper in (answering, hidden):
+            helper.kill()
+            helper.wait()
+
+
+# A background AppKit app with no window whose main menu holds one closed
+# menu, and in it the item "harness-menu-entry".
+_MENU_HELPER = r'''
+import os
+
+from AppKit import NSApplication, NSApplicationActivationPolicyAccessory, NSMenu, NSMenuItem
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+top = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("harness-menu", None, "")
+menu = NSMenu.alloc().initWithTitle_("harness-menu")
+menu.addItemWithTitle_action_keyEquivalent_("harness-menu-entry", None, "")
+top.setSubmenu_(menu)
+main = NSMenu.alloc().initWithTitle_("main")
+main.addItem_(top)
+app.setMainMenu_(main)
+print(f"READY {os.getpid()}", flush=True)
+app.run()
+'''
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("backend", ["python", pytest.param("native", marks=pytest.mark.native)])
+def test_a_search_for_what_is_on_screen_leaves_out_closed_menus_bar_one_for_menu_items(backend: str) -> None:
+    """A closed menu's items are not on screen, so a search for what is on
+    screen leaves them out -- in Safari they are most of the tree -- while
+    a search for menu items, the one a menu command's press takes, still
+    finds them."""
+    _require_live_ax(backend)
+
+    helper = subprocess.Popen(
+        [sys.executable, "-c", _MENU_HELPER],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        pid = int(_read_ready_line(helper).split(" ", 1)[1])
+        with _HelperScopedMac(backend=backend, pids={pid}) as mac:
+            swept = mac.ax.query_all("harness-menu-entry", role="any", limit=10)
+            scoped = mac.ax.query("harness-menu-entry", app=pid, role="any")
+            items = mac.ax.query("harness-menu-entry", app=pid, role="menu item")
+        for search in (swept, scoped):
+            assert list(search) == []
+            assert search.complete is True
+        assert [match["title"] for match in items] == ["harness-menu-entry"]
+    finally:
+        helper.kill()
+        helper.wait()
+
+
 def test_native_press_retries_only_on_delayed_appearance(monkeypatch) -> None:
     """A native targeted press that finds no unique match yet -- the
     agent's own ``PressCoordinator`` always reports this as
@@ -1118,6 +1461,67 @@ def test_native_press_gives_up_with_a_timeout_code_once_the_deadline_passes(
     assert exc_info.value.code == ErrorCode.TIMEOUT
     assert exc_info.value.details["timeout"] == 0
     assert [call[0] for call in client.calls] == ["press"]  # timeout=0 still tries once
+
+
+def test_native_strict_press_timeout_reports_which_bound_stopped_the_search(
+    monkeypatch,
+) -> None:
+    """An exact press the agent could not prove unique -- one match from a
+    search its node budget cut short -- is ``element.unknown`` with the
+    agent's ``complete``/``visited`` beside it. The timeout keeps those so
+    the caller knows to raise ``max_nodes`` rather than wait longer."""
+    client = _FakeNativeClient()
+    client.press_errors = [
+        MacOSError(
+            "AX press found one match for pid 55 but the search stopped "
+            "before confirming it is unique",
+            code=ErrorCode.ELEMENT_UNKNOWN,
+            details={"complete": False, "visited": 300},
+        ),
+    ]
+    mac = MacOS(backend="native")
+    monkeypatch.setattr(mac, "_acquire_native", lambda: client)
+    monkeypatch.setattr(mac, "_pid", lambda app: 55)
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(MacOSError, match="timed out") as exc_info:
+        mac.ax_press(app="Chrome", title="Save", timeout=0, max_nodes=300)
+
+    assert exc_info.value.code == ErrorCode.TIMEOUT
+    assert exc_info.value.details == {
+        "timeout": 0,
+        "pid": 55,
+        "max_nodes": 300,
+        "complete": False,
+        "visited": 300,
+        "reason": "deadline_exhausted_before_dispatch",
+    }
+    (_, params), = client.calls
+    assert params["title"] == "Save"
+    assert params["identifier"] is None
+    assert params["description"] is None
+
+
+def test_native_query_carries_exact_selectors_and_completeness(monkeypatch) -> None:
+    """The agent does the exact matching, so the selectors must reach it
+    on the wire, and its verdict on completeness must reach the caller."""
+    client = _FakeNativeClient()
+    client.query_result = [{"role": "AXButton", "title": "Save", "identifier": "_NS:9"}]
+    client.query_complete = False
+    mac = MacOS(backend="native")
+    monkeypatch.setattr(mac, "_acquire_native", lambda: client)
+    monkeypatch.setattr(mac, "_pid", lambda app: 55)
+
+    matches = mac.ax.query(app="Pages", identifier="_NS:9", description="Save it")
+
+    (_, params), = client.calls
+    assert params["text"] is None
+    assert params["title"] is None
+    assert params["identifier"] == "_NS:9"
+    assert params["description"] == "Save it"
+    assert [match["identifier"] for match in matches] == ["_NS:9"]
+    assert matches.complete is False
+    assert matches.visited == 1
 
 
 def test_native_press_never_retries_after_a_possibly_applied_failure(monkeypatch) -> None:
@@ -1225,3 +1629,88 @@ def test_ax_press_validates_timeout_and_interval_before_backend_dispatch(
         mac.ax_press(app="Chrome", text="Not Now", interval=0)
     assert exc_info.value.code == ErrorCode.BAD_REQUEST
     assert exc_info.value.details["parameter"] == "interval"
+
+
+def test_native_press_does_not_restart_its_budget_after_acquiring_the_agent(monkeypatch) -> None:
+    client = _FakeNativeClient()
+    now = 10.0
+
+    def acquire():
+        nonlocal now
+        now += 0.06
+        return client
+
+    mac = MacOS(backend="native")
+    monkeypatch.setattr(mac, "_pid", lambda app: 55)
+    monkeypatch.setattr(mac, "_acquire_native", acquire)
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: now)
+
+    with pytest.raises(MacOSError, match="deadline") as error:
+        mac.ax_press(app=55, title="Save", timeout=0.05)
+
+    assert error.value.code == ErrorCode.TIMEOUT
+    assert error.value.details["reason"] == "deadline_exhausted_before_dispatch"
+    assert client.calls == []
+
+
+def test_native_press_does_not_retry_after_sleep_exhausts_the_budget(monkeypatch) -> None:
+    client = _FakeNativeClient()
+    client.press_errors = [
+        MacOSError("no unique match", code=ErrorCode.ELEMENT_UNKNOWN,
+                   details={"complete": False, "visited": 20}),
+    ]
+    now = 10.0
+
+    def sleep(seconds):
+        nonlocal now
+        now += seconds + 0.01
+
+    mac = MacOS(backend="native")
+    monkeypatch.setattr(mac, "_pid", lambda app: 55)
+    monkeypatch.setattr(mac, "_acquire_native", lambda: client)
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(macos_module.time, "sleep", sleep)
+
+    with pytest.raises(MacOSError, match="deadline") as error:
+        mac.ax_press(app=55, title="Save", timeout=0.05, interval=0.1)
+
+    assert error.value.code == ErrorCode.TIMEOUT
+    assert error.value.details["reason"] == "deadline_exhausted_before_dispatch"
+    assert error.value.details["complete"] is False
+    assert error.value.details["visited"] == 20
+    assert [op for op, params in client.calls] == ["press"]
+
+
+@pytest.mark.parametrize("slow_read", ["search", "frontmost"])
+def test_local_press_cannot_act_after_observation_spends_the_budget(monkeypatch, slow_read) -> None:
+    now = 10.0
+    pressed = False
+
+    def wait(**kwargs):
+        nonlocal now
+        if slow_read == "search":
+            now += 0.06
+        return {"element_index": 7, "app": {"pid": 55}}
+
+    def frontmost():
+        nonlocal now
+        if slow_read == "frontmost":
+            now += 0.06
+        return {"pid": 99}
+
+    def perform(element_index, action):
+        nonlocal pressed
+        pressed = True
+
+    mac = MacOS(backend="python")
+    monkeypatch.setattr(mac, "ax_wait", wait)
+    monkeypatch.setattr(mac, "_frontmost_app", frontmost)
+    monkeypatch.setattr(mac, "perform_action", perform)
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: now)
+
+    with pytest.raises(MacOSError, match="deadline") as error:
+        mac.ax_press(app=55, title="Save", timeout=0.05)
+
+    assert error.value.code == ErrorCode.TIMEOUT
+    assert error.value.details["reason"] == "deadline_exhausted_before_dispatch"
+    assert pressed is False

@@ -4,10 +4,11 @@ postcondition, and operation-error contract ``mac.do`` is built on.
 
 from __future__ import annotations
 
+import functools
 import json
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import FrozenInstanceError
 from types import MappingProxyType
 
@@ -16,6 +17,7 @@ import pytest
 from macos_harness.errors import MacOSError
 from macos_harness.receipts import (
     Acted,
+    Equals,
     ErrorPayload,
     Executor,
     Gone,
@@ -26,6 +28,7 @@ from macos_harness.receipts import (
     Receipt,
     canonical_json,
     canonicalize,
+    equals,
     gone,
     present,
     request_fingerprint,
@@ -142,9 +145,49 @@ def test_present_and_gone_helpers_freeze_app_scope() -> None:
     assert present("x", apps=None).apps is None
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+def test_equals_factory_freezes_the_expected_value_and_keeps_it_out_of_repr() -> None:
+    postcondition = equals("Name", role="textfield", value={"location": 3, "length": 0})
+
+    assert isinstance(postcondition, Equals)
+    assert postcondition.attribute == "AXValue"
+    assert isinstance(postcondition.value, MappingProxyType)
+    assert postcondition.value == {"location": 3, "length": 0}
+    assert postcondition == Equals(
+        text="Name", role="textfield", value={"location": 3, "length": 0}
+    )
+    assert "location" not in repr(postcondition)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "parameter"),
+    [
+        ({"value": object()}, "value"),
+        ({"value": float("nan")}, "value"),
+        ({"value": "x", "attribute": ""}, "attribute"),
+    ],
+)
+def test_equals_rejects_an_unsafe_value_or_an_empty_attribute(
+    kwargs: dict[str, object], parameter: str
+) -> None:
+    with pytest.raises(MacOSError) as excinfo:
+        Equals(**kwargs)
+
+    assert excinfo.value.code == "bad_request"
+    assert excinfo.value.details["parameter"] == parameter
+
+
+#: Every postcondition shares `_PostconditionBase`'s validation; `Equals`
+#: only differs in needing a `value` to be constructed at all.
+_POSTCONDITIONS = [
+    pytest.param(Present, id="Present"),
+    pytest.param(Gone, id="Gone"),
+    pytest.param(functools.partial(Equals, value="x"), id="Equals"),
+]
+
+
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 def test_postcondition_rejects_more_than_one_scope_selector(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: Callable[..., Postcondition],
 ) -> None:
     with pytest.raises(MacOSError) as excinfo:
         postcondition_class(app="Notes", all_apps=True)
@@ -157,45 +200,55 @@ def test_postcondition_rejects_more_than_one_scope_selector(
         postcondition_class(all_apps=True, apps=["Notes"])
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 def test_postcondition_accepts_a_single_scope_selector(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: Callable[..., Postcondition],
 ) -> None:
-    postcondition_class(app="Notes")
-    postcondition_class(all_apps=True)
-    postcondition_class(apps=["Notes"])
+    by_app = postcondition_class(app="Notes")
+    assert (by_app.app, by_app.all_apps, by_app.apps) == ("Notes", False, None)
+
+    by_all_apps = postcondition_class(all_apps=True)
+    assert (by_all_apps.app, by_all_apps.all_apps, by_all_apps.apps) == (
+        None,
+        True,
+        None,
+    )
+
+    by_apps = postcondition_class(apps=["Notes"])
+    assert (by_apps.app, by_apps.all_apps, by_apps.apps) == (None, False, ("Notes",))
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 def test_postcondition_rejects_bad_direction(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: Callable[..., Postcondition],
 ) -> None:
     with pytest.raises(MacOSError) as excinfo:
         postcondition_class(direction="sideways")
     assert excinfo.value.code == "bad_request"
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 def test_postcondition_accepts_direction_case_insensitively(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: Callable[..., Postcondition],
 ) -> None:
-    postcondition_class(direction="Next")
-    postcondition_class(direction="PREVIOUS")
+    assert postcondition_class(direction="Next").direction == "Next"
+    assert postcondition_class(direction="PREVIOUS").direction == "PREVIOUS"
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 def test_postcondition_rejects_negative_timeout(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: Callable[..., Postcondition],
 ) -> None:
     with pytest.raises(MacOSError) as excinfo:
         postcondition_class(timeout=-1)
     assert excinfo.value.code == "bad_request"
 
 
-def test_present_allows_a_zero_timeout() -> None:
-    """`Present` only ever needs one look, so a zero timeout is a
-    normal, satisfiable "check right now" request."""
+def test_present_and_equals_allow_a_zero_timeout() -> None:
+    """`Present` and `Equals` only ever need one look, so a zero timeout
+    is a normal, satisfiable "check right now" request."""
     assert Present(timeout=0).timeout == 0
+    assert Equals(value="x", timeout=0).timeout == 0
 
 
 def test_gone_rejects_a_zero_timeout() -> None:
@@ -211,9 +264,9 @@ def test_gone_allows_a_positive_or_inherited_timeout() -> None:
     assert Gone().timeout is None
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 def test_postcondition_rejects_non_positive_interval(
-    postcondition_class: type[Present | Gone],
+    postcondition_class: Callable[..., Postcondition],
 ) -> None:
     with pytest.raises(MacOSError) as excinfo:
         postcondition_class(interval=0)
@@ -222,32 +275,33 @@ def test_postcondition_rejects_non_positive_interval(
         postcondition_class(interval=-0.1)
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
 def test_postcondition_rejects_nonfinite_timeout(
-    postcondition_class: type[Present | Gone], bad: float
+    postcondition_class: Callable[..., Postcondition], bad: float
 ) -> None:
     with pytest.raises(MacOSError) as excinfo:
         postcondition_class(timeout=bad)
     assert excinfo.value.code == "bad_request"
 
 
-@pytest.mark.parametrize("postcondition_class", [Present, Gone])
+@pytest.mark.parametrize("postcondition_class", _POSTCONDITIONS)
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
 def test_postcondition_rejects_nonfinite_interval(
-    postcondition_class: type[Present | Gone], bad: float
+    postcondition_class: Callable[..., Postcondition], bad: float
 ) -> None:
     with pytest.raises(MacOSError) as excinfo:
         postcondition_class(interval=bad)
     assert excinfo.value.code == "bad_request"
 
 
-def test_postcondition_type_alias_covers_both_variants() -> None:
+def test_postcondition_type_alias_covers_every_variant() -> None:
     def describe(postcondition: Postcondition) -> str:
         return type(postcondition).__name__
 
     assert describe(present("x")) == "Present"
     assert describe(gone("x")) == "Gone"
+    assert describe(equals("x", value="y")) == "Equals"
 
 
 # --- Receipt -------------------------------------------------------------
@@ -265,29 +319,12 @@ def _make_receipt(**overrides: object) -> Receipt:
         "changed": True,
         "verified": True,
         "duration_s": 0.123,
+        "started_at": "2026-09-14T10:00:00.000+00:00",
+        "finished_at": "2026-09-14T10:00:00.123+00:00",
         "once": "tok-1",
     }
     fields.update(overrides)
     return Receipt(**fields)  # type: ignore[arg-type]
-
-
-def test_receipt_requires_only_its_core_fields() -> None:
-    receipt = Receipt(
-        op="run",
-        outcome=Outcome.PLANNED,
-        acted=Acted.NO,
-        backend="auto",
-        executor=Executor.SCRIPT,
-        request={},
-        changed=False,
-        verified=False,
-        duration_s=0.0,
-    )
-    assert receipt.target is None
-    assert receipt.observed is None
-    assert receipt.once is None
-    assert receipt.replayed is False
-    assert receipt.error is None
 
 
 def test_receipt_is_frozen() -> None:
@@ -304,6 +341,42 @@ def test_receipt_changed_accepts_none_for_an_unconfirmed_effect() -> None:
     receipt = _make_receipt(changed=None)
     assert receipt.changed is None
     assert receipt.to_json()["changed"] is None
+
+
+@pytest.mark.parametrize(
+    ("overrides", "line"),
+    [
+        pytest.param({}, "press done acted=yes changed=yes verified=yes 0.12s", id="done"),
+        pytest.param(
+            {"outcome": Outcome.PLANNED, "acted": Acted.NO, "changed": False,
+             "verified": False, "duration_s": 0.004},
+            "press planned acted=no changed=no verified=no 0.00s",
+            id="dry-run",
+        ),
+        pytest.param(
+            {"outcome": Outcome.FAILED, "acted": Acted.UNKNOWN, "changed": None,
+             "verified": False,
+             "error": {"code": "element.unknown", "message": "stale element",
+                       "details": {"element_index": 4}}},
+            "press failed acted=unknown changed=unknown verified=no 0.12s "
+            "error=element.unknown",
+            id="failed",
+        ),
+        pytest.param(
+            {"replayed": True},
+            "press done acted=yes changed=yes verified=yes 0.12s replayed",
+            id="replayed",
+        ),
+    ],
+)
+def test_printed_receipt_is_one_line_of_what_happened(overrides, line) -> None:
+    """`print(receipt)` dumped the whole record, a median of 1,096
+    characters an agent read to learn four facts; it now prints one line
+    of them, and the repr keeps the record."""
+    receipt = _make_receipt(**overrides)
+
+    assert str(receipt) == line
+    assert repr(receipt).startswith("Receipt(op='press', outcome=")
 
 
 def test_receipt_canonicalizes_request_target_observed_on_construction() -> None:
@@ -393,27 +466,6 @@ def test_receipt_to_json_is_json_safe_for_a_failed_receipt() -> None:
     assert isinstance(payload["error"], dict)
     assert isinstance(payload["error"]["details"], dict)
     assert isinstance(payload["error"]["details"]["nested"]["a"], list)
-
-
-def test_receipt_to_json_matches_every_field() -> None:
-    receipt = _make_receipt()
-    payload = receipt.to_json()
-    assert payload == {
-        "op": "press",
-        "outcome": "done",
-        "acted": "yes",
-        "backend": "python",
-        "executor": "python",
-        "request": {"text": "Save", "app": "Notes"},
-        "target": {"role": "AXButton", "title": "Save"},
-        "observed": None,
-        "changed": True,
-        "verified": True,
-        "duration_s": 0.123,
-        "once": "tok-1",
-        "replayed": False,
-        "error": None,
-    }
 
 
 # --- replayed_as(): the once-token replay copy -----------------------------

@@ -10,10 +10,21 @@ from typing import TYPE_CHECKING, Any
 import ApplicationServices as AS
 
 from .errors import ErrorCode, MacOSError
-from .macos import _AX_SAFE_ATTRIBUTES
+from .macos import _AX_SAFE_ATTRIBUTES, _AX_SEARCH_ROLES, ElementRef, SearchMatches
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .macos import MacOS
+
+# Each role a search can target, by its friendly name ("text field" ->
+# "textfield") and by the AX name a match reports ("AXTextField" ->
+# "axtextfield"), so a role read off one match can find the next.
+_ROLE_SEARCH_KEYS = {"any": "AXAnyTypeSearchKey"} | {
+    alias: search_key
+    for search_key, ax_role in _AX_SEARCH_ROLES.items()
+    for alias in (ax_role.casefold(), ax_role[2:].casefold())
+}
 
 
 class Accessibility:
@@ -58,13 +69,20 @@ class Accessibility:
         y: float,
         *,
         app: str | None = None,
+        screenshot: str | Path | None = None,
         coordinate_space: str = "screenshot",
         attributes: Iterable[str] = _COMPACT_ATTRIBUTES,
         include_actions: bool = True,
     ) -> dict[str, Any]:
+        """The element of ``app`` at ``x``, ``y``, or of any app without one.
+
+        A screenshot point maps through the last `see`, or the PNG
+        ``screenshot`` names, which must still show ``app``'s window where
+        it is now."""
         self._host._ensure_accessibility()
-        point = self._host._screen_point(x, y, coordinate_space)
+        self._host._use_screenshot(screenshot)
         pid = self._host._pid(app)
+        point = self._host._screen_point(x, y, coordinate_space, pid=pid)
         root = (
             self._host._application_element(pid)
             if pid is not None
@@ -97,32 +115,20 @@ class Accessibility:
             )
         if role is None:
             return search_key or "AXAnyTypeSearchKey"
-        aliases = {
-            "any": "AXAnyTypeSearchKey",
-            "button": "AXButtonSearchKey",
-            "checkbox": "AXCheckBoxSearchKey",
-            "combobox": "AXComboBoxSearchKey",
-            "image": "AXImageSearchKey",
-            "link": "AXLinkSearchKey",
-            "list": "AXListSearchKey",
-            "menu": "AXMenuSearchKey",
-            "menuitem": "AXMenuItemSearchKey",
-            "radiobutton": "AXRadioButtonSearchKey",
-            "statictext": "AXStaticTextSearchKey",
-            "table": "AXTableSearchKey",
-            "textarea": "AXTextAreaSearchKey",
-            "textfield": "AXTextFieldSearchKey",
-        }
         normalized = re.sub(r"[^a-z0-9]", "", role.casefold())
         try:
-            return aliases[normalized]
+            return _ROLE_SEARCH_KEYS[normalized]
         except KeyError as exc:
             valid = (
                 "any, button, checkbox, combo box, image, link, list, menu, "
                 "menu item, radio button, static text, table, text area, text field"
             )
             raise MacOSError(
-                f"Unknown AX role {role!r}; choose one of: {valid}",
+                f"Unknown AX role {role!r}; choose one of: {valid}, or the "
+                "same role by its AX name ('AXButton'). For any other kind "
+                "(window, row, group, scroll bar, ...) pass role='any' and "
+                "read each match's 'role'; mac.windows(app) lists an app's "
+                "windows",
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "role", "value": role},
             ) from exc
@@ -132,22 +138,40 @@ class Accessibility:
         text: str | None = None,
         *,
         app: str | int | None = None,
+        all_apps: bool = False,
+        apps: str | int | Iterable[str | int] | None = None,
         element_index: int | None = None,
         role: str | None = None,
         search_key: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         limit: int = 20,
         direction: str = "next",
         immediate_descendants_only: bool = False,
-        attributes: Iterable[str] = _COMPACT_ATTRIBUTES,
+        attributes: Iterable[str] | None = None,
         include_actions: bool = False,
-        max_nodes: int = 500,
-    ) -> list[dict[str, Any]]:
-        return self._host.ax_search(
-            element_index=element_index,
+        max_nodes: int = 5000,
+    ) -> SearchMatches:
+        """Search one app, or every app (``all_apps=True``) or ``apps``.
+
+        ``attributes`` defaults to role, title, description, value, and
+        frame; a cross-app search leaves ``AXValue`` out by default.
+        """
+        if attributes is None:
+            cross_process = all_apps or apps is not None
+            attributes = self._SAFE_ATTRIBUTES if cross_process else self._COMPACT_ATTRIBUTES
+        return self._host.ax_query(
             app=app,
+            all_apps=all_apps,
+            apps=apps,
+            element_index=element_index,
             search_key=self._search_key(search_key, role),
             text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             limit=limit,
             direction=direction,
@@ -161,21 +185,33 @@ class Accessibility:
         self,
         text: str | None = None,
         *,
+        app: str | int | None = None,
+        all_apps: bool = False,
         apps: str | int | Iterable[str | int] | None = None,
         role: str | None = None,
         search_key: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         limit: int = 20,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _SAFE_ATTRIBUTES,
         include_actions: bool = False,
-        max_nodes: int = 500,
-    ) -> list[dict[str, Any]]:
-        return self._host.ax_search_all(
+        max_nodes: int = 5000,
+    ) -> SearchMatches:
+        """`query` that searches every running app unless a scope narrows it."""
+        return self.query(
+            text,
+            app=app,
+            all_apps=all_apps or (app is None and apps is None),
             apps=apps,
-            search_key=self._search_key(search_key, role),
-            text=text,
+            role=role,
+            search_key=search_key,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             limit=limit,
             direction=direction,
@@ -194,12 +230,15 @@ class Accessibility:
         apps: str | int | Iterable[str | int] | None = None,
         role: str | None = None,
         search_key: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _SAFE_ATTRIBUTES,
         include_actions: bool = False,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
         timeout: float = 5.0,
         interval: float = 0.1,
     ) -> dict[str, Any]:
@@ -209,6 +248,9 @@ class Accessibility:
             apps=apps,
             search_key=self._search_key(search_key, role),
             text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             direction=direction,
             immediate_descendants_only=immediate_descendants_only,
@@ -228,11 +270,14 @@ class Accessibility:
         apps: str | int | Iterable[str | int] | None = None,
         role: str | None = None,
         search_key: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _SAFE_ATTRIBUTES,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
         timeout: float = 5.0,
         interval: float = 0.1,
     ) -> None:
@@ -242,6 +287,9 @@ class Accessibility:
             apps=apps,
             search_key=self._search_key(search_key, role),
             text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             direction=direction,
             immediate_descendants_only=immediate_descendants_only,
@@ -260,11 +308,14 @@ class Accessibility:
         apps: str | int | Iterable[str | int] | None = None,
         role: str | None = None,
         search_key: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _SAFE_ATTRIBUTES,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
         timeout: float = 5.0,
         interval: float = 0.1,
     ) -> dict[str, Any]:
@@ -274,6 +325,9 @@ class Accessibility:
             apps=apps,
             search_key=self._search_key(search_key, role),
             text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             direction=direction,
             immediate_descendants_only=immediate_descendants_only,
@@ -284,23 +338,23 @@ class Accessibility:
         )
 
     def get(
-        self, element_index: int, attributes: str | Iterable[str] = "AXValue"
+        self, element_index: ElementRef, attributes: str | Iterable[str] = "AXValue"
     ) -> Any:
         if isinstance(attributes, str):
             return self._host.get(element_index, attributes)
         return self._host.get_attributes(element_index, attributes)
 
-    def set(self, element_index: int, attribute: str, value: Any) -> None:
+    def set(self, element_index: ElementRef, attribute: str, value: Any) -> None:
         self._host.set(element_index, value, attribute)
 
-    def actions(self, element_index: int) -> list[str]:
+    def actions(self, element_index: ElementRef) -> list[str]:
         element = self._host._local_element(element_index)
         return self._host._actions(element)
 
-    def perform(self, element_index: int, action: str = "AXPress") -> None:
+    def perform(self, element_index: ElementRef, action: str = "AXPress") -> None:
         self._host.perform_action(element_index, action)
 
-    def parameterized(self, element_index: int, attribute: str, parameter: Any) -> Any:
+    def parameterized(self, element_index: ElementRef, attribute: str, parameter: Any) -> Any:
         error, value = AS.AXUIElementCopyParameterizedAttributeValue(
             self._host._local_element(element_index), attribute, parameter, None
         )
@@ -316,7 +370,7 @@ class Accessibility:
             )
         return self._host._jsonable(value)
 
-    def raw(self, element_index: int) -> Any:
+    def raw(self, element_index: ElementRef) -> Any:
         return self._host._local_element(element_index)
 
     def dump(self, app: str, **kwargs: Any) -> dict[str, Any]:

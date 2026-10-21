@@ -28,8 +28,8 @@ classifiers = [
 ]
 dependencies = [
   "browser-harness>=0.1.9",
-  "pillow>=11.3",
   "pyobjc-framework-ApplicationServices>=12.0; sys_platform == 'darwin'",
+  "pyobjc-framework-ScreenCaptureKit>=12.0; sys_platform == 'darwin'",
 ]
 
 [dependency-groups]
@@ -58,7 +58,8 @@ artifacts = ["src/macos_harness/bin/macos-harness-agent"]
 [tool.hatch.build.targets.wheel.hooks.custom]
 
 [tool.hatch.build.targets.wheel.force-include]
-"skills/macos-harness/SKILL.md" = "macos_harness/SKILL.md"
+"skills/macos-harness/SKILL.md" = "macos_harness/skill/SKILL.md"
+"skills/macos-harness/references" = "macos_harness/skill/references"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -33,6 +33,8 @@ struct Main {
       exit(1)
     }
 
+    // The session must run on the main thread: `AXExecutor` turns the main run loop there so
+    // `NSWorkspace` reports apps launched and activated after the first read.
     exit(exitCode(for: Session(fd: fd).run()))
   }
 

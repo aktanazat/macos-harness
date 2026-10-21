@@ -1,28 +1,44 @@
 """Direct macOS control through public ApplicationServices APIs.
 
 No Codex or OpenAI Computer Use runtime is used here. Accessibility supplies
-the semantic tree/actions; Core Graphics supplies raw input; the system
-``screencapture`` executable captures a specific window.
+the semantic tree/actions; Core Graphics supplies raw input; ScreenCaptureKit
+renders a specific window (see ``capture.py``).
 """
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import json
 import math
+import operator
 import os
+import plistlib
 import re
-import struct
 import subprocess
 import tempfile
 import threading
 import time
+import uuid
 import weakref
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
 
-from PIL import Image, ImageDraw
-
+from .capture import (
+    GrayPrint,
+    WindowCapture,
+    capture_screen,
+    capture_window,
+    changed_area,
+    displays,
+    draw_pointer,
+    gray_print,
+    write_png,
+)
 from .errors import (
     AccessibilityPermissionError,
     ApplicationNotFoundError,
@@ -31,8 +47,15 @@ from .errors import (
     MacOSError,
 )
 from .handoff import HandoffReason, HumanHandoff
+from .ops import _Deadline, _utc_timestamp
 from .overlay import LivePointerOverlay
-from .pointer import POINTER_HOTSPOT, pointer_points
+from .receipts import (
+    JSONValue,
+    Receipt,
+    validate_click_aim,
+    validate_exact_selectors,
+    validate_scope,
+)
 
 if TYPE_CHECKING:
     # Only for annotations -- `native.py` imports from this module at
@@ -44,14 +67,127 @@ if TYPE_CHECKING:
 
 try:
     import ApplicationServices as AS
-    from AppKit import NSRunningApplication, NSWorkspace
+    import objc
+    from AppKit import (
+        NSURL,
+        NSApplicationActivateIgnoringOtherApps,
+        NSRunningApplication,
+        NSWorkspace,
+        NSWorkspaceOpenConfiguration,
+    )
 except ImportError as exc:  # pragma: no cover - exercised on non-macOS hosts
     AS = None  # type: ignore[assignment]
+    objc = None  # type: ignore[assignment]
+    NSURL = None  # type: ignore[assignment]
+    NSApplicationActivateIgnoringOtherApps = 0
     NSRunningApplication = None  # type: ignore[assignment]
     NSWorkspace = None  # type: ignore[assignment]
+    NSWorkspaceOpenConfiguration = None  # type: ignore[assignment]
     _IMPORT_ERROR: ImportError | None = exc
 else:
     _IMPORT_ERROR = None
+
+
+class _CGPoint(ctypes.Structure):
+    _fields_ = (("x", ctypes.c_double), ("y", ctypes.c_double))
+
+
+class _TargetWindow(NamedTuple):
+    """The window a posted mouse or scroll event is bound to."""
+
+    window_id: int
+    origin: tuple[float, float]  # top-left screen point
+
+class _AppIdentity(NamedTuple):
+    pid: int
+    bundle_id: str | None
+    launched_at: float
+    name: str
+    path: str | None
+
+
+@dataclass(slots=True)
+class _Picture:
+    """A window as this process last pictured it, where the next
+    `wait_change` of it measures from. ``first_of`` is the pid whose
+    first window it was then, the one input naming only that app
+    reaches; ``acted`` says an input has reached the window since."""
+
+    window_id: int
+    capture: WindowCapture
+    first_of: int | None = None
+    acted: bool = False
+
+
+# A mouse or scroll event posted with ``CGEventPostToPid`` skips the window
+# server's hit test, so AppKit has to learn the destination window from the
+# event itself: the window number in this private ``CGEventField`` plus the
+# window-local point written by the private ``CGEventSetWindowLocation``.
+# Without both, AppKit finds no window under the event and drops it, and
+# the caret in TextEdit never moves (measured 2026-09-13; the field is the
+# one ``NSEvent.mouseEventWithType:...windowNumber:`` fills, and the
+# recipe is the one https://github.com/Lakr233/bgclick-rev-skill recovered).
+_CG_EVENT_WINDOW_NUMBER = 51
+_CORE_GRAPHICS = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+
+
+def _load_window_location_setter() -> Callable[[int, _CGPoint], None] | None:
+    """Resolve ``CGEventSetWindowLocation``; ``None`` on a macOS that dropped it."""
+    try:
+        setter = ctypes.CDLL(_CORE_GRAPHICS).CGEventSetWindowLocation
+    except (OSError, AttributeError):
+        return None
+    setter.argtypes = (ctypes.c_void_p, _CGPoint)
+    setter.restype = None
+    return setter
+
+
+_set_window_location = _load_window_location_setter() if AS else None
+
+class _ProcessBSDInfo(ctypes.Structure):
+    # sys/proc_info.h: PROC_PIDTBSDINFO / struct proc_bsdinfo.
+    _fields_ = (
+        ("pbi_flags", ctypes.c_uint32), ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32), ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32), ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32), ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32), ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32), ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16), ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32), ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32), ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32), ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64), ("pbi_start_tvusec", ctypes.c_uint64),
+    )
+
+
+def _load_process_info() -> Callable[[int, int, int, object, int], int] | None:
+    try:
+        function = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidinfo
+    except (OSError, AttributeError):
+        return None
+    function.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
+    function.restype = ctypes.c_int
+    return function
+
+
+_process_info = _load_process_info() if AS else None
+
+
+def _process_start_time(pid: int) -> float:
+    if _process_info is None:
+        raise MacOSError("Process start identity is unavailable", code=ErrorCode.UNSUPPORTED_OP)
+    info = _ProcessBSDInfo()
+    size = ctypes.sizeof(info)
+    returned = _process_info(pid, 3, 0, ctypes.byref(info), size)
+    if returned != size:
+        error = ctypes.get_errno()
+        if returned == 0 and error == errno.ESRCH:
+            raise ApplicationNotFoundError("The process exited before its identity could be read",
+                                           details={"pid": pid})
+        raise MacOSError("Could not read the process start identity", code=ErrorCode.UNSUPPORTED_OP,
+                         details={"pid": pid, "errno": error, "bytes_read": returned})
+    return info.pbi_start_tvsec + info.pbi_start_tvusec / 1_000_000
 
 
 _AX_SUCCESS = 0
@@ -59,6 +195,8 @@ _AX_ATTRIBUTES = (
     "AXRole",
     "AXSubrole",
     "AXRoleDescription",
+    "AXMain",
+    "AXModal",
     "AXTitle",
     "AXDescription",
     "AXHelp",
@@ -79,6 +217,9 @@ _AX_ATTRIBUTES = (
 )
 _AX_SAFE_ATTRIBUTES = (
     "AXRole",
+    "AXSubrole",
+    "AXMain",
+    "AXModal",
     "AXTitle",
     "AXDescription",
     "AXPlaceholderValue",
@@ -92,8 +233,44 @@ _AX_SAFE_ATTRIBUTES = (
     "AXFrame",
 )
 _AX_CROSS_APP_MESSAGING_TIMEOUT = 0.5
+# How many matches a wait with search text reads: enough for the tiebreak
+# (`MacOS._settle_tie`) to see every candidate a label search
+# plausibly finds -- "Allow" also finds "Don't Allow". Mirrors
+# `PressCoordinator.labelSearchLimit` in the native agent.
+_AX_LABEL_SEARCH_LIMIT = 20
+# How many apps a broad sweep asks at once whether they can answer
+# Accessibility (`MacOS._silent_pids`): enough that the few that never
+# answer cost one messaging timeout together instead of one each.
+_AX_PROBE_WORKERS = 16
+# A process younger than this with no window is presumed still launching,
+# and a capture waits for its first window instead of failing at once.
+_LAUNCH_GRACE_SECONDS = 5.0
+_LAUNCH_WINDOW_TIMEOUT = 2.0
+# The most an `inspect` walks; a larger ask walks this much and says so.
+_INSPECT_MAX_NODES = 5000
+_INSPECT_MAX_DEPTH = 25
+# `wait_change` looks at a window this often, and a look counts as changed
+# once about 64 square points of it moved in brightness -- one short word
+# of body text; a blinking caret is about 20 -- or 2% of a watched region,
+# whichever is less. A whole-window print keeps one pixel per 2 points.
+_CHANGE_POLL_SECONDS = 0.05
+_CHANGE_SETTLE_SECONDS = 0.15
+_CHANGE_AREA = 64.0
+_CHANGE_REGION_SHARE = 0.02
+_CHANGE_BASELINE_SIZE = 640
+_PRINT_POINTS_PER_PIXEL = 2.0
+_PRINT_MAX_WIDTH = 400
+# What `wait_change(by="ax")` compares: what an element says and its
+# state, not where it sits.
+_AX_LOOK_ATTRIBUTES = (
+    "AXSubrole", "AXTitle", "AXDescription", "AXValue", "AXPlaceholderValue",
+    "AXEnabled", "AXSelected",
+)
+_Look = TypeVar("_Look")
 _AX_NODE_MAPPING = {
     "AXSubrole": "subrole",
+    "AXMain": "main",
+    "AXModal": "modal",
     "AXRoleDescription": "role_description",
     "AXTitle": "title",
     "AXDescription": "description",
@@ -111,6 +288,38 @@ _AX_NODE_MAPPING = {
     "AXSize": "size",
     "AXFrame": "frame",
 }
+# The attributes a bounded walk's substring match reads, in the order it
+# checks them (`MacOS._bounded_ax_search`).
+_AX_MATCH_ATTRIBUTES = (
+    "AXTitle",
+    "AXDescription",
+    "AXValue",
+    "AXHelp",
+    "AXIdentifier",
+    "AXDOMIdentifier",
+    "AXPlaceholderValue",
+)
+# What `_focus_sample` reads from the focused element, and the receipt
+# name for each. Identity first, on its own: it decides whether the
+# details may be read at all, so a secure field's value, length and
+# selection are never requested, not merely dropped -- and an identity
+# read that failed raises (see `_copy_attributes`), so it authorizes
+# nothing either.
+_FOCUS_IDENTITY_ATTRIBUTES = {
+    "AXRole": "role",
+    "AXSubrole": "subrole",
+}
+_FOCUS_DETAIL_ATTRIBUTES = {
+    "AXTitle": "title",
+    "AXDescription": "description",
+    "AXPosition": "position",
+    "AXSize": "size",
+    "AXValue": "value",
+    "AXSelectedTextRange": "selected_range",
+    "AXNumberOfCharacters": "characters",
+}
+_SECURE_SUBROLE = "AXSecureTextField"
+_SENSITIVE_ATTRIBUTES = frozenset({"AXValue", "AXSelectedText", "AXSelectedTextRange", "AXNumberOfCharacters"})
 _SETTABLE_CANDIDATES = ("AXValue", "AXFocused", "AXSelected")
 _ACTION_ALIASES = {
     "press": "AXPress",
@@ -181,6 +390,50 @@ _AX_SEARCH_ROLES = {
         "TextField",
     )
 }
+# The searches for menus or their items, which a closed menu holds too: a
+# closed menu's command still answers a press.
+_AX_MENU_SEARCH_KEYS = frozenset({"AXMenuSearchKey", "AXMenuItemSearchKey"})
+# The role each role search key finds, the other way round, so a match's
+# role names the search that finds it again (`MacOS._find_again`).
+_SEARCH_KEY_OF_ROLE = {role: key for key, role in _AX_SEARCH_ROLES.items()}
+
+
+def _on_screen_only(visible_only: bool, search_key: str) -> bool:
+    """Whether a search looks only at what is on screen: ``visible_only``,
+    and not a search for menus or their items (`_AX_MENU_SEARCH_KEYS`)."""
+    return visible_only and search_key not in _AX_MENU_SEARCH_KEYS
+
+
+# Where a menu path's first step is looked for, by the bar it starts in.
+_MENU_BAR_PLACES = {"AXMenuBar": "in its menu bar", "AXExtrasMenuBar": "among its status items"}
+
+
+def _menu_label(text: str) -> str:
+    """``text`` as a menu path step compares it: case and runs of spaces
+    ignored, and "..." read as the "…" menus use."""
+    return " ".join(text.replace("...", "…").split()).casefold()
+
+
+def _menu_miss(
+    pid: int, before: Sequence[str | None], step: str | None, found: int, bar: str
+) -> str:
+    """Why a menu path stops at ``step``, which ``found`` items answer
+    after the steps ``before``."""
+    if step is None:
+        return (
+            f"Process {pid} has {found} status items, not one; "
+            "with several, name= picks one by its title or description"
+        )
+    place = (
+        f"under {' > '.join(name or 'its status item' for name in before)}"
+        if before else _MENU_BAR_PLACES[bar]
+    )
+    return (
+        f"Process {pid} has {found} items named {step!r} {place}; "
+        "a menu path needs exactly one at each step"
+    )
+
+
 _KEYCODES = {
     "a": 0,
     "s": 1,
@@ -252,6 +505,54 @@ _KEYCODES = {
 _SHIFTED_CHARACTERS = dict(
     zip('~!@#$%^&*()_+{}|:"<>?', "`1234567890-=[]\\;',./", strict=True)
 )
+# Characters `type` sends by key name rather than by character: a space
+# so the keycode is right, and the three that must always arrive as a
+# key press, never inside a packed run of text.
+_KEY_NAMES = {" ": "space", "\n": "return", "\r": "return", "\t": "tab"}
+_KEY_ONLY_CHARACTERS = frozenset("\n\r\t")
+# The most UTF-16 units one packed key event carries: 20 landed exactly
+# in every app measured, and larger payloads were not measured.
+_TYPE_CHUNK_UNITS = 20
+# macOS has no gesture past a triple click.
+_MAX_CLICKS = 3
+
+
+def _character_key(character: str) -> tuple[int, int]:
+    """The keycode and modifier flags one typed ``character`` rides on."""
+    base = _SHIFTED_CHARACTERS.get(character, _KEY_NAMES.get(character, character.casefold()))
+    flags = (
+        AS.kCGEventFlagMaskShift
+        if character.isupper() or character in _SHIFTED_CHARACTERS
+        else 0
+    )
+    return _KEYCODES.get(base, 0), flags
+
+
+def _typing_chunks(text: str, *, packed: bool) -> Iterator[str]:
+    """The strings each key event of `MacOS.type` carries, in order.
+
+    A `_KEY_ONLY_CHARACTERS` member always travels alone; unpacked, so
+    does every other character. Packed, the rest group into runs of at
+    most `_TYPE_CHUNK_UNITS` UTF-16 units, split only between code
+    points so a surrogate pair never straddles two events.
+    """
+    run: list[str] = []
+    units = 0
+    for character in text:
+        if not packed or character in _KEY_ONLY_CHARACTERS:
+            if run:
+                yield "".join(run)
+                run, units = [], 0
+            yield character
+            continue
+        width = 2 if ord(character) > 0xFFFF else 1
+        if units + width > _TYPE_CHUNK_UNITS:
+            yield "".join(run)
+            run, units = [], 0
+        run.append(character)
+        units += width
+    if run:
+        yield "".join(run)
 
 
 def _parse_key(key: str) -> tuple[int, tuple[tuple[int, int], ...]]:
@@ -304,24 +605,304 @@ def _truncate(value: str, limit: int = 160) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
-def _png_size(path: Path) -> tuple[int, int]:
-    with path.open("rb") as handle:
-        header = handle.read(24)
-    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
-        raise MacOSError(
-            f"Screenshot is not a PNG: {path}",
-            code=ErrorCode.AX_ERROR,
-            details={"path": str(path)},
-        )
-    return struct.unpack(">II", header[16:24])
+# What the AXError codes agents meet mean, so an error says what happened
+# instead of only a number. Apple's `AXError.h`, in words.
+_AX_ERROR_MEANINGS = {
+    -25202: "the element is gone; query it again",
+    -25204: "the app did not answer in time",
+    -25205: "the element has no such attribute",
+    -25206: "the element does not support that action",
+    -25208: "the app does not implement Accessibility",
+    -25211: "Accessibility is off for this process, or the app refuses it",
+    -25212: "the attribute has no value",
+}
 
 
-def _ax_error(operation: str, error: int, **details: object) -> MacOSError:
+def _ax_error(
+    operation: str, error: int, *, hint: str | None = None, **details: object
+) -> MacOSError:
+    meaning = _AX_ERROR_MEANINGS.get(int(error))
+    message = f"{operation} failed with AXError {error}"
+    if meaning is not None:
+        message += f" ({meaning})"
+    if hint is not None:
+        message += f"; {hint}"
     return MacOSError(
-        f"{operation} failed with AXError {error}",
+        message,
         code=ErrorCode.AX_ERROR,
         details={"ax_error": int(error), "operation": operation, **details},
     )
+
+
+def _ax_absent(error: int) -> bool:
+    """Whether ``error`` is AX reporting that an attribute has nothing to
+    say -- the element has no such attribute, or it has no value right
+    now -- as opposed to a read that failed: the app did not answer, the
+    element is gone, the API is off. A lossy read treats both as absent;
+    a checked one (`MacOS._copy_attribute`) only the first."""
+    return error in (AS.kAXErrorNoValue, AS.kAXErrorAttributeUnsupported)
+
+
+def _hides_match(error: int) -> bool:
+    """Whether a read that failed with ``error`` can hide a search match.
+
+    kAXErrorFailure is the app answering that it cannot produce the value
+    -- the Dock for an item's description, Ghostty for a radio button's.
+    No read ever returns that value, so no search can match on it, and a
+    search that met the failure still saw everything it could. Every other
+    failure (the app did not answer, the element went away mid-read) may
+    hide a match.
+    """
+    return error != AS.kAXErrorFailure
+
+
+class _AttributeValues(dict[str, Any | None]):
+    """Best-effort attribute values without treating failed reads as absence.
+
+    ``failures`` maps each attribute whose read failed -- as opposed to one
+    the element lacks or has no value for (`_ax_absent`) -- to its AXError.
+    """
+
+    __slots__ = ("failures",)
+
+    def __init__(
+        self,
+        values: Iterable[tuple[str, Any | None]] = (),
+        *,
+        failures: Iterable[tuple[str, int]] = (),
+    ) -> None:
+        super().__init__(values)
+        self.failures = dict(failures)
+
+    @property
+    def complete(self) -> bool:
+        """Every read succeeded or found the attribute absent."""
+        return not self.failures
+
+    @property
+    def conclusive(self) -> bool:
+        """No failed read can hide a search match (`_hides_match`)."""
+        return not any(_hides_match(error) for error in self.failures.values())
+
+
+class SearchMatches(list[dict[str, JSONValue]]):
+    """The matches of one AX search, plus whether they are all of them.
+
+    ``complete`` is True when no limit or failed read left part of the
+    searched scope unexamined. ``visited`` counts the candidates returned
+    by an app's optimized search, or nodes visited by the bounded walk.
+    Exact waits require completeness before accepting one match;
+    disappearance waits require it before accepting an empty search.
+    """
+
+    __slots__ = ("complete", "partial", "unanswered", "visited")
+
+    def __init__(
+        self,
+        matches: Iterable[dict[str, JSONValue]] = (),
+        *,
+        complete: bool,
+        visited: int,
+    ) -> None:
+        super().__init__(matches)
+        self.complete = complete
+        self.visited = visited
+        # A cross-app sweep's gaps: the apps it searched only in part, by
+        # name, and how many apps did not answer at all.
+        self.partial: list[str] = []
+        self.unanswered = 0
+
+
+# An element: an index this run's last search or snapshot handed out, or
+# a match a search returned, in this run or an earlier one, which
+# `MacOS._find_again` finds again by its pid, role, labels, and frame.
+ElementRef = int | Mapping[str, JSONValue]
+
+
+def _with_pid(matches: SearchMatches, pid: int | None) -> SearchMatches:
+    """``matches``, each naming the process its one searched app runs as,
+    so that a later run can find it again (`MacOS._find_again`)."""
+    if pid is not None:
+        for match in matches:
+            match["pid"] = pid
+    return matches
+
+
+def _search_gaps(matches: SearchMatches, max_nodes: int) -> tuple[str, dict[str, JSONValue]]:
+    """What an incomplete search left out, for a timeout to say: the apps
+    a sweep searched only in part, the apps that did not answer, or the
+    node budget that cut one app's walk short."""
+    note = ""
+    if matches.partial:
+        shown = ", ".join(matches.partial[:5])
+        more = len(matches.partial) - 5
+        note += (
+            f"; searched only in part: {shown}"
+            + (f" and {more} more" if more > 0 else "")
+            + " (pass app= to search one of them alone, or a larger max_nodes)"
+        )
+    elif not matches.unanswered and matches.visited >= max_nodes:
+        note += f"; the search stopped at max_nodes={max_nodes}, so pass a larger max_nodes"
+    if matches.unanswered:
+        apps = "1 app" if matches.unanswered == 1 else f"{matches.unanswered} apps"
+        note += f"; {apps} did not answer"
+    return note, {
+        "complete": False,
+        "visited": matches.visited,
+        "max_nodes": max_nodes,
+        "partial": list(matches.partial),
+        "unanswered": matches.unanswered,
+    }
+
+
+def _did_not_answer(exc: MacOSError) -> bool:
+    """Whether a search failed only because its app did not answer in time
+    (AXError -25204). An app still launching or busy answers nothing for a
+    while -- Secretive and Activity Monitor for over a second after
+    ``open -a`` -- so a wait polls on (`_unanswered_search`)."""
+    return exc.details.get("ax_error") == AS.kAXErrorCannotComplete
+
+
+def _unanswered_search() -> SearchMatches:
+    """The poll a wait records for a search its app did not answer: one
+    that found nothing and saw nothing, its one app unanswered."""
+    matches = SearchMatches(complete=False, visited=0)
+    matches.unanswered = 1
+    return matches
+
+
+def _no_window_error(
+    info: Mapping[str, object], *, timeout: float | None = None, surfaces: Sequence[int] = ()
+) -> MacOSError:
+    """A running app with no window to capture, and the call that opens
+    one. An app such as Secretive keeps running with no window until its
+    Dock icon is clicked; AppleScript's ``reopen`` is that click, and
+    TextEdit answered it without coming forward. An app that shows only
+    a panel or prompt off the normal layer names those by window id."""
+    target = (
+        f'id "{info["bundle_id"]}"' if info.get("bundle_id") else f'"{info["name"]}"'
+    )
+    if surfaces:
+        return MacOSError(
+            f"{info['name']} has no normal window but shows "
+            f"{len(surfaces)} other surface(s), such as a panel or prompt: "
+            f"mac.see(window_id={surfaces[0]}) captures one, and "
+            f"mac.windows({info['pid']}, all_layers=True) lists them",
+            code=ErrorCode.ELEMENT_UNKNOWN,
+            details={"app": info, "window_ids": list(surfaces)},
+        )
+    state = (
+        "has no open windows"
+        if timeout is None
+        else f"showed no window within {timeout:g}s"
+    )
+    return MacOSError(
+        f"{info['name']} is running but {state}; "
+        f"mac.script('tell application {target} to reopen') asks it to open "
+        "its window, as clicking its Dock icon would",
+        code=ErrorCode.ELEMENT_UNKNOWN if timeout is None else ErrorCode.TIMEOUT,
+        details={"app": info} if timeout is None else {"app": info, "timeout": timeout},
+    )
+
+
+def _png_output(path: str | Path | None) -> Path:
+    """Where `see` writes its PNG: ``path``, or a fresh temporary file."""
+    if path is None:
+        with tempfile.NamedTemporaryFile(
+            prefix="macos-harness-", suffix=".png", delete=False
+        ) as handle:
+            return Path(handle.name)
+    output = Path(path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return output
+
+
+# What `see` records beside each PNG, so a later run can map that
+# image's pixels to the screen and check its window has not moved.
+_CAPTURE_RECORD_KEYS = (
+    "app", "pid", "window_id", "bounds", "width", "height", "scale_x", "scale_y",
+    "captured_at",
+)
+
+
+def _record_path(png: str | Path) -> Path:
+    """The capture record of the PNG ``png``: beside it, ``.json`` appended."""
+    return Path(f"{Path(png).expanduser().resolve()}.json")
+
+
+def _capture_record(png: str | Path) -> dict[str, JSONValue]:
+    """The screenshot `see` recorded beside ``png``, in this run or an
+    earlier one, as `_screen_point` maps coordinates through it."""
+    try:
+        record = json.loads(_record_path(png).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        record = None
+    if not isinstance(record, dict) or not record.keys() >= set(_CAPTURE_RECORD_KEYS):
+        raise MacOSError(
+            f"{png} has no capture record beside it; pass a PNG that mac.see() "
+            "wrote, or see again",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": "screenshot", "value": str(png)},
+        )
+    return record
+
+
+class _ExactSelector(NamedTuple):
+    """The exact-equality half of a search: each field that is set must
+    equal the element's attribute of the same name, character for
+    character. Substring ``text`` narrows the candidates; this decides
+    them."""
+
+    title: str | None
+    identifier: str | None
+    description: str | None
+
+    @classmethod
+    def parse(
+        cls, *, title: str | None, identifier: str | None, description: str | None
+    ) -> _ExactSelector:
+        validate_exact_selectors(
+            title=title, identifier=identifier, description=description
+        )
+        return cls(title, identifier, description)
+
+    @property
+    def active(self) -> bool:
+        return any(value is not None for value in self)
+
+    @property
+    def attributes(self) -> tuple[str, ...]:
+        """The AX attributes a candidate must be read for before `matches`
+        can judge it."""
+        return tuple(
+            source
+            for source, target in _EXACT_ATTRIBUTES.items()
+            if getattr(self, target) is not None
+        )
+
+    def matches(self, fields: Mapping[str, JSONValue]) -> bool:
+        """Whether ``fields`` -- wire-named, as `_describe_element` builds
+        them -- carries every set selector's value exactly."""
+        return all(
+            value is None or fields.get(name) == value
+            for name, value in zip(self._fields, self, strict=True)
+        )
+
+
+_EXACT_ATTRIBUTES = {
+    "AXTitle": "title",
+    "AXIdentifier": "identifier",
+    "AXDescription": "description",
+}
+
+
+class _TreeSnapshot(NamedTuple):
+    """Visited nodes and the limits or failed reads that left gaps."""
+
+    nodes: list[dict[str, JSONValue]]
+    node_cut: bool
+    depth_cut: bool
+    read_cut: bool
 
 
 _BACKENDS = ("python", "native", "auto")
@@ -367,23 +948,26 @@ class _Unresolved:
 _UNRESOLVED = _Unresolved()
 
 
-def _finalize_native_session(session_box: list[Any | None]) -> None:
-    """Finalizer callback for one ``MacOS`` instance's native agent child.
+def _finalize_native_session(
+    session_box: list[Any | None], overlay: LivePointerOverlay
+) -> None:
+    """Finalize this instance's private agent and disposable pointer child.
 
-    Deliberately a free function taking only a plain mutable box, never a
-    bound method or closure over the owning ``MacOS`` instance itself:
-    ``MacOS`` and ``Accessibility`` hold references to each other
-    (``self.ax = Accessibility(self)``), and a ``weakref.finalize``
-    callback that captures its own target, even indirectly, keeps that
-    target permanently unreachable-but-never-collectable. ``MacOS.close()``
+    The callback keeps only the session box and the separately owned pointer,
+    never a bound method or closure over ``MacOS`` itself. Neither resource
+    refers back to the instance, so the finalizer cannot keep it alive.
+    ``MacOS.close()``
     calls this same finalizer directly (idempotent: a finalizer only ever
     fires once), and it also runs automatically once the owning instance
     is unreachable or the interpreter exits, even if ``close()`` was
     never called at all.
     """
     session, session_box[0] = session_box[0], None
-    if session is not None:
-        session.close()
+    try:
+        if session is not None:
+            session.close()
+    finally:
+        overlay.close()
 
 
 #: Every ``MacOS`` instance that might still hold a live native-agent
@@ -427,6 +1011,16 @@ if hasattr(os, "register_at_fork"):  # pragma: no branch - always true on macOS
 class MacOS:
     """Low-level macOS observation and control for one persistent process."""
 
+    # Identity for `inspect` and `diff`, held on the class so it reads as
+    # "nothing inspected yet" and every write below replaces it with an
+    # instance attribute. `_observation_refs` maps the accessibility
+    # elements of the previous inspection to their `ref`; only that one
+    # generation is kept.
+    _observation_session: str | None = None
+    _observation_sequence: int = 0
+    _observation_refs: Mapping[Any, int] = MappingProxyType({})
+    _observation_ref_seq: int = 0
+
     def __init__(self, *, backend: str | None = None) -> None:
         _require_macos()
         self._elements: dict[int, Any] = {}
@@ -434,20 +1028,40 @@ class MacOS:
         self._last_app: dict[str, Any] | None = None
         self._last_windows: list[dict[str, Any]] = []
         self._last_screenshot: dict[str, Any] | None = None
+        # The last `see` before its pointer was drawn, or a picture in its
+        # pixels taken since, by a wait's look or `_hold_before_input`:
+        # where the next `wait_change` of that window measures from.
+        self._last_capture: _Picture | None = None
+        # The same for one window no `see` holds, at most 640 pixels a side.
+        self._before_input: _Picture | None = None
         self._event_source = AS.CGEventSourceCreate(AS.kCGEventSourceStatePrivate)
         if self._event_source is None:
             raise MacOSError(
                 "Could not create a private Core Graphics event source",
                 code=ErrorCode.AX_ERROR,
             )
+        # A fresh private source suppresses the user's own hardware input
+        # for 250 ms after every posted event. Nothing here needs that
+        # quiet window, and a typing loop would turn it into a stuck
+        # keyboard, so let every local event through in both states.
+        AS.CGEventSourceSetLocalEventsSuppressionInterval(self._event_source, 0.0)
+        for state in (
+            AS.kCGEventSuppressionStateRemoteMouseDrag,
+            AS.kCGEventSuppressionStateSuppressionInterval,
+        ):
+            AS.CGEventSourceSetLocalEventsFilterDuringSuppressionState(
+                self._event_source, AS.kCGEventFilterMaskPermitAllEvents, state
+            )
 
         from .controls import Accessibility
         from .ops import Operations
+        from .routes import Routes
 
         self._pointer_position: tuple[float, float] | None = None
         self._overlay = LivePointerOverlay()
         self.ax = Accessibility(self)
         self.do = Operations(self)
+        self.route = Routes(self)
         self._backend = _resolve_backend(backend)
         self._native_client: NativeClient | None = None
         self._native_error: Exception | None = None
@@ -459,7 +1073,7 @@ class MacOS:
         # and `close()`/`_acquire_native()` mutate its one slot in place.
         self._native_session_box: list[Any | None] = [None]
         self._native_finalizer = weakref.finalize(
-            self, _finalize_native_session, self._native_session_box
+            self, _finalize_native_session, self._native_session_box, self._overlay
         )
         # See `_check_native_owner` below: a forked child inherits a
         # byte-for-byte copy of this instance, including `_native_lock`,
@@ -467,6 +1081,213 @@ class MacOS:
         # every later native-session entry point can tell.
         self._creator_pid = os.getpid()
         _live_macos_instances.add(self)
+
+    def timeline(self) -> list[dict[str, JSONValue]]:
+        """Return recent receipted operations without observing the desktop."""
+        return [receipt.to_json() for receipt in self.do.history()]
+
+    def _diagnostic_identity(self, app: str | int | Receipt) -> _AppIdentity:
+        if not isinstance(app, Receipt):
+            return self._process_identity(app)
+        process, target = app.process, app.target
+        info = target.get("app") if isinstance(target, Mapping) else None
+        if not isinstance(process, Mapping) or not isinstance(info, Mapping):
+            raise MacOSError("Receipt has no bound app identity; select an app explicitly",
+                             code=ErrorCode.BAD_REQUEST)
+        pid, launched = process.get("pid"), process.get("launched_at")
+        if type(pid) is not int or type(launched) not in (int, float):
+            raise MacOSError("Receipt has no process launch identity", code=ErrorCode.BAD_REQUEST)
+        bundle, name, path = info.get("bundle_id"), info.get("name"), info.get("path")
+        return _AppIdentity(pid, bundle if isinstance(bundle, str) else None, launched,
+                            name if isinstance(name, str) else "", path if isinstance(path, str) else None)
+
+    def _status_identity(self, identity: _AppIdentity) -> dict[str, JSONValue]:
+        return {
+            "app": {"pid": identity.pid, "name": identity.name,
+                    "bundle_id": identity.bundle_id, "path": identity.path},
+            "process": self._observe_process(identity),
+            "build": self._build_status(identity), "observed_at": _utc_timestamp(time.time()),
+        }
+
+    def status(self, app: str | int | Receipt) -> dict[str, JSONValue]:
+        """Read app lifetime and on-disk build metadata without reading its UI."""
+        self.do._check_owner()
+        return self._status_identity(self._diagnostic_identity(app))
+
+    def inspect(
+        self, app: str | int | Receipt, *, max_depth: int = 12, max_nodes: int = 300,
+        include_values: bool = False, screenshot: bool = False,
+    ) -> dict[str, JSONValue]:
+        """Collect a bounded, non-enhancing snapshot; values and capture are opt-in.
+
+        ``max_nodes`` above 5000 or ``max_depth`` above 25 walks the cap
+        instead, and the result's ``capped`` says what was asked and used."""
+        from .diagnostics import inspection_findings
+
+        self.do._check_owner()
+        if isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or max_nodes < 1:
+            raise MacOSError("max_nodes must be a positive integer", code=ErrorCode.BAD_REQUEST)
+        if isinstance(max_depth, bool) or not isinstance(max_depth, int) or max_depth < 0:
+            raise MacOSError("max_depth must be a non-negative integer", code=ErrorCode.BAD_REQUEST)
+        capped: dict[str, JSONValue] = {
+            name: {"asked": asked, "used": cap}
+            for name, asked, cap in (
+                ("max_nodes", max_nodes, _INSPECT_MAX_NODES),
+                ("max_depth", max_depth, _INSPECT_MAX_DEPTH),
+            )
+            if asked > cap
+        }
+        max_nodes = min(max_nodes, _INSPECT_MAX_NODES)
+        max_depth = min(max_depth, _INSPECT_MAX_DEPTH)
+        if not isinstance(include_values, bool) or not isinstance(screenshot, bool):
+            raise MacOSError("include_values and screenshot must be booleans", code=ErrorCode.BAD_REQUEST)
+        with self.do._dispatch_lock:
+            identity = self._diagnostic_identity(app)
+            status = self._status_identity(identity)
+            process = status["process"]
+            if isinstance(process, Mapping) and process.get("state") == "running":
+                try:
+                    state = self.get_app_state(
+                        identity.pid, max_depth=max_depth, max_nodes=max_nodes,
+                        include_values=include_values, screenshot=screenshot,
+                        include_actions=False, include_settable=False, enhance=False,
+                    )
+                except MacOSError as exc:
+                    state = {"error": exc.to_json()}
+                try:
+                    state["focus"] = self._focus_sample(identity.pid, include_values=include_values)
+                except MacOSError as exc:
+                    state["focus_error"] = exc.to_json()
+                state.update(status)
+                state["process"] = self._observe_process(identity)
+            else:
+                state = status
+            state["observed_at"] = _utc_timestamp(time.time())
+            self._identify_observation(state)
+            state.update(inspection_findings(state, app if isinstance(app, Receipt) else None))
+            if capped:
+                state["capped"] = capped
+            return state
+
+    def _identify_observation(self, state: dict[str, JSONValue]) -> None:
+        """Give each inspected control a `ref` that survives one re-inspection.
+
+        `element_index` cannot: `_snapshot_tree` clears `self._elements`
+        and `_remember_element` hands out the next unused integer, so the
+        same control is numbered differently in every snapshot and
+        comparing those numbers would read an untouched window as wholly
+        removed and re-added. A node keeps its previous `ref` whenever
+        accessibility returns an element equal to one seen last time --
+        `CFEqual`, the same equality the tree walk already uses to avoid
+        visiting a control twice -- and gets a fresh one otherwise.
+
+        Only the previous inspection's elements are retained, so this
+        holds one extra reference per node and costs one dictionary
+        lookup each. The price is that only consecutive inspections can
+        be compared, which `state["observation"]` records: the session
+        that numbered these refs, this inspection's number, and the
+        number of the inspection its refs were matched against.
+        `diagnostics.diff_inspections` refuses every other pair rather
+        than trusting two integers that happen to agree.
+        """
+        nodes = state.get("nodes")
+        if not isinstance(nodes, list):
+            return
+        previous, refs = self._observation_refs, {}
+        ref_seq = self._observation_ref_seq
+        for node in nodes:
+            element = self._elements[node["element_index"]]
+            ref = previous.get(element)
+            if ref is None:
+                ref, ref_seq = ref_seq, ref_seq + 1
+            refs[element] = ref
+            node["ref"] = ref
+        if self._observation_session is None:
+            self._observation_session = uuid.uuid4().hex
+        state["observation"] = {
+            "session": self._observation_session,
+            "sequence": self._observation_sequence + 1,
+            "previous": self._observation_sequence or None,
+        }
+        self._observation_refs, self._observation_ref_seq = refs, ref_seq
+        self._observation_sequence += 1
+
+    def _diagnostic_pid(self, subject: Receipt | tuple[str, str], app: str | int | None) -> int:
+        from .diagnostics import receipt_pid
+
+        if isinstance(subject, Receipt):
+            if app is not None:
+                raise MacOSError("A receipt already supplies the target app", code=ErrorCode.BAD_REQUEST)
+            return receipt_pid(subject)
+        if isinstance(app, int) and not isinstance(app, bool) and app > 0:
+            return app
+        if isinstance(app, str):
+            return self._process_identity(app).pid
+        raise MacOSError("An explicit time interval needs an app or pid", code=ErrorCode.BAD_REQUEST)
+
+    def logs(
+        self, subject: Receipt | tuple[str, str], *, app: str | int | None = None,
+        subsystem: str | None = None, category: str | None = None, level: str = "info",
+        limit: int = 200, timeout: float = 5.0, max_bytes: int = 1024 * 1024,
+    ) -> dict[str, JSONValue]:
+        """Read bounded unified logs for an action or explicit UTC interval."""
+        from .diagnostics import collect_logs
+
+        self.do._check_owner()
+        return collect_logs(subject, self._diagnostic_pid(subject, app), subsystem=subsystem,
+                            category=category, level=level, limit=limit, timeout=timeout, max_bytes=max_bytes)
+
+    def crashes(
+        self, subject: Receipt | tuple[str, str], *, app: str | int | None = None,
+        limit: int = 3, max_files: int = 128,
+    ) -> dict[str, JSONValue]:
+        """Look up bounded modern crash reports; absence is only this lookup's result."""
+        from .diagnostics import collect_crashes
+
+        self.do._check_owner()
+        return collect_crashes(subject, self._diagnostic_pid(subject, app), limit=limit, max_files=max_files,
+                               directories=(Path.home() / "Library/Logs/DiagnosticReports",
+                                            Path("/Library/Logs/DiagnosticReports")))
+
+    def sample(
+        self, app: str | int | Receipt, *, duration: int = 1, timeout: float = 5.0,
+        max_bytes: int = 1024 * 1024,
+    ) -> dict[str, JSONValue]:
+        """Collect a bounded call graph explicitly, without diagnosing a hang from it."""
+        from .diagnostics import collect_sample
+
+        self.do._check_owner()
+        identity = self._diagnostic_identity(app)
+        process = self._observe_process(identity)
+        if process.get("state") != "running":
+            return {"kind": "sample", "status": "failed", "pid": identity.pid, "process": process,
+                    "error": MacOSError("The bound app is no longer available for sampling",
+                                        code=ErrorCode.APP_EXITED if process.get("state") == "exited"
+                                        else ErrorCode.UNSUPPORTED_OP).to_json()}
+        result = collect_sample(identity.pid, duration=duration, timeout=timeout, max_bytes=max_bytes)
+        result["process"] = self._observe_process(identity)
+        return result
+
+    @staticmethod
+    def explain(receipt: Receipt, *evidence: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        """Explain a receipt using only supplied evidence, without a fresh observation."""
+        from .diagnostics import explain
+
+        return explain(receipt, evidence)
+
+    @staticmethod
+    def diff_windows(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        """Compare supplied window snapshots without observing the desktop."""
+        from .diagnostics import diff_windows
+
+        return diff_windows(before, after)
+
+    @staticmethod
+    def diff(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+        """Compare two consecutive inspections of one app without observing it again."""
+        from .diagnostics import diff_inspections
+
+        return diff_inspections(before, after)
 
     def _check_native_owner(self) -> None:
         """Fail closed before touching ``_native_lock`` from a forked child.
@@ -493,7 +1314,7 @@ class MacOS:
             )
 
     def close(self) -> None:
-        """Tear down this instance's private native agent child, if any.
+        """Reap this instance's private helpers, never app windows or documents.
 
         Idempotent: safe to call more than once, and safe when no native
         session was ever launched (the common, default ``python`` backend
@@ -517,7 +1338,10 @@ class MacOS:
         with self._native_lock:
             self._native_closed = True
             self._native_client = None
-        self._native_finalizer()
+        try:
+            self._native_finalizer()
+        finally:
+            self._overlay.close()
 
     def __enter__(self) -> Self:
         return self
@@ -634,12 +1458,36 @@ class MacOS:
             if client is not None:
                 return client.list_apps()
         apps: list[dict[str, Any]] = []
-        for app in NSWorkspace.sharedWorkspace().runningApplications():
+        for app in self._running_applications():
             info = self._app_info(app)
             if not info["name"]:
                 continue
             apps.append(info)
         return sorted(apps, key=lambda item: (item["name"].casefold(), item["pid"]))
+
+    @staticmethod
+    def _take_in_workspace_changes() -> None:
+        """Let `NSWorkspace` catch up with every app that launched, quit,
+        or came to the front since this process last looked.
+
+        It updates ``runningApplications`` and ``frontmostApplication``
+        from notifications it takes in on the main thread's run loop,
+        which this process otherwise never turns. Without a turn, an app
+        that launches after the first read -- the process behind a
+        permission dialog, say -- stays missing for good, and the
+        frontmost app stays whatever it was: `activate` never sees its
+        request take, and every focus guard compares one stale reading
+        with itself. One zero-wait turn takes the changes in.
+        """
+        from Foundation import NSDate, NSDefaultRunLoopMode, NSRunLoop
+
+        NSRunLoop.currentRunLoop().runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.date())
+
+    @classmethod
+    def _running_applications(cls) -> Iterable[NSRunningApplication]:
+        """Every running app as of now, not as of this process's last look."""
+        cls._take_in_workspace_changes()
+        return NSWorkspace.sharedWorkspace().runningApplications()
 
     @staticmethod
     def _app_info(app: Any) -> dict[str, Any]:
@@ -653,8 +1501,92 @@ class MacOS:
             "path": str(path) if path else None,
         }
 
+    def _process_identity(self, query: str | int) -> _AppIdentity:
+        try:
+            _, info = self._resolve_app(query)
+        except ApplicationNotFoundError:
+            if not isinstance(query, int) or isinstance(query, bool):
+                raise
+            # Command-line processes have a kernel identity without an AppKit record.
+            info = {"pid": query}
+        return self._identity_from_info(info)
+
+    @staticmethod
+    def _identity_from_info(info: Mapping[str, JSONValue]) -> _AppIdentity:
+        pid = info.get("pid")
+        if type(pid) is not int or pid <= 0:
+            raise MacOSError("Resolved app has no valid pid", code=ErrorCode.AX_ERROR)
+        bundle_id, name, path = info.get("bundle_id"), info.get("name"), info.get("path")
+        return _AppIdentity(
+            pid=pid, launched_at=_process_start_time(pid),
+            bundle_id=bundle_id if isinstance(bundle_id, str) else None,
+            name=name if isinstance(name, str) else "",
+            path=path if isinstance(path, str) else None,
+        )
+
+    def _observe_process(self, expected: _AppIdentity) -> dict[str, JSONValue]:
+        observation: dict[str, JSONValue] = {
+            "pid": expected.pid, "launched_at": expected.launched_at,
+        }
+        try:
+            observation["state"] = "running" if self._same_process(expected) else "exited"
+        except MacOSError as exc:
+            observation.update(state="unknown", error=exc.to_json())
+        return observation
+
+    def _same_process(self, expected: _AppIdentity) -> bool:
+        try:
+            current = self._process_identity(expected.pid)
+        except ApplicationNotFoundError:
+            return False
+        return (current.pid, current.bundle_id, current.launched_at) == (
+            expected.pid, expected.bundle_id, expected.launched_at
+        )
+
+    @staticmethod
+    def _bundle_info(path: str | None) -> dict[str, object]:
+        if path is None:
+            return {}
+        try:
+            with (Path(path) / "Contents" / "Info.plist").open("rb") as source:
+                info = plistlib.load(source)
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            return {}
+        return info if isinstance(info, dict) else {}
+
+    @classmethod
+    def _bundle_version(cls, path: str | None) -> tuple[str | None, str | None]:
+        info = cls._bundle_info(path)
+        version = info.get("CFBundleShortVersionString")
+        build = info.get("CFBundleVersion")
+        return (version if isinstance(version, str) else None,
+                build if isinstance(build, str) else None)
+
+    def _build_status(self, identity: _AppIdentity) -> dict[str, JSONValue]:
+        info = self._bundle_info(identity.path)
+        version, build = info.get("CFBundleShortVersionString"), info.get("CFBundleVersion")
+        result: dict[str, JSONValue] = {
+            "on_disk_version": version if isinstance(version, str) else None,
+            "on_disk_build": build if isinstance(build, str) else None,
+            "executable_modified_at": None, "potentially_stale": None,
+        }
+        executable = info.get("CFBundleExecutable")
+        if (identity.path is None or not isinstance(executable, str)
+                or not executable or Path(executable).name != executable):
+            return result
+        try:
+            modified = (Path(identity.path) / "Contents" / "MacOS" / executable).stat().st_mtime
+        except OSError as exc:
+            result["error"] = str(exc)
+        else:
+            result["executable_modified_at"] = _utc_timestamp(modified)
+            result["potentially_stale"] = modified > identity.launched_at
+        return result
+
     @classmethod
     def _frontmost_app(cls) -> dict[str, Any] | None:
+        """The app in front now, not as of this process's last look."""
+        cls._take_in_workspace_changes()
         app = NSWorkspace.sharedWorkspace().frontmostApplication()
         return None if app is None else cls._app_info(app)
 
@@ -691,27 +1623,43 @@ class MacOS:
             )
 
         if isinstance(query, int):
-            # An exact pid resolves directly against the process table --
-            # no need to enumerate every running application to find one
-            # match by exact value, and no risk of the notification-cache
-            # staleness `NSWorkspace.runningApplications()` can have in a
-            # process that never pumps its own run loop (a freshly
-            # launched app can otherwise appear to not exist yet, purely
-            # as an artifact of when this process last observed a change).
-            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(query)
+            # The direct pid lookup is quick but no witness of absence: it
+            # missed 2 of 5 Calculators this process had just launched while
+            # the workspace list held each one, live and finished launching.
+            # A miss falls back to that list.
+            app = self._application_with_pid(query)
+            if app is None:
+                app = next(
+                    (
+                        candidate for candidate in self._running_applications()
+                        if int(candidate.processIdentifier()) == query
+                    ),
+                    None,
+                )
             if app is None or app.isTerminated():
                 raise ApplicationNotFoundError(
                     f"No running application matches {query!r}",
                     details={"query": query},
                 )
-            return app, self._app_info(app)
+            info = self._app_info(app)
+            if info["pid"] == -1:
+                # AppKit can hand back an app it has not tied to a process
+                # yet (Device Hub, every time): the pid asked for is it.
+                info["pid"] = query
+            return app, info
 
         needle = str(query).casefold()
         candidates: list[tuple[Any, dict[str, Any]]] = []
         exact: list[tuple[Any, dict[str, Any]]] = []
-        for app in NSWorkspace.sharedWorkspace().runningApplications():
+        for app in self._running_applications():
             info = self._app_info(app)
-            values = [str(info["pid"]), info["name"], info["bundle_id"], info["path"]]
+            # A pid names one process exactly. Substring-matching it lets a pid
+            # that is no longer running match an unrelated app that is, and the
+            # caller then posts events at that app without ever being told.
+            if needle == str(info["pid"]):
+                exact.append((app, info))
+                continue
+            values = [info["name"], info["bundle_id"], info["path"]]
             lowered = [str(value).casefold() for value in values if value]
             if needle in lowered:
                 exact.append((app, info))
@@ -719,24 +1667,122 @@ class MacOS:
                 candidates.append((app, info))
 
         matches = exact or candidates
+        if len(exact) > 1:
+            # Extensions can inherit their containing app's localized name.
+            # A name selects that app, not its nested extension; distinct apps
+            # still require the caller to choose an explicit identity.
+            app_paths = tuple(
+                info["path"].casefold() + "/"
+                for _, info in exact
+                if info["name"].casefold() == needle
+                and info["path"] and info["path"].casefold().endswith(".app")
+            )
+            if app_paths:
+                matches = [
+                    (app, info) for app, info in exact
+                    if not (
+                        info["name"].casefold() == needle
+                        and info["path"]
+                        and info["path"].casefold().endswith(".appex")
+                        and info["path"].casefold().startswith(app_paths)
+                    )
+                ]
         if not matches:
             raise ApplicationNotFoundError(
                 f"No running application matches {query!r}",
                 details={"query": query},
             )
+        ready = [match for match in matches if match[1]["pid"] != -1]
+        if not ready:
+            name = matches[0][1]["name"]
+            raise ApplicationNotFoundError(
+                f"{name} is still launching: macOS lists it without a process "
+                f"yet. mac.launch({name!r}) waits until it has one",
+                details={"query": query, "launching": [info for _, info in matches]},
+            )
+        matches = ready
         if len(matches) > 1:
-            names = ", ".join(
-                f"{item[1]['name']} ({item[1]['pid']})" for item in matches[:8]
+            ranked = self._rank_matches(matches)
+            windowed = [item["pid"] for item in ranked if item["on_screen_windows"]]
+            if exact and len(windowed) == 1 and ranked[0]["pid"] == windowed[0]:
+                # A twin without a window is a copy still quitting or one
+                # nobody sees: the one with a window is the app meant,
+                # unless a windowless twin is in front.
+                return next(match for match in matches if match[1]["pid"] == windowed[0])
+            names = ", ".join(self._describe_match(info) for info in ranked[:8])
+            # Only partial matches usually means the app itself is not
+            # running and the name hit its helpers ("Passwords" finding
+            # PasswordsMenuBarExtra): picking a pid would act on the wrong
+            # process.
+            choose = (
+                "pass a pid"
+                if exact
+                else f"no running app is named exactly {query!r}, so launch it "
+                "first, or pass the pid of one of these"
             )
             raise MacOSError(
-                f"Application query {query!r} is ambiguous: {names}",
+                f"Application query {query!r} is ambiguous; {choose}: {names}",
                 code=ErrorCode.APP_AMBIGUOUS,
-                details={
-                    "query": query,
-                    "matches": [info for _, info in matches],
-                },
+                details={"query": query, "matches": ranked},
             )
         return matches[0]
+
+    @staticmethod
+    def _launched_seconds_ago(app: Any) -> float | None:
+        launched = app.launchDate()
+        if launched is None:
+            return None
+        return max(0.0, -float(launched.timeIntervalSinceNow()))
+
+    def _rank_matches(
+        self, matches: list[tuple[Any, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        """Order ambiguous matches by the evidence a caller picks a pid on.
+
+        Two processes with one name are common: a relaunch that has not
+        exited yet, or a helper beside its parent. The frontmost one, then
+        the one with on-screen windows, then the newest, is almost always
+        the one meant. An exact name whose only windowed process also ranks
+        first is picked for the caller (`_resolve_app`); otherwise this
+        ranks the choices the error reports.
+        """
+        frontmost = self._frontmost_app()
+        frontmost_pid = None if frontmost is None else int(frontmost["pid"])
+        ranked: list[dict[str, Any]] = []
+        for app, info in matches:
+            on_screen = [
+                window for window in self.windows(info["pid"]) if window["on_screen"]
+            ]
+            ranked.append(
+                {
+                    **info,
+                    "frontmost": info["pid"] == frontmost_pid,
+                    "on_screen_windows": len(on_screen),
+                    "launched_seconds_ago": self._launched_seconds_ago(app),
+                }
+            )
+        ranked.sort(
+            key=lambda item: (
+                not item["frontmost"],
+                -item["on_screen_windows"],
+                math.inf
+                if item["launched_seconds_ago"] is None
+                else item["launched_seconds_ago"],
+                item["pid"],
+            )
+        )
+        return ranked
+
+    @staticmethod
+    def _describe_match(info: dict[str, Any]) -> str:
+        notes = []
+        if info["frontmost"]:
+            notes.append("frontmost")
+        notes.append(f"{info['on_screen_windows']} on-screen window(s)")
+        age = info["launched_seconds_ago"]
+        if age is not None:
+            notes.append(f"launched {age:.0f}s ago")
+        return f"{info['name']} ({info['pid']}: {', '.join(notes)})"
 
     # --- AX tree ---------------------------------------------------------
 
@@ -773,6 +1819,13 @@ class MacOS:
         messaging_timeout: float | None = None,
         enhance: bool = True,
     ) -> Any:
+        """Create the AX root for ``pid``.
+
+        ``enhance`` sets ``AXEnhancedUserInterface``, the "a screen reader
+        is running" signal Chromium and Electron use to build their full
+        tree. It also changes how AppKit apps animate and lay out, so a
+        caller that only needs the root can pass ``enhance=False``.
+        """
         root = AS.AXUIElementCreateApplication(pid)
         if messaging_timeout is not None:
             error = AS.AXUIElementSetMessagingTimeout(root, messaging_timeout)
@@ -789,38 +1842,81 @@ class MacOS:
         return root
 
     @staticmethod
-    def _copy_attribute(element: Any, attribute: str) -> Any | None:
+    def _copy_attribute(element: Any, attribute: str, *, checked: bool = False) -> Any | None:
+        """One attribute, ``None`` when the element has nothing to report
+        for it. A read that failed outright is ``None`` too, unless
+        ``checked``, where it raises: a witness must not pass a refused
+        read off as an absence (see `_ax_absent`)."""
         error, value = AS.AXUIElementCopyAttributeValue(element, attribute, None)
-        return value if error == _AX_SUCCESS else None
+        if error == _AX_SUCCESS:
+            return value
+        if checked and not _ax_absent(error):
+            raise _ax_error(f"Read {attribute}", error)
+        return None
 
     @staticmethod
     def _copy_attributes(
-        element: Any, attributes: Iterable[str]
-    ) -> dict[str, Any | None]:
-        """Read AX attributes in one application round trip when supported."""
+        element: Any, attributes: Iterable[str], *, checked: bool = False
+    ) -> _AttributeValues:
+        """Read AX attributes in one application round trip when supported.
+
+        An unsupported batch API falls back to single reads. A failed
+        batch stays incomplete rather than repeating its failure for each
+        attribute. ``checked`` raises for failed reads on either path.
+        """
         names = tuple(dict.fromkeys(str(attribute) for attribute in attributes))
         if not names:
-            return {}
+            return _AttributeValues()
         try:
             error, values = AS.AXUIElementCopyMultipleAttributeValues(
                 element, names, 0, None
             )
         except (AttributeError, TypeError, ValueError):
-            error, values = -1, None
+            error, values = AS.kAXErrorNotImplemented, None
+        if error not in (_AX_SUCCESS, AS.kAXErrorNotImplemented, AS.kAXErrorAttributeUnsupported):
+            if checked:
+                raise _ax_error("Read attribute batch", error)
+            return _AttributeValues(
+                ((name, None) for name in names),
+                failures=((name, int(error)) for name in names),
+            )
+        result = _AttributeValues()
         if error != _AX_SUCCESS or values is None or len(values) != len(names):
-            return {name: MacOS._copy_attribute(element, name) for name in names}
-
-        result: dict[str, Any | None] = {}
-        for name, value in zip(names, values, strict=True):
-            try:
-                value_type = AS.AXValueGetType(value)
-            except (TypeError, ValueError):
-                pass
-            else:
-                if value_type == AS.kAXValueAXErrorType:
+            for name in names:
+                single_error, value = AS.AXUIElementCopyAttributeValue(element, name, None)
+                if single_error != _AX_SUCCESS:
+                    if not _ax_absent(single_error):
+                        if checked:
+                            raise _ax_error(f"Read {name}", single_error)
+                        result.failures[name] = int(single_error)
                     value = None
+                result[name] = value
+            return result
+
+        for name, value in zip(names, values, strict=True):
+            slot_error = MacOS._slot_error(value)
+            if slot_error is not None:
+                if not _ax_absent(slot_error):
+                    if checked:
+                        raise _ax_error(f"Read {name}", slot_error)
+                    result.failures[name] = slot_error
+                value = None
             result[name] = value
         return result
+
+    @staticmethod
+    def _slot_error(value: Any) -> int | None:
+        """The AXError an ``AXUIElementCopyMultipleAttributeValues`` slot
+        carries in place of a value, ``None`` for a real value."""
+        try:
+            value_type = AS.AXValueGetType(value)
+        except (TypeError, ValueError):
+            return None
+        if value_type != AS.kAXValueAXErrorType:
+            return None
+        # The type was just checked, so the decode cannot fail.
+        _, code = AS.AXValueGetValue(value, AS.kAXValueAXErrorType, None)
+        return int(code)
 
     @staticmethod
     def _actions(element: Any) -> list[str]:
@@ -831,6 +1927,53 @@ class MacOS:
     def _settable(element: Any, attribute: str) -> bool:
         error, value = AS.AXUIElementIsAttributeSettable(element, attribute, None)
         return bool(value) if error == _AX_SUCCESS else False
+
+    def _focus_sample(self, pid: int, *, include_values: bool = True) -> dict[str, JSONValue]:
+        """What has keyboard focus in ``pid`` right now, in one cheap reading.
+
+        Up to five AX calls and no ``AXEnhancedUserInterface`` toggle, so
+        it costs about a millisecond and is safe to take before and after
+        every posted input. The root's focused window and focused element
+        are read one at a time: Safari answers a batched read of the two
+        with no element (10 of 10 tries) while single reads find it every
+        time. Then the window's title, the focused element's identity,
+        and -- only when that identity is not a secure field -- its
+        details, so a password's value, length and selection are never
+        requested. ``value`` is the raw attribute; a receipt summarizes
+        it before storing.
+
+        Every read is checked: one the app refuses raises `MacOSError`
+        rather than reading as an absence, so a sample is either a whole
+        observation or no observation. A refused identity read therefore
+        never lets the details be requested, and a focused element that
+        stopped answering never counts as focus having moved.
+        """
+        root = self._application_element(pid, enhance=False)
+        window = self._copy_attribute(root, "AXFocusedWindow", checked=True)
+        focused = self._copy_attribute(root, "AXFocusedUIElement", checked=True)
+        frontmost = self._frontmost_app()
+        sample: dict[str, JSONValue] = {
+            "frontmost_pid": None if frontmost is None else int(frontmost["pid"]),
+            "window": None
+            if window is None
+            else self._jsonable(self._copy_attribute(window, "AXTitle", checked=True)),
+            "focused": None,
+        }
+        if focused is None:
+            return sample
+        attributes = self._copy_attributes(focused, _FOCUS_IDENTITY_ATTRIBUTES, checked=True)
+        if attributes.get("AXSubrole") != _SECURE_SUBROLE:
+            details = _FOCUS_DETAIL_ATTRIBUTES if include_values else (
+                name for name in _FOCUS_DETAIL_ATTRIBUTES if name not in _SENSITIVE_ATTRIBUTES
+            )
+            attributes.update(self._copy_attributes(focused, details, checked=True))
+        names = {**_FOCUS_IDENTITY_ATTRIBUTES, **_FOCUS_DETAIL_ATTRIBUTES}
+        sample["focused"] = {
+            names[name]: self._jsonable(value)
+            for name, value in attributes.items()
+            if value is not None
+        }
+        return sample
 
     @staticmethod
     def _is_ax_element(value: Any) -> bool:
@@ -868,8 +2011,12 @@ class MacOS:
 
     @staticmethod
     def _jsonable(value: Any) -> Any:
-        if value is None or isinstance(value, (str, int, bool)):
+        if value is None or isinstance(value, (int, bool)):
             return value
+        if isinstance(value, str):
+            # An AX string arrives as `pyobjc_unicode`; a receipt's value
+            # summary names the type, so hand back the plain `str`.
+            return str(value)
         if isinstance(value, float):
             return MacOS._finite_float(value)
         if isinstance(value, bytes):
@@ -888,19 +2035,18 @@ class MacOS:
         except (TypeError, ValueError):
             return str(value)
 
-        type_specs = {
-            AS.kAXValueCGPointType: ("point", ("x", "y")),
-            AS.kAXValueCGSizeType: ("size", ("width", "height")),
-            AS.kAXValueCGRectType: ("rect", ("origin", "size")),
-            AS.kAXValueCFRangeType: ("range", ("location", "length")),
+        kinds = {
+            AS.kAXValueCGPointType: "point",
+            AS.kAXValueCGSizeType: "size",
+            AS.kAXValueCGRectType: "rect",
+            AS.kAXValueCFRangeType: "range",
         }
-        spec = type_specs.get(value_type)
-        if spec is None:
+        kind = kinds.get(value_type)
+        if kind is None:
             return str(value)
         ok, decoded = AS.AXValueGetValue(value, value_type, None)
         if not ok:
             return str(value)
-        kind, fields = spec
         if kind == "point":
             return {
                 "x": MacOS._finite_float(decoded.x, field="x"),
@@ -918,7 +2064,10 @@ class MacOS:
                 "width": MacOS._finite_float(decoded.size.width, field="width"),
                 "height": MacOS._finite_float(decoded.size.height, field="height"),
             }
-        return {field: int(getattr(decoded, field)) for field in fields}
+        # A decoded ``CFRange`` arrives as a plain ``(location, length)``
+        # tuple, not a struct wrapper with named fields.
+        location, length = decoded
+        return {"location": int(location), "length": int(length)}
 
     def _snapshot_tree(
         self,
@@ -932,11 +2081,13 @@ class MacOS:
         include_actions: bool = True,
         include_settable: bool = True,
         reset_elements: bool = True,
-    ) -> list[dict[str, Any]]:
+        skip_closed_menus: bool = False,
+    ) -> _TreeSnapshot:
         if reset_elements:
             self._elements = {}
         nodes: list[dict[str, Any]] = []
-        seen: set[int] = set()
+        seen: set[Any] = set()
+        node_cut = depth_cut = read_cut = False
         requested_attributes = tuple(
             dict.fromkeys(
                 (
@@ -955,19 +2106,36 @@ class MacOS:
             "AXWindows",
         }
 
-        def visit(element: Any, depth: int) -> None:
-            if depth > max_depth or len(nodes) >= max_nodes:
-                return
-            try:
-                identity = hash(element)
-            except TypeError:
-                identity = id(element)
-            if identity in seen:
-                return
-            seen.add(identity)
+        safe_attributes = tuple(name for name in requested_attributes if name not in _SENSITIVE_ATTRIBUTES)
+        reads_values = len(safe_attributes) != len(requested_attributes)
 
-            raw = self._copy_attributes(element, requested_attributes)
-            if raw.get("AXRole") == "AXMenuBar" and not include_menu_bar:
+        def visit(element: Any, depth: int) -> None:
+            nonlocal node_cut, depth_cut, read_cut
+            if element in seen:
+                return
+            if depth > max_depth:
+                depth_cut = True
+                return
+            if len(nodes) >= max_nodes:
+                node_cut = True
+                return
+            seen.add(element)
+
+            if reads_values:
+                identity = self._copy_attributes(element, _FOCUS_IDENTITY_ATTRIBUTES)
+                allowed = identity.complete and identity.get("AXSubrole") != _SECURE_SUBROLE
+                raw = self._copy_attributes(element, requested_attributes if allowed else safe_attributes)
+                # An identity that did not read in full left the values unread.
+                read_cut = read_cut or not identity.complete
+            else:
+                raw = self._copy_attributes(element, requested_attributes)
+            read_cut = read_cut or not raw.conclusive
+            role = raw.get("AXRole")
+            if role == "AXMenuBar" and not include_menu_bar:
+                return
+            # AppKit keeps a closed menu in the tree, items and all, though
+            # none of it is on screen.
+            if skip_closed_menus and role == "AXMenu" and self._closed_menu(element):
                 return
             index = self._remember_element(element)
             node: dict[str, Any] = {
@@ -980,10 +2148,10 @@ class MacOS:
                 if value not in (None, "", [], {}):
                     node[target] = value
             extra = {
-                name: self._jsonable(raw[name])
+                name: self._jsonable(raw.get(name))
                 for name in requested_attributes
                 if name not in standard_attributes
-                and self._jsonable(raw[name]) not in (None, "", [], {})
+                and self._jsonable(raw.get(name)) not in (None, "", [], {})
             }
             if extra:
                 node["attributes"] = extra
@@ -1012,7 +2180,13 @@ class MacOS:
                         visit(child, depth + 1)
 
         visit(root, 0)
-        return nodes
+        return _TreeSnapshot(nodes, node_cut, depth_cut, read_cut)
+
+    def _closed_menu(self, menu: object) -> bool:
+        """Whether ``menu`` is closed: AppKit keeps a closed menu at zero
+        size and gives an open one its size on screen. A menu whose size
+        does not read counts as open."""
+        return self._jsonable(self._copy_attribute(menu, "AXSize")) == {"width": 0.0, "height": 0.0}
 
     @staticmethod
     def _render_tree(nodes: list[dict[str, Any]], *, truncated: bool = False) -> str:
@@ -1043,7 +2217,7 @@ class MacOS:
 
     def get_app_state(
         self,
-        app: str,
+        app: str | int,
         *,
         screenshot: bool = False,
         max_depth: int = 25,
@@ -1053,26 +2227,36 @@ class MacOS:
         extra_attributes: Iterable[str] = (),
         include_actions: bool = True,
         include_settable: bool = True,
+        include_values: bool = True,
+        enhance: bool = True,
     ) -> dict[str, Any]:
         self._ensure_accessibility()
         _, info = self._resolve_app(app)
-        root = self._application_element(info["pid"])
-        nodes = self._snapshot_tree(
+        root = self._application_element(info["pid"], enhance=enhance)
+        snapshot = self._snapshot_tree(
             root,
             max_depth=max_depth,
             max_nodes=max_nodes,
             include_menu_bar=include_menu_bar,
-            extra_attributes=extra_attributes,
+            attributes=_AX_ATTRIBUTES if include_values else _AX_SAFE_ATTRIBUTES,
+            extra_attributes=tuple(name for name in extra_attributes
+                                   if include_values or name not in _SENSITIVE_ATTRIBUTES),
             include_actions=include_actions,
             include_settable=include_settable,
         )
+        nodes = snapshot.nodes
         self._last_app = info
-        self._last_windows = self.windows(app)
+        self._last_windows = self.windows(info["pid"])
         state: dict[str, Any] = {
             "app": info,
             "nodes": nodes,
-            "text": self._render_tree(nodes, truncated=len(nodes) >= max_nodes),
+            "text": self._render_tree(
+                nodes, truncated=snapshot.node_cut or snapshot.depth_cut or snapshot.read_cut
+            ),
             "windows": self._last_windows,
+            "coverage": {"complete": not (snapshot.node_cut or snapshot.depth_cut or snapshot.read_cut),
+                         "node_cut": snapshot.node_cut, "depth_cut": snapshot.depth_cut,
+                         "read_cut": snapshot.read_cut},
         }
         if screenshot:
             try:
@@ -1091,15 +2275,66 @@ class MacOS:
 
     # --- AX actions ------------------------------------------------------
 
-    def _element(self, element_index: int) -> Any:
+    def _element(self, element_index: ElementRef) -> Any:
+        """The element an index from this run names, or that a match
+        describes (`_find_again`)."""
+        if isinstance(element_index, Mapping):
+            return self._find_again(element_index)
         try:
             return self._elements[int(element_index)]
         except (KeyError, ValueError) as exc:
             raise MacOSError(
-                f"Unknown element index {element_index!r}; take a fresh snapshot first",
+                f"Unknown element index {element_index!r}; an index lasts only "
+                "until the next search or snapshot in the same macos-harness "
+                "run. Pass the match itself, which finds the element again in "
+                "any run, or query again",
                 code=ErrorCode.ELEMENT_UNKNOWN,
                 details={"element_index": element_index},
             ) from exc
+
+    def _find_again(self, match: Mapping[str, JSONValue]) -> object:
+        """The element ``match`` describes -- a match a search returned, in
+        this run or an earlier one -- searched for again in its app: the
+        one element of its role and labels or, among several, the one at
+        its frame. An index cannot outlive its run; a match can."""
+        pid, role = match.get("pid"), match.get("role")
+        if not isinstance(pid, int) or not isinstance(role, str):
+            raise MacOSError(
+                "An element passed as a match needs the pid and role its "
+                "search returned",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "element_index"},
+            )
+        title, identifier, description = (
+            value if isinstance(value, str) and value else None
+            for value in (
+                match.get("title"), match.get("identifier"), match.get("description")
+            )
+        )
+        found = self.ax_search(
+            app_pid=pid,
+            search_key=_SEARCH_KEY_OF_ROLE.get(role, "AXAnyTypeSearchKey"),
+            title=title,
+            identifier=identifier,
+            description=description,
+            limit=-1,
+            attributes=("AXRole", "AXFrame"),
+            include_actions=False,
+            reset_elements=False,
+        )
+        same = [candidate for candidate in found if candidate.get("role") == role]
+        frame = match.get("frame")
+        if frame is not None and (len(same) > 1 or not found.complete):
+            same = [candidate for candidate in same if candidate.get("frame") == frame]
+        if len(same) != 1:
+            label = title or identifier or description or "untitled"
+            raise MacOSError(
+                f"Found {len(same)} {role} {label!r} in process {pid} where the "
+                "match needs exactly one; query it again",
+                code=ErrorCode.ELEMENT_UNKNOWN,
+                details={"pid": pid, "role": role, "found": len(same)},
+            )
+        return self._elements[int(same[0]["element_index"])]
 
     def _remember_element(self, element: Any) -> int:
         index = self._element_seq
@@ -1107,7 +2342,7 @@ class MacOS:
         self._elements[index] = element
         return index
 
-    def _local_element(self, element_index: int) -> Any:
+    def _local_element(self, element_index: ElementRef) -> Any:
         """Resolve element_index to a local AXUIElement; never a native handle."""
         element = self._element(element_index)
         if not self._is_ax_element(element):
@@ -1246,6 +2481,7 @@ class MacOS:
         pid: int,
         search_key: str,
         text: str | None,
+        exact: _ExactSelector,
         visible_only: bool,
         limit: int,
         direction: str,
@@ -1256,13 +2492,16 @@ class MacOS:
         reset_elements: bool,
         messaging_timeout: float | None,
         enhance: bool,
-    ) -> list[dict[str, Any]]:
+    ) -> SearchMatches:
         if reset_elements:
             self._elements = {}
         params = {
             "app_pid": pid,
             "search_key": search_key,
             "text": text,
+            "title": exact.title,
+            "identifier": exact.identifier,
+            "description": exact.description,
             "visible_only": bool(visible_only),
             "limit": int(limit),
             "direction": direction,
@@ -1274,7 +2513,12 @@ class MacOS:
             "messaging_timeout": messaging_timeout,
             "enhance": bool(enhance),
         }
-        return [self._intern_native_match(raw, client) for raw in client.query(params)]
+        result = client.query(params)
+        return SearchMatches(
+            (self._intern_native_match(raw, client) for raw in result.matches),
+            complete=result.complete,
+            visited=result.visited,
+        )
 
     def _native_press(
         self,
@@ -1283,32 +2527,41 @@ class MacOS:
         pid: int,
         search_key: str,
         text: str | None,
+        exact: _ExactSelector,
         visible_only: bool,
         direction: str,
         immediate_descendants_only: bool,
         attributes: Iterable[str],
         max_nodes: int,
         timeout: float,
+        deadline: _Deadline,
+        single_attempt: bool,
         interval: float,
     ) -> dict[str, Any]:
         """Press via the agent, retrying only a not-yet-unique match.
 
         Mirrors ``ax_wait``'s own deadline/retry shape: ``element.unknown``
         is the one outcome ``PressCoordinator`` (agent-side) guarantees
-        happens before any ``AXPress`` is ever dispatched, so it is the
-        only failure retried here, from one monotonic deadline. Every
-        other code -- ``focus.changed`` (the press already happened),
-        ``permission.accessibility``, or any transport/protocol failure
-        whose relation to dispatch is unknown -- propagates immediately:
-        retrying those could fire ``AXPress`` a second time.
+        happens before any ``AXPress`` is ever dispatched -- no match, or
+        one match from a search an exact selector needs complete -- so it
+        is the only failure retried here, from one monotonic deadline.
+        Every other code -- ``focus.changed`` (the press already
+        happened), ``permission.accessibility``, or any
+        transport/protocol failure whose relation to dispatch is unknown
+        -- propagates immediately: retrying those could fire ``AXPress``
+        a second time. A timeout carries the agent's last reason
+        (``complete``, ``visited``) beside ``max_nodes``.
         """
+        self._hold_before_input(pid)
         self._elements = {}
         params = {
             "app_pid": pid,
             "search_key": search_key,
             "text": text,
+            "title": exact.title,
+            "identifier": exact.identifier,
+            "description": exact.description,
             "visible_only": bool(visible_only),
-            "limit": 2,
             "direction": direction,
             "immediate_descendants_only": bool(immediate_descendants_only),
             "attributes": [str(item) for item in attributes],
@@ -1317,22 +2570,25 @@ class MacOS:
             "reset_elements": True,
             "messaging_timeout": None,
             "enhance": True,
+            "action_deadline": None if single_attempt else deadline.expires_at,
         }
-        deadline = time.monotonic() + timeout
+        last_details: dict[str, JSONValue] | None = None
         while True:
+            if not single_attempt:
+                deadline.check_dispatch(last_details)
             try:
                 match = client.press(params)
             except MacOSError as exc:
                 if exc.code != ErrorCode.ELEMENT_UNKNOWN.value:
                     raise
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise MacOSError(
-                        "AX press timed out without a unique match",
-                        code=ErrorCode.TIMEOUT,
-                        details={"timeout": timeout, "pid": pid},
-                    ) from exc
-                time.sleep(min(interval, remaining))
+                last_details = {
+                    "timeout": timeout,
+                    "pid": pid,
+                    "max_nodes": max_nodes,
+                    **exc.details,
+                }
+                deadline.check_dispatch(last_details)
+                time.sleep(min(interval, deadline.remaining()))
                 continue
             return self._intern_native_match(match, client)
 
@@ -1373,11 +2629,22 @@ class MacOS:
                 node["actions"] = actions
         return node
 
-    def get(self, element_index: int, attribute: str = "AXValue") -> Any:
+    def get(
+        self, element_index: ElementRef, attribute: str = "AXValue", *, missing_ok: bool = False
+    ) -> Any:
+        """Read one attribute; missing_ok permits absence, never a failed read."""
         element = self._element(element_index)
         if not self._is_ax_element(element):
-            return element.client.get(element, attribute)
+            try:
+                return element.client.get(element, attribute)
+            except MacOSError as exc:
+                error = exc.details.get("ax_error")
+                if missing_ok and isinstance(error, int) and _ax_absent(error):
+                    return None
+                raise
         error, value = AS.AXUIElementCopyAttributeValue(element, attribute, None)
+        if missing_ok and _ax_absent(error):
+            return None
         if error != _AX_SUCCESS:
             raise _ax_error(
                 f"Read {attribute} from element {element_index}",
@@ -1388,7 +2655,7 @@ class MacOS:
         return self._jsonable(value)
 
     def get_attributes(
-        self, element_index: int, attributes: Iterable[str]
+        self, element_index: ElementRef, attributes: Iterable[str]
     ) -> dict[str, Any | None]:
         """Read multiple raw AX attributes with Apple's batch API."""
         element = self._element(element_index)
@@ -1407,18 +2674,39 @@ class MacOS:
         app_pid: int | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = False,
         limit: int = -1,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_ATTRIBUTES,
         include_actions: bool = True,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
         reset_elements: bool = True,
         messaging_timeout: float | None = None,
         enhance: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Search a Chromium/WebKit AX subtree, including virtualized nodes."""
+    ) -> SearchMatches:
+        """Search a Chromium/WebKit AX subtree, including virtualized nodes.
+
+        ``text`` is the app's own substring search. ``title``,
+        ``identifier`` and ``description`` are exact: a match must carry
+        that attribute with exactly that value. With any of them set the
+        app's search is asked for up to ``max_nodes`` candidates, which
+        are then judged here, so ``max_nodes`` bounds that path too. The
+        result's ``complete`` says whether it holds every match in scope.
+        """
+        exact = _ExactSelector.parse(
+            title=title, identifier=identifier, description=description
+        )
+        attributes = tuple(str(item) for item in attributes)
+        if exact.active and max_nodes <= 0:
+            raise MacOSError(
+                "AX search max_nodes must be positive with an exact selector",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "max_nodes", "value": max_nodes},
+            )
         if element_index is not None and (app is not None or app_pid is not None):
             raise MacOSError(
                 "AX search element_index cannot be combined with app",
@@ -1448,11 +2736,12 @@ class MacOS:
                         code=ErrorCode.BAD_REQUEST,
                         details={"parameter": "direction", "value": direction},
                     )
-                return self._native_query(
+                return _with_pid(self._native_query(
                     client,
                     pid=native_pid,
                     search_key=search_key,
                     text=text,
+                    exact=exact,
                     visible_only=visible_only,
                     limit=limit,
                     direction=direction.casefold(),
@@ -1463,7 +2752,7 @@ class MacOS:
                     reset_elements=reset_elements,
                     messaging_timeout=messaging_timeout,
                     enhance=enhance,
-                )
+                ), native_pid)
 
         self._ensure_accessibility()
         if element_index is None:
@@ -1480,6 +2769,7 @@ class MacOS:
                 enhance=enhance,
             )
         else:
+            pid = None
             root = self._local_element(element_index)
         if reset_elements:
             self._elements = {}
@@ -1496,10 +2786,14 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "direction", "value": direction},
             ) from exc
+        # With an exact selector the app's search only narrows; the
+        # judgement happens here, so ask for every candidate the walk
+        # bound allows and apply ``limit`` after judging.
+        requested_limit = max_nodes if exact.active else int(limit)
         predicate: dict[str, Any] = {
             "AXSearchKey": search_key,
             "AXVisibleOnly": bool(visible_only),
-            "AXResultsLimit": int(limit),
+            "AXResultsLimit": requested_limit,
             "AXDirection": ax_direction,
             "AXImmediateDescendantsOnly": bool(immediate_descendants_only),
         }
@@ -1509,10 +2803,11 @@ class MacOS:
             root, "AXUIElementsForSearchPredicate", predicate, None
         )
         if error == AS.kAXErrorParameterizedAttributeUnsupported:
-            return self._bounded_ax_search(
+            return _with_pid(self._bounded_ax_search(
                 root,
                 search_key=search_key,
                 text=text,
+                exact=exact,
                 visible_only=visible_only,
                 limit=limit,
                 direction=direction,
@@ -1520,25 +2815,47 @@ class MacOS:
                 attributes=attributes,
                 include_actions=include_actions,
                 max_nodes=max_nodes,
-                reset_elements=False,
-            )
+            ), pid)
         if error != _AX_SUCCESS:
             raise _ax_error("AXUIElementsForSearchPredicate", error, element_index=element_index)
 
+        candidates = [
+            element for element in values or [] if self._is_ax_element(element)
+        ]
+        described = tuple(dict.fromkeys((*attributes, *exact.attributes)))
         matches: list[dict[str, Any]] = []
-        for element in values or []:
-            if not self._is_ax_element(element):
-                continue
+        read_complete = True
+        for element in candidates:
+            if exact.active:
+                raw = self._copy_attributes(element, exact.attributes)
+                read_complete = read_complete and raw.conclusive
+                fields = {
+                    _AX_NODE_MAPPING[name]: self._jsonable(value)
+                    for name, value in raw.items()
+                }
+                if not exact.matches(fields):
+                    continue
             index = self._remember_element(element)
             matches.append(
                 self._describe_element(
                     element,
                     index,
-                    attributes=attributes,
+                    attributes=described,
                     include_actions=include_actions,
                 )
             )
-        return matches
+        cut = 0 <= limit < len(matches)
+        if cut:
+            del matches[limit:]
+        # The app returns at most ``requested_limit`` candidates and says
+        # nothing more, so a full page may hide more; a short page is all
+        # there was.
+        complete = (
+            requested_limit < 0 or len(candidates) < requested_limit
+        ) and not cut and read_complete
+        return _with_pid(
+            SearchMatches(matches, complete=complete, visited=len(candidates)), pid
+        )
 
     def _bounded_ax_search(
         self,
@@ -1546,6 +2863,7 @@ class MacOS:
         *,
         search_key: str,
         text: str | None,
+        exact: _ExactSelector,
         visible_only: bool,
         limit: int,
         direction: str,
@@ -1553,53 +2871,71 @@ class MacOS:
         attributes: Iterable[str],
         include_actions: bool,
         max_nodes: int,
-        reset_elements: bool,
-    ) -> list[dict[str, Any]]:
-        """Search a small ordinary AX tree when optimized search is unavailable."""
+    ) -> SearchMatches:
+        """Search a small ordinary AX tree when optimized search is unavailable.
+
+        The walk reads only what judging a node takes -- its role, whether
+        it is hidden, and the requested attributes a match can rest on --
+        and describes each match afresh, so the rest of ``attributes``
+        costs nothing per node. A search for what is on screen
+        (`_on_screen_only`) leaves out what closed menus hold. The walk
+        numbers nodes into a table of its own; only the matches get
+        handles, as on the optimized path, so a search that keeps earlier
+        handles grows the registry by what it returns.
+        """
         if max_nodes <= 0:
             raise MacOSError(
                 "AX fallback max_nodes must be positive",
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "max_nodes", "value": max_nodes},
             )
+        role = _AX_SEARCH_ROLES.get(search_key)
+        if role is None and search_key != "AXAnyTypeSearchKey":
+            raise MacOSError(
+                f"AX fallback does not support {search_key!r}",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"search_key": search_key},
+            )
         result_limit = max_nodes if limit < 0 else int(limit)
         if result_limit <= 0:
-            return []
+            return SearchMatches(complete=False, visited=0)
 
-        role = _AX_SEARCH_ROLES.get(search_key)
         needle = text.casefold() if text is not None else None
+        attributes = tuple(str(item) for item in attributes)
+        described = tuple(dict.fromkeys((*attributes, *exact.attributes)))
         traversal_attributes = tuple(
             dict.fromkeys(
                 (
-                    *(str(item) for item in attributes),
+                    *(name for name in attributes if name in _AX_MATCH_ATTRIBUTES),
+                    *exact.attributes,
                     "AXHidden",
                 )
             )
         )
-        nodes = self._snapshot_tree(
-            root,
-            max_depth=1 if immediate_descendants_only else 25,
-            max_nodes=max_nodes,
-            include_menu_bar=True,
-            attributes=traversal_attributes,
-            include_actions=include_actions,
-            include_settable=False,
-            reset_elements=reset_elements,
-        )[1:]
+        held = self._elements
+        try:
+            snapshot = self._snapshot_tree(
+                root,
+                # Chromium trees run deeper than native ones: Slack's reaches 28.
+                max_depth=1 if immediate_descendants_only else 50,
+                max_nodes=max_nodes,
+                include_menu_bar=True,
+                attributes=traversal_attributes,
+                include_actions=False,
+                include_settable=False,
+                skip_closed_menus=_on_screen_only(visible_only, search_key),
+            )
+            walked = self._elements
+        finally:
+            self._elements = held
+        nodes = snapshot.nodes[1:]
         if direction.casefold() == "previous":
             nodes.reverse()
 
         matches: list[dict[str, Any]] = []
+        cut = False
         for node in nodes:
-            values = (
-                node.get("title"),
-                node.get("description"),
-                node.get("value"),
-                node.get("help"),
-                node.get("identifier"),
-                node.get("dom_identifier"),
-                node.get("placeholder"),
-            )
+            values = tuple(node.get(_AX_NODE_MAPPING[name]) for name in _AX_MATCH_ATTRIBUTES)
             text_matches = needle is None or any(
                 needle in str(value).casefold()
                 for value in values
@@ -1609,35 +2945,39 @@ class MacOS:
                 (role is None or node.get("role") == role)
                 and (not visible_only or not bool(node.get("hidden")))
                 and text_matches
+                and exact.matches(node)
             ):
-                index = int(node["element_index"])
+                if len(matches) >= result_limit:
+                    cut = True
+                    break
+                element = walked[int(node["element_index"])]
                 matches.append(
                     self._describe_element(
-                        self._element(index),
-                        index,
-                        attributes=attributes,
+                        element,
+                        self._remember_element(element),
+                        attributes=described,
                         include_actions=include_actions,
                     )
                 )
-                if len(matches) >= result_limit:
-                    break
-        return matches
+        # A depth cut only matters when the walk was meant to go deep: an
+        # immediate-descendants search stops at depth 1 by design.
+        complete = (
+            not cut
+            and not snapshot.node_cut
+            and not snapshot.read_cut
+            and (immediate_descendants_only or not snapshot.depth_cut)
+        )
+        return SearchMatches(matches, complete=complete, visited=len(snapshot.nodes))
 
     @staticmethod
     def _normalize_apps(
         apps: str | int | Iterable[str | int] | None,
     ) -> tuple[str, ...] | None:
+        apps = validate_scope(app=None, all_apps=False, apps=apps, required=False)
         if apps is None:
             return None
-        values = (apps,) if isinstance(apps, (str, int)) else tuple(apps)
-        normalized = tuple(str(value).strip() for value in values)
-        if not normalized or any(not value for value in normalized):
-            raise MacOSError(
-                "apps must contain at least one non-empty selector",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "apps"},
-            )
-        return normalized
+        values = (apps,) if isinstance(apps, (str, int)) else apps
+        return tuple(str(value).strip() for value in values)
 
     def _resolve_apps(self, selectors: tuple[str, ...] | None) -> list[dict[str, Any]]:
         if selectors is None:
@@ -1653,6 +2993,47 @@ class MacOS:
             resolved.append(info)
         return resolved
 
+    def _unanswered_pids(self, pids: Iterable[int]) -> frozenset[int]:
+        """The apps among ``pids`` that cannot answer Accessibility now.
+
+        A process that is not serving Accessibility -- a web content
+        helper, a command-line tool registered as an app -- fails a search
+        only after the full cross-app messaging timeout, every sweep, one
+        after another. One cheap read of every app at once finds them in
+        about one timeout together, so a sweep can skip them. The native
+        backend asks its agent, which holds the Accessibility trust.
+        """
+        pids = tuple(pids)
+        if self._backend != "python":
+            client = self._acquire_native()
+            if client is not None:
+                return client.unanswered_apps(pids, _AX_CROSS_APP_MESSAGING_TIMEOUT)
+        # PyObjC binds framework symbols lazily, and two threads binding
+        # the same one at once can fail with KeyError: bind them here,
+        # on one thread, before fanning out.
+        create = AS.AXUIElementCreateApplication
+        set_timeout = AS.AXUIElementSetMessagingTimeout
+        copy_value = AS.AXUIElementCopyAttributeValue
+        cannot_complete = AS.kAXErrorCannotComplete
+
+        def silent(pid: int) -> bool:
+            element = create(pid)
+            set_timeout(element, _AX_CROSS_APP_MESSAGING_TIMEOUT)
+            error, _ = copy_value(element, "AXRole", None)
+            return error == cannot_complete
+
+        with ThreadPoolExecutor(max_workers=_AX_PROBE_WORKERS) as pool:
+            quiet = tuple(pool.map(silent, pids))
+        return frozenset(pid for pid, is_silent in zip(pids, quiet, strict=True) if is_silent)
+
+    @staticmethod
+    def _onscreen_window_owners() -> frozenset[int]:
+        """The pids that own a window on screen now."""
+        values = AS.CGWindowListCopyWindowInfo(
+            AS.kCGWindowListOptionOnScreenOnly, AS.kCGNullWindowID
+        )
+        return frozenset(int(value[AS.kCGWindowOwnerPID]) for value in values or ())
+
     @classmethod
     def _ax_scope(
         cls,
@@ -1661,24 +3042,14 @@ class MacOS:
         all_apps: bool,
         apps: str | int | Iterable[str | int] | None,
         text: str | None,
+        exact: _ExactSelector,
     ) -> tuple[tuple[str, ...] | None, bool]:
+        apps = validate_scope(app=app, all_apps=all_apps, apps=apps, required=False)
         selectors = cls._normalize_apps(apps)
-        if app is not None and (all_apps or selectors is not None):
-            raise MacOSError(
-                "Pass exactly one of app, all_apps=True, or apps",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "scope"},
-            )
-        if all_apps and selectors is not None:
-            raise MacOSError(
-                "Pass all_apps=True or apps, not both",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "scope"},
-            )
         cross_process = all_apps or selectors is not None
-        if cross_process and not text:
+        if cross_process and not text and not exact.active:
             raise MacOSError(
-                "Cross-app AX search requires non-empty text",
+                "Cross-app AX search requires non-empty text or an exact selector",
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "text"},
             )
@@ -1690,20 +3061,36 @@ class MacOS:
         apps: str | int | Iterable[str | int] | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         limit: int = 20,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
         include_actions: bool = False,
-        max_nodes: int = 500,
-    ) -> list[dict[str, Any]]:
-        """Search selected running AX trees without activation."""
+        max_nodes: int = 5000,
+    ) -> SearchMatches:
+        """Search selected running AX trees without activation.
+
+        The result is ``complete`` only when every app was searched to
+        completion and ``limit`` did not stop the sweep early. A broad
+        sweep for what is on screen (`_on_screen_only`, no ``apps``)
+        counts an app it cannot search as a gap only while the app has a
+        window on screen; what such an app draws outside its windows -- a
+        Dock tile, a menu bar extra -- goes unchecked. Explicit ``apps``
+        failures raise; a broad sweep raises its first error only when no
+        app was searched.
+        """
+        exact = _ExactSelector.parse(
+            title=title, identifier=identifier, description=description
+        )
         if self._backend == "python":
             self._ensure_accessibility()
-        if not text:
+        if not text and not exact.active:
             raise MacOSError(
-                "Cross-app AX search requires non-empty text",
+                "Cross-app AX search requires non-empty text or an exact selector",
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "text"},
             )
@@ -1729,19 +3116,49 @@ class MacOS:
         selectors = self._normalize_apps(apps)
         infos = self._resolve_apps(selectors)
         strict = selectors is not None
+        on_screen = not strict and _on_screen_only(visible_only, search_key)
+        # A broad sweep skips the apps that cannot answer instead of
+        # waiting out each one's timeout.
+        silent = (
+            frozenset()
+            if strict
+            else self._unanswered_pids(int(info["pid"]) for info in infos)
+        )
+        # What an app shows lives in its windows on screen, so a sweep of
+        # what is on screen loses nothing to an app without one, bar what
+        # it draws elsewhere (see above).
+        showing = self._onscreen_window_owners() if on_screen else frozenset()
         self._elements = {}
-        matches: list[dict[str, Any]] = []
+        matches = SearchMatches(complete=True, visited=0)
         first_error: MacOSError | None = None
         searched = False
+
+        def unsearched(pid: int, error: MacOSError) -> None:
+            nonlocal first_error
+            if first_error is None:
+                first_error = error
+            if not on_screen or pid in showing:
+                matches.complete = False
+                matches.unanswered += 1
+
         for info in infos:
             remaining = limit - len(matches)
             if remaining == 0:
+                # Apps after this one were never searched.
+                matches.complete = False
                 break
+            pid = int(info["pid"])
+            if pid in silent:
+                unsearched(pid, _ax_error("Read AXRole", AS.kAXErrorCannotComplete, pid=pid))
+                continue
             try:
                 app_matches = self.ax_search(
-                    app_pid=int(info["pid"]),
+                    app_pid=pid,
                     search_key=search_key,
                     text=text,
+                    title=title,
+                    identifier=identifier,
+                    description=description,
                     visible_only=visible_only,
                     limit=remaining,
                     direction=direction,
@@ -1762,16 +3179,90 @@ class MacOS:
                         code=exc.code,
                         details={**exc.details, "app": info},
                     ) from exc
-                if first_error is None:
-                    first_error = exc
+                unsearched(pid, exc)
                 continue
             searched = True
+            matches.complete = matches.complete and app_matches.complete
+            if not app_matches.complete:
+                matches.partial.append(info["name"])
+            matches.visited += app_matches.visited
             for match in app_matches:
                 match["app"] = dict(info)
                 matches.append(match)
         if not searched and first_error is not None:
             raise first_error
         return matches
+
+    def ax_query(
+        self,
+        *,
+        app: str | int | None = None,
+        all_apps: bool = False,
+        apps: str | int | Iterable[str | int] | None = None,
+        element_index: int | None = None,
+        search_key: str = "AXAnyTypeSearchKey",
+        text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
+        visible_only: bool = True,
+        limit: int = 20,
+        direction: str = "next",
+        immediate_descendants_only: bool = False,
+        attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
+        include_actions: bool = False,
+        max_nodes: int = 5000,
+    ) -> SearchMatches:
+        """Search once under the scope rules `ax_wait` polls with.
+
+        ``app`` -- or, with no scope, ``element_index`` or the last app --
+        is one `ax_search`. ``all_apps=True`` or ``apps`` is one
+        `ax_search_all`, whose matches name their owner under ``"app"``.
+        """
+        exact = _ExactSelector.parse(
+            title=title, identifier=identifier, description=description
+        )
+        selectors, cross_process = self._ax_scope(
+            app=app, all_apps=all_apps, apps=apps, text=text, exact=exact
+        )
+        if not cross_process:
+            return self.ax_search(
+                element_index=element_index,
+                app=app,
+                search_key=search_key,
+                text=text,
+                title=title,
+                identifier=identifier,
+                description=description,
+                visible_only=visible_only,
+                limit=limit,
+                direction=direction,
+                immediate_descendants_only=immediate_descendants_only,
+                attributes=attributes,
+                include_actions=include_actions,
+                max_nodes=max_nodes,
+            )
+        if element_index is not None:
+            raise MacOSError(
+                "AX search element_index cannot be combined with all_apps or apps",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "element_index"},
+            )
+        return self.ax_search_all(
+            apps=selectors,
+            search_key=search_key,
+            text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
+            visible_only=visible_only,
+            limit=limit,
+            direction=direction,
+            immediate_descendants_only=immediate_descendants_only,
+            attributes=attributes,
+            include_actions=include_actions,
+            max_nodes=max_nodes,
+        )
 
     @staticmethod
     def _match_summary(match: dict[str, Any]) -> str:
@@ -1788,7 +3279,58 @@ class MacOS:
             or match.get("identifier")
             or "untitled"
         )
-        return f"{app_name}: {role} {label!r}"
+        summary = f"{app_name}: {role} {label!r}"
+        frame = match.get("frame")
+        if isinstance(frame, dict) and all(
+            isinstance(frame.get(key), (int, float)) for key in ("x", "y", "width", "height")
+        ):
+            summary += " at ({x:.0f}, {y:.0f}) {width:.0f}x{height:.0f}".format(**frame)
+        enabled = match.get("enabled")
+        if isinstance(enabled, bool):
+            summary += ", enabled" if enabled else ", disabled"
+        return summary
+
+    @staticmethod
+    def _settle_tie(
+        matches: SearchMatches,
+        *,
+        text: str | None,
+        limit: int,
+        strict: bool,
+        actionable: bool,
+    ) -> dict[str, JSONValue] | None:
+        """The one match a tie of several settles on, when the search
+        shows no other can be.
+
+        Only a search that stopped short of ``limit`` (an unread match
+        could tie too) and, under an exact selector (``strict``), a
+        complete one can settle a tie. ``text`` is a substring search, so
+        "Allow" also finds "Don't Allow": the one title or description
+        equal to ``text`` -- whole and case-sensitive, like ``title=`` --
+        wins first. For an action (``actionable``), the one enabled match
+        among those labelled exactly ``text``, or among all matches when
+        none is, wins next: a sheet can keep disabled twins of its "Done"
+        button, and a press on one does nothing. The label decides first,
+        so a disabled "Allow" is never traded for an enabled "Don't
+        Allow". Anything else stays ambiguous.
+        """
+        if len(matches) >= limit or (strict and not matches.complete):
+            return None
+        candidates = list(matches)
+        if text:
+            labelled = [
+                match
+                for match in candidates
+                if text in (match.get("title"), match.get("description"))
+            ]
+            if len(labelled) == 1:
+                return labelled[0]
+            candidates = labelled or candidates
+        if actionable:
+            enabled = [match for match in candidates if match.get("enabled") is not False]
+            if len(enabled) == 1:
+                return enabled[0]
+        return None
 
     def ax_wait(
         self,
@@ -1798,21 +3340,40 @@ class MacOS:
         apps: str | int | Iterable[str | int] | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
         include_actions: bool = False,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
+        enhance: bool = True,
         timeout: float = 5.0,
         interval: float = 0.1,
+        actionable: bool = False,
     ) -> dict[str, Any]:
-        """Wait for exactly one AX match and fail closed on ambiguity."""
+        """Wait for exactly one AX match and fail closed on ambiguity.
+
+        With an exact selector (``title``/``identifier``/``description``),
+        a single match requires a complete search to rule out a twin.
+        Substring-only waits retain best-effort uniqueness within the
+        returned results. When ``text`` finds several matches, the only
+        one labelled exactly ``text`` wins, and for a caller about to act
+        on the match (``actionable``) the only enabled one after that
+        (see `_settle_tie`). A search the app did not answer in time
+        (AXError -25204) is a poll that found nothing yet.
+        """
+        exact = _ExactSelector.parse(
+            title=title, identifier=identifier, description=description
+        )
         selectors, cross_process = self._ax_scope(
             app=app,
             all_apps=all_apps,
             apps=apps,
             text=text,
+            exact=exact,
         )
         if not math.isfinite(timeout) or timeout < 0:
             raise MacOSError(
@@ -1827,38 +3388,64 @@ class MacOS:
                 details={"parameter": "interval", "value": interval},
             )
 
+        # Text is a substring search, so a wait for "Allow" also finds
+        # "Don't Allow": reading up to _AX_LABEL_SEARCH_LIMIT matches lets
+        # `_settle_tie` settle that tie from this one search. Without
+        # text, a second match already proves ambiguity.
+        limit = _AX_LABEL_SEARCH_LIMIT if text else 2
         deadline = time.monotonic() + timeout
         while True:
-            if cross_process:
-                matches = self.ax_search_all(
-                    apps=selectors,
-                    search_key=search_key,
-                    text=text,
-                    visible_only=visible_only,
-                    limit=2,
-                    direction=direction,
-                    immediate_descendants_only=immediate_descendants_only,
-                    attributes=attributes,
-                    include_actions=include_actions,
-                    max_nodes=max_nodes,
-                )
-            else:
-                matches = self.ax_search(
-                    app=app,
-                    search_key=search_key,
-                    text=text,
-                    visible_only=visible_only,
-                    limit=2,
-                    direction=direction,
-                    immediate_descendants_only=immediate_descendants_only,
-                    attributes=attributes,
-                    include_actions=include_actions,
-                    max_nodes=max_nodes,
-                )
-            if len(matches) == 1:
+            try:
+                if cross_process:
+                    matches = self.ax_search_all(
+                        apps=selectors,
+                        search_key=search_key,
+                        text=text,
+                        title=title,
+                        identifier=identifier,
+                        description=description,
+                        visible_only=visible_only,
+                        limit=limit,
+                        direction=direction,
+                        immediate_descendants_only=immediate_descendants_only,
+                        attributes=attributes,
+                        include_actions=include_actions,
+                        max_nodes=max_nodes,
+                    )
+                else:
+                    matches = self.ax_search(
+                        app=app,
+                        search_key=search_key,
+                        text=text,
+                        title=title,
+                        identifier=identifier,
+                        description=description,
+                        visible_only=visible_only,
+                        limit=limit,
+                        direction=direction,
+                        immediate_descendants_only=immediate_descendants_only,
+                        attributes=attributes,
+                        include_actions=include_actions,
+                        max_nodes=max_nodes,
+                        enhance=enhance,
+                    )
+            except MacOSError as exc:
+                if not _did_not_answer(exc):
+                    raise
+                matches = _unanswered_search()
+            if len(matches) == 1 and (matches.complete or not exact.active):
                 return matches[0]
             if len(matches) > 1:
-                summary = "; ".join(self._match_summary(match) for match in matches[:4])
+                settled = self._settle_tie(
+                    matches,
+                    text=text,
+                    limit=limit,
+                    strict=exact.active,
+                    actionable=actionable,
+                )
+                if settled is not None:
+                    return settled
+                summary = "; ".join(self._match_summary(match) for match in matches)
                 # More than one match is the caller's search criteria being too loose,
                 # not an unknown element -- and not worth retrying, since a second
                 # identical search will not resolve the ambiguity either. Mirrors the
@@ -1873,19 +3460,37 @@ class MacOS:
                             {
                                 "element_index": match.get("element_index"),
                                 "role": match.get("role"),
+                                "title": match.get("title"),
+                                "description": match.get("description"),
+                                "enabled": match.get("enabled"),
+                                "frame": match.get("frame"),
                                 "app": match.get("app"),
                             }
-                            for match in matches[:4]
+                            for match in matches
                         ],
                     },
                 )
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if matches.complete:
+                    raise MacOSError(
+                        "AX wait timed out without a match",
+                        code=ErrorCode.TIMEOUT,
+                        details={"timeout": timeout},
+                    )
+                message = (
+                    "AX wait timed out before a complete search confirmed "
+                    "a unique match"
+                    if matches
+                    else "AX wait timed out without a match; the last search "
+                    "was incomplete"
+                )
+                note, gaps = _search_gaps(matches, max_nodes)
                 raise MacOSError(
-                    "AX wait timed out without a match",
+                    message + note,
                     code=ErrorCode.TIMEOUT,
-                    details={"timeout": timeout},
+                    details={"timeout": timeout, **gaps},
                 )
             time.sleep(min(interval, remaining))
 
@@ -1897,20 +3502,34 @@ class MacOS:
         apps: str | int | Iterable[str | int] | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
+        enhance: bool = True,
         timeout: float = 5.0,
         interval: float = 0.1,
     ) -> None:
-        """Wait for an AX match to be absent in two consecutive polls."""
+        """Wait for an AX match to be absent in two consecutive polls.
+
+        Only a complete empty search counts as an empty poll: a walk that
+        ``max_nodes`` cut short before finding anything, or a search the
+        app did not answer in time, says nothing about the part it did not
+        reach, so it resets the count.
+        """
+        exact = _ExactSelector.parse(
+            title=title, identifier=identifier, description=description
+        )
         selectors, cross_process = self._ax_scope(
             app=app,
             all_apps=all_apps,
             apps=apps,
             text=text,
+            exact=exact,
         )
         if not math.isfinite(timeout) or timeout < 0:
             raise MacOSError(
@@ -1934,6 +3553,9 @@ class MacOS:
                         apps=selectors,
                         search_key=search_key,
                         text=text,
+                        title=title,
+                        identifier=identifier,
+                        description=description,
                         visible_only=visible_only,
                         limit=1,
                         direction=direction,
@@ -1946,32 +3568,44 @@ class MacOS:
                         app=app,
                         search_key=search_key,
                         text=text,
+                        title=title,
+                        identifier=identifier,
+                        description=description,
                         visible_only=visible_only,
                         limit=1,
                         direction=direction,
                         immediate_descendants_only=immediate_descendants_only,
                         attributes=attributes,
                         max_nodes=max_nodes,
+                        enhance=enhance,
                     )
             except ApplicationNotFoundError:
                 if app is not None or (selectors is not None and len(selectors) == 1):
                     return
                 raise
+            except MacOSError as exc:
+                if not _did_not_answer(exc):
+                    raise
+                matches = _unanswered_search()
 
-            empty_polls = empty_polls + 1 if not matches else 0
+            empty_polls = empty_polls + 1 if not matches and matches.complete else 0
             if empty_polls >= 2:
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise MacOSError(
+                message = (
                     "AX wait timed out before two consecutive empty polls "
-                    "confirmed the match was gone",
-                    code=ErrorCode.TIMEOUT,
-                    details={
-                        "timeout": timeout,
-                        "consecutive_empty_polls": empty_polls,
-                    },
+                    "confirmed the match was gone"
                 )
+                details: dict[str, JSONValue] = {
+                    "timeout": timeout,
+                    "consecutive_empty_polls": empty_polls,
+                }
+                if not matches and not matches.complete:
+                    note, gaps = _search_gaps(matches, max_nodes)
+                    message += note
+                    details.update(gaps)
+                raise MacOSError(message, code=ErrorCode.TIMEOUT, details=details)
             time.sleep(min(interval, remaining))
 
     def ax_press(
@@ -1982,15 +3616,32 @@ class MacOS:
         apps: str | int | Iterable[str | int] | None = None,
         search_key: str = "AXAnyTypeSearchKey",
         text: str | None = None,
+        title: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
         visible_only: bool = True,
         direction: str = "next",
         immediate_descendants_only: bool = False,
         attributes: Iterable[str] = _AX_SAFE_ATTRIBUTES,
-        max_nodes: int = 500,
+        max_nodes: int = 5000,
         timeout: float = 5.0,
         interval: float = 0.1,
+        _deadline: _Deadline | None = None,
     ) -> dict[str, Any]:
-        """Press one unique AX target and detect foreground activation."""
+        """Press one unique AX target and detect foreground activation.
+
+        Uniqueness follows `ax_wait`: an exact selector is pressed only
+        once a complete search has shown its single match. The deadline
+        includes app resolution, agent setup, search, and the focus reading.
+        A raw zero timeout allows one attempt without retry; a deadline
+        inherited from `mac.do` must still have time before dispatch.
+        """
+        exact = _ExactSelector.parse(
+            title=title, identifier=identifier, description=description
+        )
+        selectors, cross_process = self._ax_scope(
+            app=app, all_apps=all_apps, apps=apps, text=text, exact=exact
+        )
         if not math.isfinite(timeout) or timeout < 0:
             raise MacOSError(
                 "AX press timeout must be finite and non-negative",
@@ -2003,7 +3654,9 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "interval", "value": interval},
             )
-        targeted = not all_apps and apps is None
+        single_attempt = _deadline is None and timeout == 0
+        deadline = _deadline if _deadline is not None else _Deadline(timeout, time.monotonic)
+        targeted = not cross_process
         if targeted and self._backend != "python":
             if direction.casefold() not in {"next", "previous"}:
                 raise MacOSError(
@@ -2029,29 +3682,38 @@ class MacOS:
                     pid=target_pid,
                     search_key=search_key,
                     text=text,
+                    exact=exact,
                     visible_only=visible_only,
                     direction=direction.casefold(),
                     immediate_descendants_only=immediate_descendants_only,
                     attributes=attributes,
                     max_nodes=max_nodes,
                     timeout=timeout,
+                    deadline=deadline,
+                    single_attempt=single_attempt,
                     interval=interval,
                 )
 
+        if not single_attempt:
+            deadline.check_dispatch()
         match = self.ax_wait(
             app=app,
             all_apps=all_apps,
-            apps=apps,
+            apps=selectors,
             search_key=search_key,
             text=text,
+            title=title,
+            identifier=identifier,
+            description=description,
             visible_only=visible_only,
             direction=direction,
             immediate_descendants_only=immediate_descendants_only,
             attributes=attributes,
             include_actions=True,
             max_nodes=max_nodes,
-            timeout=timeout,
+            timeout=deadline.remaining(),
             interval=interval,
+            actionable=True,
         )
         owner = match.get("app")
         target_pid = int(owner["pid"]) if isinstance(owner, dict) else self._pid(app)
@@ -2062,18 +3724,36 @@ class MacOS:
                 details={"parameter": "app"},
             )
 
+        # Guard only after `AXPress` has returned: an action that raised
+        # keeps its own error, so `FocusChangedError` from here always means
+        # the press landed (`ops._atomic_press_acted` relies on that).
         before = self._frontmost_app()
-        try:
-            self.perform_action(int(match["element_index"]), "AXPress")
-        finally:
-            self._guard_focus(before, target_pid, "AX press")
+        if not single_attempt:
+            deadline.check_dispatch()
+        self.perform_action(int(match["element_index"]), "AXPress")
+        self._guard_focus(before, target_pid, "AX press")
         return match
 
-    def set(self, element_index: int, value: Any, attribute: str = "AXValue") -> None:
+    def set(self, element_index: ElementRef, value: Any, attribute: str = "AXValue") -> None:
+        if attribute == "AXSelectedTextRange" and isinstance(value, Mapping):
+            location, length = value.get("location"), value.get("length")
+            if (
+                set(value) != {"location", "length"}
+                or not isinstance(location, int) or isinstance(location, bool)
+                or not isinstance(length, int) or isinstance(length, bool)
+                or location < 0 or length < 0 or location + length > (1 << 63) - 1
+            ):
+                raise MacOSError(
+                    "AXSelectedTextRange requires nonnegative integer location and length",
+                    code=ErrorCode.BAD_REQUEST,
+                )
         element = self._element(element_index)
+        self._hold_before_input(self._element_pid(element_index))
         if not self._is_ax_element(element):
             element.client.set(element, attribute, value)
             return
+        if attribute == "AXSelectedTextRange" and isinstance(value, Mapping):
+            value = AS.AXValueCreate(AS.kAXValueCFRangeType, (location, length))
         error = AS.AXUIElementSetAttributeValue(element, attribute, value)
         if error != _AX_SUCCESS:
             raise _ax_error(
@@ -2085,8 +3765,9 @@ class MacOS:
 
     set_value = set
 
-    def perform_action(self, element_index: int, action: str = "AXPress") -> None:
+    def perform_action(self, element_index: ElementRef, action: str = "AXPress") -> None:
         element = self._element(element_index)
+        self._hold_before_input(self._element_pid(element_index))
         normalized = _ACTION_ALIASES.get(action.casefold(), action)
         if not self._is_ax_element(element):
             element.client.perform(element, normalized)
@@ -2103,46 +3784,176 @@ class MacOS:
                 },
             )
         error = AS.AXUIElementPerformAction(element, normalized)
-        if error != _AX_SUCCESS:
-            raise _ax_error(
-                f"Perform {normalized} on element {element_index}",
-                error,
-                element_index=element_index,
-                action=normalized,
-            )
+        if error == _AX_SUCCESS or self._gone_after_action(element, error):
+            return
+        raise _ax_error(
+            f"Perform {normalized} on element {element_index}",
+            error,
+            hint=(
+                "an app often stops answering while the action opens a "
+                "menu or dialog, so it may have taken effect: look before "
+                "you retry"
+                if error == AS.kAXErrorCannotComplete
+                else None
+            ),
+            element_index=element_index,
+            action=normalized,
+        )
+
+    @staticmethod
+    def _gone_after_action(element: object, error: int) -> bool:
+        """Whether an action that answered ``error`` took its own element
+        away, which only an action the app ran can do.
+
+        An app that tears a control down while handling its action may
+        answer for an element that no longer exists: Secretive's sheet
+        Delete button deleted the key and closed the sheet, yet answered
+        AXPress with -25205. When the element's ``AXRole`` -- which every
+        live element has -- then reads as gone (-25202) or missing
+        (-25205), the action ran. An element still there, or an app that
+        does not answer the read, keeps the error. An action refused up
+        front (the element was already gone, the action is unsupported,
+        Accessibility is off) never qualifies.
+        """
+        if error not in (
+            AS.kAXErrorFailure,
+            AS.kAXErrorCannotComplete,
+            AS.kAXErrorAttributeUnsupported,
+        ):
+            return False
+        read, _value = AS.AXUIElementCopyAttributeValue(element, "AXRole", None)
+        return read in (AS.kAXErrorInvalidUIElement, AS.kAXErrorAttributeUnsupported)
+
+    def _menu_item(
+        self, pid: int, steps: Sequence[str | None], *, bar: str
+    ) -> dict[str, JSONValue]:
+        """The item ``steps`` lead to in ``pid``'s ``bar`` -- its
+        ``AXMenuBar``, or ``AXExtrasMenuBar`` for its status items -- as
+        a search match. Each step must name exactly one item, by title or
+        description (`_menu_label`), among the items under the step
+        before; a ``None`` step takes the only item there.
+        """
+        root = self._application_element(pid, enhance=False)
+        node = self._copy_attributes(root, (bar,), checked=True).get(bar)
+        for depth, step in enumerate(steps):
+            entries = self._menu_entries(node)
+            found = entries if step is None else [
+                entry for entry in entries if _menu_label(step) in self._menu_labels(entry)
+            ]
+            if len(found) != 1:
+                raise MacOSError(
+                    _menu_miss(pid, steps[:depth], step, len(found), bar),
+                    code=ErrorCode.ELEMENT_UNKNOWN,
+                    details={"pid": pid, "step": depth, "found": len(found)},
+                )
+            node = found[0]
+        return self._describe_element(
+            node,
+            self._remember_element(node),
+            attributes=("AXTitle", "AXDescription", "AXEnabled"),
+            include_actions=False,
+        )
+
+    def _menu_labels(self, item: object) -> set[str]:
+        """``item``'s title and description as `_menu_label` compares them."""
+        names = self._copy_attributes(item, ("AXTitle", "AXDescription")).values()
+        return {_menu_label(name) for name in names if isinstance(name, str)}
+
+    def _menu_entries(self, node: object) -> list[object]:
+        """The items one level below ``node``: a menu bar's own, or those
+        of the menu a menu bar item or menu item opens. An app without
+        the bar asked for, ``None``, has none."""
+        if node is None:
+            return []
+        children = list(
+            self._copy_attributes(node, ("AXChildren",), checked=True).get("AXChildren") or ()
+        )
+        if len(children) == 1 and (
+            self._copy_attributes(children[0], ("AXRole",)).get("AXRole") == "AXMenu"
+        ):
+            return self._menu_entries(children[0])
+        return children
 
     # --- windows and screenshots ----------------------------------------
 
-    def windows(self, app: str | None = None) -> list[dict[str, Any]]:
-        _, info = self._resolve_app(app)
-        values = AS.CGWindowListCopyWindowInfo(
-            AS.kCGWindowListOptionAll, AS.kCGNullWindowID
+    @staticmethod
+    def _is_content_window(pid: int, value: Mapping[str, Any]) -> bool:
+        """Whether a `CGWindowListCopyWindowInfo` entry is one of ``pid``'s
+        windows in the everyday sense: on the normal layer and at least
+        40pt on a side. A menu bar extra, tooltip, or helper surface is
+        not, so `see` never captures one and posted input never routes
+        to one over the window it was aimed at.
+        """
+        if int(value.get(AS.kCGWindowOwnerPID, -1)) != pid:
+            return False
+        if int(value.get(AS.kCGWindowLayer, -1)) != 0:
+            return False
+        bounds = value.get(AS.kCGWindowBounds) or {}
+        return float(bounds.get("Width", 0)) >= 40 and float(bounds.get("Height", 0)) >= 40
+
+    @staticmethod
+    def _server_windows(*, on_screen_only: bool) -> Sequence[Mapping[str, object]]:
+        """The window server's list, front to back: every window, or only
+        those on screen now."""
+        option = (
+            AS.kCGWindowListOptionOnScreenOnly if on_screen_only else AS.kCGWindowListOptionAll
         )
-        windows: list[dict[str, Any]] = []
-        for value in values or []:
-            if int(value.get(AS.kCGWindowOwnerPID, -1)) != info["pid"]:
-                continue
-            if int(value.get(AS.kCGWindowLayer, -1)) != 0:
-                continue
-            bounds = value.get(AS.kCGWindowBounds) or {}
-            width = float(bounds.get("Width", 0))
-            height = float(bounds.get("Height", 0))
-            if width < 40 or height < 40:
-                continue
-            windows.append(
-                {
-                    "window_id": int(value[AS.kCGWindowNumber]),
-                    "title": str(value.get(AS.kCGWindowName) or ""),
-                    "bounds": {
-                        "x": float(bounds.get("X", 0)),
-                        "y": float(bounds.get("Y", 0)),
-                        "width": width,
-                        "height": height,
-                    },
-                    "on_screen": bool(value.get(AS.kCGWindowIsOnscreen, False)),
-                    "alpha": float(value.get(AS.kCGWindowAlpha, 1.0)),
-                }
+        return AS.CGWindowListCopyWindowInfo(option, AS.kCGNullWindowID) or ()
+
+    @staticmethod
+    def _window_description(window_id: int) -> Mapping[str, object] | None:
+        """The window server's entry for one window, or None once it is gone."""
+        return next(iter(AS.CGWindowListCreateDescriptionFromArray([window_id]) or ()), None)
+
+    @staticmethod
+    def _window_entry(value: Mapping[str, object]) -> dict[str, JSONValue]:
+        """One window as `windows` lists it, from its window server entry."""
+        bounds = value.get(AS.kCGWindowBounds) or {}
+        return {
+            "window_id": int(value[AS.kCGWindowNumber]),
+            "title": str(value.get(AS.kCGWindowName) or ""),
+            "pid": int(value.get(AS.kCGWindowOwnerPID, -1)),
+            "owner": str(value.get(AS.kCGWindowOwnerName) or ""),
+            "layer": int(value.get(AS.kCGWindowLayer, 0)),
+            "bounds": {
+                "x": float(bounds.get("X", 0)),
+                "y": float(bounds.get("Y", 0)),
+                "width": float(bounds.get("Width", 0)),
+                "height": float(bounds.get("Height", 0)),
+            },
+            "on_screen": bool(value.get(AS.kCGWindowIsOnscreen, False)),
+            "alpha": float(value.get(AS.kCGWindowAlpha, 1.0)),
+        }
+
+    def windows(
+        self, app: str | int | None = None, *, all_layers: bool = False
+    ) -> list[dict[str, Any]]:
+        """``app``'s windows, on screen and largest first; with no ``app``,
+        every app's windows on screen now, front to back.
+
+        Only a normal window of at least 40pt counts, the kind `see` and
+        pointer input pick by themselves; ``all_layers`` adds menus,
+        panels, the menu bar's items, and every other surface, any size,
+        which `see` and pointer input reach through ``window_id``.
+        """
+        if app is None:
+            return [
+                self._window_entry(value)
+                for value in self._server_windows(on_screen_only=True)
+                if all_layers
+                or self._is_content_window(int(value.get(AS.kCGWindowOwnerPID, -1)), value)
+            ]
+        _, info = self._resolve_app(app)
+        pid = int(info["pid"])
+        windows = [
+            self._window_entry(value)
+            for value in self._server_windows(on_screen_only=False)
+            if (
+                int(value.get(AS.kCGWindowOwnerPID, -1)) == pid
+                if all_layers
+                else self._is_content_window(pid, value)
             )
+        ]
         return sorted(
             windows,
             key=lambda window: (
@@ -2152,6 +3963,204 @@ class MacOS:
             ),
         )
 
+    def wait_for_window(
+        self, app: str | int | None = None, *, timeout: float = 2.0
+    ) -> list[dict[str, Any]]:
+        """Return ``windows(app)`` once it is non-empty, polling until ``timeout``.
+
+        ``open -a`` returns before the app draws anything: TextEdit's first
+        window appeared 335ms after launch and Notes' 792ms, so a capture
+        issued straight after a launch finds nothing.
+        """
+        _, info = self._resolve_app(app)
+        return self._wait_for_windows(info, timeout=timeout)
+
+    @staticmethod
+    def _now() -> float:
+        """The monotonic clock the launch, quit, window, and change waits read."""
+        return time.monotonic()
+
+    @staticmethod
+    def _pause(seconds: float) -> None:
+        """The one sleep those waits take between looks."""
+        time.sleep(seconds)
+
+    def _wait_for_windows(
+        self, info: dict[str, JSONValue], *, timeout: float, deadline: float | None = None
+    ) -> list[dict[str, Any]]:
+        if deadline is None:
+            deadline = self._now() + max(0.0, timeout)
+        while True:
+            windows = self.windows(int(info["pid"]))
+            if windows:
+                return windows
+            remaining = deadline - self._now()
+            if remaining <= 0:
+                raise _no_window_error(info, timeout=timeout)
+            self._pause(min(0.05, remaining))
+
+    def _ready_windows(
+        self,
+        running: NSRunningApplication,
+        info: dict[str, JSONValue],
+        *,
+        timeout: float,
+        deadline: float | None = None,
+    ) -> list[dict[str, JSONValue]]:
+        """``info``'s windows, waiting only for an app young enough to
+        still be drawing its first; an older app with none never will."""
+        windows = self.windows(int(info["pid"]))
+        if windows:
+            return windows
+        age = self._launched_seconds_ago(running)
+        if age is None or age >= _LAUNCH_GRACE_SECONDS:
+            surfaces = [
+                window["window_id"]
+                for window in self.windows(int(info["pid"]), all_layers=True)
+                if window["on_screen"]
+            ]
+            raise _no_window_error(info, surfaces=surfaces)
+        return self._wait_for_windows(info, timeout=timeout, deadline=deadline)
+
+    def place(
+        self,
+        app: str | int | None = None,
+        *,
+        window_index: int = 0,
+        x: float | None = None,
+        y: float | None = None,
+        width: float | None = None,
+        height: float | None = None,
+        display: int | None = None,
+    ) -> dict[str, JSONValue]:
+        """Move or resize window ``window_index`` of ``app`` through
+        Accessibility, without bringing it forward, and return the frame
+        the window reports afterwards.
+
+        ``x`` and ``y`` are screen points from the top-left of ``display``
+        (0 is the main one), or of the main display when none is given.
+        Without them, a window that does not fit inside ``display`` is
+        centered on it and any other keeps its place. A minimized window
+        refuses, as does one its app will not let move or resize, before
+        anything is written.
+        """
+        if (x is None) != (y is None):
+            raise MacOSError(
+                "give x and y together",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "x" if x is None else "y"},
+            )
+        self._ensure_accessibility()
+        _, info = self._resolve_app(app)
+        self._last_app = info
+        target = self._indexed_window(self.windows(int(info["pid"])), window_index)
+        window, before, minimized = self._ax_window(info, target, window_index)
+        if minimized:
+            raise MacOSError(
+                f"{info['name']}'s window {window_index} is minimized; restore it "
+                "before placing it",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"window_index": window_index, "window_id": target["window_id"]},
+            )
+        size = (
+            before["width"] if width is None else float(width),
+            before["height"] if height is None else float(height),
+        )
+        area = self._screen_area(0 if display is None else display, None)[2]
+        origin = (before["x"], before["y"])
+        if x is not None and y is not None:
+            origin = (area["x"] + float(x), area["y"] + float(y))
+        elif display is not None and not (
+            area["x"] <= origin[0] and origin[0] + size[0] <= area["x"] + area["width"]
+            and area["y"] <= origin[1] and origin[1] + size[1] <= area["y"] + area["height"]
+        ):
+            origin = (
+                area["x"] + max(0.0, (area["width"] - size[0]) / 2),
+                area["y"] + max(0.0, (area["height"] - size[1]) / 2),
+            )
+        position = None if origin == (before["x"], before["y"]) else origin
+        extent = None if size == (before["width"], before["height"]) else size
+        refused = [
+            verb
+            for attribute, value, verb in (
+                ("AXPosition", position, "moved"),
+                ("AXSize", extent, "resized"),
+            )
+            if value is not None and not self._settable(window, attribute)
+        ]
+        if refused:
+            raise MacOSError(
+                f"{info['name']} does not let window {window_index} be "
+                f"{' or '.join(refused)}",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"window_index": window_index, "window_id": target["window_id"]},
+            )
+        self._write_window(window, position=position, size=extent)
+        after, _ = self._window_geometry(window)
+        return {
+            "app": info,
+            "window_id": target["window_id"],
+            "requested": {"x": origin[0], "y": origin[1], "width": size[0], "height": size[1]},
+            "frame": after,
+        }
+
+    def _ax_window(
+        self, info: dict[str, JSONValue], target: dict[str, JSONValue], window_index: int
+    ) -> tuple[object, dict[str, float], bool]:
+        """The AX element of ``target``, one of `windows`, with its frame
+        and whether it is minimized. AX names no window id, so the element
+        is the one whose frame matches the window server's bounds."""
+        bounds = target["bounds"]
+        for window in self._ax_windows(int(info["pid"])):
+            frame, minimized = self._window_geometry(window)
+            if frame is not None and all(abs(frame[key] - bounds[key]) < 1 for key in bounds):
+                return window, frame, minimized
+        raise MacOSError(
+            f"{info['name']} shows no Accessibility window where window {window_index} "
+            "is; a window on another Space cannot be placed",
+            code=ErrorCode.UNSUPPORTED_OP,
+            details={"window_index": window_index, "window_id": target["window_id"]},
+        )
+
+    def _ax_windows(self, pid: int) -> list[object]:
+        """The AX elements of ``pid``'s windows on this Space."""
+        root = self._application_element(pid, enhance=False)
+        return list(self._copy_attribute(root, "AXWindows", checked=True) or ())
+
+    def _window_geometry(self, window: object) -> tuple[dict[str, float] | None, bool]:
+        """``window``'s frame in screen points, None when it reports none,
+        and whether it is minimized."""
+        values = self._copy_attributes(
+            window, ("AXPosition", "AXSize", "AXMinimized"), checked=True
+        )
+        minimized = bool(values["AXMinimized"])
+        if values["AXPosition"] is None or values["AXSize"] is None:
+            return None, minimized
+        return {
+            **self._jsonable(values["AXPosition"]),
+            **self._jsonable(values["AXSize"]),
+        }, minimized
+
+    @staticmethod
+    def _write_window(
+        window: object,
+        *,
+        position: tuple[float, float] | None,
+        size: tuple[float, float] | None,
+    ) -> None:
+        """Set ``window``'s AXPosition, then its AXSize, each only when given."""
+        for attribute, kind, value in (
+            ("AXPosition", AS.kAXValueCGPointType, position),
+            ("AXSize", AS.kAXValueCGSizeType, size),
+        ):
+            if value is None:
+                continue
+            error = AS.AXUIElementSetAttributeValue(
+                window, attribute, AS.AXValueCreate(kind, value)
+            )
+            if error != _AX_SUCCESS:
+                raise _ax_error(f"Set the window's {attribute}", error, attribute=attribute)
+
     def capture_screenshot(
         self,
         app: str | None = None,
@@ -2159,176 +4168,645 @@ class MacOS:
         window_index: int = 0,
         path: str | Path | None = None,
     ) -> dict[str, Any]:
-        self._ensure_screen_recording()
-        _, info = self._resolve_app(app)
-        windows = self.windows(str(info["pid"]))
-        if not windows:
-            raise MacOSError(
-                f"No capturable windows found for {app or self._last_app}",
-                code=ErrorCode.ELEMENT_UNKNOWN,
-                details={"app": info},
-            )
-        try:
-            window = windows[window_index]
-        except IndexError as exc:
-            raise MacOSError(
-                f"Window index {window_index} is out of range; found {len(windows)} windows",
-                code=ErrorCode.BAD_REQUEST,
-                details={
-                    "parameter": "window_index",
-                    "value": window_index,
-                    "count": len(windows),
-                },
-            ) from exc
-
-        if path is None:
-            with tempfile.NamedTemporaryFile(
-                prefix="macos-harness-", suffix=".png", delete=False
-            ) as handle:
-                output = Path(handle.name)
-            output.unlink(missing_ok=True)
-        else:
-            output = Path(path).expanduser().resolve()
-            output.parent.mkdir(parents=True, exist_ok=True)
-
-        result = subprocess.run(
-            [
-                "/usr/sbin/screencapture",
-                "-x",
-                "-o",
-                "-l",
-                str(window["window_id"]),
-                str(output),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+        """Capture one window at its native pixel size, without the pointer."""
+        return self._capture(
+            app,
+            window_index=window_index,
+            path=path,
+            max_width=None,
+            max_height=None,
+            show_pointer=False,
         )
-        if result.returncode != 0 or not output.exists():
-            output.unlink(missing_ok=True)
-            detail = (result.stderr or result.stdout or "no image returned").strip()
-            raise MacOSError(
-                f"Window screenshot failed: {detail}",
-                code=ErrorCode.AX_ERROR,
-                details={"reason": detail},
-            )
-
-        width, height = _png_size(output)
-        bounds = window["bounds"]
-        screenshot = {
-            "path": str(output),
-            "app": info,
-            "pid": info["pid"],
-            "window_id": window["window_id"],
-            "width": width,
-            "height": height,
-            "bounds": bounds,
-            "scale_x": width / bounds["width"],
-            "scale_y": height / bounds["height"],
-        }
-        self._last_app = info
-        self._last_windows = windows
-        self._last_screenshot = screenshot
-        return screenshot
 
     def see(
         self,
-        app: str | None = None,
+        app: str | int | None = None,
         *,
         window_index: int = 0,
+        window_id: int | None = None,
+        display: int | None = None,
+        region: tuple[float, float, float, float] | None = None,
         path: str | Path | None = None,
         max_width: int = 1280,
         max_height: int = 1280,
-        show_pointer: bool = True,
+        show_pointer: bool = False,
+        after_change: bool = False,
+        timeout: float = 30.0,
+        settle: float = _CHANGE_SETTLE_SECONDS,
     ) -> dict[str, Any]:
-        """Capture a bounded window image and draw the harness pointer onto it."""
+        """Capture a bounded window image; ``show_pointer`` draws the pointer onto it.
+
+        The window is ``app``'s by ``window_index``, or any window, of any
+        layer or owner, by ``window_id``. ``display`` (0 is the main one)
+        or ``region`` (x, y, width, height in screen points) captures the
+        screen there as it shows instead, every window composited; its
+        ``bounds`` map ``coordinate_space="screenshot"`` input as a
+        window's do. ``after_change`` first waits up to ``timeout``
+        seconds for the window to change from where `wait_change` would
+        measure and hold still ``settle`` seconds; the result's
+        ``changed`` says whether it did, and no change is no error here.
+        The result's ``on_screen`` is the only freshness signal: an
+        off-screen window (minimized, hidden, or on another Space) still
+        renders, but from whatever the app last drew.
+        """
         if max_width <= 0 or max_height <= 0:
             raise MacOSError(
                 "max_width and max_height must be positive",
                 code=ErrorCode.BAD_REQUEST,
                 details={"max_width": max_width, "max_height": max_height},
             )
-        screenshot = self.capture_screenshot(app, window_index=window_index, path=path)
-        output = Path(screenshot["path"])
-        raw_width = int(screenshot["width"])
-        raw_height = int(screenshot["height"])
-
-        with Image.open(output) as source:
-            image = source.convert("RGBA")
-        ratio = min(1.0, max_width / image.width, max_height / image.height)
-        if ratio < 1.0:
-            size = (
-                max(1, round(image.width * ratio)),
-                max(1, round(image.height * ratio)),
+        self._check_surface(
+            app=app, window_index=window_index, window_id=window_id, display=display,
+            region=region, after_change=after_change,
+        )
+        change = None
+        if after_change:
+            change = self._watch_change(
+                app, window_index=window_index, window_id=window_id, region=None,
+                by="pixels", timeout=timeout, settle=settle,
             )
-            image = image.resize(size, Image.Resampling.LANCZOS)
+        screenshot = self._capture(
+            app,
+            window_index=window_index,
+            window_id=window_id,
+            display=display,
+            region=region,
+            path=path,
+            max_width=max_width,
+            max_height=max_height,
+            show_pointer=show_pointer,
+        )
+        if change is not None:
+            screenshot["changed"] = change["changed"]
+        return screenshot
 
-        bounds = screenshot["bounds"]
-        scale_x = image.width / float(bounds["width"])
-        scale_y = image.height / float(bounds["height"])
-        pointer = self._pointer_position
-        pointer_info: dict[str, Any] | None = None
-        if pointer is not None:
-            image_x = (pointer[0] - float(bounds["x"])) * scale_x
-            image_y = (pointer[1] - float(bounds["y"])) * scale_y
-            inside = 0 <= image_x < image.width and 0 <= image_y < image.height
-            pointer_info = {
-                "screen": {"x": pointer[0], "y": pointer[1]},
+    @staticmethod
+    def _check_surface(
+        *,
+        app: str | int | None,
+        window_index: int,
+        window_id: int | None,
+        display: int | None,
+        region: tuple[float, float, float, float] | None,
+        after_change: bool,
+    ) -> None:
+        """Refuse a `see` that names more than one thing to capture."""
+        if display is not None and region is not None:
+            problem = "pass display or region, not both: a region finds its own display"
+            parameter = "region"
+        elif (display is not None or region is not None) and (
+            app is not None or window_id is not None or window_index != 0
+        ):
+            problem = (
+                "display and region capture the screen as it shows, not one app's "
+                "window; drop app, window_index, and window_id"
+            )
+            parameter = "display" if region is None else "region"
+        elif (display is not None or region is not None) and after_change:
+            problem = "after_change waits on one window; capture a display or region without it"
+            parameter = "after_change"
+        elif window_id is not None and window_index != 0:
+            problem = "window_id names one window and window_index picks among an app's; pass one"
+            parameter = "window_index"
+        else:
+            return
+        raise MacOSError(problem, code=ErrorCode.BAD_REQUEST, details={"parameter": parameter})
+
+    def _capture(
+        self,
+        app: str | int | None,
+        *,
+        window_index: int,
+        path: str | Path | None,
+        max_width: int | None,
+        max_height: int | None,
+        show_pointer: bool,
+        window_id: int | None = None,
+        display: int | None = None,
+        region: tuple[float, float, float, float] | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_screen_recording()
+        window: dict[str, JSONValue] | None = None
+        running: NSRunningApplication | None = None
+        info: dict[str, JSONValue] | None = None
+        if display is not None or region is not None:
+            index, display_id, frame, area = self._screen_area(display, region)
+            output = _png_output(path)
+            captured = self._screen_image(
+                display_id, area, frame, max_width=max_width, max_height=max_height
+            )
+            screenshot: dict[str, Any] = {
+                "path": str(output), "app": None, "pid": None, "window_id": None,
+                "display": index,
+            }
+        else:
+            if window_id is None:
+                running, info = self._resolve_app(app)
+                windows = self._ready_windows(running, info, timeout=_LAUNCH_WINDOW_TIMEOUT)
+                window = self._indexed_window(windows, window_index)
+            else:
+                window, running, info = self._named_window(app, window_id)
+            output = _png_output(path)
+            captured = self._window_image(
+                window["window_id"], max_width=max_width, max_height=max_height
+            )
+            screenshot = {
+                "path": str(output),
+                "app": info,
+                "pid": info["pid"],
+                "window_id": window["window_id"],
+                "title": window["title"],
+                "layer": window["layer"],
+            }
+        bounds = captured.bounds
+        frontmost = self._frontmost_app()
+        focus: dict[str, JSONValue] = {"frontmost": frontmost}
+        if info is not None:
+            focus["target_is_frontmost"] = (
+                frontmost is not None and int(frontmost["pid"]) == int(info["pid"])
+            )
+        screenshot.update(
+            width=captured.width,
+            height=captured.height,
+            bounds=bounds,
+            scale_x=captured.width / bounds["width"],
+            scale_y=captured.height / bounds["height"],
+            on_screen=captured.on_screen,
+            captured_at=captured.captured_at,
+            virtual_pointer=None,
+            focus=focus,
+        )
+
+        image = captured.image
+        if self._pointer_position is not None:
+            pointer_x, pointer_y = self._pointer_position
+            image_x, image_y, inside = self._image_point(screenshot, pointer_x, pointer_y)
+            visible = self._overlay.visible
+            screenshot["virtual_pointer"] = {
+                "screen": {"x": pointer_x, "y": pointer_y},
                 "image": {"x": image_x, "y": image_y},
                 "inside": inside,
-                "visible": self._overlay.visible,
+                "visible": visible,
             }
-            if show_pointer and self._overlay.visible and inside:
-                draw = ImageDraw.Draw(image)
-                hot_x, hot_y = POINTER_HOTSPOT
-                points = [
-                    (
-                        round(image_x + (x - hot_x) * scale_x),
-                        round(image_y + (y - hot_y) * scale_y),
-                    )
-                    for x, y in pointer_points()
-                ]
-                shadow = [
-                    (x + max(1, round(scale_x)), y + max(1, round(scale_y)))
-                    for x, y in points
-                ]
-                draw.polygon(shadow, fill=(0, 0, 0, 72))
-                outline_width = max(2, round(2.5 * (scale_x + scale_y) / 2))
-                draw.polygon(
-                    points,
-                    fill=(0, 0, 0, 255),
-                    outline=(255, 255, 255, 240),
-                    width=outline_width,
-                )
-                draw.line(
-                    [*points, points[0]],
-                    fill=(0, 0, 0, 230),
-                    width=max(1, round(0.65 * (scale_x + scale_y) / 2)),
-                    joint="curve",
-                )
-
-        image.save(output, format="PNG", optimize=True)
-        frontmost = self._frontmost_app()
-        screenshot.update(
-            {
-                "raw_width": raw_width,
-                "raw_height": raw_height,
-                "width": image.width,
-                "height": image.height,
-                "scale_x": scale_x,
-                "scale_y": scale_y,
-                "virtual_pointer": pointer_info,
-                "focus": {
-                    "frontmost": frontmost,
-                    "target_is_frontmost": (
-                        frontmost is not None
-                        and int(frontmost["pid"]) == int(screenshot["pid"])
-                    ),
-                },
-            }
+            if show_pointer and visible and inside:
+                scale = (screenshot["scale_x"] + screenshot["scale_y"]) / 2
+                image = draw_pointer(image, image_x, image_y, scale)
+        write_png(image, output)
+        _record_path(output).write_text(
+            json.dumps({key: screenshot[key] for key in _CAPTURE_RECORD_KEYS}), encoding="utf-8"
         )
+
+        if window is not None:
+            if running is not None:
+                self._last_app = info
+            seen = int(window["window_id"])
+            first_of = int(info["pid"]) if window_id is None and window_index == 0 else None
+            self._last_capture = _Picture(seen, captured, first_of)
+            if self._before_input is not None and self._before_input.window_id == seen:
+                self._before_input = None
         self._last_screenshot = screenshot
         return screenshot
+
+    def _named_window(
+        self, app: str | int | None, window_id: int
+    ) -> tuple[dict[str, JSONValue], NSRunningApplication, dict[str, JSONValue]]:
+        """The window ``window_id`` names, whatever its layer, with the
+        running app that owns it and that app's record; ``app``, when
+        given, must be that owner."""
+        window = self._described_window(window_id)
+        if app is not None:
+            running, info = self._resolve_app(app)
+            self._require_owner(window, int(info["pid"]), str(info["name"]))
+            return window, running, info
+        try:
+            running, info = self._resolve_app(window["pid"])
+        except ApplicationNotFoundError:
+            # The window server and other daemons own surfaces with no app record.
+            owner = {"name": window["owner"], "bundle_id": None, "pid": window["pid"], "path": None}
+            return window, None, owner
+        return window, running, info
+
+    def _described_window(self, window_id: int) -> dict[str, JSONValue]:
+        """`windows`' entry for the window ``window_id`` names."""
+        if type(window_id) is not int:
+            raise MacOSError(
+                f"window_id must be a window number from mac.windows(), not {window_id!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "window_id"},
+            )
+        value = self._window_description(window_id)
+        if value is None:
+            raise MacOSError(
+                f"Window {window_id} does not exist; it may have closed. "
+                "mac.windows(all_layers=True) lists what is on screen",
+                code=ErrorCode.ELEMENT_UNKNOWN,
+                details={"window_id": window_id},
+            )
+        return self._window_entry(value)
+
+    @staticmethod
+    def _require_owner(window: Mapping[str, JSONValue], pid: int, name: str | None = None) -> None:
+        """Refuse a window that ``pid``, the app the call targets, does not own."""
+        if window["pid"] != pid:
+            target = f"{name} (pid {pid})" if name else f"pid {pid}"
+            raise MacOSError(
+                f"Window {window['window_id']} belongs to {window['owner']} "
+                f"(pid {window['pid']}), not {target}",
+                code=ErrorCode.BAD_REQUEST,
+                details={
+                    "parameter": "window_id",
+                    "window_id": window["window_id"],
+                    "owner_pid": window["pid"],
+                    "pid": pid,
+                },
+            )
+
+    def _screen_area(
+        self, display: int | None, region: tuple[float, float, float, float] | None
+    ) -> tuple[int, int, dict[str, float], dict[str, float]]:
+        """For `see(display=)` or `see(region=)`: the display's index, its
+        id, its frame in screen points, and the area to capture."""
+        screens = self._displays()
+        frames = [frame for _, frame in screens]
+        if region is None:
+            if type(display) is not int or not 0 <= display < len(screens):
+                raise MacOSError(
+                    f"display must be 0 to {len(screens) - 1} on this Mac "
+                    f"(0 is the main one), not {display!r}",
+                    code=ErrorCode.BAD_REQUEST,
+                    details={"parameter": "display", "value": display, "displays": frames},
+                )
+            display_id, frame = screens[display]
+            return display, display_id, frame, frame
+        if len(region) != 4 or not all(
+            type(value) in (int, float) and math.isfinite(value) for value in region
+        ) or region[2] <= 0 or region[3] <= 0:
+            raise MacOSError(
+                "region is (x, y, width, height) in screen points, with width and height above 0",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "region", "value": list(region)},
+            )
+        x, y, width, height = (float(value) for value in region)
+        for index, (display_id, frame) in enumerate(screens):
+            if (
+                frame["x"] <= x and x + width <= frame["x"] + frame["width"]
+                and frame["y"] <= y and y + height <= frame["y"] + frame["height"]
+            ):
+                area = {"x": x, "y": y, "width": width, "height": height}
+                return index, display_id, frame, area
+        raise MacOSError(
+            "region must lie inside one display; their frames in screen points are in "
+            "details['displays']",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": "region", "value": list(region), "displays": frames},
+        )
+
+    @staticmethod
+    def _displays() -> list[tuple[int, dict[str, float]]]:
+        """Every active display, the main one first, with its frame."""
+        return displays()
+
+    def _screen_image(
+        self,
+        display_id: int,
+        area: dict[str, float],
+        frame: dict[str, float],
+        *,
+        max_width: int | None,
+        max_height: int | None,
+    ) -> WindowCapture:
+        """Render ``area`` of a display as it shows, without the virtual pointer."""
+        return capture_screen(
+            display_id, area, frame, max_width=max_width, max_height=max_height,
+            hide_pid=self._overlay.pid,
+        )
+
+    @staticmethod
+    def _window_image(
+        window_id: int,
+        *,
+        max_width: int | None,
+        max_height: int | None,
+        size: tuple[int, int] | None = None,
+    ) -> WindowCapture:
+        """Render one window; the one capture `see` and `wait_change` take."""
+        return capture_window(window_id, max_width=max_width, max_height=max_height, size=size)
+
+    @staticmethod
+    def _indexed_window(
+        windows: list[dict[str, JSONValue]], window_index: int
+    ) -> dict[str, JSONValue]:
+        try:
+            return windows[window_index]
+        except IndexError as exc:
+            count = len(windows)
+            held = (
+                "no windows" if count == 0
+                else "1 window (index 0)" if count == 1
+                else f"{count} windows (indexes 0-{count - 1})"
+            )
+            raise MacOSError(
+                f"No window at window_index {window_index}: window_index starts "
+                f"at 0, and this app has {held}",
+                code=ErrorCode.BAD_REQUEST,
+                details={
+                    "parameter": "window_index",
+                    "value": window_index,
+                    "count": count,
+                },
+            ) from exc
+
+    def wait_change(
+        self,
+        app: str | int | None = None,
+        *,
+        window_index: int = 0,
+        window_id: int | None = None,
+        region: tuple[float, float, float, float] | None = None,
+        by: str = "pixels",
+        timeout: float = 30.0,
+        settle: float = _CHANGE_SETTLE_SECONDS,
+    ) -> dict[str, JSONValue]:
+        """Return once ``app``'s window, or the one ``window_id`` names,
+        looks different and has then held still for ``settle`` seconds,
+        in place of a guessed sleep.
+
+        The baseline is the newest picture of the window this process
+        holds: its last `see`, where its last wait ended, or one taken
+        just before an input when neither came after the input before.
+        With none, it is the window as it looks now. So a change the
+        latest input made before this call still counts, and one an
+        earlier input made does not. ``region`` (x, y, width, height in
+        that `see`'s pixels) watches part of the window;
+        ``by="ax"`` compares the app's accessibility text instead of
+        pixels. A blinking caret is no change. Raises TIMEOUT, with
+        ``details["changed"]`` False, when nothing changed in time.
+        """
+        self._check_surface(
+            app=app, window_index=window_index, window_id=window_id, display=None,
+            region=None, after_change=True,
+        )
+        watched = self._watch_change(
+            app, window_index=window_index, window_id=window_id, region=region, by=by,
+            timeout=timeout, settle=settle,
+        )
+        if not watched["changed"]:
+            raise MacOSError(
+                f"{watched['app']['name']} did not change in {timeout:g}s",
+                code=ErrorCode.TIMEOUT,
+                details={**watched, "timeout": timeout},
+            )
+        return watched
+
+    def _watch_change(
+        self,
+        app: str | int | None,
+        *,
+        window_index: int,
+        window_id: int | None,
+        region: tuple[float, float, float, float] | None,
+        by: str,
+        timeout: float,
+        settle: float,
+    ) -> dict[str, JSONValue]:
+        if by not in ("pixels", "ax"):
+            raise MacOSError(
+                f"by must be 'pixels' or 'ax', not {by!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "by", "value": by},
+            )
+        if not all(
+            type(value) in (int, float) and math.isfinite(value) and value >= 0
+            for value in (timeout, settle)
+        ):
+            raise MacOSError(
+                "timeout and settle must be seconds, 0 or more",
+                code=ErrorCode.BAD_REQUEST,
+                details={"timeout": timeout, "settle": settle},
+            )
+        if region is not None and by == "ax":
+            raise MacOSError(
+                "region watches pixels; by='ax' compares the whole app's text",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "region"},
+            )
+        started = self._now()
+        deadline = started + timeout
+        if window_id is None:
+            running, info = self._resolve_app(app)
+        else:
+            _window, running, info = self._named_window(app, window_id)
+        watched: dict[str, JSONValue] = {"by": by, "app": info}
+        if by == "ax":
+            self._ensure_accessibility()
+            pid = int(info["pid"])
+            changed, settled, polls = self._until_settled(
+                lambda: self._ax_look(pid), self._ax_look(pid), operator.ne,
+                look_now=False, deadline=deadline, settle=settle,
+            )
+            watched["baseline"] = "now"
+        else:
+            self._ensure_screen_recording()
+            if window_id is None:
+                windows = self._ready_windows(running, info, timeout=_LAUNCH_WINDOW_TIMEOUT)
+                window_id = int(self._indexed_window(windows, window_index)["window_id"])
+            picture = self._held_picture(window_id)
+            framed = picture is not None and picture is self._last_capture
+            look, baseline, threshold = self._pixel_looks(window_id, picture, region, framed=framed)
+            changed, settled, polls = self._until_settled(
+                look, baseline, lambda before, after: changed_area(before, after) >= threshold,
+                look_now=picture is not None, deadline=deadline, settle=settle,
+            )
+            watched.update(
+                baseline="see" if framed else "input" if picture is not None else "now",
+                window_id=window_id,
+            )
+        watched.update(
+            changed=changed, settled=settled, polls=polls,
+            elapsed_ms=round((self._now() - started) * 1000),
+        )
+        return watched
+
+    def _pixel_looks(
+        self,
+        window_id: int,
+        picture: _Picture | None,
+        region: tuple[float, float, float, float] | None,
+        *,
+        framed: bool,
+    ) -> tuple[Callable[[], GrayPrint], GrayPrint, float]:
+        """How `wait_change` looks at a window: a fresh print, the baseline
+        print, and the square points two prints must differ by to count.
+        The baseline is ``picture``, the one held of the window, else the
+        window now; ``framed`` when it is in the last `see`'s pixels, the
+        ones ``region`` names."""
+        if region is not None and not framed:
+            raise MacOSError(
+                "region is in the pixels of the last mac.see of this window; see it first",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "region", "window_id": window_id},
+            )
+        first = picture.capture if picture is not None else self._window_image(
+            window_id, max_width=_CHANGE_BASELINE_SIZE, max_height=_CHANGE_BASELINE_SIZE
+        )
+        size, bounds = (first.width, first.height), first.bounds
+        crop = None if region is None else self._print_crop(region, *size)
+        if crop is None:
+            points = (bounds["width"], bounds["height"])
+            width = min(_PRINT_MAX_WIDTH, first.width,
+                        math.ceil(points[0] / _PRINT_POINTS_PER_PIXEL))
+            threshold = _CHANGE_AREA
+        else:
+            points = (crop[2] * bounds["width"] / first.width,
+                      crop[3] * bounds["height"] / first.height)
+            width = min(_PRINT_MAX_WIDTH, math.ceil(crop[2]))
+            threshold = min(_CHANGE_AREA, _CHANGE_REGION_SHARE * points[0] * points[1])
+        height = max(1, round(width * points[1] / points[0]))
+
+        def shrink(image: object) -> GrayPrint:
+            return gray_print(image, width=width, height=height, points=points, crop=crop)
+
+        def look() -> GrayPrint:
+            captured = self._window_image(window_id, max_width=None, max_height=None, size=size)
+            if picture is not None:
+                # The next wait measures from here, not from a change this
+                # one saw, and the next input needs no picture of its own.
+                picture.capture, picture.acted = captured, False
+            return shrink(captured.image)
+
+        return look, shrink(first.image), threshold
+
+    @staticmethod
+    def _print_crop(region: object, width: int, height: int) -> tuple[float, float, float, float]:
+        """``region`` checked against a ``width`` x ``height`` screenshot."""
+        values = tuple(region) if isinstance(region, (tuple, list)) else ()
+        if len(values) != 4 or not all(
+            type(value) in (int, float) and math.isfinite(value) for value in values
+        ):
+            raise MacOSError(
+                "region must be (x, y, width, height) in the last see's pixels",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "region"},
+            )
+        x, y, w, h = (float(value) for value in values)
+        if w < 1 or h < 1 or x < 0 or y < 0 or x + w > width or y + h > height:
+            raise MacOSError(
+                f"region must lie inside the {width}x{height} screenshot",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "region", "width": width, "height": height},
+            )
+        return x, y, w, h
+
+    def _ax_look(self, pid: int) -> tuple[str, ...]:
+        """``pid``'s accessibility text, one entry per element, for
+        `wait_change(by="ax")`; the caller's element indexes stay valid."""
+        held = self._elements
+        try:
+            snapshot = self._snapshot_tree(
+                self._application_element(pid, enhance=False),
+                max_depth=25, max_nodes=2000, include_menu_bar=False,
+                attributes=_AX_LOOK_ATTRIBUTES, include_actions=False,
+                include_settable=False, skip_closed_menus=True,
+            )
+        finally:
+            self._elements = held
+        return tuple(
+            json.dumps({key: value for key, value in node.items() if key != "element_index"},
+                       sort_keys=True, ensure_ascii=False)
+            for node in snapshot.nodes
+        )
+
+    def _until_settled(
+        self,
+        look: Callable[[], _Look],
+        baseline: _Look,
+        differs: Callable[[_Look, _Look], bool],
+        *,
+        look_now: bool,
+        deadline: float,
+        settle: float,
+    ) -> tuple[bool, bool, int]:
+        """Look until a look unlike ``baseline`` has held for ``settle``
+        seconds or ``deadline`` passes: (changed, settled, looks taken).
+        ``look_now`` takes the first look at once, for a baseline taken
+        before the change could have happened."""
+        looks, previous, since = 0, baseline, None
+        while True:
+            if looks or not look_now:
+                remaining = deadline - self._now()
+                if remaining <= 0:
+                    return since is not None, False, looks
+                self._pause(min(_CHANGE_POLL_SECONDS, remaining))
+            current = look()
+            looks += 1
+            now = self._now()
+            if not differs(baseline, current):
+                since = None
+            elif since is None or differs(previous, current):
+                since = now
+            previous = current
+            if since is not None and now - since >= settle:
+                return True, True, looks
+
+    def _held_picture(self, window_id: int) -> _Picture | None:
+        """The picture this process holds of window ``window_id``."""
+        return next(
+            (
+                picture for picture in (self._last_capture, self._before_input)
+                if picture is not None and picture.window_id == window_id
+            ),
+            None,
+        )
+
+    def _hold_before_input(self, pid: int | None, window_id: int | None = None) -> None:
+        """Picture the window an input to ``pid`` is about to reach --
+        ``window_id``'s, else the app's first, the one a wait on the app
+        watches -- unless the picture held of it came from a `see` or a
+        wait after the last input to it. A wait for this input's effect
+        then measures from just before it, not from after it already
+        showed or from before an earlier input. A held picture is retaken
+        at its own size, keeping a `see`'s in the pixels ``region``
+        names; a capture costs about 40ms. An input right after a `see`
+        or a wait costs nothing, and one naming only the app skips even
+        the window listing when that look was of the app's first window.
+        Without Screen Recording, a window, or a capture it keeps what it
+        held, and the input goes out regardless."""
+        if pid is None:
+            return
+        try:
+            first_of = None
+            if window_id is None:
+                covered = next(
+                    (
+                        picture for picture in (self._last_capture, self._before_input)
+                        if picture is not None and picture.first_of == pid and not picture.acted
+                    ),
+                    None,
+                )
+                if covered is not None:
+                    covered.acted = True
+                    return
+                windows = self.windows(pid)
+                if not windows:
+                    return
+                window_id, first_of = int(windows[0]["window_id"]), pid
+            picture = self._held_picture(window_id)
+            if picture is not None and not picture.acted:
+                picture.acted = True
+                return
+            self._ensure_screen_recording()
+            if picture is None:
+                self._before_input = _Picture(window_id, self._window_image(
+                    window_id, max_width=_CHANGE_BASELINE_SIZE, max_height=_CHANGE_BASELINE_SIZE
+                ), first_of, acted=True)
+            else:
+                picture.capture = self._window_image(
+                    window_id, max_width=None, max_height=None,
+                    size=(picture.capture.width, picture.capture.height),
+                )
+                picture.acted = True
+        except MacOSError:
+            return
 
     # --- direct visual and keyboard input -------------------------------
 
@@ -2338,6 +4816,20 @@ class MacOS:
         _, info = self._resolve_app(app)
         self._last_app = info
         return int(info["pid"])
+
+    def _input_pid(self, app: str | int | None, window_id: int | None, what: str) -> int:
+        """The pid pointer input goes to: ``app``'s, else the owner's of
+        the window ``window_id`` names, else the last app's."""
+        if app is None and window_id is not None:
+            app = self._described_window(window_id)["pid"]
+        pid = self._pid(app)
+        if pid is None:
+            raise MacOSError(
+                f"{what} requires an app or prior app snapshot",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "app"},
+            )
+        return pid
 
     @staticmethod
     def _post(event: Any, pid: int | None) -> None:
@@ -2349,29 +4841,120 @@ class MacOS:
             )
         AS.CGEventPostToPid(pid, event)
 
+    def _target_window(
+        self, pid: int, point: tuple[float, float], window_id: int | None = None
+    ) -> _TargetWindow:
+        """Find the frontmost on-screen window of ``pid`` under ``point``,
+        or check the one ``window_id`` names.
+
+        Only a window `windows` would list counts by itself, so input
+        routes to a window `see` can capture and never to a same-app
+        tooltip or helper surface over it; a menu, popover, or panel
+        takes input only when ``window_id`` names it. ``origin`` is the
+        window's top-left screen point, which ``_route_to_window`` needs
+        to express each event in window coordinates. Other apps' windows
+        over the point do not matter: input posted to a pid only ever
+        reaches that pid, so the covered window is still the one the
+        event lands in.
+        """
+        if _set_window_location is None:
+            raise MacOSError(
+                "This macOS build lacks CGEventSetWindowLocation, so posted "
+                "mouse input cannot be routed to a window",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"symbol": "CGEventSetWindowLocation"},
+            )
+        x, y = point
+        if window_id is not None:
+            window = self._described_window(window_id)
+            self._require_owner(window, pid)
+            bounds = window["bounds"]
+            if not window["on_screen"]:
+                raise MacOSError(
+                    f"Window {window_id} is not on screen (minimized, hidden, or on "
+                    "another Space); input there cannot land",
+                    code=ErrorCode.WINDOW_CHANGED,
+                    details={"window_id": window_id, "reason": "off_screen"},
+                )
+            if not (
+                bounds["x"] <= x < bounds["x"] + bounds["width"]
+                and bounds["y"] <= y < bounds["y"] + bounds["height"]
+            ):
+                raise MacOSError(
+                    f"Screen point ({x:.0f}, {y:.0f}) is outside window {window_id}; "
+                    "input there cannot land",
+                    code=ErrorCode.BAD_REQUEST,
+                    details={"window_id": window_id, "point": {"x": x, "y": y}, "bounds": bounds},
+                )
+            return _TargetWindow(window_id, (bounds["x"], bounds["y"]))
+        for value in self._server_windows(on_screen_only=True):
+            if not self._is_content_window(pid, value):
+                continue
+            bounds = value.get(AS.kCGWindowBounds) or {}
+            left = float(bounds.get("X", 0))
+            top = float(bounds.get("Y", 0))
+            if (
+                left <= x < left + float(bounds.get("Width", 0))
+                and top <= y < top + float(bounds.get("Height", 0))
+            ):
+                return _TargetWindow(int(value[AS.kCGWindowNumber]), (left, top))
+        raise MacOSError(
+            f"No on-screen window of pid {pid} contains screen point "
+            f"({x:.0f}, {y:.0f}); pointer input there cannot land. A menu or "
+            f"panel there takes it once window_id names it: mac.windows({pid}, "
+            "all_layers=True) lists them",
+            code=ErrorCode.BAD_REQUEST,
+            details={"pid": pid, "point": {"x": x, "y": y}},
+        )
+
+    @staticmethod
+    def _route_to_window(
+        event: Any, window: _TargetWindow, point: tuple[float, float]
+    ) -> None:
+        """Bind a mouse or scroll ``event`` at screen ``point`` to ``window``."""
+        AS.CGEventSetIntegerValueField(event, _CG_EVENT_WINDOW_NUMBER, window.window_id)
+        left, top = window.origin
+        _set_window_location(
+            objc.pyobjc_id(event), _CGPoint(point[0] - left, point[1] - top)
+        )
+
+    def _use_screenshot(self, screenshot: str | Path | None) -> None:
+        """Map this call's screenshot coordinates through the PNG
+        ``screenshot`` names, as if `see` had just taken it: its app
+        becomes the one a call without ``app`` targets."""
+        if screenshot is None:
+            return
+        record = _capture_record(screenshot)
+        self._last_screenshot = record
+        if record["app"] is not None:
+            self._last_app = record["app"]
+
     def _screen_point(
         self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
     ) -> tuple[float, float]:
         """Resolve a coordinate to a screen point, bound to ``pid`` when given.
 
-        ``pid`` -- the already-resolved target of the action this point is
-        for -- is optional: callers with no dispatch target at all (``move``,
-        an AX hit test) simply skip the binding check below. Callers that
-        *do* dispatch to a pid (``click``, ``drag``, ``scroll``) must pass
-        it, so a window/screenshot-relative coordinate computed from a
-        screenshot of one app can never be silently posted to another.
+        Every caller aiming at an app (``click``, ``drag``, ``scroll``,
+        ``move``, an AX hit test in one app) passes its ``pid``, so a
+        window/screenshot-relative coordinate computed from a screenshot of
+        one app is never applied to another, nor to a window that has moved
+        since. A hit test across all apps has no ``pid`` and skips both
+        checks. A display or region screenshot belongs to no app: it maps
+        any app's coordinates, and it has no window that could move.
         """
         if coordinate_space == "screen":
             return float(x), float(y)
         if self._last_screenshot is None:
             raise MacOSError(
-                "Take a screenshot before using window or screenshot coordinates, "
-                "or pass coordinate_space='screen'",
+                "No screenshot in this run to map window or screenshot "
+                "coordinates through: pass screenshot= the PNG path an earlier "
+                "mac.see() printed, call mac.see() first, or pass "
+                "coordinate_space='screen'",
                 code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "coordinate_space", "value": coordinate_space},
+                details={"parameter": "screenshot", "coordinate_space": coordinate_space},
             )
         shot = self._last_screenshot
-        if pid is not None and int(shot["pid"]) != int(pid):
+        if pid is not None and shot["pid"] is not None and int(shot["pid"]) != int(pid):
             raise MacOSError(
                 f"Last screenshot targets pid {shot['pid']}, not the pid {pid} "
                 "this action targets; take a fresh screenshot for this app or "
@@ -2383,6 +4966,8 @@ class MacOS:
                     "target_pid": int(pid),
                 },
             )
+        if pid is not None and shot["window_id"] is not None:
+            self._require_window_unchanged(shot)
         bounds = shot["bounds"]
         if coordinate_space == "screenshot":
             x = float(x) / float(shot["scale_x"])
@@ -2394,6 +4979,63 @@ class MacOS:
                 details={"parameter": "coordinate_space", "value": coordinate_space},
             )
         return bounds["x"] + float(x), bounds["y"] + float(y)
+
+    def _require_window_unchanged(self, shot: dict[str, Any]) -> None:
+        """Refuse screenshot coordinates once their window moved or left the screen.
+
+        A coordinate taken from a screenshot is only meaningful while the
+        window still sits where the screenshot saw it. A closed, moved,
+        resized, minimized, or other-Space window gets a fresh ``see()``
+        instead of a click that lands somewhere else or nowhere.
+        """
+        window_id = int(shot["window_id"])
+        current = self._window_description(window_id)
+        if current is None:
+            raise MacOSError(
+                f"Window {window_id} from the last screenshot is gone; "
+                "take a fresh screenshot",
+                code=ErrorCode.WINDOW_CHANGED,
+                details={"window_id": window_id, "reason": "closed"},
+            )
+        raw = current.get(AS.kCGWindowBounds) or {}
+        bounds = {
+            "x": float(raw.get("X", 0)),
+            "y": float(raw.get("Y", 0)),
+            "width": float(raw.get("Width", 0)),
+            "height": float(raw.get("Height", 0)),
+        }
+        if bounds != shot["bounds"]:
+            raise MacOSError(
+                f"Window {window_id} moved or resized since the last screenshot; "
+                "take a fresh screenshot",
+                code=ErrorCode.WINDOW_CHANGED,
+                details={
+                    "window_id": window_id,
+                    "reason": "moved",
+                    "was": shot["bounds"],
+                    "now": bounds,
+                },
+            )
+        if not bool(current.get(AS.kCGWindowIsOnscreen, False)):
+            raise MacOSError(
+                f"Window {window_id} is not on screen (minimized, hidden, or on "
+                "another Space); input at its coordinates cannot land",
+                code=ErrorCode.WINDOW_CHANGED,
+                details={"window_id": window_id, "reason": "off_screen"},
+            )
+
+    @staticmethod
+    def _image_point(
+        shot: dict[str, Any], screen_x: float, screen_y: float
+    ) -> tuple[float, float, bool]:
+        """Map a screen point into ``shot``'s image pixels; the flag says it lands inside."""
+        bounds = shot["bounds"]
+        image_x = (screen_x - float(bounds["x"])) * float(shot["scale_x"])
+        image_y = (screen_y - float(bounds["y"])) * float(shot["scale_y"])
+        inside = 0 <= image_x < float(shot["width"]) and 0 <= image_y < float(
+            shot["height"]
+        )
+        return image_x, image_y, inside
 
     def _pointer_info(self, *, pid: int | None = None) -> dict[str, object] | None:
         """Describe the current virtual pointer position.
@@ -2415,14 +5057,12 @@ class MacOS:
         screen_x, screen_y = self._pointer_position
         result: dict[str, object] = {"screen": {"x": screen_x, "y": screen_y}}
         shot = self._last_screenshot
-        if shot is not None and (pid is None or int(shot["pid"]) == int(pid)):
-            bounds = shot["bounds"]
-            image_x = (screen_x - float(bounds["x"])) * float(shot["scale_x"])
-            image_y = (screen_y - float(bounds["y"])) * float(shot["scale_y"])
+        if shot is not None and (
+            pid is None or shot["pid"] is None or int(shot["pid"]) == int(pid)
+        ):
+            image_x, image_y, inside = self._image_point(shot, screen_x, screen_y)
             result["image"] = {"x": image_x, "y": image_y}
-            result["inside"] = 0 <= image_x < float(
-                shot["width"]
-            ) and 0 <= image_y < float(shot["height"])
+            result["inside"] = inside
         return result
 
     def move(
@@ -2431,6 +5071,7 @@ class MacOS:
         y: float,
         *,
         app: str | None = None,
+        screenshot: str | Path | None = None,
         coordinate_space: str = "screenshot",
         duration: float = 0.16,
     ) -> dict[str, Any]:
@@ -2443,8 +5084,10 @@ class MacOS:
         snapshot, exactly like ``click``/``drag``/``scroll``) to bind the
         conversion to, rather than silently reusing whatever screenshot
         ``self._last_screenshot`` last happened to hold regardless of
-        which app it actually came from.
+        which app it actually came from. ``screenshot`` names an earlier
+        `see`'s PNG to convert through instead.
         """
+        self._use_screenshot(screenshot)
         pid = None
         if coordinate_space != "screen":
             pid = self._pid(app)
@@ -2476,19 +5119,264 @@ class MacOS:
     def hide_pointer(self) -> None:
         self._overlay.hide()
 
-    def click(
-        self,
-        x: float,
-        y: float,
-        *,
-        app: str | None = None,
-        button: str = "left",
-        clicks: int = 1,
-        coordinate_space: str = "screenshot",
+    def activate(
+        self, app: str | int | None = None, *, timeout: float = 0.5
     ) -> dict[str, Any]:
-        """Send one raw coordinate click to an app PID; never guess an AX action."""
-        self._ensure_accessibility()
-        self._ensure_post_events()
+        """Ask macOS to bring ``app`` frontmost and report what actually happened.
+
+        Since macOS 14 activation is a request the system may decline,
+        typically while the user is busy in another app. One request is
+        made and the frontmost app is observed for up to ``timeout``
+        seconds; ``activated`` says whether it took. Nothing here retries
+        or loops -- a declined request means the person at the keyboard
+        has priority, so hand off instead of asking again.
+        """
+        running, info = self._resolve_app(app)
+        previous = self._frontmost_app()
+        started = time.monotonic()
+        running.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        deadline = started + max(0.0, timeout)
+        while True:
+            frontmost = self._frontmost_app()
+            activated = frontmost is not None and int(frontmost["pid"]) == int(
+                info["pid"]
+            )
+            if activated or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        self._last_app = info
+        return {
+            "app": info,
+            "activated": activated,
+            "previous": previous,
+            "frontmost": frontmost,
+            "elapsed_ms": round((time.monotonic() - started) * 1000),
+        }
+
+    def frontmost(self) -> dict[str, JSONValue] | None:
+        """The app in front now: its name, bundle ID, pid, and path."""
+        return self._frontmost_app()
+
+    def launch(
+        self, app: str, *, timeout: float = 15.0, window: bool = True
+    ) -> dict[str, JSONValue]:
+        """Start ``app`` without bringing it forward; return once it shows a window.
+
+        ``app`` is a name, bundle ID, or ``.app`` path. A copy already
+        running from that bundle is used, not started again.
+        ``window=False`` returns once the process runs, for an app that
+        never shows a window. Only `activate` brings an app forward.
+        """
+        started = self._now()
+        deadline = started + max(0.0, timeout)
+        url = self._application_url(app)
+        running = self._running_copy(url)
+        launched = running is None
+        if running is None:
+            running = self._open_application(url, timeout=timeout)
+        info = self._app_info(running)
+        while info["pid"] == -1:
+            # macOS can list an app before it has a process (Device Hub).
+            remaining = deadline - self._now()
+            if remaining <= 0:
+                raise MacOSError(
+                    f"{info['name']} was still launching after {timeout:g}s",
+                    code=ErrorCode.TIMEOUT,
+                    details={"app": info, "timeout": timeout},
+                )
+            self._pause(min(0.05, remaining))
+            running = self._running_copy(url) or running
+            info = self._app_info(running)
+        windows: list[dict[str, JSONValue]] = []
+        if window and launched:
+            windows = self._wait_for_windows(info, timeout=timeout, deadline=deadline)
+        elif window:
+            windows = self._ready_windows(running, info, timeout=timeout, deadline=deadline)
+        self._last_app = info
+        return {
+            "app": info,
+            "launched": launched,
+            "windows": windows,
+            "frontmost": self._frontmost_app(),
+            "elapsed_ms": round((self._now() - started) * 1000),
+        }
+
+    def quit(
+        self, app: str | int, *, timeout: float = 10.0, force: bool = False
+    ) -> dict[str, JSONValue]:
+        """Ask ``app`` to quit, as its Quit menu item would; return once it exited.
+
+        Quit only an app this task opened. ``force=True`` ends it at once
+        and loses unsaved work.
+        """
+        running, info = self._resolve_exact(app, verb="quit")
+        started = self._now()
+        if not (running.forceTerminate() if force else running.terminate()):
+            raise MacOSError(
+                f"{info['name']} refused the request to quit",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"app": info, "forced": force},
+            )
+        deadline = started + max(0.0, timeout)
+        while not self._exited(int(info["pid"])):
+            remaining = deadline - self._now()
+            if remaining <= 0:
+                raise MacOSError(
+                    f"{info['name']} did not quit within {timeout:g}s; it may be "
+                    f"asking to save: mac.see({info['pid']}) shows it. force=True "
+                    "quits without saving",
+                    code=ErrorCode.TIMEOUT,
+                    details={"app": info, "timeout": timeout, "forced": force},
+                )
+            self._pause(min(0.05, remaining))
+        if self._last_app is not None and self._last_app["pid"] == info["pid"]:
+            self._last_app = None
+        return {
+            "app": info,
+            "forced": force,
+            "elapsed_ms": round((self._now() - started) * 1000),
+        }
+
+    def relaunch(
+        self, app: str | int, *, timeout: float = 15.0, window: bool = True
+    ) -> dict[str, JSONValue]:
+        """Quit ``app`` and start the same bundle again, or start it if closed.
+
+        The copy that was running is the one started again, so a fresh
+        build relaunches from its own path, not from /Applications.
+        """
+        try:
+            _, info = self._resolve_exact(app, verb="relaunch")
+        except ApplicationNotFoundError:
+            if not isinstance(app, str):
+                raise
+            return {**self.launch(app, timeout=timeout, window=window), "previous_pid": None}
+        if not info["path"]:
+            raise MacOSError(
+                f"{info['name']} has no app bundle to start again",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"app": info},
+            )
+        self.quit(int(info["pid"]), timeout=timeout)
+        result = self.launch(info["path"], timeout=timeout, window=window)
+        return {**result, "previous_pid": info["pid"]}
+
+    def _resolve_exact(
+        self, app: str | int, *, verb: str
+    ) -> tuple[NSRunningApplication, dict[str, JSONValue]]:
+        """`_resolve_app`, refusing a partial name match: quitting "Notes"
+        must never end "NotesHelper" because Notes itself is closed."""
+        running, info = self._resolve_app(app)
+        if isinstance(app, str):
+            identities = (info["pid"], info["name"], info["bundle_id"], info["path"])
+            if app.casefold() not in {str(value).casefold() for value in identities if value}:
+                raise ApplicationNotFoundError(
+                    f"No running application is named exactly {app!r}; the nearest "
+                    f"is {info['name']} (pid {info['pid']}). Pass its pid to {verb} it",
+                    details={"query": app, "nearest": info},
+                )
+        return running, info
+
+    @staticmethod
+    def _application_url(app: str) -> NSURL:
+        """The installed bundle ``app`` names: a ``.app`` path, a bundle ID,
+        or a name as Launch Services knows it."""
+        if not isinstance(app, str) or not app.strip():
+            raise MacOSError(
+                "launch takes an app name, bundle ID, or .app path",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "app", "value": repr(app)},
+            )
+        path = Path(app).expanduser()
+        if path.suffix == ".app" and path.is_dir():
+            return NSURL.fileURLWithPath_(str(path.resolve()))
+        workspace = NSWorkspace.sharedWorkspace()
+        url = workspace.URLForApplicationWithBundleIdentifier_(app)
+        if url is None:
+            found = workspace.fullPathForApplication_(app)
+            url = NSURL.fileURLWithPath_(found) if found else None
+        if url is None:
+            raise ApplicationNotFoundError(
+                f"No installed application matches {app!r}; pass its name, "
+                "bundle ID, or .app path",
+                details={"query": app},
+            )
+        return url
+
+    @classmethod
+    def _running_copy(cls, url: NSURL) -> NSRunningApplication | None:
+        """The running process started from the bundle at ``url``, if any."""
+        bundle = str(url.path())
+        copies = [
+            running
+            for running in cls._running_applications()
+            if not running.isTerminated()
+            and running.bundleURL() is not None
+            and str(running.bundleURL().path()) == bundle
+        ]
+        if len(copies) > 1:
+            pids = [int(running.processIdentifier()) for running in copies]
+            raise MacOSError(
+                f"{len(copies)} copies of {bundle} are running (pids "
+                f"{', '.join(map(str, pids))}); pass one pid to the next call",
+                code=ErrorCode.APP_AMBIGUOUS,
+                details={"query": bundle, "pids": pids},
+            )
+        return copies[0] if copies else None
+
+    @staticmethod
+    def _open_application(url: NSURL, *, timeout: float) -> NSRunningApplication:
+        """Ask Launch Services to start the bundle at ``url`` without
+        bringing it forward, and return its running process. Launch
+        Services answers on its own queue, so no run loop turn is needed."""
+        opened = threading.Event()
+        outcome: list[tuple[NSRunningApplication | None, object]] = []
+
+        def finished(running: NSRunningApplication | None, error: object) -> None:
+            outcome.append((running, error))
+            opened.set()
+
+        configuration = NSWorkspaceOpenConfiguration.configuration()
+        configuration.setActivates_(False)
+        NSWorkspace.sharedWorkspace().openApplicationAtURL_configuration_completionHandler_(
+            url, configuration, finished
+        )
+        bundle = str(url.path())
+        if not opened.wait(max(0.0, timeout)):
+            raise MacOSError(
+                f"macOS did not start {bundle} within {timeout:g}s",
+                code=ErrorCode.TIMEOUT,
+                details={"path": bundle, "timeout": timeout},
+            )
+        running, error = outcome[0]
+        if running is None:
+            reason = str(error.localizedDescription()) if error is not None else "no reason given"
+            raise MacOSError(
+                f"macOS could not open {bundle}: {reason}",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"path": bundle},
+            )
+        return running
+
+    @staticmethod
+    def _application_with_pid(pid: int) -> Any | None:
+        """AppKit's direct pid lookup, which can miss a live app."""
+        return NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+
+    @staticmethod
+    def _exited(pid: int) -> bool:
+        """Whether ``pid`` has left the kernel's process table. AppKit's pid
+        lookup is no witness: it can miss an app that is still running."""
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:  # alive, owned by another user
+            return False
+        return False
+
+    @staticmethod
+    def _validate_button(button: str) -> str:
         button = button.casefold()
         if button not in _BUTTONS:
             raise MacOSError(
@@ -2496,38 +5384,152 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "button", "value": button},
             )
-        pid = self._pid(app)
-        if pid is None:
+        return button
+
+    @staticmethod
+    def _validate_clicks(clicks: int) -> int:
+        """``clicks`` as a count from 1 to `_MAX_CLICKS`: macOS has no
+        gesture past a triple click, and every extra one is two more
+        posted events and a 60ms wait."""
+        if isinstance(clicks, bool) or not isinstance(clicks, int) or not 1 <= clicks <= _MAX_CLICKS:
             raise MacOSError(
-                "Pointer input requires an app or prior app snapshot",
+                f"clicks must be a count from 1 to {_MAX_CLICKS}, not {clicks!r}",
                 code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "app"},
+                details={"parameter": "clicks", "value": clicks, "limit": _MAX_CLICKS},
             )
-        point = self._screen_point(x, y, coordinate_space, pid=pid)
+        return clicks
+
+    def click(
+        self,
+        x: float | None = None,
+        y: float | None = None,
+        *,
+        element: ElementRef | None = None,
+        app: str | int | None = None,
+        window_id: int | None = None,
+        screenshot: str | Path | None = None,
+        button: str = "left",
+        clicks: int = 1,
+        coordinate_space: str = "screenshot",
+    ) -> dict[str, Any]:
+        """Send one raw coordinate click to an app PID; never guess an AX action.
+
+        The result carries ``window_id``: the window of ``app`` the click
+        was routed to. A menu, popover, or panel takes the click only when
+        ``window_id`` names it. The click still reaches that window when
+        another app is frontmost, but AppKit passes a plain first click on
+        an inactive app's view only where that view accepts first mouse;
+        elsewhere it is dropped, and ``activate`` first is the cure.
+        ``screenshot`` names the PNG of an earlier `see`, maybe from an
+        earlier run, whose pixels ``x`` and ``y`` are.
+
+        ``element``, a match or index a search returned, aims the click
+        instead of ``x`` and ``y``: at the center of the element's frame
+        as it is now, in the element's own process -- for a control that
+        ignores ``AXPress``, as a SwiftUI row can.
+        """
+        validate_click_aim(x, y, element)
+        self._ensure_accessibility()
+        self._ensure_post_events()
+        button = self._validate_button(button)
+        clicks = self._validate_clicks(clicks)
+        if element is None:
+            assert x is not None and y is not None
+            self._use_screenshot(screenshot)
+            pid = self._input_pid(app, window_id, "Pointer input")
+            point = self._screen_point(x, y, coordinate_space, pid=pid)
+        else:
+            owner = self._element_pid(element) if app is None else app
+            pid = self._input_pid(owner, window_id, "Pointer input")
+            point = self._element_point(element, pid)
+        window = self._target_window(pid, point, window_id)
+        self._post_click(pid, point, window, button=button, clicks=clicks)
+        pointer = self._pointer_info(pid=pid)
+        assert pointer is not None
+        pointer["window_id"] = window.window_id
+        return pointer
+
+    def _element_pid(self, element: ElementRef) -> int | None:
+        """The process ``element`` runs in: the pid a match names, or a
+        local element's own. None for an agent's handle, which names no
+        process, so the click goes where any click without one goes."""
+        if isinstance(element, Mapping):
+            named = element.get("pid")
+            return named if isinstance(named, int) else None
+        resolved = self._element(element)
+        if not self._is_ax_element(resolved):
+            return None
+        error, pid = AS.AXUIElementGetPid(resolved, None)
+        return int(pid) if error == _AX_SUCCESS else None
+
+    def _element_point(self, element: ElementRef, pid: int) -> tuple[float, float]:
+        """The center of ``element``'s frame as it is now, in screen
+        points, for a click posted to process ``pid``, which must be the
+        element's own: a click meant for one app never lands in another
+        app's window that happens to lie under the same point."""
+        owner = self._element_pid(element)
+        if owner not in (None, pid):
+            raise MacOSError(
+                f"The element is in process {owner}, not {pid}; aim the click at its own app",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "element", "pid": owner, "target_pid": pid},
+            )
+        frame = self.get(element, "AXFrame")
+        if not frame or frame["width"] <= 0 or frame["height"] <= 0:
+            raise MacOSError(
+                f"The element has no area on screen to click: its frame is {frame}",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"frame": frame},
+            )
+        return frame["x"] + frame["width"] / 2, frame["y"] + frame["height"] / 2
+
+    def _post_click(
+        self,
+        pid: int,
+        point: tuple[float, float],
+        window: _TargetWindow,
+        *,
+        button: str,
+        clicks: int,
+    ) -> None:
+        """Post ``clicks`` presses of ``button`` at screen ``point``, each
+        routed to ``window``. ``click`` resolves those three for a raw
+        call; ``mac.do.click`` resolves them itself, before it reserves
+        anything, and hands them over so the window it reports is the
+        one the events carry."""
+        self._hold_before_input(pid, window.window_id)
         focus_before = self._frontmost_app()
         self._pointer_position = point
         self._overlay.move(*point)
         down_type, up_type, _ = _MOUSE_EVENTS[button]
-        for click_count in range(1, max(1, int(clicks)) + 1):
-            down = AS.CGEventCreateMouseEvent(
-                self._event_source, down_type, point, _BUTTONS[button]
-            )
-            up = AS.CGEventCreateMouseEvent(
-                self._event_source, up_type, point, _BUTTONS[button]
-            )
-            AS.CGEventSetIntegerValueField(
-                down, AS.kCGMouseEventClickState, click_count
-            )
-            AS.CGEventSetIntegerValueField(up, AS.kCGMouseEventClickState, click_count)
-            self._post(down, pid)
-            time.sleep(0.03)
-            self._post(up, pid)
-            time.sleep(0.03)
+        for click_count in range(1, clicks + 1):
+            for event_type in (down_type, up_type):
+                self._post_mouse(
+                    pid, window, button, event_type, point, click_state=click_count
+                )
+                time.sleep(0.03)
             self._guard_focus(focus_before, pid, "click")
         self._overlay.click()
-        pointer = self._pointer_info(pid=pid)
-        assert pointer is not None
-        return pointer
+
+    def _post_mouse(
+        self,
+        pid: int,
+        window: _TargetWindow,
+        button: str,
+        event_type: int,
+        point: tuple[float, float],
+        *,
+        click_state: int | None = None,
+    ) -> None:
+        """Create one ``button`` mouse event of ``event_type`` at screen
+        ``point``, bind it to ``window``, and post it to ``pid``."""
+        event = AS.CGEventCreateMouseEvent(
+            self._event_source, event_type, point, _BUTTONS[button]
+        )
+        self._route_to_window(event, window, point)
+        if click_state is not None:
+            AS.CGEventSetIntegerValueField(event, AS.kCGMouseEventClickState, click_state)
+        self._post(event, pid)
 
     def drag(
         self,
@@ -2536,7 +5538,9 @@ class MacOS:
         to_x: float,
         to_y: float,
         *,
-        app: str | None = None,
+        app: str | int | None = None,
+        window_id: int | None = None,
+        screenshot: str | Path | None = None,
         button: str = "left",
         coordinate_space: str = "screenshot",
         duration: float = 0.25,
@@ -2544,53 +5548,37 @@ class MacOS:
     ) -> None:
         self._ensure_accessibility()
         self._ensure_post_events()
-        button = button.casefold()
-        if button not in _BUTTONS:
-            raise MacOSError(
-                f"Unknown mouse button {button!r}",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "button", "value": button},
-            )
-        pid = self._pid(app)
-        if pid is None:
-            raise MacOSError(
-                "Pointer input requires an app or prior app snapshot",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "app"},
-            )
+        button = self._validate_button(button)
+        self._use_screenshot(screenshot)
+        pid = self._input_pid(app, window_id, "Pointer input")
         start = self._screen_point(from_x, from_y, coordinate_space, pid=pid)
         end = self._screen_point(to_x, to_y, coordinate_space, pid=pid)
+        # AppKit keeps a drag on the window that took the mouse-down, so
+        # every event is routed there even once the point leaves it.
+        window = self._target_window(pid, start, window_id)
+        self._hold_before_input(pid, window.window_id)
         focus_before = self._frontmost_app()
         self._pointer_position = start
         self._overlay.move(*start, duration=0)
         self._overlay.move(*end, duration=duration)
         down_type, up_type, drag_type = _MOUSE_EVENTS[button]
-        self._post(
-            AS.CGEventCreateMouseEvent(
-                self._event_source, down_type, start, _BUTTONS[button]
-            ),
-            pid,
-        )
+
+        def post(event_type: int, point: tuple[float, float]) -> None:
+            self._post_mouse(pid, window, button, event_type, point)
+
+        post(down_type, start)
         self._pointer_position = end
         for index in range(1, max(1, steps) + 1):
             ratio = index / max(1, steps)
-            point = (
-                start[0] + (end[0] - start[0]) * ratio,
-                start[1] + (end[1] - start[1]) * ratio,
-            )
-            self._post(
-                AS.CGEventCreateMouseEvent(
-                    self._event_source, drag_type, point, _BUTTONS[button]
+            post(
+                drag_type,
+                (
+                    start[0] + (end[0] - start[0]) * ratio,
+                    start[1] + (end[1] - start[1]) * ratio,
                 ),
-                pid,
             )
             time.sleep(max(0.0, duration) / max(1, steps))
-        self._post(
-            AS.CGEventCreateMouseEvent(
-                self._event_source, up_type, end, _BUTTONS[button]
-            ),
-            pid,
-        )
+        post(up_type, end)
         self._guard_focus(focus_before, pid, "drag")
 
     def scroll(
@@ -2598,12 +5586,21 @@ class MacOS:
         delta_y: int,
         delta_x: int = 0,
         *,
-        app: str | None = None,
+        app: str | int | None = None,
+        window_id: int | None = None,
+        screenshot: str | Path | None = None,
         unit: str = "pixel",
         x: float | None = None,
         y: float | None = None,
         coordinate_space: str = "screenshot",
     ) -> None:
+        """Scroll ``app`` at ``x``/``y``; with no point, at the center of the
+        window ``window_id`` names or the last screenshot of ``app`` shows,
+        or the one ``screenshot`` names.
+
+        A scroll event only lands in the window it is routed to, so the
+        point decides which window scrolls; there is no app-wide scroll.
+        """
         self._ensure_accessibility()
         self._ensure_post_events()
         units = {
@@ -2624,18 +5621,29 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "x/y"},
             )
-        pid = self._pid(app)
-        if pid is None:
-            raise MacOSError(
-                "Scroll input requires an app or prior app snapshot",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "app"},
-            )
-        point: tuple[float, float] | None = None
-        if x is not None and y is not None:
-            point = self._screen_point(x, y, coordinate_space, pid=pid)
-            self._pointer_position = point
-            self._overlay.move(*point)
+        self._use_screenshot(screenshot)
+        pid = self._input_pid(app, window_id, "Scroll input")
+        if (x is None or y is None) and window_id is not None:
+            bounds = self._described_window(window_id)["bounds"]
+            x, y = bounds["x"] + bounds["width"] / 2, bounds["y"] + bounds["height"] / 2
+            coordinate_space = "screen"
+        elif x is None or y is None:
+            shot = self._last_screenshot
+            if shot is None or shot["pid"] != pid:
+                raise MacOSError(
+                    "Scroll needs x/y, or a prior screenshot of this app to "
+                    "scroll at the center of",
+                    code=ErrorCode.BAD_REQUEST,
+                    details={"parameter": "x/y"},
+                )
+            bounds = shot["bounds"]
+            x, y = bounds["width"] / 2, bounds["height"] / 2
+            coordinate_space = "window"
+        point = self._screen_point(x, y, coordinate_space, pid=pid)
+        window = self._target_window(pid, point, window_id)
+        self._hold_before_input(pid, window.window_id)
+        self._pointer_position = point
+        self._overlay.move(*point)
 
         focus_before = self._frontmost_app()
 
@@ -2650,13 +5658,26 @@ class MacOS:
             event = AS.CGEventCreateScrollWheelEvent(
                 self._event_source, scroll_unit, 2, int(step_y), int(step_x)
             )
-            if point:
-                AS.CGEventSetLocation(event, point)
+            AS.CGEventSetLocation(event, point)
+            self._route_to_window(event, window, point)
             self._post(event, pid)
             time.sleep(0.01)
             self._guard_focus(focus_before, pid, "scroll")
 
-    def type(self, text: str, *, app: str | None = None) -> None:
+    def type(self, text: str, *, app: str | int | None = None) -> None:
+        """Type ``text`` into ``app`` as keyboard events.
+
+        When ``app`` is frontmost the text goes in packed: each key event
+        carries a run of up to `_TYPE_CHUNK_UNITS` UTF-16 units, split
+        only between code points, with no pause between events. 128
+        characters land in about 30ms that way instead of 1.6s, exact in
+        TextEdit, Notes, Safari and Chrome (280 of 280 trials). An
+        inactive app gets one event pair per character with a 10ms
+        pause, because a background Chrome drops every event carrying
+        more than one unit. Newline, carriage return and tab always
+        travel alone as Return and Tab key events, so the app sees the
+        key rather than a pasted character.
+        """
         self._ensure_accessibility()
         self._ensure_post_events()
         pid = self._pid(app)
@@ -2666,29 +5687,28 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "app"},
             )
+        self._hold_before_input(pid)
         focus_before = self._frontmost_app()
-        aliases = {" ": "space", "\n": "return", "\r": "return", "\t": "tab"}
-        for character in text:
-            base = _SHIFTED_CHARACTERS.get(
-                character, aliases.get(character, character.casefold())
-            )
-            flags = (
-                AS.kCGEventFlagMaskShift
-                if character.isupper() or character in _SHIFTED_CHARACTERS
-                else 0
-            )
-            keycode = _KEYCODES.get(base, 0)
+        packed = focus_before is not None and int(focus_before["pid"]) == pid
+        for chunk in _typing_chunks(text, packed=packed):
+            if packed and chunk not in _KEY_ONLY_CHARACTERS:
+                keycode, flags = 0, 0
+            else:
+                keycode, flags = _character_key(chunk)
             down = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, True)
             up = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, False)
-            length = len(character.encode("utf-16-le")) // 2
-            AS.CGEventKeyboardSetUnicodeString(down, length, character)
-            AS.CGEventKeyboardSetUnicodeString(up, length, character)
+            length = len(chunk.encode("utf-16-le")) // 2
+            AS.CGEventKeyboardSetUnicodeString(down, length, chunk)
+            AS.CGEventKeyboardSetUnicodeString(up, length, chunk)
             AS.CGEventSetFlags(down, flags)
             AS.CGEventSetFlags(up, flags)
             self._post(down, pid)
             self._post(up, pid)
-            time.sleep(0.01)
-            self._guard_focus(focus_before, pid, "typing")
+            if not packed:
+                # A frontmost app took focus already, so the guard that
+                # stops when the target steals it has nothing to catch.
+                time.sleep(0.01)
+                self._guard_focus(focus_before, pid, "typing")
 
     @staticmethod
     def _validate_key(key: str) -> None:
@@ -2705,6 +5725,7 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "app"},
             )
+        self._hold_before_input(pid)
         focus_before = self._frontmost_app()
         active_flags = 0
         pressed: list[tuple[int, int]] = []

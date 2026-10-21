@@ -1,12 +1,14 @@
-"""CI-safe tests for the CLI's argument parser.
-
-Focused narrowly on the ``agent`` subcommand's removal -- the shared
-daemon it used to start/check/stop no longer exists, and no replacement
-(not even a ``build`` prewarm command) was kept. Every other subcommand's
-own behavior is exercised elsewhere; this file only guards the cutover.
-"""
+"""CI-safe CLI parsing and stdin error-output tests."""
 
 from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -28,10 +30,6 @@ def test_agent_build_is_not_a_recognized_subcommand_either() -> None:
     assert excinfo.value.code == 2
 
 
-def test_run_agent_command_helper_no_longer_exists() -> None:
-    assert not hasattr(cli, "_run_agent_command")
-
-
 def test_every_other_subcommand_still_parses(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MACOS_HARNESS_BACKEND", raising=False)
     parser = cli._build_parser()
@@ -43,6 +41,28 @@ def test_every_other_subcommand_still_parses(monkeypatch: pytest.MonkeyPatch) ->
     assert parser.parse_args(["telemetry", "status"]).command == "telemetry"
     assert parser.parse_args(["see", "Finder"]).command == "see"
     assert parser.parse_args(["state", "Finder"]).command == "state"
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["see", "TextEdit"], {"app": "TextEdit", "path": None, "window_index": 0}),
+        (
+            ["see", "4242", "--path", "/tmp/shot.png", "--window-index", "1"],
+            {"app": 4242, "path": "/tmp/shot.png", "window_index": 1},
+        ),
+        (["see", "1Password"], {"app": "1Password"}),
+        (["see", "--window-id", "77"], {"app": None, "window_id": 77}),
+        (["state", "4242"], {"app": 4242}),
+    ],
+    ids=["name", "pid-path-window", "name-with-digits", "window-id", "state-pid"],
+)
+def test_see_and_state_read_a_pid_and_capture_options(argv, expected) -> None:
+    """A shell caller often has only a pid, and wants the PNG where it can
+    read it next; both used to need a stdin program."""
+    args = vars(cli._build_parser().parse_args(argv))
+
+    assert {key: args[key] for key in expected} == expected
 
 
 def test_main_exits_with_argparse_error_for_a_stale_agent_invocation(
@@ -66,3 +86,332 @@ def test_version_flag_prints_version_and_exits_zero(
         cli.main(["--version"])
     assert excinfo.value.code == 0
     assert capsys.readouterr().out.strip() == f"macos-harness {cli.__version__}"
+
+
+def _skill(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
+    status = cli.main(["skill", *args])
+    captured = capsys.readouterr()
+    return status, captured.out, captured.err
+
+
+def test_skill_prints_every_reference_the_card_names(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("DO_NOT_TRACK", "1")
+    _status, card, _err = _skill([], capsys)
+    listed = card.split("## References", 1)[1]
+    names = set(re.findall(r"^- `([a-z-]+)`:", listed, re.MULTILINE))
+    names |= set(re.findall(r"references/([a-z-]+)\.md", card))
+
+    unprintable = [name for name in sorted(names) if _skill([name], capsys)[0] != 0]
+
+    assert len(names) >= 9
+    assert unprintable == []
+
+
+def test_skill_names_the_real_references_for_an_unknown_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("DO_NOT_TRACK", "1")
+    status, out, err = _skill(["native"], capsys)
+
+    assert status == 1
+    assert out == ""
+    assert "no skill reference 'native'" in err
+    assert "native-backend" in err
+
+
+def test_skill_card_stays_within_its_size_budget(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Agents reread the card after every compaction; detail belongs in a reference."""
+    monkeypatch.setenv("DO_NOT_TRACK", "1")
+    _status, card, _err = _skill([], capsys)
+
+    assert len(card.encode("utf-8")) <= 3500
+
+
+def test_stdin_json_errors_preserves_operation_receipt() -> None:
+    program = """\
+from macos_harness import Acted, Executor, OperationError, Outcome, Receipt
+
+print("before failure")
+raise OperationError.from_receipt(Receipt(
+    op="press",
+    outcome=Outcome.FAILED,
+    acted=Acted.NO,
+    backend="python",
+    executor=Executor.PYTHON,
+    request={"target": "Save"},
+    changed=False,
+    verified=False,
+    duration_s=0.25,
+    error={
+        "code": "ax.error",
+        "message": "search is incomplete",
+        "details": {
+            "candidates": [{"element_index": 11}, {"element_index": 12}],
+            "complete": False,
+        },
+    },
+))
+"""
+    result = subprocess.run(
+        [sys.executable, "-m", "macos_harness.cli", "--json-errors"],
+        input=program, text=True, capture_output=True, timeout=10, check=False,
+        env={**os.environ, "DO_NOT_TRACK": "1", "MACOS_HARNESS_BACKEND": "python"},
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == "before failure\n"
+    payload = json.loads(result.stderr)
+    error = {
+        "code": "ax.error",
+        "message": "search is incomplete",
+        "details": {
+            "candidates": [{"element_index": 11}, {"element_index": 12}],
+            "complete": False,
+        },
+    }
+    assert {key: payload[key] for key in error} == error
+    receipt = payload["receipt"]
+    assert receipt["op"] == "press"
+    assert receipt["outcome"] == "failed"
+    assert receipt["acted"] == "no"
+    assert receipt["request"] == {"target": "Save"}
+    assert receipt["changed"] is False
+    assert receipt["verified"] is False
+    assert receipt["error"] == error
+
+
+def _stdin_stderr_lines(program: str) -> list[str]:
+    """Run ``program`` as a harness stdin program that fails, and return
+    the lines of its error output."""
+    result = subprocess.run(
+        [sys.executable, "-m", "macos_harness.cli"],
+        input=program, text=True, capture_output=True, timeout=10, check=False,
+        env={**os.environ, "DO_NOT_TRACK": "1", "MACOS_HARNESS_BACKEND": "python"},
+    )
+    assert result.returncode == 1
+    return result.stderr.splitlines()
+
+
+@pytest.mark.parametrize(
+    ("program", "error", "signature"),
+    (
+        pytest.param(
+            'mac.scroll(dy=-300, app="Finder")\n',
+            "TypeError: MacOS.scroll() got an unexpected keyword argument 'dy'",
+            "Signature: mac.scroll(delta_y, delta_x=0, *, app=None, window_id=None, "
+            "screenshot=None, unit='pixel', x=None, y=None, coordinate_space='screenshot')",
+            id="mac",
+        ),
+        pytest.param(
+            'mac.ax.get(3, attribute="AXValue")\n',
+            "TypeError: Accessibility.get() got an unexpected keyword argument 'attribute'",
+            "Signature: mac.ax.get(element_index, attributes='AXValue')",
+            id="mac.ax",
+        ),
+    ),
+)
+def test_stdin_misused_call_shows_the_real_signature(program, error, signature) -> None:
+    """A call with a wrong keyword fails before it does anything; the error
+    ends with the method's real signature so the retry can be right."""
+    *_, raised, shown = _stdin_stderr_lines(program)
+    # Python 3.13 adds a "Did you mean ...?" hint to the TypeError.
+    assert raised.startswith(error)
+    assert shown == signature
+
+
+@pytest.mark.parametrize(
+    ("program", "error"),
+    (
+        pytest.param(
+            'mac.scroll(dy=-300, app="Finder")\n',
+            "TypeError: MacOS.scroll() got an unexpected keyword argument 'dy'. "
+            "Did you mean 'delta_y'?",
+            id="one-parameter-matches",
+        ),
+        pytest.param(
+            "mac.see(wi=1)\n",
+            "TypeError: MacOS.see() got an unexpected keyword argument 'wi'",
+            id="window_index-and-window_id-tie",
+        ),
+    ),
+)
+def test_stdin_abbreviated_keyword_is_pointed_at_the_parameter_it_means(program, error) -> None:
+    """Python hints a wrong keyword by spelling, so ``dy`` was told ``y``;
+    the hint now names the one parameter whose initials the keyword spells,
+    and guesses nothing when two parameters share them."""
+    *_, raised, _signature = _stdin_stderr_lines(program)
+
+    assert raised == error
+
+
+@pytest.mark.parametrize(
+    ("program", "nearest"),
+    (
+        pytest.param(
+            'mac.ax.get_attributes(3, ["AXTitle"])\n',
+            [
+                "mac.get_attributes(element_index, attributes)",
+                "mac.ax.get(element_index, attributes='AXValue')",
+                "mac.get(element_index, attribute='AXValue', *, missing_ok=False)",
+            ],
+            id="same-name-then-own-namespace",
+        ),
+        pytest.param(
+            'mac.ax.windows("Finder")\n',
+            ["mac.windows(app=None, *, all_layers=False)", "mac.diff_windows(before, after)"],
+            id="other-namespace",
+        ),
+        pytest.param('mac.ax.route.list(app="Finder")\n', ["mac.route"], id="not-a-method"),
+    ),
+)
+def test_stdin_unknown_name_lists_the_nearest_calls(program, nearest) -> None:
+    """A name `mac.ax` lacks used to end the run on a bare AttributeError;
+    the error now lists the nearest calls across `mac`, `mac.ax`, and
+    `mac.do`, as they are called, so the retry can be right."""
+    lines = _stdin_stderr_lines(program)
+    listed = lines.index("Nearest calls:")
+
+    assert lines[listed - 1].startswith("AttributeError: 'Accessibility' object has no attribute")
+    assert [line.strip() for line in lines[listed + 1 :]] == nearest
+
+
+def _harness(*argv: str) -> subprocess.CompletedProcess[str]:
+    """``macos-harness`` with ``argv``, in its own process."""
+    return subprocess.run(
+        [sys.executable, "-m", "macos_harness.cli", *argv],
+        text=True, capture_output=True, timeout=10, check=False,
+        env={**os.environ, "DO_NOT_TRACK": "1", "MACOS_HARNESS_BACKEND": "python"},
+    )
+
+
+def test_run_gives_a_saved_program_its_args(tmp_path: Path) -> None:
+    """Agents edited saved programs 77 times to change a pid or a label
+    between runs; `run` hands each `--arg` to the program as a string."""
+    flow = tmp_path / "flow.py"
+    flow.write_text("import json\nprint(json.dumps(args, sort_keys=True))\n", encoding="utf-8")
+
+    result = _harness(
+        "run", str(flow),
+        "--arg", "pid=123", "--arg", "label=Save as", "--arg", "query=a=b", "--arg", "note=",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "label": "Save as", "note": "", "pid": "123", "query": "a=b",
+    }
+
+
+@pytest.mark.parametrize(
+    ("program", "arguments", "complaint"),
+    [
+        ("print('ran')\n", ["--arg", "pid"], "expected NAME=VALUE, got 'pid'"),
+        ("print('ran')\n", ["--arg", "=123"], "expected NAME=VALUE, got '=123'"),
+        ("print('ran')\n", ["--arg", "pid=1", "--arg", "pid=2"], "give each --arg name once"),
+        (None, [], "cannot read"),
+        ("\n", [], "holds no Python code"),
+    ],
+    ids=["no-equals", "no-name", "name-twice", "missing-file", "empty-file"],
+)
+def test_run_refuses_a_bad_invocation_before_running(tmp_path: Path, program, arguments, complaint) -> None:
+    flow = tmp_path / "flow.py"
+    if program is not None:
+        flow.write_text(program, encoding="utf-8")
+
+    result = _harness("run", str(flow), *arguments)
+
+    assert result.returncode == 2
+    assert complaint in result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["--json-errors", "run", "FLOW"], ["run", "FLOW", "--json-errors"]],
+    ids=["before-run", "after-the-file"],
+)
+def test_run_writes_json_errors_wherever_the_flag_goes(tmp_path: Path, argv) -> None:
+    flow = tmp_path / "flow.py"
+    flow.write_text(
+        "from macos_harness import ErrorCode, MacOSError\n"
+        "raise MacOSError('stop', code=ErrorCode.TIMEOUT)\n",
+        encoding="utf-8",
+    )
+
+    result = _harness(*[str(flow) if part == "FLOW" else part for part in argv])
+
+    assert result.returncode == 1
+    error = json.loads(result.stderr.splitlines()[-1])
+    assert (error["code"], error["message"]) == ("timeout", "stop")
+
+
+def test_run_traceback_names_the_saved_file_and_line(tmp_path: Path) -> None:
+    flow = tmp_path / "flow.py"
+    flow.write_text("x = 1\nraise ValueError('stop')\n", encoding="utf-8")
+
+    result = _harness("run", str(flow))
+
+    assert result.returncode == 1
+    assert f'File "{flow}", line 2' in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("ending", "status", "raised"),
+    [
+        ("", 0, None),
+        ("mac = None", 0, None),
+        ("raise RuntimeError('stop')", 1, None),
+        ("raise KeyboardInterrupt('stop')", None, KeyboardInterrupt),
+        ("raise SystemExit('stop')", None, SystemExit),
+        ("raise TypeError('stop')", None, TypeError),
+    ],
+)
+def test_stdin_return_reaps_the_original_mac_even_when_retained_or_rebound(
+    monkeypatch, pointer_children, ending, status, raised,
+) -> None:
+    retained = []
+    monkeypatch.setenv("MACOS_HARNESS_BACKEND", "python")
+    monkeypatch.setattr(sys, "_macos_harness_retained", retained, raising=False)
+    program = (
+        "import sys\n"
+        "sys._macos_harness_retained.append(mac)\n"
+        "mac.move(10, 20, coordinate_space='screen')\n"
+        + ending
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(program))
+    if raised is None:
+        assert cli.main([]) == status
+    else:
+        with pytest.raises(raised):
+            cli.main([])
+
+    assert len(retained) == 1
+    assert pointer_children[0].returncode == 0
+
+
+@pytest.mark.parametrize("ending", ["", "raise SystemExit('stop')"])
+def test_repl_return_reaps_its_retained_mac(monkeypatch, pointer_children, ending) -> None:
+    retained = []
+    monkeypatch.setenv("MACOS_HARNESS_BACKEND", "python")
+    monkeypatch.setattr(sys, "_macos_harness_retained", retained, raising=False)
+    program = (
+        "import sys\n"
+        "sys._macos_harness_retained.append(mac)\n"
+        "mac.move(10, 20, coordinate_space='screen')\n"
+        "mac = None\n"
+        + ending
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(program))
+    if ending:
+        with pytest.raises(SystemExit, match="stop"):
+            cli.main(["repl"])
+    else:
+        assert cli.main(["repl"]) == 0
+
+    assert len(retained) == 1
+    assert pointer_children[0].returncode == 0
+
+

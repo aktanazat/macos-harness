@@ -12,9 +12,9 @@ argument shape, a fork-boundary violation, an invalidly-shaped deadline,
 or a ``once`` token already recorded for a different request -- raises
 a plain ``MacOSError`` instead, with no receipt to carry: nothing was
 ever attempted, so there is nothing yet to report. A ``Postcondition``
-(``Present`` or ``Gone``) lets a caller ask ``mac.do`` to confirm the
-*effect* of a mutation, not just that the underlying call returned
-without raising. ``OperationError`` is what a failed, receipted
+(``Present``, ``Gone``, or ``Equals``) lets a caller ask ``mac.do`` to
+confirm the *effect* of a mutation, not just that the underlying call
+returned without raising. ``OperationError`` is what a failed, receipted
 operation raises; it always carries the one ``Receipt`` describing that
 failure, so a caller never has to choose between "catch the exception"
 and "get the structured detail" -- both come from the same place.
@@ -40,10 +40,12 @@ from .errors import ErrorCode, MacOSError
 
 __all__ = [
     "Acted",
+    "Equals",
     "ErrorPayload",
     "Executor",
     "Gone",
     "JSONValue",
+    "Observation",
     "OperationError",
     "Outcome",
     "Postcondition",
@@ -51,9 +53,11 @@ __all__ = [
     "Receipt",
     "canonical_json",
     "canonicalize",
+    "equals",
     "gone",
     "present",
     "request_fingerprint",
+    "validate_exact_selectors",
 ]
 
 
@@ -177,9 +181,9 @@ class Outcome(StrEnum):
     never touched the ``once``-token ledger. ``ALREADY`` is the
     convergent-operation fast path: ``set``/``toggle`` found the target
     already in the requested state and returned without mutating
-    anything. ``DONE`` is a real, dispatched mutation. ``FAILED`` means
-    the operation could not complete; the receipt's ``error`` carries
-    why.
+    anything. ``DONE`` is a completed mutation or a verified ``expect``
+    observation; ``acted`` distinguishes them. ``FAILED`` means the
+    operation could not complete; the receipt's ``error`` carries why.
     """
 
     PLANNED = "planned"
@@ -191,8 +195,8 @@ class Outcome(StrEnum):
 class Acted(StrEnum):
     """Whether a ``mac.do`` operation actually dispatched a mutating call.
 
-    ``NO`` covers both a dry run and the ``ALREADY``-satisfied
-    convergent fast path -- nothing was ever dispatched. ``YES`` means a
+    ``NO`` covers a dry run, an ``expect`` observation, and the ``ALREADY``
+    convergent fast path -- nothing was dispatched. ``YES`` means a
     mutating call was dispatched, whether or not it was later confirmed
     by a postcondition. ``UNKNOWN`` is reserved for the one case where
     dispatch may or may not have happened and there is no safe way to
@@ -223,6 +227,34 @@ class Executor(StrEnum):
     SCRIPT = "script"
 
 
+class Observation(StrEnum):
+    """What one `Postcondition` check actually established about the app.
+
+    ``MET`` is the condition confirmed. The other two both leave a check
+    unverified and are *not* interchangeable, which is the whole reason
+    this is a receipt field rather than something a caller re-derives
+    from an error payload:
+
+    ``UNMET`` means the observation itself completed and the condition
+    is false -- a complete `Present` search that found nothing, a `Gone`
+    poll that found the match still there, an `Equals` attribute read
+    back with a different value. The app is in a state the caller did
+    not ask for, and acting on that is sound.
+
+    ``UNOBSERVABLE`` means the check never established anything: a
+    ``max_nodes``-truncated walk, more than one match, an attribute the
+    app refused, a deadline that expired before `Gone`'s two consecutive
+    empty polls could confirm absence. The condition may well hold. A
+    caller that treats this as ``UNMET`` is asserting a state it never
+    saw, so the safe response is to stop, widen the search, or retry --
+    never to act as though the app disagreed.
+    """
+
+    MET = "met"
+    UNMET = "unmet"
+    UNOBSERVABLE = "unobservable"
+
+
 class ErrorPayload(TypedDict):
     """The JSON-safe ``{"code", "message", "details"}`` shape produced by
     ``MacOSError.to_json()`` in ``errors.py``.
@@ -249,6 +281,106 @@ def _freeze_apps(
     return tuple(apps)
 
 
+def validate_app_selector(value: str | int | None, *, parameter: str) -> None:
+    """Reject an ``app``/``apps`` selector that could never name a running
+    app: a blank string or a pid that is zero or negative.
+
+    A selector that is merely wrong is left to resolution
+    (``ApplicationNotFoundError`` and friends); this one fails fast as a
+    plain ``BAD_REQUEST``, before any resolution, AX call, dispatch, or
+    ``once``-token reservation.
+    """
+    if value is None:
+        return
+    if isinstance(value, str):
+        if not value.strip():
+            raise MacOSError(
+                f"{parameter} must be a nonempty string, not {value!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": parameter},
+            )
+        return
+    if value <= 0:
+        raise MacOSError(
+            f"{parameter} must be a positive pid, not {value}",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": parameter, "value": value},
+        )
+
+
+def validate_scope(
+    *,
+    app: str | int | None,
+    all_apps: bool,
+    apps: str | int | Iterable[str | int] | None,
+    required: bool,
+) -> str | int | tuple[str | int, ...] | None:
+    """Check one AX scope and return ``apps`` materialized exactly once.
+
+    The one scope rule `MacOS.ax` and ``mac.do`` share: ``app``,
+    ``all_apps=True``, and ``apps`` exclude each other, and ``required``
+    (``mac.do``'s mutations) demands one of them; a raw search without
+    one uses the last app. ``app`` and every ``apps`` entry must pass
+    `validate_app_selector`, and ``apps`` must hold at least one entry, so
+    an empty iterable never widens a search to every app.
+    """
+    apps = _freeze_apps(apps)
+    provided = sum((app is not None, bool(all_apps), apps is not None))
+    if provided > 1 or (required and provided == 0):
+        raise MacOSError(
+            "Pass exactly one of app, all_apps=True, or apps",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": "scope"},
+        )
+    validate_app_selector(app, parameter="app")
+    if apps is not None:
+        entries = (apps,) if isinstance(apps, (str, int)) else apps
+        if not entries:
+            raise MacOSError(
+                "apps must contain at least one non-empty selector",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "apps"},
+            )
+        for entry in entries:
+            validate_app_selector(entry, parameter="apps")
+    return apps
+
+
+def validate_exact_selectors(**selectors: str | None) -> None:
+    """Reject an exact selector (``title``, ``identifier``, ``description``)
+    that is set but is not a non-empty ``str``.
+
+    An exact match is equality against the attribute the app reports, and
+    a search drops an empty attribute before a selector ever sees it, so
+    ``""`` could never match anything; a non-string could not either.
+    Shared by the `MacOS.ax` searches and the postconditions built here,
+    so one rule decides what an exact selector may be.
+    """
+    for name, value in selectors.items():
+        if value is not None and (not isinstance(value, str) or not value):
+            raise MacOSError(
+                f"{name} must be a non-empty str when given, not {value!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": name},
+            )
+
+
+def validate_click_aim(
+    x: float | None, y: float | None, element: int | Mapping[str, JSONValue] | None
+) -> None:
+    """Reject a click aimed at both or neither of a point (``x`` and
+    ``y``) and an ``element``, before anything resolves or is reserved.
+    Shared by `MacOS.click` and its ``mac.do`` counterpart, so one rule
+    decides what a click aims at."""
+    aimed = element is not None
+    if (x is None) != aimed or (y is None) != aimed:
+        raise MacOSError(
+            "A click aims at x and y, or at element: give one of them",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": "element"},
+        )
+
+
 def _validate_postcondition(
     *,
     app: str | int | None,
@@ -257,8 +389,12 @@ def _validate_postcondition(
     direction: str,
     timeout: float | None,
     interval: float,
+    title: str | None,
+    identifier: str | None,
+    description: str | None,
     allow_zero_timeout: bool = True,
 ) -> None:
+    validate_exact_selectors(title=title, identifier=identifier, description=description)
     scoped = sum((app is not None, all_apps, apps is not None))
     if scoped > 1:
         raise MacOSError(
@@ -303,8 +439,9 @@ class _PostconditionBase:
     """Fields and construction-time validation shared by `Present` and
     `Gone`: scope (`app`/`apps`/`all_apps`), the search itself
     (`text`/`role`/`search_key`/`visible_only`/`direction`/
-    `immediate_descendants_only`), and the two knobs (`timeout`/
-    `interval`) governing how it is verified.
+    `immediate_descendants_only`, plus the exact selectors
+    `title`/`identifier`/`description`), and the two knobs
+    (`timeout`/`interval`) governing how it is verified.
 
     `apps` accepts any `Iterable` -- a `list`, a generator, an
     already-frozen `tuple` -- and is normalized to a `tuple` in
@@ -312,6 +449,10 @@ class _PostconditionBase:
     directly or through the `present`/`gone` factory functions, so a
     constructed `Present`/`Gone` is always genuinely immutable, not
     just immutable by convention.
+
+    The exact selectors match `MacOS.ax.wait`'s: each one that is set
+    must equal the element's attribute exactly, and a search that sets
+    any of them is only satisfied by a match from a complete search.
     """
 
     text: str | None = None
@@ -329,6 +470,9 @@ class _PostconditionBase:
     #: resolution, action, and verification together.
     timeout: float | None = None
     interval: float = 0.1
+    title: str | None = None
+    identifier: str | None = None
+    description: str | None = None
 
     def _validate(self, *, allow_zero_timeout: bool) -> None:
         object.__setattr__(self, "apps", _freeze_apps(self.apps))
@@ -339,6 +483,9 @@ class _PostconditionBase:
             direction=self.direction,
             timeout=self.timeout,
             interval=self.interval,
+            title=self.title,
+            identifier=self.identifier,
+            description=self.description,
             allow_zero_timeout=allow_zero_timeout,
         )
 
@@ -377,9 +524,51 @@ class Gone(_PostconditionBase):
         self._validate(allow_zero_timeout=False)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Equals(_PostconditionBase):
+    """A postcondition satisfied once exactly one AX match's ``attribute``
+    reads back equal to ``value``.
+
+    The match is resolved with `MacOS.ax.wait`'s one-match,
+    fail-closed-on-ambiguity semantics and its ``attribute`` read with
+    `MacOS.get`, every `interval`, until the reading equals ``value``
+    (compared canonically, the way `set` judges convergence) or the
+    deadline passes. Scope inheritance and deadline behavior are as
+    for `Present`; a zero `timeout` means one look. ``value`` is frozen
+    with `canonicalize` at construction, so it must be JSON-safe, and
+    neither a receipt nor this object's ``repr`` ever carries it: a
+    receipt only ever holds its length and hash.
+    The comparison itself uses the real value, so ``Equals`` tells a
+    receipt whether a field holds the requested text, whether a
+    selection sits where a click should have put it, or whether a
+    control reads the requested state -- without a separate readback.
+    """
+
+    value: JSONValue = dataclasses.field(repr=False)
+    attribute: str = "AXValue"
+
+    def __post_init__(self) -> None:
+        self._validate(allow_zero_timeout=True)
+        if not isinstance(self.attribute, str) or not self.attribute:
+            raise MacOSError(
+                f"Equals attribute must be a nonempty str, not {self.attribute!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "attribute"},
+            )
+        try:
+            frozen = canonicalize(self.value)
+        except (TypeError, ValueError) as exc:
+            raise MacOSError(
+                f"Equals value is not JSON-safe: {exc}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "value"},
+            ) from exc
+        object.__setattr__(self, "value", frozen)
+
+
 #: What a caller hands `Operations` to confirm a mutation's effect, not
 #: just that the underlying call returned without raising.
-Postcondition: TypeAlias = Present | Gone
+Postcondition: TypeAlias = Present | Gone | Equals
 
 
 def present(
@@ -387,6 +576,9 @@ def present(
     *,
     role: str | None = None,
     search_key: str | None = None,
+    title: str | None = None,
+    identifier: str | None = None,
+    description: str | None = None,
     app: str | int | None = None,
     apps: str | int | Iterable[str | int] | None = None,
     all_apps: bool = False,
@@ -401,6 +593,9 @@ def present(
         text=text,
         role=role,
         search_key=search_key,
+        title=title,
+        identifier=identifier,
+        description=description,
         app=app,
         apps=apps,
         all_apps=all_apps,
@@ -417,6 +612,9 @@ def gone(
     *,
     role: str | None = None,
     search_key: str | None = None,
+    title: str | None = None,
+    identifier: str | None = None,
+    description: str | None = None,
     app: str | int | None = None,
     apps: str | int | Iterable[str | int] | None = None,
     all_apps: bool = False,
@@ -431,6 +629,50 @@ def gone(
         text=text,
         role=role,
         search_key=search_key,
+        title=title,
+        identifier=identifier,
+        description=description,
+        app=app,
+        apps=apps,
+        all_apps=all_apps,
+        visible_only=visible_only,
+        direction=direction,
+        immediate_descendants_only=immediate_descendants_only,
+        timeout=timeout,
+        interval=interval,
+    )
+
+
+def equals(
+    text: str | None = None,
+    *,
+    value: JSONValue,
+    attribute: str = "AXValue",
+    role: str | None = None,
+    search_key: str | None = None,
+    title: str | None = None,
+    identifier: str | None = None,
+    description: str | None = None,
+    app: str | int | None = None,
+    apps: str | int | Iterable[str | int] | None = None,
+    all_apps: bool = False,
+    visible_only: bool = True,
+    direction: str = "next",
+    immediate_descendants_only: bool = False,
+    timeout: float | None = None,
+    interval: float = 0.1,
+) -> Equals:
+    """Build an `Equals` postcondition; `present`'s call shape plus the
+    expected ``value`` and the ``attribute`` to read it from."""
+    return Equals(
+        text=text,
+        value=value,
+        attribute=attribute,
+        role=role,
+        search_key=search_key,
+        title=title,
+        identifier=identifier,
+        description=description,
         app=app,
         apps=apps,
         all_apps=all_apps,
@@ -462,24 +704,24 @@ def _freeze_error(error: ErrorPayload | None) -> Mapping[str, JSONValue] | None:
     return canonicalize(error)
 
 
+# How one printed line says `Receipt.changed`.
+_CHANGED_WORD = {True: "yes", False: "no", None: "unknown"}
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Receipt:
     """An immutable, JSON-safe record of exactly one ``mac.do`` operation:
     what was asked, what actually happened, and how thoroughly that was
     confirmed.
 
-    Every field is required except the five that only make sense
-    sometimes (`target`, `observed`, `once`, `replayed`, `error`), which
-    default to "nothing here". `request`/`target`/`observed`/
-    `error` are canonicalized (see `canonicalize`) in
+    `request`/`target`/`observed`/`error` are canonicalized (see `canonicalize`) in
     `__post_init__` regardless of what was passed in, so constructing a
     `Receipt` from plain `dict`/`list` values is always safe and the
     result is always genuinely immutable -- not merely immutable by
     caller convention.
 
     Fields:
-        op: The `mac.do` verb this receipt is for (``"press"``,
-            ``"set"``, ``"toggle"``, ``"run"``, ``"key"``, ``"recall"``).
+        op: The `mac.do` verb or lookup this receipt describes.
         outcome: What ultimately happened; see `Outcome`.
         acted: Whether a mutating call was actually dispatched; see `Acted`.
         backend: The configured `MacOS(backend=...)` choice in effect
@@ -498,14 +740,22 @@ class Receipt:
             `False` on the `Outcome.ALREADY`-satisfied convergent fast
             path (`set`/`toggle`) or any predispatch failure, the real
             before/after comparison once `set`/`toggle` has read both
-            (`True` or `False`), and `None` whenever a dispatch (or its
-            own readback) is ambiguous -- `press`/`key` with no
-            postcondition, one that never verified, or a `set`/`toggle`
-            dispatch/readback failure -- rather than a confident but
-            unconfirmed guess.
+            (`True` or `False`), `True` when a raw input (`key`/`click`/
+            `type`) with no postcondition moved the app's focus (the
+            `observed["focus"]` witness), and `None` whenever a dispatch
+            (or its own readback) is ambiguous -- `press`, or a raw input
+            whose focus witness saw nothing, with no postcondition, one
+            that never verified, or a `set`/`toggle` dispatch/readback
+            failure -- rather than a confident but unconfirmed guess.
         verified: Whether a postcondition was checked and confirmed the
             intended effect actually took hold.
-        duration_s: Wall-clock seconds this operation spent, start to finish.
+        duration_s: Elapsed monotonic seconds, independent of wall-clock changes.
+        started_at: ISO-8601 UTC start time with millisecond precision.
+        finished_at: ISO-8601 UTC completion time with millisecond precision.
+            Operations supplies both timestamps; a manually constructed
+            receipt may leave them `None`. Replays retain the original
+            times. An in-flight recall records its lookup time, not a
+            fabricated completion time for the unfinished action.
         once: The idempotency token this operation was dispatched under,
             if any.
         replayed: Whether this exact receipt was returned from the
@@ -523,9 +773,12 @@ class Receipt:
     request: Mapping[str, JSONValue]
     target: JSONValue = None
     observed: JSONValue = None
+    process: JSONValue = None
     changed: bool | None
     verified: bool
     duration_s: float
+    started_at: str | None = None
+    finished_at: str | None = None
     once: str | None = None
     replayed: bool = False
     error: Mapping[str, JSONValue] | None = None
@@ -534,6 +787,7 @@ class Receipt:
         object.__setattr__(self, "request", canonicalize(self.request))
         object.__setattr__(self, "target", canonicalize(self.target))
         object.__setattr__(self, "observed", canonicalize(self.observed))
+        object.__setattr__(self, "process", canonicalize(self.process))
         object.__setattr__(self, "error", _freeze_error(self.error))
 
     def replayed_as(self) -> Self:
@@ -547,6 +801,22 @@ class Receipt:
         from another.
         """
         return dataclasses.replace(self, replayed=True)
+
+    def __str__(self) -> str:
+        """One line for ``print(receipt)``: the verb, its outcome, whether
+        it acted, changed, and verified, its seconds, and a failure's code,
+        such as ``press done acted=yes changed=yes verified=yes 0.31s``.
+        ``repr`` and `to_json` keep the whole record."""
+        line = (
+            f"{self.op} {self.outcome.value} acted={self.acted.value} "
+            f"changed={_CHANGED_WORD[self.changed]} "
+            f"verified={'yes' if self.verified else 'no'} {self.duration_s:.2f}s"
+        )
+        if self.replayed:
+            line += " replayed"
+        if self.error is not None:
+            line += f" error={self.error['code']}"
+        return line
 
     def to_json(self) -> dict[str, JSONValue]:
         """A JSON-safe snapshot of this receipt.
@@ -566,9 +836,12 @@ class Receipt:
             "request": _plain(self.request),
             "target": _plain(self.target),
             "observed": _plain(self.observed),
+            "process": _plain(self.process),
             "changed": self.changed,
             "verified": self.verified,
             "duration_s": self.duration_s,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
             "once": self.once,
             "replayed": self.replayed,
             "error": _plain(self.error),
