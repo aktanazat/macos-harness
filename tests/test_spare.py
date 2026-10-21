@@ -731,15 +731,22 @@ def test_a_step_with_other_load_time_settings_never_gets_a_spare_loaded_without_
     assert step.returncode == 0
 
 
-def test_a_step_with_other_interpreter_flags_runs_in_its_own_process(shell: _Shell) -> None:
+@pytest.mark.parametrize(
+    ("flags", "shows", "expected"),
+    [(["-X", "utf8"], "sys.flags.utf8_mode", "1"), (["-u"], "sys.stdout.write_through", "True")],
+    ids=["utf8", "unbuffered"],
+)
+def test_a_step_with_other_interpreter_flags_runs_in_its_own_process(
+    flags: list[str], shows: str, expected: str, shell: _Shell
+) -> None:
     shell.served(_PID)
-    command = [sys.executable, "-X", "utf8", "-m", "macos_harness.cli"]
+    command = [sys.executable, *flags, "-m", "macos_harness.cli"]
     seen = []
     for _ in range(3):
         # Long enough for the next spare to be ready for the step.
         time.sleep(0.5)
-        step, out, _err = shell.step("import os, sys\nprint(os.getpid(), sys.flags.utf8_mode)\n", command)
-        seen.append(out.split() == [str(step.pid), "1"])
+        step, out, _err = shell.step(f"import os, sys\nprint(os.getpid(), {shows})\n", command)
+        seen.append(out.split() == [str(step.pid), expected])
 
     assert seen == [True, True, True]
 

@@ -210,6 +210,8 @@ def _interpreter() -> dict[str, object]:
         },
         "warnings": sys.warnoptions,
         "options": sys._xoptions,
+        # -u shows only in how the standard streams were built.
+        "unbuffered": sys.stdout.write_through,
     }
 
 
