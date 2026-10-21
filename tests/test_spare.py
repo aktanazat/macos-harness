@@ -106,11 +106,11 @@ def _cut_short(step: subprocess.Popen[bytes]) -> tuple[int, str]:
 
 
 class _Shell:
-    def __init__(self, env: dict[str, str]) -> None:
+    def __init__(self, env: dict[str, str], broker: list[str] | None = None) -> None:
         requests_end, self.requests = os.pipe()
         self.replies, replies_end = os.pipe()
         self.broker = subprocess.Popen(
-            _cli("spare"), stdin=requests_end, stdout=replies_end, env=env
+            broker or _cli("spare"), stdin=requests_end, stdout=replies_end, env=env
         )
         os.close(requests_end)
         os.close(replies_end)
@@ -175,10 +175,12 @@ class _Shell:
             time.sleep(0.05)
         raise AssertionError("no spare ran a step")
 
-    def held(self, program: str) -> tuple[subprocess.Popen[bytes], int]:
+    def held(
+        self, program: str, command: list[str] | None = None
+    ) -> tuple[subprocess.Popen[bytes], int]:
         """Start a step that prints its pid and keeps going until a spare runs it."""
         for _ in range(100):
-            step = self.start(_cli())
+            step = self.start(command or _cli())
             assert step.stdin is not None and step.stdout is not None
             step.stdin.write(program.encode())
             step.stdin.close()
@@ -501,6 +503,41 @@ def test_a_served_step_whose_output_stops_being_read_ends_as_its_own_process_wou
 
     assert _cut_short(step) == ended_alone
     assert ended_alone[1].startswith("cut short\n")
+
+
+def test_ctrl_c_stops_a_served_step_from_a_shell_without_job_control() -> None:
+    """Such a shell starts its coprocess ignoring Ctrl-C and Ctrl-\\; each
+    step's own process would not, and the spare running it does not."""
+    shell = _Shell(_env(), ["/bin/sh", "-c", 'trap "" INT QUIT; exec "$@"', "sh", *_cli("spare")])
+    try:
+        step, _spare = shell.held(
+            "import os, time\nprint(os.getpid(), flush=True)\ntime.sleep(5)\nprint('slept')\n"
+        )
+        step.send_signal(signal.SIGINT)
+        assert step.stderr is not None
+        err = step.stderr.read().decode()
+        status = step.wait(timeout=60)
+    finally:
+        shell.close()
+
+    assert status == -signal.SIGINT
+    assert err.splitlines()[-1] == "KeyboardInterrupt"
+
+
+def test_a_served_step_ignores_the_hangup_its_own_process_would(shell: _Shell) -> None:
+    """As one started with ``nohup`` does, wherever the hangup reaches it."""
+    step, spare = shell.held(
+        "import os, time\nprint(os.getpid(), flush=True)\ntime.sleep(1)\nprint('finished')\n",
+        ["/bin/sh", "-c", 'trap "" HUP; exec "$@"', "sh", *_cli()],
+    )
+
+    os.kill(step.pid, signal.SIGHUP)
+    os.kill(spare, signal.SIGHUP)
+    assert step.stdout is not None
+    out = step.stdout.read().decode()
+
+    assert step.wait(timeout=60) == 0
+    assert out == "finished\n"
 
 
 def test_the_broker_and_its_spare_die_with_the_shell() -> None:

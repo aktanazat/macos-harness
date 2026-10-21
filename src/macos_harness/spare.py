@@ -51,6 +51,7 @@ _PRELOAD = (
 )
 _STARTUP_PREFIXES = ("PYTHON", "PYOBJC", "LC_", "__CF")
 _STARTUP_NAMES = frozenset({"HOME", "LANG", "TMPDIR", "TZ"})
+_ENDING_SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
 _BROKER = "from macos_harness.spare import serve_shell; raise SystemExit(serve_shell())"
 _SPARE = "import sys; from macos_harness.spare import serve_one_step; serve_one_step(sys.argv[1:])"
 
@@ -303,6 +304,7 @@ class _Request(TypedDict):
     umask: int
     merged: bool
     blksize: list[int]
+    ignored: list[int]
     script: bool
 
 
@@ -321,6 +323,11 @@ def _request(nonce: str) -> _Request:
         "umask": mask,
         "merged": os.path.samestat(stdout, stderr),
         "blksize": [stdout.st_blksize, stderr.st_blksize],
+        "ignored": [
+            int(signum)
+            for signum in _ENDING_SIGNALS
+            if signal.getsignal(signum) == signal.SIG_IGN
+        ],
         "script": sys.modules["__main__"].__spec__ is None and sys.argv[0] != "-c",
     }
 
@@ -343,7 +350,8 @@ def _relay(frames: _Frames, spare: int, requests: int) -> int:
             os.kill(spare, signum)
 
     for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
-        signal.signal(signum, forward)
+        if signal.getsignal(signum) != signal.SIG_IGN:
+            signal.signal(signum, forward)
     unread: set[bytes] = set()
     while (frame := frames.next()) is not None:
         kind, payload = frame
@@ -714,6 +722,13 @@ def _become(request: _Request, stdin: bytes, out: int, err: int) -> None:
     os.environ.clear()
     os.environ.update(env)
     os.umask(int(request["umask"]))
+    for signum in _ENDING_SIGNALS:
+        if signum in request["ignored"]:
+            signal.signal(signum, signal.SIG_IGN)
+        elif signum == signal.SIGINT:
+            signal.signal(signum, signal.default_int_handler)
+        else:
+            signal.signal(signum, signal.SIG_DFL)
     sys.argv = list(request["argv"])
     sys.path[:] = request["path"]
 
