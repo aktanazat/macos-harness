@@ -109,13 +109,15 @@ class _Screen(MacOS):
 class _Keypad(_Screen):
     """`_Screen` whose window shows the result once a key reaches its app,
     as Calculator's does; each capture notes how many events had reached
-    it by then, and ``listings`` counts the window listings."""
+    it by then, ``listings`` counts the window listings, and the first
+    ``failing`` captures fail."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, failing: int = 0) -> None:
         super().__init__(_BLANK)
         self.posted = 0
         self.captured_after: list[int] = []
         self.listings = 0
+        self.failing = failing
 
     def _ensure_post_events(self) -> None:
         return None
@@ -137,6 +139,12 @@ class _Keypad(_Screen):
         max_height: int | None,
         size: tuple[int, int] | None = None,
     ) -> WindowCapture:
+        if self.failing:
+            self.failing -= 1
+            raise MacOSError(
+                f"Window capture returned no image for window {window_id}",
+                code=ErrorCode.AX_ERROR,
+            )
         self.captured_after.append(self.posted)
         return WindowCapture(
             image=_RESULT if self.posted else _BLANK, width=800, height=600, bounds=_BOUNDS,
@@ -261,16 +269,17 @@ def test_wait_change_waits_for_a_moving_change_to_hold_still() -> None:
 
 def test_wait_change_compares_against_the_last_see_of_the_window(tmp_path: Path) -> None:
     """The action changed the window before the wait began: measured
-    against the last `see`, the first look already counts, and every look
-    renders at that see's exact size so the two compare pixel for pixel."""
+    against the last `see`, it counts, the wait answers within a quarter
+    second, and every look renders at that see's exact size so the two
+    compare pixel for pixel."""
     mac = _Screen(_BLANK, _RESULT)
     mac.see("Test", path=tmp_path / "before.png")
 
     result = mac.wait_change("Test")
 
-    assert (result["changed"], result["baseline"], result["polls"]) == (True, "see", 4)
-    assert mac.pauses == [0.05] * 3
-    assert mac.sizes == [None] + [(800, 600)] * 4
+    assert (result["changed"], result["baseline"]) == (True, "see")
+    assert result["elapsed_ms"] <= 250
+    assert (mac.sizes[0], set(mac.sizes[1:])) == (None, {(800, 600)})
 
 
 def test_a_second_wait_measures_from_where_the_first_one_settled(tmp_path: Path) -> None:
@@ -363,6 +372,18 @@ def test_a_key_right_after_a_look_lists_no_windows_and_takes_no_picture(
     assert (mac.listings, len(mac.captured_after)) == spent
 
 
+def test_a_key_whose_picture_fails_still_goes_out_and_the_wait_measures_from_now() -> None:
+    """The capture before the key fails: the key still reaches the app,
+    and the wait measures from when it starts, as it did before inputs
+    were pictured."""
+    mac = _Keypad(failing=1)
+
+    mac.key("5", app="Test")
+    result = _outcome(lambda: mac.wait_change("Test", timeout=1.0))
+
+    assert (mac.posted, result["baseline"]) == (2, "now")
+
+
 def test_a_blinking_caret_is_no_change() -> None:
     mac = _Screen(_BLANK, _CARET, _BLANK, _CARET, _BLANK, _CARET)
 
@@ -370,7 +391,7 @@ def test_a_blinking_caret_is_no_change() -> None:
         mac.wait_change("Test", timeout=1.0)
 
     assert raised.value.code == ErrorCode.TIMEOUT
-    assert (raised.value.details["changed"], raised.value.details["polls"]) == (False, 20)
+    assert (raised.value.details["changed"], raised.value.details["elapsed_ms"]) == (False, 1000)
 
 
 @pytest.mark.parametrize(
@@ -418,7 +439,7 @@ def test_wait_change_by_ax_compares_text_and_keeps_element_indexes() -> None:
 
     result = mac.wait_change("Test", by="ax")
 
-    assert (result["changed"], result["settled"], result["polls"]) == (True, True, 5)
+    assert (result["changed"], result["settled"]) == (True, True)
     assert mac._element(held) == "button"
 
 
