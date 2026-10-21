@@ -1,8 +1,17 @@
 from __future__ import annotations
 
-import pytest
+from dataclasses import dataclass
 
-from macos_harness.capture import _await, _output_size, _sck_error
+import pytest
+import Quartz
+
+from macos_harness.capture import (
+    _await,
+    _output_size,
+    _sck_error,
+    _window_configuration,
+    gray_print,
+)
 from macos_harness.errors import AccessibilityPermissionError, ErrorCode, MacOSError
 
 
@@ -20,6 +29,38 @@ class _FakeNSError:
 
     def localizedDescription(self) -> str:
         return self._description
+
+
+@dataclass(frozen=True)
+class _Window:
+    bounds: tuple[float, float, float, float]
+    attached: tuple[_Window, ...] = ()
+
+
+def _drawn(window: _Window, config: object) -> object:
+    """The picture ScreenCaptureKit drew of ``window`` on a 2x display
+    under macOS 27: every window attached to it too, unless ``config``
+    leaves them out, the group fitted into the configured pixels from the
+    top left and never enlarged. The window draws white, anything attached
+    gray."""
+    drawn = (window, *window.attached) if config.includeChildWindows() else (window,)
+    left = min(each.bounds[0] for each in drawn)
+    top = min(each.bounds[1] for each in drawn)
+    right = max(each.bounds[0] + each.bounds[2] for each in drawn)
+    bottom = max(each.bounds[1] + each.bounds[3] for each in drawn)
+    width, height = int(config.width()), int(config.height())
+    scale = min(2.0, width / (right - left), height / (bottom - top))
+    context = Quartz.CGBitmapContextCreate(
+        None, width, height, 8, width, Quartz.CGColorSpaceCreateDeviceGray(),
+        Quartz.kCGImageAlphaNone,
+    )
+    for each in drawn:
+        x, y, w, h = each.bounds
+        Quartz.CGContextSetGrayFillColor(context, 1.0 if each is window else 0.5, 1.0)
+        Quartz.CGContextFillRect(context, Quartz.CGRectMake(
+            (x - left) * scale, height - (y - top + h) * scale, w * scale, h * scale
+        ))
+    return Quartz.CGBitmapContextCreateImage(context)
 
 
 @pytest.mark.parametrize(
@@ -91,3 +132,15 @@ def test_await_reports_a_capture_that_never_answers() -> None:
     assert exc_info.value.code == ErrorCode.TIMEOUT
     assert exc_info.value.details["operation"] == "Window capture"
     assert exc_info.value.details["timeout"] == 0.01
+
+
+def test_a_window_is_pictured_alone_at_full_size_with_a_tip_attached() -> None:
+    # Calculator and the mode tip hanging over its top edge, as the window
+    # list read them when the tip halved Calculator's picture.
+    tip = _Window((384.0, 466.0, 468.0, 101.0))
+    calculator = _Window((414.0, 559.0, 230.0, 408.0), attached=(tip,))
+
+    picture = _drawn(calculator, _window_configuration(460, 816))
+
+    looks = gray_print(picture, width=460, height=816, points=(230.0, 408.0))
+    assert set(looks.pixels) == {255}
