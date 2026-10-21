@@ -1810,16 +1810,25 @@ def test_input_verb_polls_focus_until_the_effect_shows() -> None:
     assert late.observed["focus"]["changed"] == ("window",)
 
 
-def test_input_verb_gives_up_on_focus_after_its_polling_budget() -> None:
-    slept: list[float] = []
-    host, operations = _ops(sleep=slept.append)
+def test_input_verb_gives_up_on_focus_100ms_after_dispatch() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
     before = copy.deepcopy(host.focus_sample)
     host.focus_samples.extend([before, *(copy.deepcopy(before) for _ in range(20))])
+    readings: list[float] = []
+
+    def reading() -> None:
+        # A focus reading of Calculator took 3ms.
+        readings.append(clock.now)
+        clock.now += 0.003
+
+    host.focus_hook = reading
 
     still = operations.key("cmd+s", app="Demo")
 
-    assert slept == [0.01] * 10
-    assert host.focus_sample_calls == 12
+    dispatched = readings[1]
+    assert readings[-1] - dispatched == pytest.approx(0.1)
+    assert len(readings) == 10
     assert still.changed is None
     assert still.observed["focus"]["changed"] == ()
 

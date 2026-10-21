@@ -295,13 +295,15 @@ def _changed_after_dispatch(postcondition: Postcondition | None, verified: _Veri
 # right after dispatch missed 70 of 80 effects that later showed; across
 # 360 key, click and packed-typing trials over four apps the effect showed
 # within 20ms in most, 47ms at p95 and 62ms at the latest. So when the
-# caller gave no postcondition the receipt samples every 10ms for up to
-# 100ms -- never past the shared deadline -- and stops at the first reading
-# that differs from the one before dispatch. An explicit postcondition is
-# the effect the caller asked about, so it is verified straight after the
-# one immediate reading instead of waiting behind this witness.
+# caller gave no postcondition the receipt samples every 10ms until 100ms
+# after dispatch, the readings' own time included, so at most ten times --
+# never past the shared deadline -- and stops at the first reading that
+# differs from the one before dispatch. An explicit postcondition is the
+# effect the caller asked about, so it is verified straight after the one
+# immediate reading instead of waiting behind this witness.
 _FOCUS_POLL_SECONDS = 0.01
 _FOCUS_POLLS = 10
+_FOCUS_WATCH_SECONDS = 0.1
 
 
 def _sample_focus(host: _Host, pid: int) -> dict[str, JSONValue] | None:
@@ -3113,20 +3115,24 @@ class Operations:
         """Read focus again after a raw input landed and report what moved.
 
         Always takes one reading straight away. With ``poll`` it then
-        re-reads every `_FOCUS_POLL_SECONDS` for up to `_FOCUS_POLLS`
-        readings, stopping at the first that differs from ``before``, so
-        the app's run loop gets up to 100ms to process the event before
-        the receipt calls the effect unobserved; no sleep runs past
-        ``deadline``. Either reading failing leaves ``changed`` empty:
-        no witness, not a witness of nothing.
+        re-reads every `_FOCUS_POLL_SECONDS`, at most `_FOCUS_POLLS` times
+        and never past `_FOCUS_WATCH_SECONDS` after it began, stopping at
+        the first reading that differs from ``before``, so the app's run
+        loop gets 100ms to process the event before the receipt calls the
+        effect unobserved; no sleep runs past ``deadline``. Either reading
+        failing leaves ``changed`` empty: no witness, not a witness of
+        nothing.
         """
+        watch = _Deadline(_FOCUS_WATCH_SECONDS, self._monotonic)
         after = _sample_focus(host, pid)
         if poll and before is not None:
             for _ in range(_FOCUS_POLLS):
                 if after is not None and after != before:
                     break
-                if not self._sleep_within(deadline, _FOCUS_POLL_SECONDS):
+                left = min(watch.remaining(), deadline.remaining())
+                if left <= 0:
                     break
+                self._sleep(min(_FOCUS_POLL_SECONDS, left))
                 after = _sample_focus(host, pid)
         changed = [] if before is None or after is None else _changed_focus_fields(before, after)
         return {
