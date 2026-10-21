@@ -144,6 +144,7 @@ class WindowCatalog:
         self._kept: tuple[int, tuple[object, ...], object] | None = None
 
     def content(self, window_id: int, timeout: float) -> object:
+        _require_screencapturekit()
         layout = _layout(window_id)
         if self._kept is not None and self._kept[:2] == (window_id, layout):
             return self._kept[2]
