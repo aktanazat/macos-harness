@@ -27,7 +27,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from typing import NoReturn, TextIO, TypedDict
 
 ENV = "MACOS_HARNESS_SPARE"
@@ -389,10 +389,11 @@ class _Spare:
         with contextlib.suppress(ProcessLookupError):
             os.kill(self.pid, signal.SIGKILL)
 
-    def close(self) -> int:
+    def close(self, keep: Collection[int] = ()) -> int:
         status = self.popen.wait()
         for fd in self._fds:
-            os.close(fd)
+            if fd not in keep:
+                os.close(fd)
         return status
 
 
@@ -406,6 +407,7 @@ class _Broker:
         self._spare: _Spare | None = None
         self._serving = False
         self._awaiting_input = False
+        self._left_open: set[int] = set()
         _Lifeline(self._abandon).watch(self._shell)
         if os.getppid() != self._shell:
             self._abandon()
@@ -414,12 +416,14 @@ class _Broker:
         self._spawn()
         while True:
             spare = self._spare
-            watched = [0, self._exits.fileno()]
+            watched = [0, self._exits.fileno(), *self._left_open]
             if spare is not None and spare.listening:
                 watched.append(spare.control.fd)
             if spare is not None and self._serving:
                 watched.extend(spare.outputs)
             ready = select.select(watched, [], [])[0]
+            for fd in self._left_open.intersection(ready):
+                self._drop(fd)
             if spare is not None and self._serving:
                 for fd in [fd for fd in ready if fd in spare.outputs]:
                     self._pass_on(spare, fd)
@@ -509,6 +513,11 @@ class _Broker:
         else:
             del spare.outputs[fd]
 
+    def _drop(self, fd: int) -> None:
+        if not os.read(fd, _CHUNK):
+            os.close(fd)
+            self._left_open.remove(fd)
+
     def _reap(self) -> None:
         exited = {event.ident for event in self._exits.control(None, 8, 0)}
         spare = self._spare
@@ -520,12 +529,18 @@ class _Broker:
                 self._renew()
                 self._spawn()
             return
+        # A process the step left running may still hold its output. A fresh
+        # step's would write on to the shell; closing the pipe would kill it.
+        left_open = []
         for fd, kind in spare.outputs.items():
             os.set_blocking(fd, False)
-            with contextlib.suppress(BlockingIOError):
+            try:
                 while data := os.read(fd, _CHUNK):
                     self._reply(kind, data)
-        status = spare.close()
+            except BlockingIOError:
+                left_open.append(fd)
+        status = spare.close(keep=left_open)
+        self._left_open.update(left_open)
         self._serving = self._awaiting_input = False
         self._reply(b"x", str(status).encode())
         self._renew()

@@ -59,12 +59,18 @@ def _cli(*args: str) -> list[str]:
     return [sys.executable, "-m", "macos_harness.cli", *args]
 
 
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def _gone(pid: int) -> bool:
     """Whether ``pid`` is gone within ten seconds."""
     for _ in range(200):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not _alive(pid):
             return True
         time.sleep(0.05)
     return False
@@ -330,6 +336,43 @@ def test_a_served_step_has_the_output_streams_its_own_process_would(shell: _Shel
     _step, out, _err = shell.served(program)
 
     assert out.splitlines()[1:] == alone.stdout.decode().splitlines()[1:]
+
+
+def test_a_process_a_served_step_leaves_running_lives_on_when_it_writes(
+    shell: _Shell, tmp_path: Path
+) -> None:
+    """As it would after a fresh step, and without its output reaching the
+    shell's next step."""
+    starts_writer = (
+        "import os, pathlib, subprocess\n"
+        "print(os.getpid(), flush=True)\n"
+        f"if os.getppid() != {os.getpid()}:\n"
+        "    writer = subprocess.Popen(\n"
+        "        ['/bin/sh', '-c', 'while [ ! -e stop ]; do echo late; touch wrote; sleep 0.05; done']\n"
+        "    )\n"
+        "    pathlib.Path('writer').write_text(str(writer.pid))\n"
+    )
+    waits_for_a_write = (
+        "import os, time\n"
+        "print(os.getpid(), flush=True)\n"
+        "started = time.time()\n"
+        "for _ in range(200):\n"
+        "    if os.path.exists('wrote') and os.stat('wrote').st_mtime > started:\n"
+        "        break\n"
+        "    time.sleep(0.01)\n"
+    )
+    shell.served(starts_writer, cwd=tmp_path)
+    try:
+        writer = int((tmp_path / "writer").read_text())
+        after, out, err = shell.served(waits_for_a_write, cwd=tmp_path)
+        writer_lived = _alive(writer)
+    finally:
+        (tmp_path / "stop").touch()
+
+    assert writer_lived
+    assert out.split()[1:] == []
+    assert err == ""
+    assert after.returncode == 0
 
 
 def test_a_step_runs_in_its_own_process_while_no_spare_is_ready() -> None:
