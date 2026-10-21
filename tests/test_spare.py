@@ -422,32 +422,36 @@ def test_a_step_runs_in_its_own_process_while_no_spare_is_ready() -> None:
     assert step.returncode == 0
 
 
+@pytest.mark.parametrize("elsewhere", [False, True], ids=["same-tmpdir", "other-tmpdir"])
 def test_a_second_step_at_once_runs_in_its_own_process_and_takes_no_output(
-    shell: _Shell, tmp_path: Path
+    elsewhere: bool, shell: _Shell, tmp_path: Path
 ) -> None:
+    """Whatever temporary directory the second step names. The first step's
+    output fills every pipe on its way, as when nothing reads it for a while."""
     release = tmp_path / "release"
     first, spare = shell.held(
-        "import os, time\n"
+        "import os\n"
         "from pathlib import Path\n"
         "print(os.getpid(), flush=True)\n"
         "count = 0\n"
         f"while not Path({str(release)!r}).exists():\n"
-        "    print(count, flush=True)\n"
+        "    print(count, 'x' * 1000, flush=True)\n"
         "    count += 1\n"
-        "    time.sleep(0.001)\n"
         "print('done', flush=True)\n"
     )
 
-    second, out, _err = shell.step(_PID)
+    second, out, _err = shell.step(_PID, env={"TMPDIR": str(tmp_path)} if elsewhere else None)
     release.touch()
     assert first.stdout is not None
-    lines = first.stdout.read().decode().split()
+    lines = first.stdout.read().decode().splitlines()
     first.wait(timeout=60)
 
     assert spare != first.pid
     assert int(out) == second.pid
     assert lines[-1] == "done"
-    assert lines[:-1] == [str(count) for count in range(len(lines) - 1)]
+    assert [line.split()[0] for line in lines[:-1]] == [
+        str(count) for count in range(len(lines) - 1)
+    ]
     assert first.returncode == 0
 
 

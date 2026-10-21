@@ -41,6 +41,9 @@ _CHUNK = 1 << 16
 _ANSWER_SECONDS = 0.5
 _LOCK_SPAN = 1 << 62
 _STALE = 3
+# _CS_DARWIN_USER_TEMP_DIR in <unistd.h>: the user's temporary directory,
+# whatever TMPDIR names.
+_USER_TEMP_DIR = 65537
 _PACKAGE = os.path.dirname(os.path.abspath(__file__))
 _PRELOAD = (
     "macos_harness.cli",
@@ -278,9 +281,15 @@ def _shape(args: list[str]) -> str | None:
 def _claim(requests: int) -> bool:
     """Hold this shell's spare until this process exits; False when another
     step from the same shell holds it."""
-    path = os.path.join(tempfile.gettempdir(), "macos-harness-spare.lock")
     try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        directory = os.confstr(_USER_TEMP_DIR)
+        if directory is None:
+            return False
+        fd = os.open(
+            os.path.join(directory, "macos-harness-spare.lock"),
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
     except OSError:
         return False
     try:
