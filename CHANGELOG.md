@@ -83,9 +83,43 @@ follows [Semantic Versioning](https://semver.org/).
   ignoring case and with "..." for "…", and refuse a disabled item, or a
   path that leads to no item or to more than one, before anything is
   pressed.
+- `macos-harness spare`, started once as a shell's coprocess, keeps one
+  process with the harness loaded for that shell's next step: a program on
+  stdin, or `run` with stdin from `/dev/null`. Each spare runs one step and
+  exits while the next one loads. On Calculator an empty step took 58ms
+  instead of 133ms, a window picture 200ms instead of 272ms, and a key
+  226ms instead of 297ms (15 runs each, alternating). A step runs in its
+  own process as before when its output is a terminal, it uses other
+  Python flags or load-time settings, another step from the shell is
+  running, no spare is ready, or the installed code changed since the
+  spare loaded. The spare exits with its shell, even after `kill -9`, once
+  a step it is running ends, and with the step it serves; only commands the
+  shell starts hold its pipes. `macos-harness skill spare` prints the setup
+  lines.
 
 ### Changed
 
+- A stdin step no longer loads the REPL, the nearest-call hint, the
+  cross-app sweep's thread pool, the bundle-version reader, or
+  `mac.route` before it needs them; `mac.route` is built on first use.
+  An empty step starts in about 124ms instead of 130ms (two sets of 60
+  runs each). The rest is the Accessibility, Core Graphics, and
+  ScreenCaptureKit bindings every step loads, about 110ms.
+- A `mac.do.key`, `click`, `type`, or `status_item` with no postcondition
+  watches focus until a reading starts 100ms or more after dispatch, the
+  readings' own time included, instead of waiting ten 10ms polls on top of
+  eleven readings. On Calculator the watch took 102ms instead of 129ms and
+  a receipted key about 180ms instead of 211ms (8 runs each). The latest
+  effect the watch was sized for showed at 62ms; an app whose readings take
+  50ms or more still gets a reading that starts after it.
+- A window picture reuses the window list ScreenCaptureKit gave the same
+  session's last picture of that window while the window server shows the
+  window, its app's other windows, and the displays where they were. That
+  check reads in about 0.3ms; a new list takes 16ms. A key and
+  `see(after_change=True)` on Calculator list windows once instead of five
+  times and take 474ms instead of 540ms (8 runs each, one fresh `MacOS`
+  per run). A window that moved, resized, or gained a tip between two
+  pictures is listed again and pictured where it now is.
 - The skill is now a short card (about 3 KB, down from 31 KB) plus
   references for signatures, receipts, accessibility search, invariants,
   routes, diagnostics, handoff, credentials, and the native backend. The card

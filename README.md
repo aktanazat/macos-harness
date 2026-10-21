@@ -718,6 +718,8 @@ searching and again after reading the frontmost app.
   over a local socket; off by default, see [Native backend](#native-backend)
 - Declares an explicit human handoff at a known authentication boundary
   instead of guessing from a timeout — see [Human handoff](#human-handoff-for-authentication-boundaries)
+- Can keep one loaded process ready for a shell's next step, which then skips
+  loading the harness; see `macos-harness skill spare`
 
 ## Permissions and privacy
 

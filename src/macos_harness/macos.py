@@ -13,7 +13,6 @@ import json
 import math
 import operator
 import os
-import plistlib
 import re
 import subprocess
 import tempfile
@@ -22,8 +21,8 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
@@ -31,6 +30,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
 from .capture import (
     GrayPrint,
     WindowCapture,
+    WindowCatalog,
     capture_screen,
     capture_window,
     changed_area,
@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     # annotation in this file a deferred string, so this import never
     # needs to run outside a type checker.
     from .native import NativeClient
+    from .routes import Routes
 
 try:
     import ApplicationServices as AS
@@ -1034,6 +1035,7 @@ class MacOS:
         self._last_capture: _Picture | None = None
         # The same for one window no `see` holds, at most 640 pixels a side.
         self._before_input: _Picture | None = None
+        self._capture_catalog = WindowCatalog()
         self._event_source = AS.CGEventSourceCreate(AS.kCGEventSourceStatePrivate)
         if self._event_source is None:
             raise MacOSError(
@@ -1055,13 +1057,11 @@ class MacOS:
 
         from .controls import Accessibility
         from .ops import Operations
-        from .routes import Routes
 
         self._pointer_position: tuple[float, float] | None = None
         self._overlay = LivePointerOverlay()
         self.ax = Accessibility(self)
         self.do = Operations(self)
-        self.route = Routes(self)
         self._backend = _resolve_backend(backend)
         self._native_client: NativeClient | None = None
         self._native_error: Exception | None = None
@@ -1349,6 +1349,12 @@ class MacOS:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    @cached_property
+    def route(self) -> Routes:
+        from .routes import Routes
+
+        return Routes(self)
+
     # --- permissions and app discovery ---------------------------------
 
     def is_accessibility_trusted(self) -> bool:
@@ -1547,6 +1553,8 @@ class MacOS:
     def _bundle_info(path: str | None) -> dict[str, object]:
         if path is None:
             return {}
+        import plistlib
+
         try:
             with (Path(path) / "Contents" / "Info.plist").open("rb") as source:
                 info = plistlib.load(source)
@@ -3022,6 +3030,8 @@ class MacOS:
             error, _ = copy_value(element, "AXRole", None)
             return error == cannot_complete
 
+        from concurrent.futures import ThreadPoolExecutor
+
         with ThreadPoolExecutor(max_workers=_AX_PROBE_WORKERS) as pool:
             quiet = tuple(pool.map(silent, pids))
         return frozenset(pid for pid, is_silent in zip(pids, quiet, strict=True) if is_silent)
@@ -4481,8 +4491,8 @@ class MacOS:
             hide_pid=self._overlay.pid,
         )
 
-    @staticmethod
     def _window_image(
+        self,
         window_id: int,
         *,
         max_width: int | None,
@@ -4490,7 +4500,10 @@ class MacOS:
         size: tuple[int, int] | None = None,
     ) -> WindowCapture:
         """Render one window; the one capture `see` and `wait_change` take."""
-        return capture_window(window_id, max_width=max_width, max_height=max_height, size=size)
+        return capture_window(
+            window_id, max_width=max_width, max_height=max_height,
+            catalog=self._capture_catalog, size=size,
+        )
 
     @staticmethod
     def _indexed_window(
