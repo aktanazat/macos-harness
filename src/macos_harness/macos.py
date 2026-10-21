@@ -239,8 +239,8 @@ _INSPECT_MAX_DEPTH = 25
 # once about 64 square points of it moved in brightness -- one short word
 # of body text; a blinking caret is about 20 -- or 2% of a watched region,
 # whichever is less. A whole-window print keeps one pixel per 2 points.
-_CHANGE_POLL_SECONDS = 0.2
-_CHANGE_SETTLE_SECONDS = 0.5
+_CHANGE_POLL_SECONDS = 0.05
+_CHANGE_SETTLE_SECONDS = 0.15
 _CHANGE_AREA = 64.0
 _CHANGE_REGION_SHARE = 0.02
 _CHANGE_BASELINE_SIZE = 640

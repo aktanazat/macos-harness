@@ -26,7 +26,7 @@ follows [Semantic Versioning](https://semver.org/).
   look.
 - `mac.wait_change(app)` returns once a window has changed since its last
   `see`, the last wait on it, or, with neither, just before the program's
-  first input to it, and held still for half a second, in place of a
+  first input to it, and held still for 0.15 seconds, in place of a
   guessed sleep, with how many looks it took. A blinking caret is no
   change; `region=` watches a smaller one and `by="ax"` compares the app's
   text. Nothing changing raises a timeout whose details say `changed` is

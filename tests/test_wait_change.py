@@ -137,6 +137,26 @@ class _Keypad(_Screen):
         )
 
 
+class _Slide(_Screen):
+    """`_Screen` whose window shows a 40-point square sliding 200 points
+    right over the first 0.3 seconds, an animation still running when the
+    wait begins, and then resting."""
+
+    def _window_image(
+        self,
+        window_id: int,
+        *,
+        max_width: int | None,
+        max_height: int | None,
+        size: tuple[int, int] | None = None,
+    ) -> WindowCapture:
+        x = 100 + 200 * min(self.clock, 0.3) / 0.3
+        return WindowCapture(
+            image=_frame((x, 100, 40, 40)), width=800, height=600, bounds=_BOUNDS,
+            on_screen=True, captured_at=0.0,
+        )
+
+
 def _outcome(call: Callable[[], Mapping[str, object]]) -> Mapping[str, object]:
     """What the wait reports, whether it returned or timed out."""
     try:
@@ -163,16 +183,28 @@ def _png_gray(path: str, x: int, y: int) -> int:
     return bytes(Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(pixel)))[0]
 
 
-def test_wait_change_returns_once_the_new_look_has_held_still() -> None:
-    """The result appears on the second look and holds: the wait returns
-    on the first look half a second later, after five short pauses."""
-    mac = _Screen(_BLANK, _BLANK, _RESULT)
+def test_wait_change_answers_within_a_quarter_second_of_a_change_that_holds() -> None:
+    """The result shows on the first look and holds: the wait returns
+    within four looks and a quarter of a second, the settle included."""
+    mac = _Screen(_BLANK, _RESULT)
 
     result = mac.wait_change("Test")
 
     assert (result["changed"], result["settled"], result["baseline"]) == (True, True, "now")
-    assert result["polls"] == 5
-    assert mac.pauses == [0.2] * 5
+    assert result["polls"] <= 4
+    assert result["elapsed_ms"] <= 250
+
+
+def test_wait_change_waits_for_a_moving_change_to_hold_still() -> None:
+    """The square is still sliding when the first looks see it: the wait
+    returns only once it has rested a settle after its last move at 0.3
+    seconds, so the shorter settle never answers mid-animation."""
+    mac = _Slide()
+
+    result = mac.wait_change("Test")
+
+    assert (result["changed"], result["settled"]) == (True, True)
+    assert result["elapsed_ms"] >= 450
 
 
 def test_wait_change_compares_against_the_last_see_of_the_window(tmp_path: Path) -> None:
@@ -185,7 +217,7 @@ def test_wait_change_compares_against_the_last_see_of_the_window(tmp_path: Path)
     result = mac.wait_change("Test")
 
     assert (result["changed"], result["baseline"], result["polls"]) == (True, "see", 4)
-    assert mac.pauses == [0.2] * 3
+    assert mac.pauses == [0.05] * 3
     assert mac.sizes == [None] + [(800, 600)] * 4
 
 
@@ -232,7 +264,7 @@ def test_a_blinking_caret_is_no_change() -> None:
         mac.wait_change("Test", timeout=1.0)
 
     assert raised.value.code == ErrorCode.TIMEOUT
-    assert (raised.value.details["changed"], raised.value.details["polls"]) == (False, 5)
+    assert (raised.value.details["changed"], raised.value.details["polls"]) == (False, 20)
 
 
 @pytest.mark.parametrize(

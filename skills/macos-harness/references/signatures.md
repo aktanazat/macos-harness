@@ -29,7 +29,7 @@ twice, or an unreadable or empty file exits 2 before anything runs.
 
 ```text
 mac.see(app=None, *, window_index=0, window_id=None, display=None, region=None, path=None, max_width=1280, max_height=1280, show_pointer=False, after_change=False, timeout=30.0)
-mac.wait_change(app=None, *, window_index=0, window_id=None, region=None, by="pixels", timeout=30.0, settle=0.5)
+mac.wait_change(app=None, *, window_index=0, window_id=None, region=None, by="pixels", timeout=30.0, settle=0.15)
 mac.key(key, *, app=None)
 mac.type(text, *, app=None)
 mac.click(x=None, y=None, *, element=None, app=None, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot")
