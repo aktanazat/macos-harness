@@ -1830,6 +1830,7 @@ def test_background_click_posts_to_pid_without_warp_or_activate(monkeypatch) -> 
     monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_post", lambda event, pid: posted.append(pid))
+    mac.hide_pointer()
     _on_screen_windows(monkeypatch, (42, 7, 0, 0, 800, 600))
     monkeypatch.setattr(
         macos_module.AS,
@@ -1868,6 +1869,7 @@ def _routed(monkeypatch, mac: MacOS) -> list[tuple[int, int, tuple[float, float]
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_post", post)
     monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+    mac.hide_pointer()
     return routed
 
 
@@ -2191,6 +2193,7 @@ def test_background_click_uses_private_event_source(monkeypatch) -> None:
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_post", lambda event, pid: None)
     monkeypatch.setattr(mac, "_route_to_window", lambda event, window, point: None)
+    mac.hide_pointer()
     _on_screen_windows(monkeypatch, (42, 7, 0, 0, 800, 600))
     monkeypatch.setattr(
         macos_module.AS,
@@ -2220,6 +2223,7 @@ def test_coordinate_click_never_guesses_an_ax_action(monkeypatch) -> None:
         lambda pid: pytest.fail("raw click must not inspect AX"),
     )
     monkeypatch.setattr(mac, "_post", lambda event, pid: posted.append(pid))
+    mac.hide_pointer()
     _on_screen_windows(monkeypatch, (42, 7, 0, 0, 800, 600))
 
     mac.click(10, 20, app="Slack", coordinate_space="screen")
@@ -2247,6 +2251,7 @@ def test_click_screen_space_omits_image_coordinates_from_a_different_app(
     monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 222)  # app B
     monkeypatch.setattr(mac, "_post", lambda event, pid: None)
+    mac.hide_pointer()
     _on_screen_windows(monkeypatch, (222, 9, 0, 0, 800, 600))
 
     pointer = mac.click(10, 20, app="B", coordinate_space="screen")
@@ -2860,6 +2865,7 @@ def test_click_accepts_a_screenshot_from_the_same_app(monkeypatch) -> None:
     monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_post", lambda event, pid: posted.append(pid))
+    mac.hide_pointer()
     mac._last_screenshot = {
         "pid": 42,
         "window_id": 7,
