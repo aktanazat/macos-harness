@@ -97,6 +97,14 @@ def _appears(path: Path) -> bool:
     return False
 
 
+def _cut_short(step: subprocess.Popen[bytes]) -> tuple[int, str]:
+    """How a step that printed its first line ends once nothing reads its output."""
+    assert step.stdout is not None and step.stderr is not None
+    step.stdout.close()
+    err = step.stderr.read().decode()
+    return step.wait(timeout=60), err
+
+
 class _Shell:
     def __init__(self, env: dict[str, str]) -> None:
         requests_end, self.requests = os.pipe()
@@ -449,6 +457,50 @@ def test_a_killed_step_takes_its_spare_with_it(shell: _Shell) -> None:
     assert _gone(spare)
     after, out, _err = shell.served(_PID)
     assert int(out) != after.pid
+
+
+def test_a_step_whose_spare_is_killed_dies_as_its_own_process_would(shell: _Shell) -> None:
+    step, spare = shell.held("import os, time\nprint(os.getpid(), flush=True)\ntime.sleep(600)\n")
+
+    os.kill(spare, signal.SIGKILL)
+    assert step.stderr is not None
+    err = step.stderr.read().decode()
+
+    assert step.wait(timeout=60) == -signal.SIGKILL
+    assert err == ""
+
+
+def test_a_served_step_whose_output_stops_being_read_ends_as_its_own_process_would(
+    shell: _Shell,
+) -> None:
+    """As when its output goes to ``head``: its next write fails, it may
+    handle that, and nothing else breaks."""
+    program = (
+        "import os, sys\n"
+        "print(os.getpid(), flush=True)\n"
+        "try:\n"
+        "    while True:\n"
+        "        print('line', flush=True)\n"
+        "except BrokenPipeError:\n"
+        "    print('cut short', file=sys.stderr, flush=True)\n"
+    )
+    alone = subprocess.Popen(
+        _cli(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_env(),
+    )
+    assert alone.stdin is not None and alone.stdout is not None
+    alone.stdin.write(program.encode())
+    alone.stdin.close()
+    alone.stdout.readline()
+    ended_alone = _cut_short(alone)
+
+    step, _spare = shell.held(program)
+
+    assert _cut_short(step) == ended_alone
+    assert ended_alone[1].startswith("cut short\n")
 
 
 def test_the_broker_and_its_spare_die_with_the_shell() -> None:

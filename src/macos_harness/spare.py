@@ -237,7 +237,7 @@ def run_in_spare(args: list[str]) -> int | None:
     except OSError:
         print("macos-harness: the spare went away before the step started", file=sys.stderr)
         return 1
-    return _relay(frames, spare)
+    return _relay(frames, spare, requests)
 
 
 def _channel() -> tuple[int, int] | None:
@@ -337,24 +337,31 @@ def _accepted(frames: _Frames, nonce: str) -> int | None:
     return None
 
 
-def _relay(frames: _Frames, spare: int) -> int:
+def _relay(frames: _Frames, spare: int, requests: int) -> int:
     def forward(signum: int, _stack: object) -> None:
         with contextlib.suppress(ProcessLookupError):
             os.kill(spare, signum)
 
     for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, forward)
+    unread: set[bytes] = set()
     while (frame := frames.next()) is not None:
         kind, payload = frame
         if kind == b"x":
             status = int(payload)
             if status < 0:
-                signal.signal(-status, signal.SIG_DFL)
+                if -status != signal.SIGKILL:
+                    signal.signal(-status, signal.SIG_DFL)
                 os.kill(os.getpid(), -status)
                 return 128 - status
             return status
-        if kind in (b"o", b"e"):
-            _write_all(1 if kind == b"o" else 2, payload)
+        if kind in (b"o", b"e") and kind not in unread:
+            try:
+                _write_all(1 if kind == b"o" else 2, payload)
+            except BrokenPipeError:
+                unread.add(kind)
+                with contextlib.suppress(OSError):
+                    _write_all(requests, _frame(b"c", kind))
     print("macos-harness: the spare running this step went away before it finished", file=sys.stderr)
     return 1
 
@@ -390,11 +397,19 @@ class _Spare:
         self.outputs = {out: b"o", err: b"e"}
         self.ready = False
         self.listening = True
-        self._fds = (control, requests, out, err)
+        self._fds = [control, requests, out, err]
 
     def kill(self) -> None:
         with contextlib.suppress(ProcessLookupError):
             os.kill(self.pid, signal.SIGKILL)
+
+    def cut(self, kind: bytes) -> None:
+        """Stop taking the output nothing reads any more, so that the step's
+        next write to it fails as it would with no spare in between."""
+        for fd in [fd for fd, its_kind in self.outputs.items() if its_kind == kind]:
+            del self.outputs[fd]
+            self._fds.remove(fd)
+            os.close(fd)
 
     def close(self, keep: Collection[int] = ()) -> int:
         status = self.popen.wait()
@@ -569,6 +584,8 @@ class _Broker:
                 self._awaiting_input = False
                 with contextlib.suppress(OSError):
                     _write_all(self._spare.requests, _frame(b"i", payload))
+            elif kind == b"c" and self._serving and self._spare is not None:
+                self._spare.cut(payload)
         return True
 
     def _answer(self, payload: bytes) -> None:
