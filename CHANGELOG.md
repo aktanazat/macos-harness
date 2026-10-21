@@ -105,11 +105,12 @@ follows [Semantic Versioning](https://semver.org/).
   runs each). The rest is the Accessibility, Core Graphics, and
   ScreenCaptureKit bindings every step loads, about 110ms.
 - A `mac.do.key`, `click`, `type`, or `status_item` with no postcondition
-  watches focus until 100ms after dispatch, the readings' own time
-  included, instead of waiting ten 10ms polls on top of eleven readings.
-  On Calculator the watch took 102ms instead of 129ms and a receipted key
-  about 180ms instead of 211ms (8 runs each); the latest effect the watch
-  was sized for showed at 62ms.
+  watches focus until a reading starts 100ms or more after dispatch, the
+  readings' own time included, instead of waiting ten 10ms polls on top of
+  eleven readings. On Calculator the watch took 102ms instead of 129ms and
+  a receipted key about 180ms instead of 211ms (8 runs each). The latest
+  effect the watch was sized for showed at 62ms; an app whose readings take
+  50ms or more still gets a reading that starts after it.
 - A window picture reuses the window list ScreenCaptureKit gave the same
   session's last picture of that window while the window server shows the
   window, its app's other windows, and the displays where they were. That

@@ -1833,6 +1833,32 @@ def test_input_verb_gives_up_on_focus_100ms_after_dispatch() -> None:
     assert still.observed["focus"]["changed"] == ()
 
 
+@pytest.mark.parametrize("reading_seconds", [0.05, 0.12])
+def test_input_verb_sees_a_focus_effect_62ms_after_dispatch_when_readings_are_slow(
+    reading_seconds: float,
+) -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    before = copy.deepcopy(host.focus_sample)
+    landed = copy.deepcopy(before)
+    landed["window"] = "Renamed"
+    host.focus_samples.extend([before, *(copy.deepcopy(before) for _ in range(20))])
+    readings: list[float] = []
+
+    def reading() -> None:
+        readings.append(clock.now)
+        if len(readings) > 1 and clock.now - readings[1] >= 0.062:
+            host.focus_samples.appendleft(landed)
+        clock.now += reading_seconds
+
+    host.focus_hook = reading
+
+    late = operations.key("return", app="Demo")
+
+    assert late.changed is True
+    assert late.observed["focus"]["changed"] == ("window",)
+
+
 def test_input_verb_clips_focus_polling_to_the_remaining_deadline() -> None:
     clock = _SleepClock()
     host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)

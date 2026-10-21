@@ -3115,24 +3115,28 @@ class Operations:
         """Read focus again after a raw input landed and report what moved.
 
         Always takes one reading straight away. With ``poll`` it then
-        re-reads every `_FOCUS_POLL_SECONDS`, at most `_FOCUS_POLLS` times
-        and never past `_FOCUS_WATCH_SECONDS` after it began, stopping at
-        the first reading that differs from ``before``, so the app's run
-        loop gets 100ms to process the event before the receipt calls the
-        effect unobserved; no sleep runs past ``deadline``. Either reading
+        re-reads every `_FOCUS_POLL_SECONDS`, at most `_FOCUS_POLLS` times,
+        until a reading that began `_FOCUS_WATCH_SECONDS` or more after the
+        first, stopping early at the first reading that differs from
+        ``before``, so the app's run loop gets 100ms to process the event
+        before the receipt calls the effect unobserved, however long a
+        reading takes; no sleep runs past ``deadline``. Either reading
         failing leaves ``changed`` empty: no witness, not a witness of
         nothing.
         """
         watch = _Deadline(_FOCUS_WATCH_SECONDS, self._monotonic)
         after = _sample_focus(host, pid)
         if poll and before is not None:
+            began_in_watch = True
             for _ in range(_FOCUS_POLLS):
                 if after is not None and after != before:
                     break
-                left = min(watch.remaining(), deadline.remaining())
-                if left <= 0:
+                if not began_in_watch or deadline.remaining() <= 0:
                     break
-                self._sleep(min(_FOCUS_POLL_SECONDS, left))
+                pause = min(_FOCUS_POLL_SECONDS, watch.remaining(), deadline.remaining())
+                if pause > 0:
+                    self._sleep(pause)
+                began_in_watch = watch.remaining() > 0
                 after = _sample_focus(host, pid)
         changed = [] if before is None or after is None else _changed_focus_fields(before, after)
         return {
