@@ -27,6 +27,16 @@ the same shell is running, no spare is ready yet, or the installed code changed
 since the spare loaded. After an update, the first step runs alone and the
 spare reloads.
 
+## What differs
+
+- A traceback from a program that fails starts with the spare's frames instead
+  of the `macos-harness` command's; the frames of the program itself are the
+  same.
+- A process the step leaves running keeps running, but what it prints after
+  the step ends is dropped instead of reaching the shell.
+- Only stdin, stdout, and stderr reach the program; other files the shell has
+  open do not.
+
 ## Lifetime
 
 The spare and the process that keeps it exit with the shell, even when the
