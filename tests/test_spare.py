@@ -684,6 +684,47 @@ def test_a_spare_that_loaded_during_a_change_is_replaced_unasked(
     assert replacement != loading
 
 
+def test_a_change_just_after_a_spare_checks_its_code_reaches_the_next_step(
+    tmp_path: Path,
+) -> None:
+    """The moment after the spare checks its code against the broker's is
+    held open here; a change made in it must not be served."""
+    package = tmp_path / "macos_harness"
+    shutil.copytree(
+        Path(macos_harness.__file__).parent,
+        package,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    opened, shut = tmp_path / "opened", tmp_path / "shut"
+    spare = package / "spare.py"
+    checked = "        os._exit(_STALE)\n"
+    assert spare.read_text().count(checked) == 1
+    spare.write_text(
+        spare.read_text().replace(
+            checked,
+            f"{checked}    open({str(opened)!r}, 'w').close()\n"
+            f"    time.sleep(1)\n    open({str(shut)!r}, 'w').close()\n",
+        )
+    )
+    source = package / "ops.py"
+    program = (
+        "import os\nfrom macos_harness import ops\n"
+        "print(os.getpid(), getattr(ops, 'CHANGED', 'never'))\n"
+    )
+    shell = _Shell(_env(PYTHONPATH=str(tmp_path)))
+    try:
+        assert any(_appears(opened) for _ in range(10))
+        source.write_text(source.read_text() + "\nCHANGED = 'changed'\n")
+        assert any(_appears(shut) for _ in range(5))
+        # Long enough for the spare to tell the broker it is ready.
+        time.sleep(0.5)
+        _step, out, _err = shell.step(program)
+    finally:
+        shell.close()
+
+    assert out.split()[1] == "changed"
+
+
 def test_a_step_that_loads_another_copy_of_the_package_leaves_no_spare_restarting(
     shell: _Shell, tmp_path: Path
 ) -> None:

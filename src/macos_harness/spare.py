@@ -675,9 +675,9 @@ def serve_one_step(argv: list[str]) -> NoReturn:
         _kill_self()
     for name in _PRELOAD:
         importlib.import_module(name)
+    sources = _sources()
     if _code_digest() != argv[5]:
         os._exit(_STALE)
-    sources = _sources()
     _write_all(control, _frame(b"r"))
     frames = _Frames(requests)
     frame = frames.next()
