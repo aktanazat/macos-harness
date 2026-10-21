@@ -86,6 +86,14 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- A window picture reuses the window list ScreenCaptureKit gave the same
+  session's last picture of that window while the window server shows the
+  window, its app's other windows, and the displays where they were. That
+  check reads in about 0.3ms; a new list takes 16ms. A key and
+  `see(after_change=True)` on Calculator list windows once instead of five
+  times and take 474ms instead of 540ms (8 runs each, one fresh `MacOS`
+  per run). A window that moved, resized, or gained a tip between two
+  pictures is listed again and pictured where it now is.
 - The skill is now a short card (about 3 KB, down from 31 KB) plus
   references for signatures, receipts, accessibility search, invariants,
   routes, diagnostics, handoff, credentials, and the native backend. The card

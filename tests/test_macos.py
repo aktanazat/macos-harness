@@ -10,8 +10,10 @@ from typing import NamedTuple, Never
 
 import pytest
 import Quartz
+import ScreenCaptureKit
 from Foundation import NSURL
 
+import macos_harness.capture as capture_module
 import macos_harness.macos as macos_module
 from macos_harness.capture import WindowCapture
 from macos_harness.errors import ErrorCode
@@ -2454,8 +2456,8 @@ def _png_pixel(path: Path, x: int, y: int) -> tuple[int, ...]:
 _WHITE = (255, 255, 255, 255)
 
 
-def _fake_window_capture(mac: MacOS, monkeypatch) -> None:
-    """Stand in for the OS: a 400x300pt window on another Space, rendered 2x."""
+def _fake_app(mac: MacOS, monkeypatch) -> None:
+    """Stand in for the OS: app Test, pid 42, frontmost, with one window, 7."""
     monkeypatch.setattr(mac, "_ensure_screen_recording", lambda: None)
     monkeypatch.setattr(
         mac, "_resolve_app", lambda app: (object(), {"name": "Test", "pid": 42})
@@ -2470,7 +2472,12 @@ def _fake_window_capture(mac: MacOS, monkeypatch) -> None:
     )
     monkeypatch.setattr(mac._overlay, "_send", lambda payload, *, start=True: None)
 
-    def capture_window(window_id, *, max_width, max_height, size=None, timeout=5.0):
+
+def _fake_window_capture(mac: MacOS, monkeypatch) -> None:
+    """Stand in for the OS: a 400x300pt window on another Space, rendered 2x."""
+    _fake_app(mac, monkeypatch)
+
+    def capture_window(window_id, *, max_width, max_height, catalog, size=None, timeout=5.0):
         return WindowCapture(
             image=_white_image(800, 600),
             width=800,
@@ -2526,6 +2533,147 @@ def test_see_does_not_draw_a_hidden_pointer(tmp_path: Path, monkeypatch) -> None
 
     assert hidden["virtual_pointer"]["visible"] is False
     assert _png_pixel(path, 404, 312) == _WHITE
+
+
+class _ServerWindow:
+    """One window of pid 42 as the window server lists it now."""
+
+    def __init__(self, window_id: int, bounds: tuple[float, float, float, float]) -> None:
+        self.window_id = window_id
+        self.bounds = bounds
+
+    def entry(self) -> dict[str, object]:
+        x, y, width, height = self.bounds
+        return {
+            "kCGWindowNumber": self.window_id,
+            "kCGWindowOwnerPID": 42,
+            "kCGWindowBounds": {"X": x, "Y": y, "Width": width, "Height": height},
+            "kCGWindowIsOnscreen": True,
+            "kCGWindowLayer": 0,
+        }
+
+
+class _ListedWindow:
+    """An ``SCWindow``: a window as it stood when ScreenCaptureKit listed it."""
+
+    def __init__(self, window: _ServerWindow) -> None:
+        self._window_id = window.window_id
+        self._bounds = window.bounds
+
+    def windowID(self) -> int:
+        return self._window_id
+
+    def frame(self) -> object:
+        return Quartz.CGRectMake(*self._bounds)
+
+    def isOnScreen(self) -> bool:
+        return True
+
+    def owningApplication(self) -> _ListedWindow:
+        return self
+
+    def processID(self) -> int:
+        return 42
+
+
+class _ListedContent(NamedTuple):
+    listed: list[_ListedWindow]
+
+    def windows(self) -> list[_ListedWindow]:
+        return self.listed
+
+    def displays(self) -> list[object]:
+        return []
+
+
+class _PictureFilter:
+    def pointPixelScale(self) -> float:
+        return 2.0
+
+
+class _ScreenCaptureKit:
+    """ScreenCaptureKit on a 2x display over ``windows``: each listing
+    counted and frozen as the windows stood, each picture white."""
+
+    def __init__(self, windows: list[_ServerWindow]) -> None:
+        self._windows = windows
+        self.listings = 0
+        self.SCShareableContent = self
+        self.SCContentFilter = self
+        self.SCScreenshotManager = self
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(ScreenCaptureKit, name)
+
+    def getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+        self, exclude_desktop: bool, on_screen_only: bool, handler
+    ) -> None:
+        self.listings += 1
+        handler(_ListedContent([_ListedWindow(each) for each in self._windows]), None)
+
+    def alloc(self) -> _ScreenCaptureKit:
+        return self
+
+    def initWithDesktopIndependentWindow_(self, window: _ListedWindow) -> _PictureFilter:
+        return _PictureFilter()
+
+    def captureImageWithFilter_configuration_completionHandler_(
+        self, content_filter: _PictureFilter, config, handler
+    ) -> None:
+        handler(_white_image(int(config.width()), int(config.height())), None)
+
+
+def _fake_screen(mac: MacOS, monkeypatch, windows: list[_ServerWindow]) -> _ScreenCaptureKit:
+    """Stand in for the OS as `_fake_app` does, with ``windows``, window 7
+    first, on screen as the list says now."""
+    _fake_app(mac, monkeypatch)
+    screen_capture_kit = _ScreenCaptureKit(windows)
+    monkeypatch.setattr(capture_module, "SCK", screen_capture_kit)
+    monkeypatch.setattr(
+        Quartz,
+        "CGWindowListCreateDescriptionFromArray",
+        lambda ids: [each.entry() for each in windows if each.window_id in ids],
+    )
+    monkeypatch.setattr(
+        Quartz,
+        "CGWindowListCopyWindowInfo",
+        lambda options, relative: [each.entry() for each in windows],
+    )
+    return screen_capture_kit
+
+
+def test_see_lists_windows_again_only_once_the_window_server_shows_a_move(
+    tmp_path: Path, monkeypatch
+) -> None:
+    mac = MacOS()
+    window = _ServerWindow(7, (100.0, 200.0, 400.0, 300.0))
+    screen_capture_kit = _fake_screen(mac, monkeypatch, [window])
+
+    first = mac.see("Test", path=tmp_path / "first.png")
+    again = mac.see("Test", path=tmp_path / "again.png")
+    window.bounds = (300.0, 250.0, 500.0, 300.0)
+    moved = mac.see("Test", path=tmp_path / "moved.png")
+
+    assert first["bounds"] == again["bounds"] == {
+        "x": 100.0, "y": 200.0, "width": 400.0, "height": 300.0
+    }
+    assert moved["bounds"] == {"x": 300.0, "y": 250.0, "width": 500.0, "height": 300.0}
+    assert (moved["width"], moved["height"]) == (1000, 600)
+    assert screen_capture_kit.listings == 2
+
+
+def test_see_lists_windows_again_once_the_app_shows_a_tip_over_its_window(
+    tmp_path: Path, monkeypatch
+) -> None:
+    mac = MacOS()
+    windows = [_ServerWindow(7, (100.0, 200.0, 400.0, 300.0))]
+    screen_capture_kit = _fake_screen(mac, monkeypatch, windows)
+
+    mac.see("Test", path=tmp_path / "plain.png")
+    windows.append(_ServerWindow(8, (150.0, 180.0, 120.0, 40.0)))
+    mac.see("Test", path=tmp_path / "tipped.png")
+
+    assert screen_capture_kit.listings == 2
 
 
 def test_unknown_element_index_carries_element_unknown_code() -> None:

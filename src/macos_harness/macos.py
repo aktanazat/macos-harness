@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
 from .capture import (
     GrayPrint,
     WindowCapture,
+    WindowCatalog,
     capture_screen,
     capture_window,
     changed_area,
@@ -1034,6 +1035,7 @@ class MacOS:
         self._last_capture: _Picture | None = None
         # The same for one window no `see` holds, at most 640 pixels a side.
         self._before_input: _Picture | None = None
+        self._capture_catalog = WindowCatalog()
         self._event_source = AS.CGEventSourceCreate(AS.kCGEventSourceStatePrivate)
         if self._event_source is None:
             raise MacOSError(
@@ -4481,8 +4483,8 @@ class MacOS:
             hide_pid=self._overlay.pid,
         )
 
-    @staticmethod
     def _window_image(
+        self,
         window_id: int,
         *,
         max_width: int | None,
@@ -4490,7 +4492,10 @@ class MacOS:
         size: tuple[int, int] | None = None,
     ) -> WindowCapture:
         """Render one window; the one capture `see` and `wait_change` take."""
-        return capture_window(window_id, max_width=max_width, max_height=max_height, size=size)
+        return capture_window(
+            window_id, max_width=max_width, max_height=max_height,
+            catalog=self._capture_catalog, size=size,
+        )
 
     @staticmethod
     def _indexed_window(

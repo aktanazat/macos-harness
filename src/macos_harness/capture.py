@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -131,6 +131,52 @@ def _shareable_content(timeout: float) -> object:
     if error is not None:
         raise _sck_error("Window enumeration", error)
     return content
+
+
+class WindowCatalog:
+    """ScreenCaptureKit's list of what it can capture, kept for the next
+    capture of the same window while the window server's own list, read in
+    about 0.3ms where ScreenCaptureKit takes 16ms, shows nothing that
+    capture reads has changed: the window's frame and whether it is on
+    screen, the frames of its app's on-screen windows, and the displays."""
+
+    def __init__(self) -> None:
+        self._kept: tuple[int, tuple[object, ...], object] | None = None
+
+    def content(self, window_id: int, timeout: float) -> object:
+        layout = _layout(window_id)
+        if self._kept is not None and self._kept[:2] == (window_id, layout):
+            return self._kept[2]
+        content = _shareable_content(timeout)
+        # A window that moved while the list was taken may be listed where
+        # it was or where it went, so that list serves this capture only.
+        self._kept = (window_id, layout, content) if _layout(window_id) == layout else None
+        return content
+
+    def forget(self) -> None:
+        self._kept = None
+
+
+def _layout(window_id: int) -> tuple[object, ...]:
+    window = next(iter(Quartz.CGWindowListCreateDescriptionFromArray([window_id]) or ()), {})
+    pid = window.get(Quartz.kCGWindowOwnerPID)
+    shown = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID
+    ) or ()
+    return (
+        _frame(window.get(Quartz.kCGWindowBounds)),
+        bool(window.get(Quartz.kCGWindowIsOnscreen, False)),
+        sorted(
+            (int(each[Quartz.kCGWindowNumber]), _frame(each.get(Quartz.kCGWindowBounds)))
+            for each in shown
+            if pid is not None and each.get(Quartz.kCGWindowOwnerPID) == pid
+        ),
+        displays(),
+    )
+
+
+def _frame(bounds: Mapping[str, float] | None) -> tuple[float, ...]:
+    return tuple(float((bounds or {}).get(key, 0)) for key in ("X", "Y", "Width", "Height"))
 
 
 def _window_in(windows: object, window_id: int) -> object:
@@ -261,6 +307,7 @@ def capture_window(
     *,
     max_width: int | None,
     max_height: int | None,
+    catalog: WindowCatalog,
     size: tuple[int, int] | None = None,
     timeout: float = CAPTURE_TIMEOUT,
 ) -> WindowCapture:
@@ -274,9 +321,11 @@ def capture_window(
     window rendered by itself (``desktopIndependentWindow``) is not clipped
     at the screen edge, and an off-screen one still renders, but from
     whatever the app last drew -- apps do not repaint hidden content, so
-    ``on_screen`` is the caller's only freshness signal.
+    ``on_screen`` is the caller's only freshness signal. ``catalog`` lends
+    the window list of an earlier capture of the window while the window,
+    its app's other windows, and the displays stand where they did.
     """
-    content = _shareable_content(timeout)
+    content = catalog.content(window_id, timeout)
     windows = content.windows()
     window = _window_in(windows, window_id)
     display = _crop_display(window, windows, content.displays())
@@ -313,8 +362,10 @@ def capture_window(
     )
     captured_at = time.time()
     if error is not None:
+        catalog.forget()
         raise _sck_error("Window capture", error, window_id=window_id)
     if image is None:
+        catalog.forget()
         raise MacOSError(
             f"Window capture returned no image for window {window_id}",
             code=ErrorCode.AX_ERROR,
