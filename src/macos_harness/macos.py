@@ -13,7 +13,6 @@ import json
 import math
 import operator
 import os
-import plistlib
 import re
 import subprocess
 import tempfile
@@ -22,8 +21,8 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
@@ -65,6 +64,7 @@ if TYPE_CHECKING:
     # annotation in this file a deferred string, so this import never
     # needs to run outside a type checker.
     from .native import NativeClient
+    from .routes import Routes
 
 try:
     import ApplicationServices as AS
@@ -1057,13 +1057,11 @@ class MacOS:
 
         from .controls import Accessibility
         from .ops import Operations
-        from .routes import Routes
 
         self._pointer_position: tuple[float, float] | None = None
         self._overlay = LivePointerOverlay()
         self.ax = Accessibility(self)
         self.do = Operations(self)
-        self.route = Routes(self)
         self._backend = _resolve_backend(backend)
         self._native_client: NativeClient | None = None
         self._native_error: Exception | None = None
@@ -1351,6 +1349,12 @@ class MacOS:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    @cached_property
+    def route(self) -> Routes:
+        from .routes import Routes
+
+        return Routes(self)
+
     # --- permissions and app discovery ---------------------------------
 
     def is_accessibility_trusted(self) -> bool:
@@ -1549,6 +1553,8 @@ class MacOS:
     def _bundle_info(path: str | None) -> dict[str, object]:
         if path is None:
             return {}
+        import plistlib
+
         try:
             with (Path(path) / "Contents" / "Info.plist").open("rb") as source:
                 info = plistlib.load(source)
@@ -3023,6 +3029,8 @@ class MacOS:
             set_timeout(element, _AX_CROSS_APP_MESSAGING_TIMEOUT)
             error, _ = copy_value(element, "AXRole", None)
             return error == cannot_complete
+
+        from concurrent.futures import ThreadPoolExecutor
 
         with ThreadPoolExecutor(max_workers=_AX_PROBE_WORKERS) as pool:
             quiet = tuple(pool.map(silent, pids))

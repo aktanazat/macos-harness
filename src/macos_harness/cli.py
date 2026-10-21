@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import code
-import difflib
 import inspect
 import json
 import re
@@ -108,6 +106,8 @@ def _nearness(missing: str, name: str) -> float:
     """How likely ``name`` is the call ``missing`` meant: a name one word
     apart from it ranks just below the same name, and any other by how
     alike the two are spelled."""
+    import difflib
+
     if missing.startswith(f"{name}_") or name.startswith(f"{missing}_"):
         return 0.95
     return difflib.SequenceMatcher(None, missing, name).ratio()
@@ -327,6 +327,8 @@ def main(argv: list[str] | None = None) -> int:
             result = 0
             return result
         if args.command == "repl":
+            import code
+
             with _namespace() as namespace:
                 code.interact(
                     banner=(

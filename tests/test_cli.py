@@ -279,6 +279,25 @@ def test_stdin_unknown_name_lists_the_nearest_calls(program, nearest) -> None:
     assert [line.strip() for line in lines[listed + 1 :]] == nearest
 
 
+def test_a_step_loads_no_module_only_a_rarer_call_needs() -> None:
+    """Every stdin step pays for each module it loads: the REPL, the
+    nearest-call hint, the cross-app sweep, the bundle versions and
+    `mac.route` cost a step 5ms of about 130 when loaded up front."""
+    program = (
+        "import sys\n"
+        "rare = {'code', 'concurrent.futures', 'difflib', 'macos_harness.routes', 'plistlib'}\n"
+        "print(sorted(rare & set(sys.modules)))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "macos_harness.cli"],
+        input=program, text=True, capture_output=True, timeout=10, check=False,
+        env={**os.environ, "DO_NOT_TRACK": "1", "MACOS_HARNESS_BACKEND": "python"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "[]\n"
+
+
 def _harness(*argv: str) -> subprocess.CompletedProcess[str]:
     """``macos-harness`` with ``argv``, in its own process."""
     return subprocess.run(

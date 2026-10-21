@@ -86,6 +86,12 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- A stdin step no longer loads the REPL, the nearest-call hint, the
+  cross-app sweep's thread pool, the bundle-version reader, or
+  `mac.route` before it needs them; `mac.route` is built on first use.
+  An empty step starts in about 124ms instead of 130ms (two sets of 60
+  runs each). The rest is the Accessibility, Core Graphics, and
+  ScreenCaptureKit bindings every step loads, about 110ms.
 - A `mac.do.key`, `click`, `type`, or `status_item` with no postcondition
   watches focus until 100ms after dispatch, the readings' own time
   included, instead of waiting ten 10ms polls on top of eleven readings.
