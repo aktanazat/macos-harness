@@ -133,15 +133,49 @@ def _shareable_content(timeout: float) -> object:
     return content
 
 
-def shareable_window(window_id: int, *, timeout: float = CAPTURE_TIMEOUT) -> Any:
-    """Return the ``SCWindow`` for a Core Graphics window number."""
-    for window in _shareable_content(timeout).windows():
+def _window_in(windows: object, window_id: int) -> object:
+    """The ``SCWindow`` for a Core Graphics window number."""
+    for window in windows:
         if int(window.windowID()) == window_id:
             return window
     raise MacOSError(
         f"Window {window_id} is not capturable; it may have closed",
         code=ErrorCode.ELEMENT_UNKNOWN,
         details={"window_id": window_id},
+    )
+
+
+def _owner_pid(window: object) -> int | None:
+    app = window.owningApplication()
+    return None if app is None else int(app.processID())
+
+
+def _crop_display(window: object, windows: object, displays: object) -> object | None:
+    """The display to cut ``window`` out of, or ``None`` to render the
+    window by itself.
+
+    Rendered by itself, a window brings the sheets, popovers, and tips
+    attached to it, and ScreenCaptureKit shrinks the whole group into the
+    window's pixels: a tip over Calculator's top edge halved it. So when
+    another on-screen window of the same app overlaps ``window`` and reaches
+    past its edge, the window is cut out of the display it lies on instead,
+    with what is attached drawn where it sits and the rest cut off. A window
+    not wholly on one display is still rendered by itself.
+    """
+    frame = window.frame()
+    pid = _owner_pid(window)
+    overhung = pid is not None and any(
+        other.isOnScreen()
+        and Quartz.CGRectIntersectsRect(other.frame(), frame)
+        and not Quartz.CGRectContainsRect(frame, other.frame())
+        and _owner_pid(other) == pid
+        for other in windows
+    )
+    if not overhung:
+        return None
+    return next(
+        (display for display in displays if Quartz.CGRectContainsRect(display.frame(), frame)),
+        None,
     )
 
 
@@ -190,9 +224,8 @@ def _output_size(
 
 
 def _window_configuration(width: int, height: int) -> object:
-    """How one window renders: into exactly ``width`` x ``height`` pixels,
-    shrunk to fit but never enlarged, with no shadow, no cursor, and, from
-    macOS 14.2, no window but that one."""
+    """How a window renders by itself: into exactly ``width`` x ``height``
+    pixels, shrunk to fit but never enlarged, with no shadow and no cursor."""
     config = SCK.SCStreamConfiguration.alloc().init()
     config.setWidth_(width)
     config.setHeight_(height)
@@ -204,11 +237,22 @@ def _window_configuration(width: int, height: int) -> object:
     config.setIgnoreShadowsSingleWindow_(True)
     config.setIgnoreGlobalClipSingleWindow_(True)
     config.setShouldBeOpaque_(False)
-    # ScreenCaptureKit otherwise draws the windows attached to this one too
-    # and shrinks the group into this window's pixels: an overhanging tip
-    # halved Calculator. The switch arrived in macOS 14.2.
-    if config.respondsToSelector_("setIncludeChildWindows:"):
-        config.setIncludeChildWindows_(False)
+    return config
+
+
+def _crop_configuration(frame: object, screen: object, width: int, height: int) -> object:
+    """How a window at ``frame`` is cut out of the display at ``screen``
+    (both in global points): into exactly ``width`` x ``height`` pixels,
+    with no shadow and no cursor."""
+    config = SCK.SCStreamConfiguration.alloc().init()
+    config.setSourceRect_(Quartz.CGRectOffset(frame, -screen.origin.x, -screen.origin.y))
+    config.setWidth_(width)
+    config.setHeight_(height)
+    config.setPixelFormat_(_PIXEL_FORMAT_BGRA)
+    config.setCaptureResolution_(SCK.SCCaptureResolutionBest)
+    config.setShowsCursor_(False)
+    config.setIgnoreShadowsDisplay_(True)
+    config.setShouldBeOpaque_(False)
     return config
 
 
@@ -225,19 +269,24 @@ def capture_window(
     ``None`` for either bound keeps the window's native pixel size on that
     axis; ``size`` asks for exactly that many pixels instead, so a later
     capture compares pixel for pixel with an earlier one. The window is
-    captured on its own (``desktopIndependentWindow``): no shadow, no other
-    window (from macOS 14.2 not even a sheet, popover, or tip attached to
-    it), and no clipping at the screen edge. An
-    off-screen window still renders, but from whatever the app last drew --
-    apps do not repaint hidden content, so ``on_screen`` is the caller's
-    only freshness signal.
+    captured on its own: no shadow and no other window, but any sheet,
+    popover, or tip attached to it drawn where it sits over the window. A
+    window rendered by itself (``desktopIndependentWindow``) is not clipped
+    at the screen edge, and an off-screen one still renders, but from
+    whatever the app last drew -- apps do not repaint hidden content, so
+    ``on_screen`` is the caller's only freshness signal.
     """
-    window = shareable_window(window_id, timeout=timeout)
-    content_filter = SCK.SCContentFilter.alloc().initWithDesktopIndependentWindow_(
-        window
+    content = _shareable_content(timeout)
+    windows = content.windows()
+    window = _window_in(windows, window_id)
+    display = _crop_display(window, windows, content.displays())
+    content_filter = (
+        SCK.SCContentFilter.alloc().initWithDesktopIndependentWindow_(window)
+        if display is None
+        else SCK.SCContentFilter.alloc().initWithDisplay_includingWindows_(display, [window])
     )
     scale = float(content_filter.pointPixelScale())
-    bounds = _points(content_filter.contentRect())
+    bounds = _points(window.frame())
     natural_width = bounds["width"] * scale
     natural_height = bounds["height"] * scale
     if natural_width < 1 or natural_height < 1:
@@ -247,7 +296,11 @@ def capture_window(
             details={"window_id": window_id, "bounds": bounds},
         )
     width, height = size or _output_size(natural_width, natural_height, max_width, max_height)
-    config = _window_configuration(width, height)
+    config = (
+        _window_configuration(width, height)
+        if display is None
+        else _crop_configuration(window.frame(), display.frame(), width, height)
+    )
 
     image, error = _await(
         lambda handler: (
