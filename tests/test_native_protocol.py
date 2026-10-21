@@ -25,6 +25,7 @@ from macos_harness.macos import (
     AccessibilityPermissionError,
     ApplicationNotFoundError,
     FocusChangedError,
+    MacOS,
     MacOSError,
 )
 from macos_harness.native import (
@@ -35,6 +36,7 @@ from macos_harness.native import (
     NativeProtocolError,
     _NativeHandle,
 )
+from macos_harness.receipts import Acted, JSONValue, OperationError, Outcome, equals
 
 #: Sentinel script entries.
 CLOSE = object()  # drop the connection without responding
@@ -148,8 +150,15 @@ def _ping_result(**overrides: Any) -> dict[str, Any]:
     return result
 
 
+def _query_result(
+    *matches: dict[str, JSONValue], complete: bool = True
+) -> dict[str, JSONValue]:
+    """An ``ax_query`` answer as a protocol-2 agent frames it."""
+    return {"matches": list(matches), "complete": complete, "visited": len(matches)}
+
+
 def test_handshake_rejects_protocol_major_mismatch() -> None:
-    agent = _FakeAgent([_ok(1, _ping_result(protocol=2))])
+    agent = _FakeAgent([_ok(1, _ping_result(protocol=PROTOCOL_VERSION + 1))])
     try:
         client = _client(agent)
         with pytest.raises(NativeProtocolError, match="protocol"):
@@ -176,7 +185,7 @@ def test_handshake_rejects_protocol_major_mismatch() -> None:
 def test_error_codes_map_to_expected_exception(
     code: str, expected: type[MacOSError]
 ) -> None:
-    ax_error = -25200 if code == "ax.error" else None
+    ax_error = {"ax.error": -25200, "timeout": -25204}.get(code)
     agent = _FakeAgent(
         [_ok(1, _ping_result()), _err(2, code, f"boom: {code}", ax_error=ax_error)]
     )
@@ -212,6 +221,61 @@ def test_malformed_json_line_raises_and_connection_survives() -> None:
         assert client.generation == 1
         assert client.list_apps() == []
         assert client.generation == 1
+    finally:
+        agent.close()
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        pytest.param({"matches": []}, id="no-completeness"),
+        pytest.param({"matches": [], "complete": 1, "visited": 0}, id="int-complete"),
+        pytest.param({"matches": [], "complete": True, "visited": True}, id="bool-visited"),
+        pytest.param({"matches": [], "complete": True, "visited": 2.0}, id="float-visited"),
+    ],
+)
+def test_query_without_a_trustworthy_completeness_is_malformed(
+    result: dict[str, JSONValue],
+) -> None:
+    """A protocol-1 agent answered ``ax_query`` with matches alone. That
+    answer says nothing about whether the search saw every candidate, and
+    `MacOS.ax_wait` decides uniqueness from it, so the client must refuse
+    rather than assume either way."""
+    agent = _FakeAgent([_ok(1, _ping_result()), _ok(2, result)])
+    try:
+        client = _client(agent)
+        client.connect()
+        with pytest.raises(NativeProtocolError, match="Malformed ax_query") as excinfo:
+            client.query({"text": "Not Now", "reset_elements": False})
+        assert excinfo.value.code == ErrorCode.AX_ERROR
+        assert client.connected is True
+    finally:
+        agent.close()
+
+
+def test_error_details_from_the_agent_reach_the_caller() -> None:
+    """The agent says which bound stopped a press search in ``details``;
+    the client merges them so a timed-out press can report them."""
+    error = {
+        "code": "element.unknown",
+        "message": "found 0",
+        "details": {"complete": False, "visited": 500},
+    }
+    payload = {"id": 2, "ok": False, "error": error}
+    agent = _FakeAgent(
+        [
+            _ok(1, _ping_result()),
+            (json.dumps(payload, separators=(",", ":")) + "\n").encode(),
+        ]
+    )
+    try:
+        client = _client(agent)
+        client.connect()
+        with pytest.raises(MacOSError) as excinfo:
+            client.press({"text": "Not Now"})
+        assert excinfo.value.code == ErrorCode.ELEMENT_UNKNOWN
+        assert excinfo.value.details["complete"] is False
+        assert excinfo.value.details["visited"] == 500
     finally:
         agent.close()
 
@@ -299,7 +363,7 @@ def test_write_side_cap_counts_the_trailing_newline(
     ~110-byte response so ``connect()`` still succeeds normally.
     """
     monkeypatch.setattr(native_module, "MAX_LINE_BYTES", 4096)
-    agent = _FakeAgent([_ok(1, _ping_result()), _ok(2, {"matches": []})])
+    agent = _FakeAgent([_ok(1, _ping_result()), _ok(2, _query_result())])
     try:
         client = _client(agent)
         client.connect()
@@ -426,7 +490,7 @@ def test_stale_generation_handle_rejected_without_wire_call() -> None:
     agent = _FakeAgent(
         [
             _ok(1, _ping_result()),  # connect() handshake -> generation 1
-            _ok(2, {"matches": []}),  # query(reset_elements=True) -> generation 2
+            _ok(2, _query_result()),  # query(reset_elements=True) -> generation 2
         ]
     )
     try:
@@ -486,8 +550,8 @@ def test_full_operation_surface_round_trips() -> None:
     match = {"handle": 11, "role": "AXButton", "title": "Not Now"}
     responses = [
         _ok(1, _ping_result()),  # connect handshake
-        _ok(2, {"matches": [match]}),  # query
-        _ok(3, {"attributes": {"AXValue": "hello"}}),  # get
+        _ok(2, _query_result(match)),  # query
+        _ok(3, {"value": "hello"}),  # get
         _ok(
             4, {"attributes": {"AXValue": "hello", "AXTitle": "Not Now"}}
         ),  # get_attributes
@@ -498,9 +562,11 @@ def test_full_operation_surface_round_trips() -> None:
     agent = _FakeAgent(responses)
     try:
         client = _client(agent)
-        matches = client.query({"text": "Not Now", "reset_elements": True})
-        assert matches == [match]
-        handle = _NativeHandle(client, matches[0]["handle"], client.generation)
+        result = client.query({"text": "Not Now", "reset_elements": True})
+        assert result.matches == [match]
+        assert result.complete is True
+        assert result.visited == 1
+        handle = _NativeHandle(client, result.matches[0]["handle"], client.generation)
 
         assert client.get(handle, "AXValue") == "hello"
         assert client.get_attributes(handle, ["AXValue", "AXTitle"]) == {
@@ -509,7 +575,7 @@ def test_full_operation_surface_round_trips() -> None:
         }
         client.set(handle, "AXValue", "world")
         client.perform(handle, "AXPress")
-        pressed = client.press({"text": "Not Now"})
+        pressed = client.press({"app_pid": 55, "text": "Not Now", "action_deadline": None})
         assert pressed == match
         with pytest.raises(MacOSError, match="stale") as exc_info:
             client.get(handle, "AXValue")
@@ -522,8 +588,8 @@ def test_full_operation_surface_round_trips() -> None:
         assert query_request["params"] == {"text": "Not Now", "reset_elements": True}
 
         get_request = json.loads(agent.received[2])
-        assert get_request["op"] == "ax_element_get"
-        assert get_request["params"] == {"handle": 11, "attributes": ["AXValue"]}
+        assert get_request["op"] == "ax_element_get_value"
+        assert get_request["params"] == {"handle": 11, "attribute": "AXValue"}
 
         get_attrs_request = json.loads(agent.received[3])
         assert get_attrs_request["op"] == "ax_element_get"
@@ -546,7 +612,185 @@ def test_full_operation_surface_round_trips() -> None:
 
         press_request = json.loads(agent.received[6])
         assert press_request["op"] == "ax_press"
-        assert press_request["params"] == {"text": "Not Now"}
+        assert press_request["params"] == {"app_pid": 55, "text": "Not Now", "action_deadline": None}
+    finally:
+        agent.close()
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {},
+        # The best-effort batch shape, where a refused slot is a `null`:
+        # the one answer a required read must never accept as a value.
+        {"attributes": {"AXValue": None}},
+    ],
+    ids=["empty", "batch-shape"],
+)
+def test_single_read_result_without_a_value_key_is_a_protocol_error(
+    result: dict[str, object],
+) -> None:
+    agent = _FakeAgent([_ok(1, _ping_result()), _ok(2, result)])
+    try:
+        client = _client(agent)
+        client.connect()
+        handle = _NativeHandle(client, 11, client.generation)
+        with pytest.raises(NativeProtocolError, match="ax_element_get_value"):
+            client.get(handle, "AXValue")
+    finally:
+        agent.close()
+
+
+def test_single_read_explicit_null_is_a_value() -> None:
+    agent = _FakeAgent([_ok(1, _ping_result()), _ok(2, {"value": None})])
+    try:
+        client = _client(agent)
+        client.connect()
+        handle = _NativeHandle(client, 11, client.generation)
+        assert client.get(handle, "AXValue") is None
+    finally:
+        agent.close()
+
+
+def test_single_read_against_an_older_agent_is_refused_not_downgraded() -> None:
+    """An agent binary that predates ``ax_element_get_value`` answers
+    ``unsupported_op``; the client surfaces that verbatim rather than
+    retrying through the lossy batch op it could have used instead."""
+    agent = _FakeAgent(
+        [
+            _ok(1, _ping_result()),
+            _err(2, "unsupported_op", 'Unsupported operation "ax_element_get_value"'),
+        ]
+    )
+    try:
+        client = _client(agent)
+        client.connect()
+        handle = _NativeHandle(client, 11, client.generation)
+        with pytest.raises(MacOSError, match="Unsupported operation") as exc_info:
+            client.get(handle, "AXValue")
+        assert exc_info.value.code == "unsupported_op"
+        agent.join(timeout=2.0)
+        assert [json.loads(line)["op"] for line in agent.received] == [
+            "ping",
+            "ax_element_get_value",
+        ]
+    finally:
+        agent.close()
+
+
+# --- consumer consequences: a refused single read reaches mac.do ----------
+
+
+def _native_mac(
+    monkeypatch: pytest.MonkeyPatch, agent: _FakeAgent
+) -> tuple[MacOS, int]:
+    """A real ``MacOS`` whose one interned element is a live native handle
+    over ``agent``'s socket, with app resolution, target discovery, and the
+    focus guard pinned so the only thing between ``mac.do`` and the wire is
+    the production read path under test."""
+    client = _client(agent)
+    client.connect()
+    mac = MacOS(backend="native")
+    index = mac._remember_element(_NativeHandle(client, 11, client.generation))
+    app_info = {"pid": 41, "name": "Demo", "bundle_id": "com.example.demo"}
+    match = {
+        "element_index": index,
+        "role": "AXCheckBox",
+        "title": "Enabled",
+        "description": None,
+        "identifier": None,
+        "actions": ["AXPress"],
+        "app": app_info,
+    }
+    monkeypatch.setattr(mac, "_resolve_app", lambda query: (object(), dict(app_info)))
+    monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
+    monkeypatch.setattr(mac, "ax_wait", lambda **kwargs: dict(match))
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: dict(app_info))
+    monkeypatch.setattr(mac, "_guard_focus", lambda before, target_pid, operation: None)
+    return mac, index
+
+
+def test_toggle_never_presses_a_control_whose_state_it_could_not_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrong-direction bug: a refused ``AXValue`` read once arrived as
+    ``None``, read as "currently off", and ``toggle(False)`` reported
+    ``already`` (or ``toggle(True)`` pressed an already-on control off)."""
+    agent = _FakeAgent(
+        [
+            _ok(1, _ping_result()),
+            _err(2, "timeout", "Read AXValue from element 11 failed", ax_error=-25204),
+        ]
+    )
+    try:
+        mac, _ = _native_mac(monkeypatch, agent)
+        with pytest.raises(OperationError) as caught:
+            mac.do.toggle(False, app="Demo", text="Enabled")
+        receipt = caught.value.receipt
+        assert receipt.outcome is Outcome.FAILED
+        assert receipt.acted is Acted.NO
+        assert receipt.changed is False
+        assert receipt.verified is False
+        assert receipt.error is not None
+        assert receipt.error["code"] == "timeout"
+        assert receipt.error["details"]["ax_error"] == -25204
+        agent.join(timeout=2.0)
+        assert [json.loads(line)["op"] for line in agent.received] == [
+            "ping",
+            "ax_element_get_value",
+        ]
+    finally:
+        agent.close()
+
+
+def test_press_with_a_null_expectation_fails_on_a_refused_read_and_replays_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``equals(value=None)`` once verified against the ``None`` a refused
+    read produced. The press still happened, so the receipt keeps
+    ``acted=yes`` with ``verified=False``, and recalling the token returns
+    that failure without pressing again."""
+    agent = _FakeAgent(
+        [
+            _ok(1, _ping_result()),
+            _err(2, "timeout", "Read AXValue from element 11 failed", ax_error=-25204),
+        ]
+    )
+    try:
+        mac, index = _native_mac(monkeypatch, agent)
+        presses: list[object] = []
+        pressed = {
+            "element_index": index,
+            "role": "AXButton",
+            "title": "Save",
+            "actions": ["AXPress"],
+            "app": {"pid": 41, "name": "Demo", "bundle_id": "com.example.demo"},
+        }
+        monkeypatch.setattr(
+            mac, "ax_press", lambda **kwargs: presses.append(kwargs) or dict(pressed)
+        )
+        with pytest.raises(OperationError) as caught:
+            mac.do.press(
+                app="Demo",
+                text="Save",
+                once="null-witness",
+                postcondition=equals("Enabled", value=None),
+            )
+        receipt = caught.value.receipt
+        assert receipt.outcome is Outcome.FAILED
+        assert receipt.acted is Acted.YES
+        assert receipt.verified is False
+        assert receipt.changed is None
+        assert receipt.error is not None
+        assert receipt.error["code"] == "timeout"
+        assert len(presses) == 1
+
+        with pytest.raises(OperationError) as replayed:
+            mac.do.recall("null-witness")
+        assert replayed.value.receipt.replayed is True
+        assert replayed.value.receipt.outcome is Outcome.FAILED
+        assert replayed.value.receipt.verified is False
+        assert len(presses) == 1
     finally:
         agent.close()
 
@@ -656,7 +900,7 @@ def test_protocol_mismatch_is_not_the_connection_error_subclass() -> None:
     the agent; it must stay a plain ``NativeProtocolError`` a
     ``backend="auto"`` caller narrowly catching ``NativeConnectionError``
     will never swallow."""
-    agent = _FakeAgent([_ok(1, _ping_result(protocol=2))])
+    agent = _FakeAgent([_ok(1, _ping_result(protocol=PROTOCOL_VERSION + 1))])
     try:
         client = _client(agent)
         with pytest.raises(NativeProtocolError) as excinfo:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import gc
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -12,19 +14,28 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import pytest
 
-from macos_harness.errors import ErrorCode, FocusChangedError, MacOSError
+from macos_harness import receipt_log
+from macos_harness.errors import (
+    ApplicationNotFoundError,
+    ErrorCode,
+    FocusChangedError,
+    MacOSError,
+)
+from macos_harness.macos import MacOS, _AppIdentity
 from macos_harness.ops import Operations
 from macos_harness.receipts import (
     Acted,
     Executor,
     OperationError,
     Outcome,
+    Receipt,
     canonical_json,
     canonicalize,
+    equals,
     gone,
     present,
 )
@@ -32,6 +43,7 @@ from macos_harness.receipts import (
 
 class FakeAX:
     _ALIASES: ClassVar[dict[str, str]] = {
+        "any": "AXAnyTypeSearchKey",
         "button": "AXButtonSearchKey",
         "checkbox": "AXCheckBoxSearchKey",
         "textfield": "AXTextFieldSearchKey",
@@ -49,10 +61,19 @@ class FakeAX:
             raise MacOSError("Unsupported role", code=ErrorCode.BAD_REQUEST) from exc
 
 
+class _Window(NamedTuple):
+    window_id: int
+    origin: tuple[float, float]
+
+
 class FakeHost:
     def __init__(self) -> None:
         self._backend = "python"
+        self._native_client: object | None = None
         self.ax = FakeAX()
+        self.identity = _AppIdentity(41, "com.example.demo", 1000.0, "Demo", None)
+        self.process_running = True
+        self.process_error: MacOSError | None = None
         self.app_info: dict[str, object] = {
             "pid": 41,
             "name": "Demo",
@@ -92,11 +113,46 @@ class FakeHost:
         self.press_calls: list[dict[str, object]] = []
         self.press_results: deque[dict[str, object] | BaseException] = deque()
         self.press_hook: Callable[[], None] | None = None
+        # A `MacOSError` queued here is raised by that `_focus_sample` call.
+        self.focus_samples: deque[dict[str, object] | MacOSError] = deque()
+        self.focus_hook: Callable[[], None] | None = None
+        self.frontmost_hook: Callable[[], None] | None = None
+        self.focus_sample: dict[str, object] = {
+            "frontmost_pid": 41,
+            "window": "Untitled",
+            "focused": {"role": "AXTextArea", "value": "old", "selected_range": {"location": 3, "length": 0}},
+        }
+        self.focus_sample_calls = 0
+        self.click_calls: list[dict[str, object]] = []
+        self.click_error: BaseException | None = None
+        self.type_calls: list[tuple[str, str | int | None]] = []
+        self.type_error: BaseException | None = None
+        self.screen_point_error: MacOSError | None = None
+        self.screen_point_calls: list[dict[str, object]] = []
+        self.target_window_error: MacOSError | None = None
+        self.target_window_calls: list[tuple[int, tuple[float, float], int | None]] = []
+        self.screenshots_used: list[object] = []
 
     def _resolve_app(self, query: str | int | None) -> tuple[object, dict[str, object]]:
         if query is None:
             raise MacOSError("missing app", code=ErrorCode.BAD_REQUEST)
         return object(), dict(self.app_info)
+
+    def _process_identity(self, query: str | int) -> _AppIdentity:
+        if self.process_error is not None:
+            raise self.process_error
+        if not self.process_running:
+            raise ApplicationNotFoundError("App exited")
+        return self.identity
+
+    def _identity_from_info(self, info: dict[str, object]) -> _AppIdentity:
+        return self._process_identity(info["pid"])
+
+    def exit(self) -> None:
+        self.process_running = False
+
+    _same_process = MacOS._same_process
+    _observe_process = MacOS._observe_process
 
     def _ensure_accessibility(self) -> None:
         self.ensure_accessibility_calls += 1
@@ -109,7 +165,63 @@ class FakeHost:
         if self.validation_error is not None:
             raise self.validation_error
 
+    def _validate_button(self, button: str) -> str:
+        if button.casefold() not in {"left", "right", "middle"}:
+            raise MacOSError(
+                f"Unknown mouse button {button!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "button", "value": button},
+            )
+        return button.casefold()
+
+    def _validate_clicks(self, clicks: int) -> int:
+        if not 1 <= clicks <= 3:
+            raise MacOSError(
+                f"clicks must be a count from 1 to 3, not {clicks!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "clicks", "value": clicks, "limit": 3},
+            )
+        return clicks
+
+    def _use_screenshot(self, screenshot: object) -> None:
+        self.screenshots_used.append(screenshot)
+
+    def _screen_point(
+        self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
+    ) -> tuple[float, float]:
+        self.screen_point_calls.append(
+            {"x": x, "y": y, "coordinate_space": coordinate_space, "pid": pid}
+        )
+        if self.screen_point_error is not None:
+            raise self.screen_point_error
+        if coordinate_space == "screen":
+            return float(x), float(y)
+        return float(x) + 100.0, float(y) + 200.0
+
+    def _target_window(
+        self, pid: int, point: tuple[float, float], window_id: int | None = None
+    ) -> _Window:
+        """The app's window under ``point``, or the one ``window_id`` names."""
+        self.target_window_calls.append((pid, point, window_id))
+        if self.target_window_error is not None:
+            raise self.target_window_error
+        return _Window(7 if window_id is None else window_id, (100.0, 200.0))
+
+    def _focus_sample(self, pid: int) -> dict[str, object]:
+        assert pid == 41
+        self.focus_sample_calls += 1
+        if self.focus_hook is not None:
+            self.focus_hook()
+        if self.focus_samples:
+            sample = self.focus_samples.popleft()
+            if isinstance(sample, MacOSError):
+                raise sample
+            self.focus_sample = sample
+        return copy.deepcopy(self.focus_sample)
+
     def _frontmost_app(self) -> dict[str, object]:
+        if self.frontmost_hook is not None:
+            self.frontmost_hook()
         return dict(self.app_info)
 
     def _guard_focus(
@@ -135,9 +247,11 @@ class FakeHost:
         self.wait_calls.append(dict(kwargs))
         if self.wait_hook is not None:
             self.wait_hook()
-        if (kwargs.get("all_apps") or kwargs.get("apps") is not None) and kwargs.get("text") is None:
+        cross_app = kwargs.get("all_apps") or kwargs.get("apps") is not None
+        exact = any(kwargs.get(name) for name in ("title", "identifier", "description"))
+        if cross_app and kwargs.get("text") is None and not exact:
             raise MacOSError(
-                "Cross-app search requires text",
+                "Cross-app AX search requires non-empty text or an exact selector",
                 code=ErrorCode.BAD_REQUEST,
             )
         if self.wait_results:
@@ -198,6 +312,26 @@ class FakeHost:
             self.key_hook()
         if self.key_error is not None:
             raise self.key_error
+
+    def _post_click(
+        self,
+        pid: int,
+        point: tuple[float, float],
+        window: _Window,
+        *,
+        button: str,
+        clicks: int,
+    ) -> None:
+        self.click_calls.append(
+            {"pid": pid, "point": point, "window_id": window.window_id, "button": button, "clicks": clicks}
+        )
+        if self.click_error is not None:
+            raise self.click_error
+
+    def type(self, text: str, *, app: str | int | None = None) -> None:
+        self.type_calls.append((text, app))
+        if self.type_error is not None:
+            raise self.type_error
 
 
 def _exit_script(returncode: int = 0, *, stdout: bytes = b"", stderr: bytes = b"") -> str:
@@ -328,16 +462,18 @@ def _ops(
     *,
     spawn: PopenFactory | None = None,
     monotonic: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    wall_clock: Callable[[], float] | None = None,
 ) -> tuple[FakeHost, Operations]:
     host = FakeHost()
-    if spawn is None and monotonic is None:
-        return host, Operations(host)
-    if spawn is None:
-        assert monotonic is not None
-        return host, Operations(host, _monotonic=monotonic)
-    if monotonic is None:
-        return host, Operations(host, _spawn=spawn)
-    return host, Operations(host, _spawn=spawn, _monotonic=monotonic)
+    kwargs: dict[str, object] = {"_sleep": sleep if sleep is not None else lambda _seconds: None}
+    if spawn is not None:
+        kwargs["_spawn"] = spawn
+    if monotonic is not None:
+        kwargs["_monotonic"] = monotonic
+    if wall_clock is not None:
+        kwargs["_wall_clock"] = wall_clock
+    return host, Operations(host, **kwargs)
 
 
 def _failed(call: Callable[[], object]) -> OperationError:
@@ -380,6 +516,24 @@ def _delayed_clock(
         return start if calls <= calls_before_jump else jump_to
 
     return _monotonic
+
+
+class _SleepClock:
+    """A monotonic clock that only advances inside ``sleep``: every read
+    between two sleeps returns the same instant, so a polling loop's
+    deadline arithmetic depends on the sleeps it asked for and never on
+    how many times it happened to read the clock."""
+
+    def __init__(self, start: float = 100.0) -> None:
+        self.now = start
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
 def test_operations_weak_host_matches_other_child_surfaces() -> None:
@@ -548,24 +702,6 @@ def test_press_replay_does_not_resolve_again() -> None:
     assert len(host.press_calls) == 1
 
 
-def test_press_uses_one_deadline_and_verifies_present() -> None:
-    clock = iter((100.0, 101.0, 102.0, 103.0, 104.0))
-    host, operations = _ops(monotonic=lambda: next(clock))
-
-    receipt = operations.press(
-        app="Demo",
-        text="Save",
-        timeout=5.0,
-        postcondition=present("Saved", role="button"),
-    )
-
-    assert host.press_calls[0]["timeout"] == pytest.approx(3.0)
-    assert host.wait_calls[0]["timeout"] == pytest.approx(2.0)
-    assert host.wait_calls[0]["app"] == "Demo"
-    assert receipt.duration_s == pytest.approx(4.0)
-    assert receipt.verified is True
-
-
 def test_press_verifies_gone_with_inherited_scope() -> None:
     host, operations = _ops()
 
@@ -579,6 +715,71 @@ def test_press_verifies_gone_with_inherited_scope() -> None:
     assert receipt.verified is True
     assert host.gone_calls[0]["app"] == "Demo"
     assert host.gone_calls[0]["search_key"] == "AXButtonSearchKey"
+
+
+def test_press_exact_selectors_reach_the_dispatch_the_receipt_and_the_postcondition() -> None:
+    """An exact selector is part of what was asked, so it must reach the
+    press, be recorded in the receipt (a replay with a different exact
+    selector is a different request), and reach the wait that verifies
+    the postcondition."""
+    host, operations = _ops()
+
+    receipt = operations.press(
+        app="Demo",
+        text="Save",
+        title="Save",
+        identifier="_NS:9",
+        postcondition=present(identifier="_NS:10", description="Saved"),
+    )
+
+    assert receipt.outcome is Outcome.DONE
+    assert host.press_calls[0]["title"] == "Save"
+    assert host.press_calls[0]["identifier"] == "_NS:9"
+    assert host.press_calls[0]["description"] is None
+    assert receipt.request["title"] == "Save"
+    assert receipt.request["identifier"] == "_NS:9"
+    assert receipt.request["description"] is None
+    assert receipt.request["postcondition"]["text"] is None
+    assert receipt.request["postcondition"]["identifier"] == "_NS:10"
+    assert receipt.request["postcondition"]["description"] == "Saved"
+    assert host.wait_calls[0]["identifier"] == "_NS:10"
+    assert host.wait_calls[0]["description"] == "Saved"
+    assert host.wait_calls[0]["text"] is None
+
+
+def test_press_gone_postcondition_with_only_an_exact_selector_is_verified() -> None:
+    host, operations = _ops()
+
+    receipt = operations.press(
+        app="Demo",
+        text="Save",
+        postcondition=gone(title="Save", role="button"),
+    )
+
+    assert receipt.verified is True
+    assert host.gone_calls[0]["title"] == "Save"
+    assert host.gone_calls[0]["text"] is None
+
+
+@pytest.mark.parametrize("field", ["title", "identifier", "description"])
+def test_press_rejects_an_empty_exact_selector_before_dispatch(field: str) -> None:
+    host, operations = _ops()
+
+    with pytest.raises(MacOSError, match=f"{field} must be a non-empty str") as exc_info:
+        operations.press(app="Demo", text="Save", **{field: ""})
+
+    assert exc_info.value.code == ErrorCode.BAD_REQUEST
+    assert host.press_calls == []
+
+
+def test_press_exact_selector_alone_satisfies_a_cross_app_search() -> None:
+    host, operations = _ops()
+
+    receipt = operations.press(all_apps=True, identifier="_NS:9")
+
+    assert receipt.outcome is Outcome.DONE
+    assert host.wait_calls[0]["text"] is None
+    assert host.wait_calls[0]["identifier"] == "_NS:9"
 
 
 def test_press_focus_failure_is_finalized_and_never_redispatched() -> None:
@@ -685,7 +886,9 @@ def test_press_deadline_exhausted_before_dispatch_fails_without_acting_or_burnin
 
 
 def test_press_gone_postcondition_deadline_exhausted_fails_without_polling() -> None:
-    host, operations = _ops(monotonic=_delayed_clock(3))
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.press_hook = lambda: clock.sleep(5.0)
 
     error = _failed(
         lambda: operations.press(
@@ -721,6 +924,80 @@ def test_press_changed_is_none_without_a_verified_postcondition_true_once_verifi
         lambda: operations.press(app="Demo", text="Save", postcondition=gone("Save", role="button"))
     )
     assert failed_verify.receipt.changed is None
+
+
+def test_press_equals_polls_the_attribute_until_it_reads_the_expected_value() -> None:
+    sleeps: list[float] = []
+    host, operations = _ops(sleep=sleeps.append)
+    host.get_results.extend([[], ["Inbox"], ["Inbox", "Sent"]])
+
+    receipt = operations.press(
+        app="Demo",
+        text="Save",
+        postcondition=equals(
+            "Mailboxes",
+            search_key="AXTableSearchKey",
+            value=["Inbox", "Sent"],
+            attribute="AXSelectedRows",
+            interval=0.02,
+        ),
+    )
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.verified is True
+    assert receipt.changed is True
+    assert sleeps == [0.02, 0.02]
+    assert [call["text"] for call in host.wait_calls] == ["Mailboxes"] * 3
+    assert host.wait_calls[-1]["app"] == "Demo"
+    assert host.wait_calls[-1]["search_key"] == "AXTableSearchKey"
+    assert receipt.request["postcondition"]["attribute"] == "AXSelectedRows"
+    assert receipt.observed["attribute"] == "AXSelectedRows"
+    assert receipt.observed["value"] == _value_summary(["Inbox", "Sent"])
+
+
+def test_press_equals_fails_at_the_deadline_with_summaries_and_never_the_value() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.get_results.extend(["hunter2"] * 4)
+    host.value = "hello"
+
+    error = _failed(
+        lambda: operations.press(
+            app="Demo",
+            text="Save",
+            postcondition=equals(
+                "Name", role="textfield", value="hello", timeout=0.3, interval=0.125
+            ),
+        )
+    )
+
+    assert error.receipt.acted is Acted.YES
+    assert error.receipt.verified is False
+    assert error.receipt.changed is None
+    assert error.receipt.error["code"] == ErrorCode.TIMEOUT.value
+    assert error.receipt.error["details"]["attribute"] == "AXValue"
+    assert error.receipt.error["details"]["expected"] == _value_summary("hello")
+    assert error.receipt.error["details"]["observed"] == _value_summary("hunter2")
+    assert error.receipt.duration_s == pytest.approx(0.3)
+    assert max(clock.sleeps) <= 0.125
+    assert [call["text"] for call in host.wait_calls] == ["Name"] * 4
+    assert "hunter2" not in json.dumps(error.receipt.to_json())
+
+
+def test_once_token_distinguishes_equals_postconditions_by_expected_value() -> None:
+    host, operations = _ops()
+    host.value = "a"
+    operations.key(
+        "return", app="Demo", once="same", postcondition=equals("Name", role="textfield", value="a")
+    )
+
+    with pytest.raises(MacOSError) as caught:
+        operations.key(
+            "return", app="Demo", once="same", postcondition=equals("Name", role="textfield", value="b")
+        )
+
+    assert caught.value.code == ErrorCode.BAD_REQUEST
+    assert len(host.key_calls) == 1
 
 
 def test_press_changed_is_none_for_ambiguous_or_focus_changed_dispatch_failures() -> None:
@@ -809,15 +1086,36 @@ def test_press_atomic_classifies_pre_dispatch_codes_as_acted_no(code: ErrorCode)
     assert error.receipt.error["code"] == code.value
 
 
+def test_known_predispatch_press_timeout_keeps_the_once_token_available() -> None:
+    host, operations = _ops()
+    host.press_results.append(MacOSError(
+        "deadline exhausted before dispatch", code=ErrorCode.TIMEOUT,
+        details={"reason": "deadline_exhausted_before_dispatch"},
+    ))
+
+    error = _failed(lambda: operations.press(app="Demo", title="Save", once="late"))
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.changed is False
+
+    receipt = operations.press(app="Demo", title="Save", once="late")
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.replayed is False
+
+
 @pytest.mark.parametrize("code", [ErrorCode.AX_ERROR, ErrorCode.TIMEOUT])
 def test_press_atomic_classifies_other_codes_as_acted_unknown(code: ErrorCode) -> None:
     host, operations = _ops()
     host.press_results.append(MacOSError("ambiguous outcome", code=code))
 
-    error = _failed(lambda: operations.press(app="Demo", text="Save"))
+    error = _failed(lambda: operations.press(app="Demo", text="Save", once="uncertain"))
 
     assert error.receipt.acted is Acted.UNKNOWN
     assert error.receipt.changed is None
+    replay = _failed(lambda: operations.press(app="Demo", text="Save", once="uncertain"))
+    assert replay.receipt.replayed is True
+    assert replay.receipt.acted is Acted.UNKNOWN
+    assert len(host.press_calls) == 1
 
 
 def test_set_is_convergent_and_reads_back_changed_value() -> None:
@@ -851,15 +1149,37 @@ def test_set_post_dispatch_read_failure_returns_failed_receipt() -> None:
     assert host.set_calls == 1
 
 
-def test_set_reports_failed_convergence() -> None:
-    host, operations = _ops()
-    host.get_results.extend(("old", "other"))
+def test_set_waits_for_a_lagging_readback_without_setting_twice() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.get_results.extend(("old", "old", "old", "new"))
 
-    error = _failed(lambda: operations.set("new", app="Demo", text="Field"))
+    receipt = operations.set("new", app="Demo", text="Field", interval=0.05)
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.acted is Acted.YES
+    assert receipt.changed is True
+    assert receipt.observed == _value_summary("new")
+    assert host.set_calls == 1
+    assert clock.sleeps == [0.05, 0.05]
+
+
+def test_set_reports_failed_convergence_at_the_deadline() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.get_results.extend(["old"] + ["other"] * 4)
+
+    error = _failed(
+        lambda: operations.set("new", app="Demo", text="Field", timeout=0.3, interval=0.125)
+    )
 
     assert error.receipt.acted is Acted.YES
+    assert error.receipt.error["code"] == ErrorCode.AX_ERROR.value
     assert error.receipt.observed == _value_summary("other")
     assert error.receipt.changed is True
+    assert error.receipt.duration_s == pytest.approx(0.3)
+    assert host.set_calls == 1
+    assert not host.get_results
 
 
 def test_toggle_is_convergent_and_presses_only_when_needed() -> None:
@@ -927,6 +1247,42 @@ def test_toggle_deadline_exhausted_before_dispatch_fails_without_acting() -> Non
     assert error.receipt.error["details"]["reason"] == "deadline_exhausted_before_dispatch"
     assert host.action_calls == 0
 
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda operations: operations.press(
+            all_apps=True, identifier="save", once="late-focus", timeout=0.05
+        ),
+        lambda operations: operations.toggle(
+            True, app="Demo", identifier="save", timeout=0.05
+        ),
+    ],
+    ids=["press", "toggle"],
+)
+def test_slow_frontmost_read_cannot_authorize_a_late_action(
+    invoke: Callable[[Operations], Receipt],
+) -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.frontmost_hook = lambda: clock.sleep(0.06)
+    host.toggle_on_press = True
+
+    error = _failed(lambda: invoke(operations))
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.changed is False
+    assert error.code == ErrorCode.TIMEOUT
+    assert error.receipt.error["details"]["reason"] == "deadline_exhausted_before_dispatch"
+    assert host.value is False
+    assert host.action_calls == 0
+
+    host.frontmost_hook = None
+    completed = invoke(operations)
+    assert completed.outcome is Outcome.DONE
+    assert completed.replayed is False
+    assert host.value is True
+    assert host.action_calls == 1
+
 
 def test_set_receipt_never_contains_the_raw_secret_value() -> None:
     host, operations = _ops()
@@ -943,11 +1299,16 @@ def test_set_receipt_never_contains_the_raw_secret_value() -> None:
 
 
 def test_set_convergence_failure_error_never_contains_the_raw_secret_value() -> None:
-    host, operations = _ops()
-    host.get_results.extend(("old", "still-old"))
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.get_results.extend(["old"] + ["still-old"] * 4)
     secret = "super-secret-password"
 
-    error = _failed(lambda: operations.set(secret, app="Demo", text="Password"))
+    error = _failed(
+        lambda: operations.set(
+            secret, app="Demo", text="Password", timeout=0.3, interval=0.125
+        )
+    )
 
     blob = repr(error.receipt.to_json()) + repr(error.to_json())
     assert secret not in blob
@@ -956,15 +1317,38 @@ def test_set_convergence_failure_error_never_contains_the_raw_secret_value() -> 
     assert error.receipt.error["details"]["observed"] == _value_summary("still-old")
 
 
-def test_toggle_receipt_uses_value_summaries_not_raw_booleans() -> None:
-    host, operations = _ops()
-    host.get_results.extend((False, False))
+def test_toggle_waits_for_a_lagging_readback_without_pressing_twice() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.get_results.extend((False, False, True))
 
-    error = _failed(lambda: operations.toggle(True, app="Demo", text="Enabled"))
+    receipt = operations.toggle(True, app="Demo", text="Enabled", interval=0.05)
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.changed is True
+    assert receipt.observed == _value_summary(True)
+    assert host.action_calls == 1
+    assert clock.sleeps == [0.05]
+
+
+def test_toggle_receipt_uses_value_summaries_not_raw_booleans() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    host.get_results.extend([False] * 5)
+
+    error = _failed(
+        lambda: operations.toggle(
+            True, app="Demo", text="Enabled", timeout=0.3, interval=0.125
+        )
+    )
 
     assert error.receipt.request["desired"] == _value_summary(True)
+    assert error.receipt.error["code"] == ErrorCode.AX_ERROR.value
     assert error.receipt.error["details"]["requested"] == _value_summary(True)
     assert error.receipt.error["details"]["observed"] == _value_summary(False)
+    assert error.receipt.changed is False
+    assert error.receipt.duration_s == pytest.approx(0.3)
+    assert host.action_calls == 1
 
 
 def test_run_dry_run_compiles_only_and_does_not_reserve() -> None:
@@ -1355,6 +1739,8 @@ def test_key_deadline_exhausted_before_dispatch_fails_without_acting_or_burning_
     assert error.receipt.error["code"] == ErrorCode.TIMEOUT.value
     assert error.receipt.error["details"]["reason"] == "deadline_exhausted_before_dispatch"
     assert host.key_calls == []
+    # A spent budget never spends AX time on the app either.
+    assert host.focus_sample_calls == 0
 
     receipt = operations.key("return", app="Demo", once="deadline-key")
 
@@ -1385,6 +1771,491 @@ def test_key_changed_is_true_once_a_postcondition_verifies() -> None:
 
     assert receipt.outcome is Outcome.DONE
     assert receipt.changed is True
+
+
+def test_key_reports_changed_when_the_focus_sample_moves() -> None:
+    host, operations = _ops()
+    before = copy.deepcopy(host.focus_sample)
+    after = copy.deepcopy(before)
+    after["focused"]["value"] = "olx"
+    after["focused"]["selected_range"] = {"location": 4, "length": 0}
+    host.focus_samples.extend([before, after])
+
+    receipt = operations.key("x", app="Demo")
+
+    assert receipt.changed is True
+    assert receipt.verified is False
+    focus = receipt.observed["focus"]
+    assert focus["changed"] == ("focused.selected_range", "focused.value")
+    assert focus["before"]["focused"]["value"] == _value_summary("old")
+    assert focus["after"]["focused"]["value"] == _value_summary("olx")
+    assert receipt.observed["postcondition"] is None
+    assert "olx" not in canonical_json(receipt.to_json())
+
+
+def test_input_verb_polls_focus_until_the_effect_shows() -> None:
+    slept: list[float] = []
+    host, operations = _ops(sleep=slept.append)
+    before = copy.deepcopy(host.focus_sample)
+    landed = copy.deepcopy(before)
+    landed["window"] = "Renamed"
+    # Dispatch reading, then three unchanged readings before the effect.
+    host.focus_samples.extend([before, *(copy.deepcopy(before) for _ in range(3)), landed])
+
+    late = operations.key("return", app="Demo")
+
+    assert slept == [0.01] * 3
+    assert host.focus_sample_calls == 5
+    assert late.changed is True
+    assert late.observed["focus"]["changed"] == ("window",)
+
+
+def test_input_verb_gives_up_on_focus_after_its_polling_budget() -> None:
+    slept: list[float] = []
+    host, operations = _ops(sleep=slept.append)
+    before = copy.deepcopy(host.focus_sample)
+    host.focus_samples.extend([before, *(copy.deepcopy(before) for _ in range(20))])
+
+    still = operations.key("cmd+s", app="Demo")
+
+    assert slept == [0.01] * 10
+    assert host.focus_sample_calls == 12
+    assert still.changed is None
+    assert still.observed["focus"]["changed"] == ()
+
+
+def test_input_verb_clips_focus_polling_to_the_remaining_deadline() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    before = copy.deepcopy(host.focus_sample)
+    host.focus_samples.extend([before, *(copy.deepcopy(before) for _ in range(20))])
+
+    still = operations.key("cmd+s", app="Demo", timeout=0.025)
+
+    assert still.outcome is Outcome.DONE
+    assert clock.sleeps == pytest.approx([0.01, 0.01, 0.005])
+    assert host.focus_sample_calls == 5
+    assert still.changed is None
+    assert host.key_calls == [("cmd+s", 41)]
+
+
+def test_input_verb_refuses_to_dispatch_when_the_focus_sample_spends_the_deadline() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    delays = deque([0.06])
+
+    def slow_app() -> None:
+        if delays:
+            clock.now += delays.popleft()
+
+    host.focus_hook = slow_app
+
+    error = _failed(
+        lambda: operations.key("return", app="Demo", timeout=0.05, once="late")
+    )
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.changed is False
+    assert error.receipt.error["code"] == ErrorCode.TIMEOUT.value
+    assert error.receipt.error["details"]["reason"] == "deadline_exhausted_before_dispatch"
+    assert host.key_calls == []
+    assert host.focus_sample_calls == 1
+
+    receipt = operations.key("return", app="Demo", timeout=0.05, once="late")
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.replayed is False
+    assert host.key_calls == [("return", 41)]
+
+
+def test_input_verb_reserves_the_once_token_after_the_focus_sample_and_before_dispatch() -> None:
+    host, operations = _ops()
+    before = copy.deepcopy(host.focus_sample)
+    landed = copy.deepcopy(before)
+    landed["window"] = "Renamed"
+    host.focus_samples.extend([before, landed])
+    seen: list[str] = []
+
+    def observe() -> None:
+        status, _op, _receipt = operations._ledger.peek("order")
+        seen.append(status)
+
+    host.focus_hook = observe
+    host.key_hook = observe
+
+    operations.key("return", app="Demo", once="order")
+
+    # The before-sample sees no reservation, the dispatch and the
+    # after-sample both see it in flight.
+    assert seen == ["unknown", "in_flight", "in_flight"]
+
+
+def test_input_verb_verifies_an_explicit_postcondition_without_waiting_on_focus() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    before = copy.deepcopy(host.focus_sample)
+    host.focus_samples.extend([before, *(copy.deepcopy(before) for _ in range(20))])
+    host.get_results.extend(["old", "ready"])
+
+    receipt = operations.key(
+        "return",
+        app="Demo",
+        timeout=0.025,
+        postcondition=equals("Status", value="ready", interval=0.01),
+    )
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.verified is True
+    assert receipt.changed is True
+    assert clock.sleeps == [0.01]
+    assert host.focus_sample_calls == 2
+    assert receipt.observed["focus"]["changed"] == ()
+    assert host.key_calls == [("return", 41)]
+
+
+def test_input_verb_survives_a_failed_focus_reading() -> None:
+    """The focus witness must never fail -- or strand the token of -- the
+    input it observes: a failed reading leaves the receipt without a
+    witness, not without a dispatch."""
+    slept: list[float] = []
+    host, operations = _ops(sleep=slept.append)
+    host.focus_samples.append(MacOSError("bad geometry", code=ErrorCode.AX_ERROR))
+
+    receipt = operations.key("return", app="Demo", once="blind")
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.acted is Acted.YES
+    assert receipt.changed is None
+    focus = receipt.observed["focus"]
+    assert focus["before"] is None
+    assert focus["changed"] == ()
+    # The one reading after dispatch is still reported: it is a witness
+    # of the end state, just not of a change.
+    assert focus["after"]["window"] == "Untitled"
+    assert host.focus_sample_calls == 2
+    assert host.key_calls == [("return", 41)]
+    assert slept == []
+    assert operations.recall("blind").replayed is True
+
+    # A reading that fails mid-poll is skipped, and polling goes on.
+    before = copy.deepcopy(host.focus_sample)
+    landed = copy.deepcopy(before)
+    landed["window"] = "Renamed"
+    host.focus_samples.extend(
+        [before, MacOSError("bad geometry", code=ErrorCode.AX_ERROR), landed]
+    )
+    late = operations.key("return", app="Demo")
+
+    assert late.changed is True
+    assert late.observed["focus"]["changed"] == ("window",)
+    assert slept == [0.01]
+
+
+def test_input_verb_polls_a_refused_focus_reading_to_the_deadline_and_reports_no_witness() -> None:
+    """An app whose AX tree stops answering after the input lands (the
+    focused element went away, the app is busy) gets the same polling
+    budget as a slow one, and the receipt then says so: no after-reading,
+    no change claimed, the dispatch and its token untouched."""
+    clock = _SleepClock()
+    host, operations = _ops(monotonic=clock.monotonic, sleep=clock.sleep)
+    refused = MacOSError(
+        "Read AXFocusedUIElement failed with AXError -25204", code=ErrorCode.AX_ERROR
+    )
+    host.focus_samples.extend([copy.deepcopy(host.focus_sample), *(refused for _ in range(4))])
+
+    receipt = operations.key("return", app="Demo", timeout=0.025, once="deaf")
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.acted is Acted.YES
+    assert receipt.changed is None
+    assert receipt.verified is False
+    focus = receipt.observed["focus"]
+    assert focus["before"]["window"] == "Untitled"
+    assert focus["after"] is None
+    assert focus["changed"] == ()
+    assert clock.sleeps == pytest.approx([0.01, 0.01, 0.005])
+    assert host.focus_sample_calls == 5
+    assert operations.recall("deaf").replayed is True
+    assert host.key_calls == [("return", 41)]
+
+
+def test_click_resolves_the_point_before_dispatch_and_posts_to_that_window() -> None:
+    host, operations = _ops()
+
+    planned = operations.click(10, 20, app="Demo", dry_run=True)
+    done = operations.click(10, 20, app="Demo", button="Right", clicks=2)
+
+    assert planned.outcome is Outcome.PLANNED
+    assert planned.target["point"] == {"x": 110.0, "y": 220.0}
+    assert planned.target["window_id"] == 7
+    assert done.executor is Executor.INPUT
+    assert done.acted is Acted.YES
+    assert done.target["window_id"] == 7
+    assert host.click_calls == [
+        {"pid": 41, "point": (110.0, 220.0), "window_id": 7, "button": "right", "clicks": 2}
+    ]
+    assert host.screen_point_calls[-1] == {"x": 10, "y": 20, "coordinate_space": "screenshot", "pid": 41}
+    assert host.target_window_calls[-1] == (41, (110.0, 220.0), None)
+
+
+def test_click_with_window_id_posts_to_the_named_menu_or_panel() -> None:
+    """A menu or panel takes a click only when the caller names it."""
+    host, operations = _ops()
+
+    done = operations.click(10, 20, app="Demo", window_id=25)
+
+    assert host.target_window_calls == [(41, (110.0, 220.0), 25)]
+    assert done.target["window_id"] == 25
+    assert host.click_calls[0]["window_id"] == 25
+
+
+def test_click_maps_through_the_screenshot_it_names() -> None:
+    """A PNG from an earlier `see` reaches the host before the point maps,
+    and the receipt records which image the coordinates came from."""
+    host, operations = _ops()
+
+    done = operations.click(10, 20, app="Demo", screenshot="/tmp/earlier.png")
+
+    assert host.screenshots_used == ["/tmp/earlier.png"]
+    assert done.request["screenshot"] == "/tmp/earlier.png"
+
+
+def test_click_rejects_more_than_a_triple_click_before_reserving_the_token() -> None:
+    host, operations = _ops()
+
+    error = _failed(lambda: operations.click(10, 20, app="Demo", clicks=4, once="quad"))
+
+    assert error.code == ErrorCode.BAD_REQUEST
+    assert error.receipt.acted is Acted.NO
+    assert host.click_calls == []
+    assert host.focus_sample_calls == 0
+    with pytest.raises(MacOSError, match="Unknown once token"):
+        operations.recall("quad")
+
+
+def test_type_rejects_oversized_or_malformed_text_before_reserving_the_token() -> None:
+    host, operations = _ops()
+
+    too_long = _failed(lambda: operations.type("a" * 4097, app="Demo", once="long"))
+    malformed = _failed(lambda: operations.type("ab\udc80", app="Demo", once="lone"))
+
+    assert too_long.code == ErrorCode.BAD_REQUEST
+    assert too_long.receipt.error["details"] == {"parameter": "text", "length": 4097, "limit": 4096}
+    assert malformed.code == ErrorCode.BAD_REQUEST
+    assert malformed.receipt.error["details"]["parameter"] == "text"
+    assert host.type_calls == []
+    assert host.focus_sample_calls == 0
+    with pytest.raises(MacOSError, match="Unknown once token 'long'"):
+        operations.recall("long")
+    with pytest.raises(MacOSError, match="Unknown once token 'lone'"):
+        operations.recall("lone")
+
+
+def test_click_over_none_of_the_apps_windows_fails_before_anything_is_posted() -> None:
+    host, operations = _ops()
+    host.target_window_error = MacOSError("no window there", code=ErrorCode.BAD_REQUEST)
+
+    error = _failed(lambda: operations.click(10, 20, app="Demo"))
+
+    assert error.code == ErrorCode.BAD_REQUEST
+    assert error.receipt.acted is Acted.NO
+    assert "point" not in error.receipt.target
+    assert host.click_calls == []
+    assert host.focus_sample_calls == 0
+
+
+def test_click_with_a_stale_screenshot_fails_before_anything_is_posted() -> None:
+    host, operations = _ops()
+    host.screen_point_error = MacOSError("window moved", code=ErrorCode.WINDOW_CHANGED)
+
+    error = _failed(lambda: operations.click(10, 20, app="Demo"))
+
+    assert error.code == ErrorCode.WINDOW_CHANGED
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.changed is False
+    assert host.click_calls == []
+    assert host.focus_sample_calls == 0
+
+
+def test_click_rejects_an_unknown_button_without_resolving_a_point() -> None:
+    host, operations = _ops()
+
+    error = _failed(lambda: operations.click(10, 20, app="Demo", button="sideways"))
+
+    assert error.code == ErrorCode.BAD_REQUEST
+    assert error.receipt.acted is Acted.NO
+    assert host.screen_point_calls == []
+    assert host.click_calls == []
+
+
+def test_type_receipt_never_carries_the_text() -> None:
+    host, operations = _ops()
+    before = copy.deepcopy(host.focus_sample)
+    after = copy.deepcopy(before)
+    after["focused"]["value"] = "oldhunter2"
+    host.focus_samples.extend([before, after])
+
+    receipt = operations.type("hunter2", app="Demo", once="secret")
+    replay = operations.type("hunter2", app="Demo", once="secret")
+
+    assert host.type_calls == [("hunter2", 41)]
+    assert receipt.request["text"] == _value_summary("hunter2")
+    assert receipt.changed is True
+    assert replay.replayed is True
+    assert "hunter2" not in canonical_json(receipt.to_json())
+    assert "hunter2" not in canonical_json(replay.to_json())
+
+
+def test_type_failure_after_dispatch_is_acted_unknown() -> None:
+    host, operations = _ops()
+    host.type_error = MacOSError("post failed", code=ErrorCode.AX_ERROR)
+
+    error = _failed(lambda: operations.type("abc", app="Demo"))
+
+    assert error.receipt.acted is Acted.UNKNOWN
+    assert error.receipt.changed is None
+    assert host.focus_sample_calls == 1
+
+
+class FormHost(FakeHost):
+    def __init__(self) -> None:
+        super().__init__()
+        self.value = "doubleclick.net"
+        self.model = ""
+        self.other_value = "untouched"
+        self.focused = False
+        self.enabled = True
+        self.subrole = "AXUnknown"
+        self.selection = {"location": 0, "length": 0}
+        self.selects_all = True
+        self.lose_focus = False
+        self.reject_text = False
+        self.match.update(role="AXTextField", title="Domain", identifier="domain")
+
+    def ax_wait(self, **kwargs: object) -> dict[str, object]:
+        match = super().ax_wait(**kwargs)
+        if kwargs.get("search_key") == "AXButtonSearchKey":
+            match.update(element_index=8, role="AXButton", title="Check")
+        return match
+
+    def get(
+        self, element_index: int, attribute: str = "AXValue", *, missing_ok: bool = False
+    ) -> object:
+        if element_index == 8:
+            return bool(self.model)
+        if attribute == "AXValue":
+            assert self.subrole != "AXSecureTextField", "a secure value was read"
+            return self.value
+        return {
+            "AXRole": "AXTextField", "AXSubrole": self.subrole,
+            "AXEnabled": self.enabled, "AXFocused": self.focused,
+            "AXSelectedTextRange": self.selection,
+        }[attribute]
+
+    def set(self, element_index: int, value: object, attribute: str = "AXValue") -> None:
+        if attribute == "AXFocused":
+            self.focused = bool(value)
+        elif attribute == "AXSelectedTextRange":
+            if self.selects_all and self.focused:
+                assert isinstance(value, dict)
+                self.selection = value
+            if self.lose_focus:
+                self.focused = False
+        else:
+            super().set(element_index, value, attribute)
+
+    def key(self, key: str, *, app: str | int | None = None) -> None:
+        if key == "backspace":
+            self.type("", app=app)
+        else:
+            super().key(key, app=app)
+
+    def type(self, text: str, *, app: str | int | None = None) -> None:
+        if self.reject_text:
+            return
+        if not self.focused:
+            self.other_value += text
+        elif self.selection == {"location": 0, "length": len(self.value.encode("utf-16-le")) // 2}:
+            self.value = self.model = text
+        else:
+            self.value += text
+            self.model = self.value
+
+
+def _form_ops() -> tuple[FormHost, Operations]:
+    host = FormHost()
+    clock = _SleepClock()
+    return host, Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+
+
+def test_fill_updates_the_app_model_even_when_visible_text_matches() -> None:
+    host, operations = _form_ops()
+    receipt = operations.fill(
+        "doubleclick.net", app="Demo", identifier="domain",
+        postcondition=equals(title="Check", role="button", attribute="AXEnabled", value=True),
+    )
+    assert host.model == "doubleclick.net"
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.verified is True
+    assert "doubleclick.net" not in canonical_json(receipt.to_json())
+
+
+def test_fill_clears_a_field_containing_non_bmp_text() -> None:
+    host, operations = _form_ops()
+    host.value = "a\U0001f600b"
+    receipt = operations.fill("", app="Demo")
+    assert host.value == ""
+    assert host.model == ""
+    assert receipt.verified is True
+
+
+@pytest.mark.parametrize(("failure", "code", "acted"), [
+    ("selection", ErrorCode.TIMEOUT, Acted.UNKNOWN),
+    ("focus", ErrorCode.FOCUS_CHANGED, Acted.YES),
+])
+def test_fill_leaves_text_untouched_when_it_cannot_replace_safely(
+    failure: str, code: ErrorCode, acted: Acted,
+) -> None:
+    host, operations = _form_ops()
+    host.selects_all = failure != "selection"
+    host.lose_focus = failure == "focus"
+    error = _failed(lambda: operations.fill("replacement", app="Demo", timeout=0.1))
+    assert error.code == code
+    assert error.receipt.acted is acted
+    assert host.value == "doubleclick.net"
+    assert host.other_value == "untouched"
+    assert host.model == ""
+
+
+@pytest.mark.parametrize("restriction", ["secure", "disabled"])
+def test_fill_refuses_restricted_fields_before_reading_or_focusing(restriction: str) -> None:
+    host, operations = _form_ops()
+    host.subrole = "AXSecureTextField" if restriction == "secure" else "AXUnknown"
+    host.enabled = restriction != "disabled"
+    error = _failed(lambda: operations.fill("replacement", app="Demo"))
+    assert error.code == ErrorCode.UNSUPPORTED_OP
+    assert error.receipt.acted is Acted.NO
+    assert host.focused is False
+    assert host.value == "doubleclick.net"
+
+
+def test_fill_replay_preserves_later_user_edits() -> None:
+    host, operations = _form_ops()
+    operations.fill("replacement", app="Demo", once="form")
+    host.value = host.model = "manual edit"
+    receipt = operations.fill("replacement", app="Demo", once="form")
+    assert receipt.replayed is True
+    assert host.value == "manual edit"
+    assert host.model == "manual edit"
+
+
+def test_fill_fails_when_the_app_drops_the_text() -> None:
+    host, operations = _form_ops()
+    host.reject_text = True
+    error = _failed(lambda: operations.fill("replacement", app="Demo", timeout=0.1))
+    assert error.code == ErrorCode.TIMEOUT
+    assert error.receipt.verified is False
+    assert host.value == "doubleclick.net"
 
 
 def test_once_collision_rejects_different_request_without_dispatch() -> None:
@@ -1676,3 +2547,196 @@ def test_key_dispatch_failure_is_ambiguous_not_confirmed() -> None:
 
     assert error.receipt.acted is Acted.UNKNOWN
     assert len(host.key_calls) == 1
+
+
+def test_receipt_times_cover_the_action_and_survive_replay() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(
+        monotonic=clock.monotonic, sleep=clock.sleep, wall_clock=clock.monotonic
+    )
+    host.press_hook = lambda: clock.sleep(0.25)
+
+    original = operations.press(app="Demo", identifier="save", once="stamp")
+    clock.sleep(60.0)
+    repeated = operations.press(app="Demo", identifier="save", once="stamp")
+    recalled = operations.recall("stamp")
+
+    assert original.started_at == "1970-01-01T00:01:40.000+00:00"
+    assert original.finished_at == "1970-01-01T00:01:40.250+00:00"
+    assert original.duration_s == 0.25
+    assert repeated.to_json() == {**original.to_json(), "replayed": True}
+    assert recalled.to_json() == repeated.to_json()
+    assert operations.history() == (original,)
+
+
+def test_expect_timestamps_include_observation_time() -> None:
+    clock = _SleepClock()
+    host, operations = _ops(
+        monotonic=clock.monotonic, sleep=clock.sleep, wall_clock=clock.monotonic
+    )
+    host.wait_hook = lambda: clock.sleep(0.5)
+
+    receipt = operations.expect(present(app="Demo", identifier="save"))
+
+    assert receipt.started_at == "1970-01-01T00:01:40.000+00:00"
+    assert receipt.finished_at == "1970-01-01T00:01:40.500+00:00"
+    assert receipt.duration_s == 0.5
+
+
+def test_history_keeps_failures_in_completion_order_when_wall_time_moves_back() -> None:
+    wall = _SleepClock()
+    host, operations = _ops(wall_clock=wall.monotonic)
+    completed = operations.set(True, app="Demo", identifier="save")
+    wall.now = 50.0
+    host.set_error = MacOSError("read-only control", code=ErrorCode.AX_ERROR)
+
+    failed = _failed(lambda: operations.set(False, app="Demo", identifier="save"))
+
+    assert failed.code == ErrorCode.AX_ERROR
+    assert failed.receipt.finished_at < completed.finished_at
+    assert operations.history() == (completed, failed.receipt)
+
+
+def test_history_eviction_does_not_release_a_once_token() -> None:
+    host, operations = _ops()
+
+    def toggle() -> None:
+        host.value = not bool(host.value)
+
+    host.press_hook = toggle
+    original = operations.press(app="Demo", identifier="save", once="retained")
+    for _ in range(256):
+        operations.expect(present(app="Demo", identifier="save"))
+
+    recent = operations.history()
+    replay = operations.press(app="Demo", identifier="save", once="retained")
+
+    assert len(recent) == 256
+    assert all(receipt.op == "expect" for receipt in recent)
+    assert replay.to_json() == {**original.to_json(), "replayed": True}
+    assert host.value is True
+    assert operations.history() == recent
+
+
+def test_exit_evidence_preserves_a_failed_press_and_its_original_identity() -> None:
+    host, operations = _ops()
+    failure = MacOSError("App stopped answering", code=ErrorCode.AX_ERROR)
+    host.press_results.append(failure)
+    host.press_hook = host.exit
+
+    failed = _failed(lambda: operations.press(app="Demo", identifier="save", once="exit"))
+
+    assert failed.receipt.error == failure.to_json()
+    assert failed.receipt.acted is Acted.UNKNOWN
+    assert failed.receipt.target["app"]["pid"] == 41
+    assert failed.receipt.process == {"pid": 41, "launched_at": 1000.0, "state": "exited"}
+    host.process_running = True
+    host.identity = host.identity._replace(launched_at=2000.0)
+    recalled = _failed(lambda: operations.recall("exit"))
+    assert recalled.receipt.process == failed.receipt.process
+
+
+def test_unconfirmed_exit_is_a_failure_without_reclassifying_the_input() -> None:
+    host, operations = _ops()
+    host.key_hook = host.exit
+
+    failed = _failed(lambda: operations.key("return", app="Demo"))
+
+    assert failed.code == ErrorCode.APP_EXITED
+    assert failed.receipt.acted is Acted.YES
+    assert failed.receipt.verified is False
+    assert failed.receipt.process["state"] == "exited"
+
+
+def test_expected_disappearance_succeeds_even_when_the_app_exits() -> None:
+    host, operations = _ops()
+    host.key_hook = host.exit
+
+    receipt = operations.key("cmd+q", app="Demo", postcondition=gone(role="button", identifier="save"))
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.verified is True
+    assert receipt.process["state"] == "exited"
+
+
+def test_failed_lifetime_observation_does_not_fail_a_successful_action() -> None:
+    host, operations = _ops()
+
+    def lose_metadata() -> None:
+        host.process_error = MacOSError("No metadata", code=ErrorCode.UNSUPPORTED_OP)
+
+    host.key_hook = lose_metadata
+
+    receipt = operations.key("return", app="Demo")
+
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.acted is Acted.YES
+    assert receipt.process["state"] == "unknown"
+    assert receipt.process["error"]["code"] == ErrorCode.UNSUPPORTED_OP
+
+
+def _receipt_log(tmp_path: Path) -> Path:
+    return tmp_path / "Library" / "Logs" / "macos-harness" / "receipts.jsonl"
+
+
+def test_receipt_log_records_each_receipt_without_the_typed_text(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(receipt_log.ENV, "1")
+    host, operations = _ops(wall_clock=lambda: 1_760_000_000.0)
+
+    operations.type("hunter2", app="Demo")
+    host.type_error = MacOSError("could not type hunter2", code=ErrorCode.AX_ERROR)
+    _failed(lambda: operations.type("hunter2", app="Demo"))
+
+    text = _receipt_log(tmp_path).read_text(encoding="utf-8")
+    lines = [json.loads(line) for line in text.splitlines()]
+    assert [(line["op"], line["outcome"], line["acted"]) for line in lines] == [
+        ("type", "done", "yes"),
+        ("type", "failed", "unknown"),
+    ]
+    assert lines[0]["time"] == "2025-10-09T08:53:20.000+00:00"
+    assert lines[0]["app"] == {"name": "Demo", "bundle_id": "com.example.demo", "pid": 41}
+    assert lines[1]["error"] == {"code": "ax.error"}
+    assert "hunter2" not in text
+
+
+def test_receipt_log_names_the_app_of_a_press_that_never_found_its_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(receipt_log.ENV, "1")
+    _host, operations = _ops()
+
+    _failed(lambda: operations.press("Missing", app="Demo", role="button", timeout=0))
+
+    line = json.loads(_receipt_log(tmp_path).read_text(encoding="utf-8"))
+    assert (line["op"], line["outcome"], line["app"]) == ("press", "failed", "Demo")
+
+
+def test_receipt_log_is_off_unless_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(receipt_log.ENV, raising=False)
+    _host, operations = _ops()
+
+    operations.key("return", app="Demo")
+
+    assert not (tmp_path / "Library").exists()
+
+
+def test_receipt_log_rotates_before_passing_its_size_bound(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(receipt_log.ENV, "1")
+    log = _receipt_log(tmp_path)
+    log.parent.mkdir(parents=True)
+    with log.open("wb") as full:
+        full.truncate(receipt_log.MAX_BYTES)
+    _host, operations = _ops()
+
+    operations.key("return", app="Demo")
+
+    assert log.with_name("receipts.jsonl.1").stat().st_size == receipt_log.MAX_BYTES
+    assert [json.loads(line)["op"] for line in log.read_text(encoding="utf-8").splitlines()] == ["key"]

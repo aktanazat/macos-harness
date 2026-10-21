@@ -7,13 +7,13 @@
 #
 # Requires the Xcode Command Line Tools (swift, lipo, codesign) on macOS.
 # Builds each architecture as its own release slice via `swift build
-# --triple`, in a scratch directory dedicated to this script (never
-# native/macos-harness-agent/.build, which a developer's own `swift
-# build`/`swift test` may be using concurrently), then combines the two
-# slices with a single `lipo -create`. The combined binary is freshly
-# ad-hoc signed after combining -- lipo does not carry a valid signature
-# across the merge -- and both architectures are verified present before
-# signing, and the signature is verified again after.
+# --triple`, each in its own scratch directory dedicated to this script
+# (never native/macos-harness-agent/.build, which a developer's own `swift
+# build`/`swift test` may be using concurrently), asks SwiftPM where it put
+# each slice, then combines the two slices with a single `lipo -create`. The
+# combined binary is freshly ad-hoc signed after combining -- lipo does not
+# carry a valid signature across the merge -- and both architectures are
+# verified present before signing, and the signature is verified again after.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -45,13 +45,16 @@ has_both_archs() {
 slice_paths=()
 for triple in arm64-apple-macosx x86_64-apple-macosx; do
   echo "build-universal-agent.sh: building release slice for $triple" >&2
-  swift build \
-    --package-path "$PACKAGE_DIR" \
-    --configuration release \
-    --triple "$triple" \
-    --scratch-path "$SCRATCH_DIR" \
-    --product "$PRODUCT" >&2
-  slice_path="$SCRATCH_DIR/$triple/release/$PRODUCT"
+  # One scratch directory per triple: some SwiftPM versions put every
+  # triple's products at the same path under one scratch directory.
+  build_args=(
+    --package-path "$PACKAGE_DIR"
+    --configuration release
+    --triple "$triple"
+    --scratch-path "$SCRATCH_DIR/$triple"
+  )
+  swift build "${build_args[@]}" --product "$PRODUCT" >&2
+  slice_path="$(swift build "${build_args[@]}" --show-bin-path)/$PRODUCT"
   [[ -f "$slice_path" ]] || {
     echo "build-universal-agent.sh: expected build output missing: $slice_path" >&2
     exit 1

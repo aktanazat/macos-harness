@@ -3,6 +3,449 @@
 All notable changes to macOS Harness are documented here. This project
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `MACOS_HARNESS_RECEIPT_LOG=1` appends each finished `mac.do` receipt as one
+  JSON line to `~/Library/Logs/macos-harness/receipts.jsonl`, without values
+  or typed text, rotating at 5 MiB. It is off by default.
+- `macos-harness skill <name>` prints one skill reference, and
+  `scripts/install-skill.sh` copies the card and every reference into an
+  agent skills directory.
+- `mac.launch(app)` starts an app without bringing it forward and returns
+  once its first window is up, instead of `open -a` and a fixed sleep. It
+  takes a name, bundle ID, or `.app` path and reuses a running copy.
+  `mac.quit(app)` asks an app to quit and returns once it has exited; it
+  never forces unless `force=True`, and refuses a partial name match.
+  `mac.relaunch(app)` restarts the same bundle, and `mac.frontmost()` names
+  the app in front.
+- `macos-harness see` takes `--path` and `--window-index`, and `see` and
+  `state` read an all-digit app as a pid. The skill card shows reading the
+  PNG in the same omp eval cell that captured it, which saves a turn per
+  look.
+- `mac.wait_change(app)` returns once a window has changed since just before
+  the program's latest input to it, or since its last `see` or wait when no
+  input came after that, and held still for 0.15 seconds, in place of a
+  guessed sleep, with how many looks it took. A blinking caret is no
+  change; `region=` watches a smaller one and `by="ax"` compares the app's
+  text. Nothing changing raises a timeout whose details say `changed` is
+  false. `mac.see(app, after_change=True)` waits the same way, `settle=`
+  included, and then captures, reporting `changed` instead of raising.
+- `mac.see(window_id=N)` captures any window, panel, menu, prompt, or the
+  menu bar, whoever owns it, and reports its `layer` and owner `pid`;
+  `macos-harness see --window-id N` does the same. `mac.see(display=0)` and
+  `mac.see(region=(x, y, w, h))` capture the screen as it shows, in screen
+  points, and their pixels map later clicks like a window's.
+  `mac.windows()` with no app lists every app's windows on screen, and
+  `all_layers=True` adds the menus and panels, each with its owner and
+  layer. `click`, `drag`, `scroll`, `mac.do.click`, and `wait_change` take
+  `window_id=` too; without it, pointer input still lands only in a normal
+  window. An app showing only a panel now names the panel's window id
+  instead of reporting no window.
+- A later run can aim through an earlier run's screenshot: `see` keeps a
+  record beside each PNG, and `click`, `drag`, `scroll`, `move`, `ax.at`,
+  and `mac.do.click` take `screenshot="<png>"`, which maps that image's
+  pixels and targets its app without a new `see`. A window that has moved
+  or closed since still refuses. The error for screenshot pixels with no
+  `see` in the run now names `screenshot=`.
+- `mac.ax.get`, `set`, `perform`, and the other element calls take the
+  match a search returned in place of its index. An index lasts until the
+  next search in one run; a match, which now carries its app's `pid`, is
+  found again by role, labels, and frame in any later run, and raises
+  `element.unknown` when that finds no element or more than one.
+- `macos-harness run FILE.py --arg NAME=VALUE` runs a saved program with
+  each `--arg` as a string in its `args` dict, so a rerun with another pid
+  or label no longer means editing the file. Tracebacks name the file and
+  line, and `--json-errors` works before `run` or after the file. A
+  malformed `--arg` exits 2 before anything runs.
+- `mac.place(app, x=, y=, width=, height=)` moves or resizes a window
+  through Accessibility without bringing it forward, in place of System
+  Events, and returns the frame the window reports afterwards. `x` and `y`
+  count from the top-left of `display=` (0 is the main one); with `display`
+  and no `x` or `y`, a window that does not fit on that display is centered
+  there. A minimized window, or one its app will not move or resize, raises
+  `unsupported_op` before anything changes.
+- `mac.click(element=match)` and `mac.do.click(element=match, app=...)`
+  click the center of an element's frame as it is now, in the element's
+  own process, for a control that ignores `AXPress`, as SwiftUI rows can.
+  The element may be a match from any run or an index from this one. An
+  element of another app, or one with no area on screen, is refused before
+  anything is posted, and the receipt names the element by its role and
+  labels, never its value.
+- `mac.do.menu("View > Reload Page", app=...)` chooses a menu command by its
+  path, each step found only under the one before, so an item two menus
+  share, such as Close under File and under Window, is never ambiguous.
+  `mac.do.status_item(path, app=...)` does the same in the menu of the app's
+  menu bar icon, or with no path opens it; `name=` picks the icon when the
+  app has several, since many have no title or description. Both press
+  through Accessibility without bringing the app forward, match names
+  ignoring case and with "..." for "…", and refuse a disabled item, or a
+  path that leads to no item or to more than one, before anything is
+  pressed.
+
+### Changed
+
+- The skill is now a short card (about 3 KB, down from 31 KB) plus
+  references for signatures, receipts, accessibility search, invariants,
+  routes, diagnostics, handoff, credentials, and the native backend. The card
+  shows waiting for the next control after a press, and asks for
+  `macos-harness doctor` only after a permission or connection error.
+- CLI commands and the REPL close their original `MacOS` instance before
+  returning, including on errors and interruptions. Retaining or replacing
+  the preloaded `mac` variable no longer keeps its private helpers alive.
+- `MacOS.close()` and instance finalization also reap the disposable pointer
+  helper, including on the default Python backend. Pointer helpers are no
+  longer retained until interpreter exit. Explicit pointer use can recreate
+  one lazily; cleanup never closes app windows, documents, or human handoffs.
+- With the default Python backend, an all-apps search, query or press now
+  reaches an app that started after the harness first listed apps, such as
+  the process behind a permission dialog. Each listing reads the running
+  apps afresh; before, the list stayed as it was at the first read.
+- An app given by pid is found even when AppKit's direct pid lookup misses
+  it, which happened to 2 of 5 Calculators the same process had just
+  launched; a miss now falls back to the running-apps list. Receipts no
+  longer report such an app as exited, and `mac.quit` reads the exit from
+  the kernel's process table.
+- An app given by pid keeps that pid when AppKit hands back a record whose
+  pid reads -1, as Device Hub's did every time; every later call used to
+  fail on "No running application matches -1". A name whose app has no
+  process yet now says it is still launching, and `mac.launch` waits for
+  the pid. Of processes with exactly the asked name, the only one with an
+  on-screen window is picked instead of raising `app.ambiguous`, unless a
+  windowless one is frontmost; two windowed copies, or names that match
+  only helpers, still raise.
+- The frontmost app is read afresh on both backends. `mac.activate` now sees
+  its request take, and the focus guard after a press catches a target that
+  brings itself to the front; before, a process kept seeing whichever app was
+  in front at its first look. The native agent's app list and app lookup
+  likewise see apps launched after its first read.
+- A broad all-apps search, query, wait or press first asks every app at once
+  whether it can answer Accessibility, then skips the ones that cannot (a
+  stopped app, a web content helper) instead of waiting out each one's
+  half-second timeout in turn: about 1.8 s instead of 2.7 to 3.4 s per sweep
+  on the Python backend, and 1.6 s instead of 3.6 to 4.4 s on the native
+  backend, on a Mac running about 90 apps. The native agent asks through a
+  new op, `ax_unanswered_apps`; an agent binary that predates it refuses it
+  as `unsupported_op`. Skipped apps leave the search incomplete, so a wait
+  never confirms a match or its absence across them.
+- A wait that times out on an incomplete search names the apps it searched
+  only in part and counts the apps that did not answer, in the message and
+  in `details["partial"]` and `details["unanswered"]`.
+- An all-apps sweep for what is on screen now reaches the whole of big apps
+  like Safari and Slack and reports itself complete. A search that walks an
+  app's tree for what is on screen leaves out the items of closed menus,
+  which were most of Safari's tree; a search for menus or menu items still
+  reads them, so `role="menu item"` reaches a command in a closed menu. The
+  walk now goes 50 levels deep instead of 25 (Slack's tree reaches 28), and
+  `max_nodes` defaults to 5000 instead of 500 for AX queries, waits and
+  presses.
+- A broad sweep for what is on screen no longer counts an app it cannot
+  search against completeness unless that app has a window on screen; a
+  stopped background process or web content helper shows nothing to find.
+  An all-apps wait for something to disappear can now confirm it.
+- A value an app reports it cannot produce (AXError -25200) no longer leaves
+  a search or an exact-title match incomplete; a read that failed because the
+  element vanished or the app did not answer still does.
+- AXError messages say what the code means. An action that fails with -25204
+  warns that it may have taken effect.
+- `mac.do.press` takes the search text as its first positional argument,
+  like `mac.ax.press`.
+- The errors for an unknown role, an element index from an earlier search
+  or run, and screenshot coordinates with no screenshot in the run say what
+  to do instead.
+- A stdin program that calls a name `mac`, `mac.ax`, or `mac.do` lacks,
+  such as `mac.ax.get_attributes`, now gets the nearest calls across all
+  three as they are called. A keyword that abbreviates a parameter, such as
+  `dy` for `delta_y`, is pointed at it; Python's own hint said `y`.
+  `mac.inspect` past 5000 nodes or 25 levels walks the cap instead of
+  failing and reports `capped`, and a `window_index` past an app's windows
+  says the index starts at 0 and which indexes the app has.
+- `print(receipt)` shows one line, such as
+  `press done acted=yes changed=yes verified=yes 0.31s`, with `error=<code>`
+  on a failure, instead of the whole record (a median of 1,096 characters).
+  `repr(receipt)` and `receipt.to_json()` keep the record.
+- An AX wait, and the search inside a Python-backend press, keeps polling
+  while the app does not answer in time (AXError -25204), as Secretive and
+  Activity Monitor do for a second or more after `open -a`; before, the
+  first such poll failed the wait. A wait that times out this way says the
+  app did not answer.
+- `role=` accepts the AX name a match reports, such as `"AXButton"`, for
+  every role it accepts a friendly name for.
+- A press, `mac.do.set`, `toggle` or `fill` on the Python backend whose
+  search finds several matches takes the only enabled one among the exact
+  labels, or among all matches when none is exact; the exact label still
+  decides first. A tie that remains lists every match, not the first four,
+  with its frame and whether it is enabled.
+- An action whose element is gone right afterward counts as done even when
+  the app answered it with AXError -25200, -25204 or -25205: Secretive's
+  sheet Delete button deleted the key and closed the sheet but answered
+  -25205.
+- `mac.see` on an app that runs with no window says so and names
+  `mac.script('tell application id "…" to reopen')`, which opens the window
+  the way a Dock click does.
+
+- A substring AX search that finds several matches now takes the one whose
+  whole title or description equals the search text, so
+  `mac.ax.press("Allow", all_apps=True)` presses "Allow" beside "Don't Allow".
+  Two exact labels, none, a search that filled its limit, or an exact
+  selector's incomplete search still fail closed. Raw waits and presses,
+  `mac.do`, and the native agent apply the same rule.
+- `mac.ax.query`, `query_all`, `wait`, `wait_gone`, and `press`, and
+  `mac.do.press`, `set`, and `toggle` take `app=`, `all_apps=True`, or `apps=`
+  through one check with one error. `query` gains `all_apps` and `apps`;
+  `query_all` gains `app` and `all_apps`. A blank selector is refused like an
+  empty one.
+- A stdin program that calls a harness method with a wrong keyword ends its
+  `TypeError` with the method's real signature. The skill lists each
+  primitive's exact signature.
+- Exact app-name queries ignore same-named extensions nested inside the
+  matching app bundle. Explicit PID, bundle ID, and path selectors still
+  reach extensions; multiple matching apps remain ambiguous.
+- `mac.diff(before, after)` compares consecutive inspections using stable
+  control references. Partial observations separate uncertain appearances
+  and disappearances from proven additions and removals.
+- `mac.do.expect_any` waits for named outcomes in one read-only call and
+  reports every match in the first successful pass. One cooperative timeout
+  covers the checks; failures retain each outcome's observation state.
+- Saved routes accept named form inputs through `rec.fill`. Definitions keep
+  parameter names, not entered text. Replay validates all inputs before action
+  and does not mistake the previous input's goal for completion of a new run.
+- `mac.do.fill` replaces a plain text field through keyboard input and checks
+  the text readback. It handles UTF-16 selection on both backends, refuses
+  secure or disabled fields, and stops if focus or text changes before typing.
+  Use an app-level postcondition to check that the app processed the input.
+- Help and version commands defer loading macOS frameworks. `--json-errors`
+  emits structured harness errors and operation receipts on stderr when requested.
+- A failed AX attribute batch stays incomplete instead of repeating the
+  failed read for every attribute. Bounded searches collect action names
+  only for matches. Unsupported batch APIs retain their single-read fallback.
+- `mac.explain` retains partial or unavailable inspection coverage and shows
+  nearby controls for the `any` role as well as specific roles.
+- A failed `mac.do.expect` receipt now reports what the check established.
+  `observed` carries `state` — the new public `Observation` enum, `UNMET` or
+  `UNOBSERVABLE` — and a `reason` naming the case: a completed search that
+  found nothing, a value that differed, a truncated tree walk, an ambiguous
+  match, a refused reading, an exhausted deadline, or a disappearance no
+  second poll confirmed. Route replay reads that state instead of re-deriving
+  it from error details, so a goal read that established nothing no longer
+  authorizes replaying presses; previously an unconfirmed disappearance was
+  treated as a definite unmet goal.
+- App-bound receipts retain process lifetime evidence without replacing the
+  original action error or input classification. Otherwise-successful input
+  fails with `app.exited` after an observed exit when the effect was unverified.
+  A verified expected disappearance can succeed. Replayed receipts retain their
+  original process evidence.
+- `mac.status` reports process and on-disk build metadata, including command-line
+  PIDs. `mac.inspect` composes bounded snapshots, focus, blocking-dialog evidence,
+  and current same-role controls after a failed search. Values and screenshots
+  are opt-in; secure fields and failed identity reads exclude content attributes.
+  `mac.diff_windows` compares supplied observations without reading the desktop.
+- `mac.logs`, `mac.crashes`, and `mac.sample` collect bounded diagnostic evidence
+  on request. Collection failures and partial results remain explicit.
+  `mac.explain` correlates supplied evidence without changing the receipt,
+  collecting more data, or retrying input.
+- `mac.route` records explicit press/set/toggle/key calls and saves a validated
+  navigation definition with entry and terminal conditions. Replay stays on one
+  app process, shares one deadline, and stops at the first divergence while
+  retaining the failing receipt. Dry runs observe only current conditions and
+  targets. Failed recordings preserve the previous file; no route retries,
+  resume, rollback, or implicit activation are added.
+- Presses keep their original deadline through agent setup, searches, retry
+  delays, and focus readings on both backends. A known pre-dispatch timeout
+  reports `acted=no` and releases its once-token reservation. Other timeouts
+  retain the token because the action may have happened. Raw zero-timeout
+  presses still make one attempt.
+- Receipts include original ISO-8601 UTC start and completion timestamps.
+  `mac.timeline()` returns the latest 256 non-replayed receipts, including
+  failures and calls without once tokens, without collecting new observations.
+  History eviction leaves the at-most-once token ledger intact.
+- AX searches accept exact `title`, `identifier`, and `description` selectors
+  alongside substring `text`. Results expose `complete` and `visited`; strict
+  waits and presses refuse an unproved unique match, and disappearance requires
+  two complete empty searches. Failed reads and traversal limits leave a search
+  incomplete. Unsupported fallback predicates now raise instead of broadening
+  the search. The native wire protocol is version 2.
+- `mac.do.expect` checks an explicitly scoped `present`, `gone`, or `equals`
+  condition through the existing verifier and returns a read-only receipt. It
+  does not enable accessibility features, sample focus, or reserve a once token.
+- `mac.do.set` and `mac.do.toggle` wait for their readback. Both used to
+  read the attribute once after the mutation and fail with `acted=yes`
+  when that first reading still showed the old state, which is what an
+  app that applies a set or a press on its next run-loop turn looks like.
+  They now re-read every `interval` until the requested state shows or
+  the shared deadline runs out, with the same summary-only receipt, and
+  the mutation is never repeated: a stable mismatch still fails with the
+  last reading, and a refused read is still an error, not a retry.
+- `mac.see()` and `capture_screenshot()` render one window through
+  ScreenCaptureKit at the requested output size instead of running
+  `screencapture` and shrinking a full Retina PNG with Pillow. A 1280px
+  `see` of a 880x448pt window takes 67ms warm (138ms cold) in an 85MB
+  process; the old path took 480ms in 186MB. A window behind others or
+  on another Space still captures, and the result carries `on_screen`
+  (from ScreenCaptureKit) and `captured_at` so a stale render is
+  visible. `raw_width`/`raw_height` are gone; `width`/`height` are the
+  image size, `bounds` the window's points. Pillow is no longer a
+  dependency; `pyobjc-framework-ScreenCaptureKit` is.
+- The live pointer overlay draws the system arrow cursor at the user's
+  Accessibility pointer size instead of a fixed hand-drawn 44pt arrow,
+  sits at status-window level on every Space, honors Reduce Motion, and
+  hides itself after three idle seconds. `hide_pointer()` is sticky: no
+  helper is spawned again until `show_pointer()`.
+- `see(show_pointer=...)` defaults to `False`; the CLI flag is `see
+  --pointer`. Sessions passed `show_pointer=False` 78 times for every
+  `True`, and the drawn arrow was the "huge pointer" in screenshots.
+- Window and screenshot coordinates are checked against the window
+  before input: a click, drag, scroll, or move after the window closed,
+  moved, resized, or left the screen raises `MacOSError` with the new
+  code `window.changed` (`details.reason` is `closed`, `moved`, or
+  `off_screen`) instead of posting to the wrong place. The wire
+  vocabulary is ten codes.
+- Local event suppression is disabled on the harness event source, so a
+  posted click no longer pauses the user's own mouse for the system's
+  default suppression interval.
+- `mac.see()` on an app launched less than five seconds ago waits up to
+  two seconds for its first window instead of failing with "No
+  capturable windows". `open -a` returns about 50ms after launch, but
+  TextEdit's first window appears 335ms later and Notes' 792ms later, so
+  a capture straight after a launch used to fail every time.
+- An ambiguous app query ranks its matches -- frontmost first, then most
+  on-screen windows, then newest -- and reports `frontmost`,
+  `on_screen_windows`, and `launched_seconds_ago` for each, so the
+  caller can pick the pid. Nothing is picked on its behalf.
+- `mac.ax.get(handle, "AXSelectedTextRange")` returns
+  `{"location", "length"}`; it raised `AttributeError` before.
+- Posted clicks, drags, and scrolls now land. `CGEventPostToPid` skips
+  the window server's hit test, so AppKit found no window under the
+  event and dropped it: a raw `mac.click` never moved TextEdit's caret,
+  and a raw `mac.scroll` never scrolled, active app or not. Each mouse
+  and scroll event now carries the app's frontmost on-screen window
+  under the point and the point in that window's coordinates, the two
+  fields AppKit hit-tests, and `click` returns the `window_id` it
+  routed to. Only a window `windows()` would list counts -- on the
+  normal layer and at least 40pt on a side -- so a same-app tooltip or
+  helper surface over the point does not take the event. A point over
+  none of the app's windows raises `bad_request` before anything is
+  posted. A drag stays on the window that took its mouse-down. `scroll`
+  with no `x`/`y` scrolls at the center of the window in the last
+  screenshot of that app instead of posting an event with no target;
+  without such a screenshot it raises `bad_request`. The routing uses
+  the private `CGEventSetWindowLocation` symbol; a macOS build without
+  it raises `unsupported_op` instead of posting an event that cannot
+  land.
+- `mac.type` into the frontmost app sends text in runs of up to 20
+  UTF-16 units per key event with no pause between events: 128
+  characters land in about 30ms instead of 1.6s, exact in TextEdit,
+  Notes, Safari, and Chrome (280 of 280 trials). An inactive app still
+  gets one event pair per character with a 10ms pause, because a
+  background Chrome drops every event carrying more than one unit.
+  Newline, carriage return, and tab always travel alone as Return and
+  Tab key events.
+- `clicks` is a count from 1 to 3 (macOS has no gesture past a triple
+  click); `mac.click` and `mac.do.click` reject anything else with
+  `bad_request` before posting. `drag` and `scroll` accept a pid for
+  `app`, as `click` and `type` already did.
+
+### Added
+
+- `mac.activate(app, timeout=0.5)`: one explicit activation request that
+  reports `activated`, `previous`, `frontmost`, and `elapsed_ms` from
+  what macOS actually did. It never retries: since macOS 14 activation
+  is a request the system may decline while the user is busy elsewhere.
+  Sessions were forcing this through `osascript` 88 times, some in a
+  ten-attempt loop.
+- `mac.wait_for_window(app, timeout=2.0)`: `windows(app)` once it is
+  non-empty, polled every 50ms; `MacOSError` with code `timeout`
+  otherwise.
+- `mac.do.click(x, y, app=...)` and `mac.do.type(text, app=...)`: the
+  receipted counterparts of `mac.click` and `mac.type`. `click` resolves
+  the screen point, the target `window_id`, the button, and the click
+  count before anything is reserved or posted, so a stale screenshot, a
+  moved window, a point over none of the app's windows, or a fourth
+  click fails with `acted=no`, and the events go to the very window the
+  receipt names. A `type` receipt carries the text's length and hash,
+  never the text; text longer than 4096 characters or holding a lone
+  surrogate fails with `acted=no` before a `once` token is reserved.
+- `mac.do.key`, `click`, and `type` receipts report what the input did to
+  focus. `observed.focus` holds a before/after sample of the frontmost
+  pid, the focused window title, and the focused element (role, title,
+  value summary, selected range, character count, position, size), and
+  `changed` lists which of those moved. A verb whose postcondition is
+  not verified is `changed=True` when focus moved and `None` when nothing
+  observable moved, so a key that AppKit silently dropped -- a menu
+  shortcut sent to an inactive app -- comes back as a done receipt whose
+  effect is unconfirmed rather than one that claims it. The sample reads
+  the focused element without enhanced accessibility, so an app that
+  keeps AX off stays that way. Every read in it is checked: one the app
+  refuses -- it did not answer, the element is gone -- fails the whole
+  reading rather than passing as a missing field the receipt would count
+  as a move, while an attribute AX reports as absent is an ordinary
+  absence. A secure field reports its role and subrole only, and only a
+  subrole the app actually reported clears a field for its details, so a
+  password's value, length, and selection are never requested. One sample
+  costs about 0.4ms (p95 0.9ms over 50 readings of TextEdit, measured
+  before the reads were checked; the checks add no round trip).
+- The focus witness waits for the effect, but never past the deadline.
+  Without a postcondition the reading after dispatch is repeated every
+  10ms for up to 100ms until it differs from the one before: the first
+  reading missed 70 of 80 effects that showed within 62ms. With a
+  postcondition the single after-reading is taken and the postcondition
+  is verified straight away, so the effect the caller asked about never
+  waits behind the witness. A reading the app refuses, before or after,
+  leaves the receipt without a witness (`observed.focus.after` is `None`
+  when every after-reading was refused), never without its dispatch or
+  its `once` token, and the polling goes on to the deadline in case the
+  app answers again.
+- The focus reading before dispatch counts against the budget: the
+  deadline is checked again after it and before the `once` token is
+  reserved, so an app whose AX tree answers slowly costs the call its
+  dispatch (`acted=no`, the token unspent), never a late mutation.
+- `equals(...)`, a third postcondition beside `present`/`gone`: one AX
+  match resolved the way `present` resolves it, its `attribute` (default
+  `AXValue`) read back every `interval`, satisfied once the reading equals
+  `value` under the same canonical comparison `set` uses to judge
+  convergence. `key`, `click`, and `type` gain a way to verify what a
+  field holds or where a selection landed, not just that focus moved. A
+  receipt carries the expected and observed values as length/SHA-256
+  summaries; a timeout reports both under `error.details`. `value` must
+  be JSON-safe and `attribute` nonempty, checked at construction.
+
+### Fixed
+
+- `mac.ax.press` ran its focus guard in a `finally`, so an `AXPress` that
+  raised while the target came frontmost was reported as `focus.changed`
+  instead of its own error, and a receipted `mac.do.press(app=...)` then
+  read that code as proof the press landed (`acted=yes`). The guard now
+  runs only after `AXPress` returns, the order `mac.do.press(apps=...)`,
+  `toggle`, and the native agent already used: a failed action keeps its
+  error and the receipt says `acted=unknown`.
+- On the native backend, `mac.ax.get` read one attribute through the
+  agent's best-effort batch op, which answers `null` for a read the app
+  refuses -- it did not answer in time, the element is gone, the
+  attribute is unsupported. So `mac.do.toggle` read a refused `AXValue`
+  as "off" and pressed a control it could not see, `set` judged
+  convergence against nothing, and `equals(value=None)` verified a
+  postcondition the app never answered. The agent now has a single
+  required-value read, `ax_element_get_value`, that returns the error the
+  Python backend already raised: `timeout` when the app did not answer
+  (`ax_error` -25204), `ax.error` otherwise, with a successful explicit
+  `null` still a value. An agent binary that predates the op refuses it
+  as `unsupported_op`; nothing downgrades to the batch read.
+  `mac.ax.get_attributes` is unchanged: a bulk sample where an unreadable
+  attribute is `None`.
+
+### Removed
+
+- The credential broker: `macos-harness credential` (`check`,
+  `fill-browser`, `fill-native`, `enroll`), `CredentialBroker`,
+  `CredentialManifest`, `CredentialEnrollment`, `CredentialReceipt`,
+  `CredentialError`, `DEFAULT_CREDENTIAL_MANIFEST`, the worker, and
+  `~/.config/macos-harness/credentials.toml`. Its one sink was a field in
+  a live ego-browser taskspace, and that route is retired: browser
+  credentials belong to the browser's own password manager, and a native
+  login field keeps its two owners, system AutoFill or `mac.handoff`.
+  Nothing else in the harness read the manifest or the vault.
+
 ## [0.5.0] - 2026-08-22
 
 ### Added

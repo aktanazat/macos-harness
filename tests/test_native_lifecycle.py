@@ -92,7 +92,7 @@ def main():
         if first and mode == "wrong_pid":
             pid += 1
         result = {
-            "protocol": 1,
+            "protocol": __PROTOCOL__,
             "agent_version": "fake-e2e",
             "pid": pid,
             "trusted": True,
@@ -128,7 +128,10 @@ def isolated_native_paths(
 @pytest.fixture
 def fake_agent_script(tmp_path: Path) -> Path:
     script = tmp_path / "fake-macos-harness-agent"
-    script.write_text(f"#!{sys.executable}\n{_FAKE_AGENT_BODY}", encoding="utf-8")
+    body = _FAKE_AGENT_BODY.replace(
+        "__PROTOCOL__", str(native_module.PROTOCOL_VERSION)
+    )
+    script.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
     script.chmod(0o700)
     return script
 

@@ -66,6 +66,14 @@ final class HandlerSeamTests: XCTestCase {
         .object(["handle": .number(1), "attribute": .string("value"), "value": .string("x")])
       ),
       (14, "ax_element_perform", .object(["handle": .number(1), "action": .string("AXPress")])),
+      (
+        15, "ax_element_get_value",
+        .object(["handle": .number(1), "attribute": .string("AXValue")])
+      ),
+      (
+        16, "ax_unanswered_apps",
+        .object(["pids": .array([.number(1)]), "messaging_timeout": .number(0.5)])
+      ),
     ]
     for (id, op, params) in axOps {
       let response = handlers.handle(WireRequest(v: 1, id: id, op: op, params: params))
@@ -85,7 +93,7 @@ final class HandlerSeamTests: XCTestCase {
     XCTAssertNotEqual(response.error?.code, "permission.accessibility")
   }
 
-  func testPingResultCarriesProtocolMajorOne() throws {
+  func testPingResultCarriesTheCurrentProtocolVersion() throws {
     let handlers = AgentHandlers()
     let response = handlers.handle(WireRequest(v: 1, id: 22, op: "ping", params: .object([:])))
     XCTAssertTrue(response.ok)
@@ -95,7 +103,9 @@ final class HandlerSeamTests: XCTestCase {
     guard case .number(let protocolVersion)? = result["protocol"] else {
       return XCTFail("expected ping result to carry a numeric protocol field")
     }
-    XCTAssertEqual(protocolVersion, 1)
+    // Version 2 added `complete`/`visited` to ax_query results and exact selectors to the
+    // search ops; a client that pins 1 must be told this agent is newer.
+    XCTAssertEqual(protocolVersion, 2)
   }
 
   func testPingReportsThisProcessOwnProcessIdentifier() throws {
@@ -235,6 +245,52 @@ final class HandlerSeamTests: XCTestCase {
     XCTAssertNotEqual(response.error?.code, "bad_request")
   }
 
+  func testQueryRejectsEmptyExactSelector() {
+    // An empty exact selector could never equal an attribute a search keeps, so it is a
+    // malformed request rather than a silent never-match. Mirrors validate_exact_selectors
+    // in receipts.py.
+    for key in ["title", "identifier", "description"] {
+      let response = axQueryResponse([key: .string("")])
+      XCTAssertEqual(response.error?.code, "bad_request", "empty \(key) must be rejected")
+    }
+  }
+
+  func testQueryRejectsNonStringExactSelector() {
+    let response = axQueryResponse(["identifier": .number(7)])
+    XCTAssertEqual(response.error?.code, "bad_request")
+  }
+
+  func testQueryRejectsOversizedExactSelector() {
+    let overlong = String(repeating: "x", count: 1024 * 1024 + 1)
+    let response = axQueryResponse(["title": .string(overlong)])
+    XCTAssertEqual(response.error?.code, "bad_request")
+  }
+
+  func testQueryAcceptsExactSelectorsWithoutText() {
+    // An exact selector is a complete search on its own; it needs no substring `text`.
+    let response = axQueryResponse([
+      "title": .string("Save"), "identifier": .string("_NS:9"), "description": .string("Save"),
+    ])
+    XCTAssertNotEqual(response.error?.code, "bad_request")
+  }
+
+  func testQueryTreatsNullExactSelectorAsUnset() {
+    let response = axQueryResponse(["title": .null])
+    XCTAssertNotEqual(response.error?.code, "bad_request")
+  }
+
+  func testPressRejectsEmptyExactSelector() {
+    let handlers = AgentHandlers(trustCheck: { true })
+    let response = handlers.handle(
+      WireRequest(
+        v: 2, id: 1, op: "ax_press",
+        // An expired deadline is valid and stops this seam before any AX access.
+        params: .object([
+          "app_pid": .number(1), "description": .string(""), "action_deadline": .number(0),
+        ])))
+    XCTAssertEqual(response.error?.code, "bad_request")
+  }
+
   func testElementGetRejectsOversizedAttributesArray() {
     let handlers = AgentHandlers(trustCheck: { true })
     let tooMany = (0..<65).map { JSONValue.string("AXAttr\($0)") }
@@ -242,6 +298,16 @@ final class HandlerSeamTests: XCTestCase {
       WireRequest(
         v: 1, id: 1, op: "ax_element_get",
         params: .object(["handle": .number(1), "attributes": .array(tooMany)])))
+    XCTAssertEqual(response.error?.code, "bad_request")
+  }
+
+  func testElementGetValueRequiresAnAttributeName() {
+    // Decoded before the executor is reached, so this is deterministic on a trusted Mac too:
+    // a single read with no attribute is a malformed request, not a read of some default.
+    let handlers = AgentHandlers(trustCheck: { true })
+    let response = handlers.handle(
+      WireRequest(
+        v: 1, id: 1, op: "ax_element_get_value", params: .object(["handle": .number(1)])))
     XCTAssertEqual(response.error?.code, "bad_request")
   }
 

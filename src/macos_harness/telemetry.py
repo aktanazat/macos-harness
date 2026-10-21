@@ -10,6 +10,7 @@ import sys
 import uuid
 from pathlib import Path
 
+from ._paths import config_dir
 from ._version import __version__
 
 POSTHOG_KEY = "phc_nud39qe8UBkoFaMM2RwQ8LPWbWDNQNdPUeGShNTCHVXv"
@@ -29,15 +30,8 @@ COMMANDS = {"python", "doctor", "apps", "repl", "skill", "see", "state"}
 _endpoint_override: str | None = None
 
 
-def _config_dir() -> Path:
-    override = os.environ.get("MACOS_HARNESS_HOME")
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / "Library" / "Application Support" / "macos-harness"
-
-
 def _config_path() -> Path:
-    return _config_dir() / "telemetry.json"
+    return config_dir() / "telemetry.json"
 
 
 def _load() -> dict:

@@ -40,8 +40,10 @@ class ErrorCode(StrEnum):
 
     PERMISSION_ACCESSIBILITY = "permission.accessibility"
     APP_NOT_FOUND = "app.not_found"
+    APP_EXITED = "app.exited"
     APP_AMBIGUOUS = "app.ambiguous"
     FOCUS_CHANGED = "focus.changed"
+    WINDOW_CHANGED = "window.changed"
     AX_ERROR = "ax.error"
     ELEMENT_UNKNOWN = "element.unknown"
     TIMEOUT = "timeout"
