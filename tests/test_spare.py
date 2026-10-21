@@ -35,6 +35,7 @@ server = subprocess.Popen(["sleep", "600"], pass_fds=(replies, requests))
 print(broker.pid, server.pid, flush=True)
 time.sleep(600)
 """
+_STARTS_ITS_COPROCESS = "import os, subprocess, sys\nos.setsid()\nsys.exit(subprocess.call(sys.argv[1:]))\n"
 _CLIENT_LOADS = """\
 import atexit, sys
 atexit.register(lambda: open({path!r}, "w").write("\\n".join(sys.modules)))
@@ -557,6 +558,39 @@ def test_the_broker_and_its_spare_die_with_the_shell() -> None:
         os.kill(server, signal.SIGKILL)
         stand_in.stdout.close()
 
+    assert broker_gone
+    assert spare_gone
+
+
+def test_a_served_step_runs_to_its_end_after_its_shell_hangs_up_and_exits() -> None:
+    """As a step started with ``nohup`` or disowned would. The shell hangs
+    up its coprocess's whole process group as it goes."""
+    shell = _Shell(_env(), [sys.executable, "-c", _STARTS_ITS_COPROCESS, *_cli("spare")])
+    try:
+        broker = _child(shell.broker.pid)
+        step, spare = shell.held(
+            "import os, time\n"
+            "print(os.getpid(), flush=True)\n"
+            "while True:\n"
+            "    try:\n"
+            f"        os.kill({shell.broker.pid}, 0)\n"
+            "    except ProcessLookupError:\n"
+            "        break\n"
+            "    time.sleep(0.01)\n"
+            "time.sleep(0.5)\n"
+            "print('finished', flush=True)\n"
+        )
+        os.killpg(shell.broker.pid, signal.SIGHUP)
+        shell.broker.wait()
+        assert step.stdout is not None
+        out = step.stdout.read().decode()
+        status = step.wait(timeout=60)
+        broker_gone, spare_gone = _gone(broker), _gone(spare)
+    finally:
+        shell.close()
+
+    assert out == "finished\n"
+    assert status == 0
     assert broker_gone
     assert spare_gone
 

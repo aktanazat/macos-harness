@@ -436,11 +436,15 @@ class _Broker:
         self._exits = select.kqueue()
         self._spare: _Spare | None = None
         self._serving = False
+        self._client: int | None = None
         self._awaiting_input = False
         self._left_open: set[int] = set()
+        # A shell hangs up its jobs as it exits; the lifeline says so instead,
+        # and the broker outlives the shell while it serves a step.
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         _Lifeline(self._abandon).watch(self._shell)
         if os.getppid() != self._shell:
-            self._abandon()
+            self._quit()
 
     def run(self) -> int:
         self._spawn()
@@ -466,7 +470,15 @@ class _Broker:
         self._retire()
         return 0
 
-    def _abandon(self) -> NoReturn:
+    def _abandon(self) -> None:
+        """The shell is gone: a step being served runs on to its end, as its
+        own process would, and then the broker goes too."""
+        if self._serving and self._client is not None:
+            _Lifeline(self._quit).watch(self._client)
+        else:
+            self._quit()
+
+    def _quit(self) -> NoReturn:
         spare = self._spare
         if spare is not None:
             spare.kill()
@@ -476,7 +488,7 @@ class _Broker:
         try:
             _write_all(1, _frame(kind, payload))
         except BrokenPipeError:
-            self._abandon()
+            self._quit()
 
     def _spawn(self) -> None:
         digest = _code_digest()
@@ -600,6 +612,7 @@ class _Broker:
         try:
             request = json.loads(payload)
             nonce = str(request["nonce"]).encode()
+            client = int(request["pid"])
             env = {str(name): str(value) for name, value in request["env"].items()}
         except (ValueError, KeyError, TypeError, AttributeError):
             return
@@ -617,6 +630,7 @@ class _Broker:
             answer = None
         if answer is not None and answer[0] == b"k":
             self._serving = self._awaiting_input = True
+            self._client = client
             self._reply(b"a", nonce + b" " + str(spare.pid).encode())
             return
         self._reply(b"n", nonce)
@@ -729,6 +743,9 @@ def _become(request: _Request, stdin: bytes, out: int, err: int) -> None:
             signal.signal(signum, signal.default_int_handler)
         else:
             signal.signal(signum, signal.SIG_DFL)
+    # The shell hangs up its coprocess's whole process group as it exits,
+    # and a step's own process is not in that group.
+    os.setpgid(0, 0)
     sys.argv = list(request["argv"])
     sys.path[:] = request["path"]
 

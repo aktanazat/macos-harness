@@ -92,9 +92,10 @@ follows [Semantic Versioning](https://semver.org/).
   own process as before when its output is a terminal, it uses other
   Python flags or load-time settings, another step from the shell is
   running, no spare is ready, or the installed code changed since the
-  spare loaded. The spare exits with its shell, even after `kill -9`, and
-  with the step it serves; only commands the shell starts hold its pipes.
-  `macos-harness skill spare` prints the setup lines.
+  spare loaded. The spare exits with its shell, even after `kill -9`, once
+  a step it is running ends, and with the step it serves; only commands the
+  shell starts hold its pipes. `macos-harness skill spare` prints the setup
+  lines.
 
 ### Changed
 

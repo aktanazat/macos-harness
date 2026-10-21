@@ -36,9 +36,12 @@ spare reloads.
   the step ends is dropped instead of reaching the shell.
 - Only stdin, stdout, and stderr reach the program; other files the shell has
   open do not.
+- The program runs in a process group of its own, not the step's.
 
 ## Lifetime
 
 The spare and the process that keeps it exit with the shell, even when the
-shell is killed, and a spare exits with the step it serves. They listen
-nowhere: only commands the shell starts hold the pipes.
+shell is killed. A step running in a spare when the shell exits, such as one
+started with `nohup` or left in the background, runs to its end first, as its
+own process would, and then they exit. A spare exits with the step it serves.
+They listen nowhere: only commands the shell starts hold the pipes.
