@@ -18,7 +18,7 @@ from typing import TextIO
 from ._version import __version__
 from .browser import BrowserHarness
 from .errors import ErrorCode, MacOSError
-from .receipts import OperationError
+from .receipts import OperationError, equals, gone, present
 from .telemetry import capture_cli
 from .telemetry import run_cli as run_telemetry_cli
 
@@ -34,6 +34,9 @@ def _namespace(program_args: Mapping[str, str] | None = None) -> Iterator[dict[s
             "browser": BrowserHarness(),
             "mac": mac,
             "Path": Path,
+            "equals": equals,
+            "gone": gone,
+            "present": present,
             "subprocess": subprocess,
         }
 
@@ -217,7 +220,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="macos-harness",
         description="Execute Python with browser, macOS, and filesystem access.",
         epilog=(
-            "Typical usage:\n  macos-harness <<'PY'\n  print(mac.see('Spotify'))\n  PY"
+            "Typical usage:\n  macos-harness <<'PY'\n  print(mac.see('Spotify'))\n  PY\n"
+            "  macos-harness -c 'print(mac.windows())'"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -227,23 +231,42 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--json-errors",
         action="store_true",
-        help="write native stdin execution errors as JSON to stderr",
+        help="write execution errors as JSON to stderr",
+    )
+    parser.add_argument("-c", dest="code", metavar="CODE", help="run CODE instead of stdin")
+    errors = argparse.ArgumentParser(add_help=False)
+    errors.add_argument(
+        "--json-errors",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="write errors as JSON to stderr",
     )
     subparsers = parser.add_subparsers(dest="command")
-    doctor = subparsers.add_parser("doctor", help="check macOS permissions and runtime")
+    doctor = subparsers.add_parser(
+        "doctor", parents=[errors], help="check macOS permissions and runtime"
+    )
     doctor.add_argument(
         "--request", action="store_true", help="request missing global permissions"
     )
-    subparsers.add_parser("apps", help="list running macOS applications")
-    subparsers.add_parser("repl", help="start a persistent interactive Python session")
-    skill = subparsers.add_parser("skill", help="print the macOS Harness skill card or one reference")
+    apps = subparsers.add_parser(
+        "apps", parents=[errors], help="list running macOS applications, one per line"
+    )
+    apps.add_argument(
+        "name", nargs="?", help="only apps whose name or bundle ID contains this, any case"
+    )
+    subparsers.add_parser(
+        "repl", parents=[errors], help="start a persistent interactive Python session"
+    )
+    skill = subparsers.add_parser(
+        "skill", parents=[errors], help="print the macOS Harness skill card or one reference"
+    )
     skill.add_argument("reference", nargs="?", help="a reference name, such as signatures")
     telemetry = subparsers.add_parser(
         "telemetry", help="inspect or change telemetry (off by default)"
     )
     telemetry.add_argument("action", nargs="?", choices=("status", "enable", "disable"))
     see = subparsers.add_parser(
-        "see", help="capture an app's window, or any window by --window-id"
+        "see", parents=[errors], help="capture an app's window, or any window by --window-id"
     )
     see.add_argument(
         "app", nargs="?", type=_app_query, help="an app name, bundle ID, path, or pid"
@@ -259,15 +282,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pointer", action="store_true", help="draw the virtual pointer onto the image"
     )
     state = subparsers.add_parser(
-        "state", help="print an application's AX state as JSON"
+        "state", parents=[errors], help="print an application's AX state as JSON"
     )
     state.add_argument("app", type=_app_query)
     state.add_argument("--screenshot", action="store_true")
     state.add_argument("--max-depth", type=int, default=25)
-    state.add_argument("--max-nodes", type=int, default=5000)
+    state.add_argument("--max-nodes", type=int, default=400)
     state.add_argument("--include-menu-bar", action="store_true")
     run = subparsers.add_parser(
-        "run", help="run a saved program; each --arg NAME=VALUE lands in its `args` dict"
+        "run",
+        parents=[errors],
+        help="run a saved program; each --arg NAME=VALUE lands in its `args` dict",
     )
     run.add_argument("file", type=Path, help="a Python program, run like one on stdin")
     run.add_argument(
@@ -278,12 +303,6 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="program_args",
         metavar="NAME=VALUE",
         help="a string the program reads as args[NAME]; repeat for more",
-    )
-    run.add_argument(
-        "--json-errors",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="write execution errors as JSON to stderr",
     )
     subparsers.add_parser(
         "spare",
@@ -305,6 +324,8 @@ def main(argv: list[str] | None = None) -> int:
             return status
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.code is not None and args.command is not None:
+        parser.error(f"-c runs CODE in place of a command; drop -c or {args.command}")
     if args.command == "telemetry":
         return run_telemetry_cli([args.action] if args.action else [])
     if args.command == "spare":
@@ -333,7 +354,20 @@ def main(argv: list[str] | None = None) -> int:
             from .macos import MacOS
 
             with MacOS() as mac:
-                print(json.dumps(mac.list_apps(), indent=2))
+                apps = mac.list_apps()
+            if args.name is not None:
+                needle = args.name.casefold()
+                apps = [
+                    app for app in apps
+                    if needle in app["name"].casefold() or needle in (app["bundle_id"] or "").casefold()
+                ]
+                if not apps:
+                    raise MacOSError(
+                        f"No running app's name or bundle ID contains {args.name!r}",
+                        code=ErrorCode.APP_NOT_FOUND,
+                    )
+            for app in apps:
+                _print_json_line(app, file=sys.stdout)
             result = 0
             return result
         if args.command == "skill":
@@ -382,9 +416,18 @@ def main(argv: list[str] | None = None) -> int:
                     include_menu_bar=args.include_menu_bar,
                 )
             print(json.dumps(state, indent=2, ensure_ascii=False))
+            if not state["coverage"]["complete"]:
+                print(
+                    f"macos-harness: the tree stopped at --max-nodes {args.max_nodes} or "
+                    f"--max-depth {args.max_depth}; raise them to read further",
+                    file=sys.stderr,
+                )
             result = 0
             return result
         if args.command is None:
+            if args.code is not None:
+                result = _execute(args.code, filename="<-c>")
+                return result
             if sys.stdin.isatty():
                 parser.print_help()
                 result = 2
@@ -393,7 +436,7 @@ def main(argv: list[str] | None = None) -> int:
             return result
         parser.error(f"unknown command: {args.command}")
     except (MacOSError, RuntimeError) as exc:
-        if args.command in (None, "run") and args.json_errors and isinstance(exc, MacOSError):
+        if args.json_errors and isinstance(exc, MacOSError):
             payload = exc.to_json()
             if isinstance(exc, OperationError):
                 payload["receipt"] = exc.receipt.to_json()
