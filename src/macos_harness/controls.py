@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import difflib
 import re
 import weakref
 from collections.abc import Iterable
@@ -129,6 +128,8 @@ class Accessibility:
             return _ROLE_SEARCH_KEYS[normalized]
         if re.fullmatch(r"AX[A-Z][A-Za-z]*", role):
             return role
+        import difflib
+
         named = {ax_role[2:].casefold(): ax_role for ax_role in _AX_ROLES}
         suggestions = [
             named[name] for name in difflib.get_close_matches(normalized, named, n=3, cutoff=0.5)
