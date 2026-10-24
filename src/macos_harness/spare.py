@@ -30,6 +30,8 @@ import time
 from collections.abc import Callable, Collection, Mapping
 from typing import NoReturn, TextIO, TypedDict
 
+from ._paths import user_temp_dir
+
 ENV = "MACOS_HARNESS_SPARE"
 
 _MAGIC = b"\x00MHSPR\x01\xfe"
@@ -41,9 +43,6 @@ _CHUNK = 1 << 16
 _ANSWER_SECONDS = 0.5
 _LOCK_SPAN = 1 << 62
 _STALE = 3
-# _CS_DARWIN_USER_TEMP_DIR in <unistd.h>: the user's temporary directory,
-# whatever TMPDIR names.
-_USER_TEMP_DIR = 65537
 _PACKAGE = os.path.dirname(os.path.abspath(__file__))
 _PRELOAD = (
     "macos_harness.cli",
@@ -287,9 +286,7 @@ def _claim(requests: int) -> bool:
     """Hold this shell's spare until this process exits; False when another
     step from the same shell holds it."""
     try:
-        directory = os.confstr(_USER_TEMP_DIR)
-        if directory is None:
-            return False
+        directory = user_temp_dir()
         fd = os.open(
             os.path.join(directory, "macos-harness-spare.lock"),
             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
