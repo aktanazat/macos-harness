@@ -1,12 +1,25 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import subprocess
 import sys
 
 import pytest
 
+import macos_harness.capture as capture_module
 import macos_harness.overlay as overlay_module
+
+
+@pytest.fixture(autouse=True)
+def own_capture_lock(monkeypatch, tmp_path):
+    """Each test's process owns capture through a lock of its own, never
+    the one a live harness on this Mac holds."""
+    monkeypatch.setattr(capture_module, "user_temp_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(capture_module, "_capture_owner", None)
+    yield
+    if capture_module._capture_owner is not None:
+        os.close(capture_module._capture_owner)
 
 
 @pytest.fixture

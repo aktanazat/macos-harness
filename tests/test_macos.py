@@ -2338,40 +2338,51 @@ def test_scroll_without_a_point_at_an_app_with_no_window_is_refused(monkeypatch)
 
 
 @pytest.mark.parametrize(
-    ("frontmost_after", "activated"),
+    ("appkit_takes", "accessibility_takes", "activated", "via", "ax_requests"),
     [
-        ({"name": "Test", "bundle_id": None, "pid": 42, "path": None}, True),
-        ({"name": "Other", "bundle_id": None, "pid": 7, "path": None}, False),
+        (True, False, True, "appkit", []),
+        (False, True, True, "accessibility", [(42, "AXFrontmost", True)]),
+        (False, False, False, None, [(42, "AXFrontmost", True)]),
     ],
 )
-def test_activate_makes_one_request_and_reports_what_macos_did(
-    monkeypatch, frontmost_after, activated
+def test_activate_falls_back_to_accessibility_once_and_reports_what_macos_did(
+    monkeypatch, appkit_takes, accessibility_takes, activated, via, ax_requests
 ) -> None:
     mac = MacOS()
-    requests = []
     other = {"name": "Other", "bundle_id": None, "pid": 7, "path": None}
     info = {"name": "Test", "bundle_id": None, "pid": 42, "path": None}
+    front = [other]
+    requests = []
 
     class _Running:
         def activateWithOptions_(self, options: int) -> bool:
             requests.append(options)
+            if appkit_takes:
+                front[0] = info
             return True
 
+    def set_attribute(element, attribute, value):
+        requests.append((element, attribute, value))
+        if accessibility_takes:
+            front[0] = info
+        return 0
+
     monkeypatch.setattr(mac, "_resolve_app", lambda app: (_Running(), info))
-    # Frontmost stays on the other app for the first poll, then settles.
-    polls = iter([other, other, frontmost_after])
-    monkeypatch.setattr(mac, "_frontmost_app", lambda: next(polls, frontmost_after))
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: front[0])
+    monkeypatch.setattr(mac, "is_accessibility_trusted", lambda: True)
+    monkeypatch.setattr(macos_module.AS, "AXUIElementCreateApplication", lambda pid: pid)
+    monkeypatch.setattr(macos_module.AS, "AXUIElementSetAttributeValue", set_attribute)
     clock = iter(range(10_000))
     monkeypatch.setattr(macos_module.time, "monotonic", lambda: next(clock) * 0.1)
     monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
 
     result = mac.activate("Test", timeout=0.5)
 
-    assert requests == [macos_module.NSApplicationActivateIgnoringOtherApps]
+    assert requests == [macos_module.NSApplicationActivateIgnoringOtherApps, *ax_requests]
     assert result["activated"] is activated
+    assert result["via"] == via
     assert result["previous"] == other
-    assert result["frontmost"] == frontmost_after
-    assert result["app"] == info
+    assert result["frontmost"] == (info if activated else other)
 
 
 def test_input_without_target_is_refused(monkeypatch) -> None:
@@ -2596,9 +2607,27 @@ def test_click_screen_space_omits_image_coordinates_from_a_different_app(
 
     pointer = mac.click(10, 20, app="B", coordinate_space="screen")
 
-    assert pointer == {"screen": {"x": 10.0, "y": 20.0}, "window_id": 9}
+    assert pointer["screen"] == {"x": 10.0, "y": 20.0}
+    assert pointer["window_id"] == 9
     assert "image" not in pointer
     assert "inside" not in pointer
+
+
+@pytest.mark.parametrize(("frontmost_pid", "in_front"), [(222, True), (7, False)])
+def test_click_reports_whether_its_app_was_in_front(monkeypatch, frontmost_pid, in_front) -> None:
+    mac = MacOS()
+    monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
+    monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
+    monkeypatch.setattr(mac, "_pid", lambda app: 222)
+    monkeypatch.setattr(mac, "_post", lambda event, pid: None)
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "Front", "pid": frontmost_pid})
+    mac.hide_pointer()
+    _on_screen_windows(monkeypatch, (222, 9, 0, 0, 800, 600))
+
+    pointer = mac.click(10, 20, app="B", coordinate_space="screen")
+
+    assert pointer["target_is_frontmost"] is in_front
+    assert ("mac.activate(222)" in pointer.get("note", "")) is not in_front
 
 
 def test_screen_point_requires_screenshot() -> None:

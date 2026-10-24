@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from dataclasses import dataclass
 
 import pytest
 import Quartz
 
+import macos_harness.capture as capture_module
+from macos_harness._paths import user_temp_dir
 from macos_harness.capture import (
     GrayPrint,
+    WindowCatalog,
     _await,
     _crop_configuration,
     _crop_display,
     _output_size,
     _sck_error,
     _window_configuration,
+    capture_window,
     gray_print,
 )
 from macos_harness.errors import AccessibilityPermissionError, ErrorCode, MacOSError
@@ -186,6 +192,42 @@ def test_await_reports_a_capture_that_never_answers() -> None:
     assert exc_info.value.code == ErrorCode.TIMEOUT
     assert exc_info.value.details["operation"] == "Window capture"
     assert exc_info.value.details["timeout"] == 0.01
+
+
+_CAPTURE_AND_STAY = """
+import sys
+from macos_harness.capture import WindowCatalog, capture_window
+capture_window(int(sys.argv[1]), max_width=200, max_height=None, catalog=WindowCatalog())
+print("captured", flush=True)
+sys.stdin.read()
+"""
+
+
+@pytest.mark.smoke
+def test_a_window_captures_while_another_live_process_has_captured(monkeypatch) -> None:
+    monkeypatch.setattr(capture_module, "user_temp_dir", user_temp_dir)
+    window_id = next(
+        int(each[Quartz.kCGWindowNumber])
+        for each in Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
+        )
+        if each.get(Quartz.kCGWindowLayer) == 0
+    )
+    other = subprocess.Popen(
+        [sys.executable, "-c", _CAPTURE_AND_STAY, str(window_id)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert other.stdout.readline() == "captured\n"
+
+        picture = capture_window(
+            window_id, max_width=200, max_height=None, catalog=WindowCatalog()
+        )
+    finally:
+        other.communicate("", timeout=30)
+
+    assert picture.width == 200
 
 
 def test_a_sheet_inside_a_window_is_in_its_picture() -> None:

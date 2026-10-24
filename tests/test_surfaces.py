@@ -177,9 +177,10 @@ class _Desk(MacOS):
         *,
         button: str,
         clicks: int,
-    ) -> None:
+    ) -> bool:
         self._pointer_position = point
         self.clicks.append((pid, point, window.window_id, window.origin))
+        return self._frontmost_app()["pid"] == pid
 
     def _post(self, event: object, pid: int | None) -> None:
         location = Quartz.CGEventGetLocation(event)
@@ -377,6 +378,21 @@ def test_see_after_change_watches_the_window_window_id_names(tmp_path: Path) -> 
 
     assert shot["changed"] is False
     assert set(mac.window_captures) == {_PANEL}
+
+
+def test_see_region_names_the_windows_it_shows_with_front_ones_hiding_those_behind(
+    tmp_path: Path,
+) -> None:
+    """A region capture of a dialog that another app's window covered came
+    back as that window's pixels with nothing saying so; a full-screen game
+    above the normal layer covered it as well."""
+    shot = _Desk().see(region=(300, 100, 400, 400), path=tmp_path / "region.png")
+
+    assert [(shown["window_id"], shown["owner"], shown["share"]) for shown in shot["shows"]] == [
+        (_DOC, "Finder", 0.69),
+        (_PANEL, "Finder", 0.19),
+        (_NOTE, "Notes", 0.12),
+    ]
 
 
 # Each way to aim at screenshot pixels, none naming the app: through the

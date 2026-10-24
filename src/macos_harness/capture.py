@@ -8,7 +8,11 @@ encoded exactly once, by ImageIO, straight into the output file.
 
 from __future__ import annotations
 
+import fcntl
 import math
+import os
+import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -16,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ._paths import user_temp_dir
 from .errors import AccessibilityPermissionError, ErrorCode, MacOSError
 from .pointer import POINTER_HOTSPOT, pointer_points
 
@@ -36,6 +41,9 @@ else:
 # not answered by then is reported, not cancelled: the native work finishes
 # on its own and the late callback lands in a box nobody reads.
 CAPTURE_TIMEOUT = 5.0
+_CAPTURE_LOCK = "macos-harness-capture.lock"
+_SCREENCAPTURE = "/usr/sbin/screencapture"
+_capture_owner: int | None = None
 _SC_STREAM_ERROR_DOMAIN = "com.apple.ScreenCaptureKit.SCStreamErrorDomain"
 _SC_ERROR_USER_DECLINED = -3801
 _PIXEL_FORMAT_BGRA = 1111970369  # kCVPixelFormatType_32BGRA ('BGRA')
@@ -87,6 +95,98 @@ def _await(
             details={"operation": operation, "timeout": timeout},
         )
     return box[0], box[1]
+
+
+def _owns_capture() -> bool:
+    """Whether this process is the one that renders through
+    ScreenCaptureKit, held from its first capture until it exits.
+
+    macOS's capture service tells its clients apart by executable path, so
+    two live processes of one Python are one client to it: once both had
+    captured, every capture either asked for went unanswered, 30 seconds
+    as surely as 5, until one exited. Another process captures through
+    ``screencapture``, which ran beside a capturing harness 6 times in 6."""
+    global _capture_owner
+    if _capture_owner is not None:
+        return True
+    fd = os.open(
+        os.path.join(user_temp_dir(), _CAPTURE_LOCK),
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    _capture_owner = fd
+    return True
+
+
+def _screencapture(arguments: list[str], operation: str, timeout: float) -> object:
+    """The image ``screencapture`` takes with ``arguments``, at full pixel size."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "capture.png")
+        try:
+            subprocess.run(
+                [_SCREENCAPTURE, "-x", "-t", "png", *arguments, path],
+                check=True, capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise MacOSError(
+                f"{operation} did not answer within {timeout:g}s",
+                code=ErrorCode.TIMEOUT,
+                details={"operation": operation, "timeout": timeout, "via": "screencapture"},
+            ) from None
+        except subprocess.CalledProcessError as error:
+            raise MacOSError(
+                f"{operation} failed: screencapture said {error.stderr.strip() or error.returncode}",
+                code=ErrorCode.AX_ERROR,
+                details={"operation": operation, "via": "screencapture"},
+            ) from None
+        encoded = Path(path).read_bytes() if os.path.exists(path) else b""
+    source = Quartz.CGImageSourceCreateWithData(encoded, None)
+    image = None if source is None else Quartz.CGImageSourceCreateImageAtIndex(source, 0, None)
+    if image is None:
+        raise MacOSError(
+            f"{operation} wrote no image",
+            code=ErrorCode.AX_ERROR,
+            details={"operation": operation, "via": "screencapture"},
+        )
+    return image
+
+
+def _resized(image: object, width: int, height: int) -> object:
+    """``image`` drawn into exactly ``width`` x ``height`` pixels."""
+    if (Quartz.CGImageGetWidth(image), Quartz.CGImageGetHeight(image)) == (width, height):
+        return image
+    context = Quartz.CGBitmapContextCreate(
+        None, width, height, 8, 0,
+        Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB),
+        Quartz.kCGImageAlphaPremultipliedLast,
+    )
+    Quartz.CGContextSetInterpolationQuality(context, Quartz.kCGInterpolationHigh)
+    Quartz.CGContextDrawImage(context, Quartz.CGRectMake(0, 0, width, height), image)
+    return Quartz.CGBitmapContextCreateImage(context)
+
+
+def _rendered(
+    image: object,
+    bounds: dict[str, float],
+    *,
+    max_width: int | None,
+    max_height: int | None,
+    size: tuple[int, int] | None,
+    on_screen: bool,
+) -> WindowCapture:
+    """A ``screencapture`` image of ``bounds`` fitted to the size asked for."""
+    width, height = size or _output_size(
+        Quartz.CGImageGetWidth(image), Quartz.CGImageGetHeight(image), max_width, max_height
+    )
+    return WindowCapture(
+        image=_resized(image, width, height), width=width, height=height,
+        bounds=bounds, on_screen=on_screen, captured_at=time.time(),
+    )
 
 
 def _sck_error(operation: str, error: Any, **details: Any) -> MacOSError:
@@ -325,7 +425,28 @@ def capture_window(
     ``on_screen`` is the caller's only freshness signal. ``catalog`` lends
     the window list of an earlier capture of the window while the window,
     its app's other windows, and the displays stand where they did.
+
+    A process that does not own capture (see `_owns_capture`) renders
+    the window through ``screencapture`` instead, by itself with no
+    shadow, so an attached sheet is cut off where it overhangs.
     """
+    if not _owns_capture():
+        described = next(
+            iter(Quartz.CGWindowListCreateDescriptionFromArray([window_id]) or ()), None
+        )
+        if described is None:
+            raise MacOSError(
+                f"Window {window_id} is not capturable; it may have closed",
+                code=ErrorCode.ELEMENT_UNKNOWN,
+                details={"window_id": window_id},
+            )
+        x, y, width, height = _frame(described.get(Quartz.kCGWindowBounds))
+        return _rendered(
+            _screencapture(["-o", "-l", str(window_id)], "Window capture", timeout),
+            {"x": x, "y": y, "width": width, "height": height},
+            max_width=max_width, max_height=max_height, size=size,
+            on_screen=bool(described.get(Quartz.kCGWindowIsOnscreen, False)),
+        )
     content = catalog.content(window_id, timeout)
     windows = content.windows()
     window = _window_in(windows, window_id)
@@ -395,6 +516,14 @@ def capture_screen(
     """Render ``area`` (screen points inside the display at
     ``display_bounds``) as it shows on screen: every window there,
     composited, except those of ``hide_pid``."""
+    if not _owns_capture():
+        return _rendered(
+            _screencapture(
+                ["-R", ",".join(f"{area[key]:g}" for key in ("x", "y", "width", "height"))],
+                "Screen capture", timeout,
+            ),
+            dict(area), max_width=max_width, max_height=max_height, size=None, on_screen=True,
+        )
     content = _shareable_content(timeout)
     display = next(
         (item for item in content.displays() if int(item.displayID()) == display_id), None

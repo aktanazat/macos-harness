@@ -70,8 +70,10 @@ with repeated keys, clicks, deletion loops, or bulk input.
 
 - Input targets an already-running app PID and never activates it on its own.
   `mac.activate(app)` is the one explicit request. It returns `activated` from
-  what macOS actually did; a declined request means the user has priority, so
-  hand off instead of asking again.
+  what macOS actually did and `via`, the request that worked: when macOS
+  declines the ordinary one, as for Wine apps, it asks once through
+  Accessibility. Declined both ways means the user has priority, so hand off
+  instead of asking again.
 - A background target becoming frontmost raises `FocusChangedError`; never
   manipulate focus to restore it.
 - `mac.click()` is raw PID-targeted input and never guesses an AX action. Every
@@ -85,7 +87,9 @@ with repeated keys, clicks, deletion loops, or bulk input.
   seconds. `mac.do.type` takes at most 4096 characters.
 - An inactive app takes scrolls, plain keys, and typed text, but AppKit drops a
   menu shortcut (`cmd+a`) sent to it and passes a first click only to a view
-  that accepts first mouse; text views do not. The receipt then says
+  that accepts first mouse; text views do not. The click result says
+  `target_is_frontmost`, and when it is false a `note` names the check,
+  `mac.wait_change(window_id=N)`, and the cure; the receipt says
   `changed=None`, and a printed `do.click` receipt on an app in the
   background names the cure: `mac.activate(app)` first, or `mac.do.press`.
 - `mac.frontmost()`, and `activate`'s and `launch`'s `previous` or

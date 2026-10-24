@@ -7,6 +7,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `mac.activate` asks once more through Accessibility when macOS declines
+  the ordinary request, as it does for Wine apps, and says which request
+  worked under `via` (`appkit`, `accessibility`, or `None`).
+- `mac.click` reports `target_is_frontmost`; a click on an app in the
+  background adds a `note` that a first click there may be dropped, with
+  the `wait_change` and `activate` calls that check and cure it.
+- `see(region=...)` and `see(display=...)` name the windows they show
+  under `shows`, the most visible first, each with its visible `share`,
+  so a picture covered by another app's window says so.
+- Two live harness processes capture side by side: the first to capture
+  keeps ScreenCaptureKit and others render through `screencapture`.
+  Before, once both had captured, every capture in either timed out.
 - `mac.ax` takes any AX role, by its AX name or in words (`pop up button`,
   `AXRow`); a role Apple's search has no key for is filtered from an
   any-role search, and `role="window"` finds the app's windows. A

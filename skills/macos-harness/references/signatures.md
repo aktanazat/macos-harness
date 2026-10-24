@@ -82,7 +82,16 @@ Export"` for a submenu, or with no path the menus in the menu bar: each has
 screen points captures the screen as it shows, every window composited.
 The result has no `app` or `pid`, and its pixels map a later
 `coordinate_space="screenshot"` click for whichever app owns the window
-there.
+there. Its `shows` lists the windows in the picture, the most visible
+first, each with `window_id`, `owner`, `pid`, `title`, and the `share` of
+the area it covers; another app's window in front means the picture shows
+it, not what lies behind.
+
+One process at a time keeps ScreenCaptureKit: macOS treats two live
+harness processes on one Python as one client and answers neither. The
+first to capture keeps it until it exits; any other renders through
+`screencapture`, where a window's sheet that hangs past its edge is cut
+off.
 
 `place(app, x=, y=, width=, height=)` moves or resizes window
 `window_index`, or the one `window_id=` names, through Accessibility,

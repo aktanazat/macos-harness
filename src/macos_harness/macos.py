@@ -287,6 +287,7 @@ _CHANGE_REGION_SHARE = 0.02
 _CHANGE_BASELINE_SIZE = 640
 _PRINT_POINTS_PER_PIXEL = 2.0
 _PRINT_MAX_WIDTH = 400
+_AREA_SAMPLES = 32
 # What `wait_change(by="ax")` compares: what an element says and its
 # state, not where it sits.
 _AX_LOOK_ATTRIBUTES = (
@@ -4987,7 +4988,8 @@ class MacOS:
         or ``region`` (x, y, width, height in screen points) captures the
         screen there as it shows instead, every window composited; its
         ``bounds`` map ``coordinate_space="screenshot"`` input as a
-        window's do. ``after_change`` first waits up to ``timeout``
+        window's do, and its ``shows`` names the windows in the picture,
+        the most visible first. ``after_change`` first waits up to ``timeout``
         seconds for the window to change from where `wait_change` would
         measure and hold still ``settle`` seconds; the result's
         ``changed`` says whether it did, and no change is no error here:
@@ -5087,7 +5089,7 @@ class MacOS:
             )
             screenshot: dict[str, Any] = {
                 "path": str(output), "app": None, "pid": None, "window_id": None,
-                "display": index,
+                "display": index, "shows": self._windows_in_area(area),
             }
         else:
             if window_id is None:
@@ -5270,6 +5272,51 @@ class MacOS:
             display_id, area, frame, max_width=max_width, max_height=max_height,
             hide_pid=self._overlay.pid,
         )
+
+    def _windows_in_area(self, area: Mapping[str, float]) -> list[dict[str, JSONValue]]:
+        """The windows that show in screen ``area``, of every layer, front
+        ones hiding those behind, each with the share of the area it
+        covers, largest first. Desktop showing through counts for none,
+        and the harness pointer, left out of the capture, for nothing."""
+        left, top = area["x"], area["y"]
+        right, bottom = left + area["width"], top + area["height"]
+        windows = [
+            window for window in self.windows(all_layers=True)
+            if window["alpha"] > 0
+            and window["layer"] >= 0
+            and window["pid"] != self._overlay.pid
+            and window["bounds"]["x"] < right
+            and window["bounds"]["x"] + window["bounds"]["width"] > left
+            and window["bounds"]["y"] < bottom
+            and window["bounds"]["y"] + window["bounds"]["height"] > top
+        ]
+        counts = [0] * len(windows)
+        for row in range(_AREA_SAMPLES):
+            y = top + (row + 0.5) * area["height"] / _AREA_SAMPLES
+            for column in range(_AREA_SAMPLES):
+                x = left + (column + 0.5) * area["width"] / _AREA_SAMPLES
+                for index, window in enumerate(windows):
+                    bounds = window["bounds"]
+                    if (
+                        bounds["x"] <= x < bounds["x"] + bounds["width"]
+                        and bounds["y"] <= y < bounds["y"] + bounds["height"]
+                    ):
+                        counts[index] += 1
+                        break
+        shown = sorted(
+            ((count, index) for index, count in enumerate(counts) if count),
+            key=lambda item: (-item[0], item[1]),
+        )
+        return [
+            {
+                "window_id": windows[index]["window_id"],
+                "owner": windows[index]["owner"],
+                "pid": windows[index]["pid"],
+                "title": windows[index]["title"],
+                "share": round(count / _AREA_SAMPLES**2, 2),
+            }
+            for count, index in shown
+        ]
 
     def _window_image(
         self,
@@ -5917,34 +5964,54 @@ class MacOS:
     ) -> dict[str, Any]:
         """Ask macOS to bring ``app`` frontmost and report what actually happened.
 
-        Since macOS 14 activation is a request the system may decline,
-        typically while the user is busy in another app. One request is
-        made and the frontmost app is observed for up to ``timeout``
-        seconds; ``activated`` says whether it took. Nothing here retries
-        or loops -- a declined request means the person at the keyboard
-        has priority, so hand off instead of asking again.
+        Since macOS 14 activation is a request the system may decline.
+        AppKit's request comes first; when ``app`` is not frontmost after
+        ``timeout`` seconds, one Accessibility request sets the app's
+        ``AXFrontmost``, the route System Events takes, and the frontmost
+        app is observed for up to ``timeout`` again. Wine declined every
+        AppKit request and took the Accessibility one in 19ms.
+        ``activated`` says whether either took and ``via`` which:
+        ``appkit`` or ``accessibility``, None when neither did. Nothing
+        here retries further -- a request both routes decline means the
+        person at the keyboard has priority, so hand off instead of
+        asking again.
         """
         running, info = self._resolve_app(app)
+        pid = int(info["pid"])
         previous = self._frontmost_app()
         started = time.monotonic()
         running.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
-        deadline = started + max(0.0, timeout)
-        while True:
-            frontmost = self._frontmost_app()
-            activated = frontmost is not None and int(frontmost["pid"]) == int(
-                info["pid"]
+        frontmost, activated = self._await_frontmost(pid, timeout)
+        via = "appkit" if activated else None
+        if not activated and self.is_accessibility_trusted():
+            AS.AXUIElementSetAttributeValue(
+                AS.AXUIElementCreateApplication(pid), "AXFrontmost", True
             )
-            if activated or time.monotonic() >= deadline:
-                break
-            time.sleep(0.02)
+            frontmost, activated = self._await_frontmost(pid, timeout)
+            via = "accessibility" if activated else None
         self._last_app = info
         return {
             "app": info,
             "activated": activated,
+            "via": via,
             "previous": self._mark_owned(previous),
             "frontmost": self._mark_owned(frontmost),
             "elapsed_ms": round((time.monotonic() - started) * 1000),
         }
+
+    def _await_frontmost(
+        self, pid: int, timeout: float
+    ) -> tuple[dict[str, JSONValue] | None, bool]:
+        """The frontmost app once it is ``pid``, else when ``timeout``
+        seconds have passed, and whether it is ``pid``."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            frontmost = self._frontmost_app()
+            if frontmost is not None and int(frontmost["pid"]) == pid:
+                return frontmost, True
+            if time.monotonic() >= deadline:
+                return frontmost, False
+            time.sleep(0.02)
 
     def frontmost(self) -> dict[str, JSONValue] | None:
         """The app in front now: its name, bundle ID, pid, and path;
@@ -6256,10 +6323,18 @@ class MacOS:
             pid = self._input_pid(owner, window_id, "Pointer input")
             point = self._element_point(element, pid)
         window = self._target_window(pid, point, window_id)
-        self._post_click(pid, point, window, button=button, clicks=clicks)
+        in_front = self._post_click(pid, point, window, button=button, clicks=clicks)
         pointer = self._pointer_info(pid=pid)
         assert pointer is not None
         pointer["window_id"] = window.window_id
+        pointer["target_is_frontmost"] = in_front
+        if not in_front:
+            pointer["note"] = (
+                f"pid {pid} was in the background, where AppKit passes a first click "
+                "only to a view that accepts first mouse, so this one may have been "
+                f"dropped: mac.wait_change(window_id={window.window_id}) says whether "
+                f"the window changed, and mac.activate({pid}) first makes a click land"
+            )
         return pointer
 
     def _element_pid(self, element: ElementRef) -> int | None:
@@ -6304,12 +6379,12 @@ class MacOS:
         *,
         button: str,
         clicks: int,
-    ) -> None:
+    ) -> bool:
         """Post ``clicks`` presses of ``button`` at screen ``point``, each
-        routed to ``window``. ``click`` resolves those three for a raw
-        call; ``mac.do.click`` resolves them itself, before it reserves
-        anything, and hands them over so the window it reports is the
-        one the events carry."""
+        routed to ``window``, and say whether ``pid`` was frontmost then.
+        ``click`` resolves those three for a raw call; ``mac.do.click``
+        resolves them itself, before it reserves anything, and hands them
+        over so the window it reports is the one the events carry."""
         self._hold_before_input(pid, window.window_id)
         focus_before = self._frontmost_app()
         self._pointer_position = point
@@ -6323,6 +6398,7 @@ class MacOS:
                 time.sleep(0.03)
             self._guard_focus(focus_before, pid, "click")
         self._overlay.click()
+        return focus_before is not None and int(focus_before["pid"]) == pid
 
     def _post_mouse(
         self,
