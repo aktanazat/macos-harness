@@ -822,6 +822,8 @@ def test_strict_wait_never_trusts_one_match_from_a_cut_search(monkeypatch) -> No
     assert exc_info.value.code == ErrorCode.TIMEOUT
     assert exc_info.value.details == {
         "timeout": 0,
+        "polls": 1,
+        "query": {"title": "Save", "app": "Pages", "visible_only": True},
         "complete": False,
         "visited": 1,
         "max_nodes": 300,
@@ -1258,7 +1260,8 @@ def _app_search(monkeypatch, children: dict, data: dict) -> None:
     """Serve the app's own search predicate over a `_bounded_tree`: the
     descendants of the root's windows, in order, of the role the
     predicate's key names (any kind for the any-type key) and holding its
-    text. Like a real app's search it never returns the windows."""
+    text; a visible-only search leaves out an element marked
+    ``"offscreen"``. Like a real app's search it never returns windows."""
 
     def descendants(element):
         for child in children.get(element, []):
@@ -1273,7 +1276,8 @@ def _app_search(monkeypatch, children: dict, data: dict) -> None:
             for element in descendants(root)
             if data[element]["AXRole"] != "AXWindow"
             and role in {None, data[element]["AXRole"]}
-            and any(text in str(value).casefold() for name, value in data[element].items() if name != "AXRole")
+            and not (predicate["AXVisibleOnly"] and data[element].get("offscreen"))
+            and any(text in value.casefold() for value in data[element].values() if isinstance(value, str))
         ]
         limit = predicate["AXResultsLimit"]
         return macos_module._AX_SUCCESS, found if limit < 0 else found[:limit]
@@ -1296,6 +1300,45 @@ def _settings_app(monkeypatch, *, app_search: bool) -> MacOS:
     if app_search:
         _app_search(monkeypatch, children, data)
     return mac
+
+
+def _meetings_app(monkeypatch) -> MacOS:
+    mac = MacOS()
+    root, window, heading, below = (object() for _ in range(4))
+    children = {root: [window], window: [heading, below]}
+    data = {
+        root: {"AXRole": "AXApplication"},
+        window: {"AXRole": "AXWindow", "AXTitle": "Calendar"},
+        heading: {"AXRole": "AXStaticText", "AXValue": "Upcoming meetings"},
+        below: {"AXRole": "AXStaticText", "AXValue": "Synthetic planning call", "offscreen": True},
+    }
+    _bounded_tree(monkeypatch, mac, root, children, data)
+    _app_search(monkeypatch, children, data)
+    return mac
+
+
+def test_ax_wait_timeout_names_a_match_that_is_only_off_screen(monkeypatch) -> None:
+    """A wait for what is on screen that times out says the same query
+    matches below the fold, so the caller scrolls instead of retrying."""
+    mac = _meetings_app(monkeypatch)
+
+    with pytest.raises(MacOSError, match="matches 1 element.*off screen.*AXStaticText 'Synthetic planning call'") as caught:
+        mac.ax.wait("Synthetic planning call", app="Demo", timeout=0)
+
+    assert caught.value.code == ErrorCode.TIMEOUT
+    assert caught.value.details["elsewhere"] == [{"role": "AXStaticText"}]
+
+
+def test_ax_wait_timeout_names_the_on_screen_labels_nearest_its_text(monkeypatch) -> None:
+    """A wait whose words are slightly off times out naming the label it
+    probably meant, so the caller fixes the text instead of the timing."""
+    mac = _meetings_app(monkeypatch)
+
+    with pytest.raises(MacOSError, match="nearest on screen: AXStaticText 'Upcoming meetings'") as caught:
+        mac.ax.wait("Upcomng meetings", app="Demo", timeout=0)
+
+    assert caught.value.details["nearest"] == [{"role": "AXStaticText", "label": "Upcoming meetings"}]
+    assert "elsewhere" not in caught.value.details
 
 
 @pytest.mark.parametrize(

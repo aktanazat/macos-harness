@@ -8,6 +8,7 @@ renders a specific window (see ``capture.py``).
 from __future__ import annotations
 
 import ctypes
+import difflib
 import errno
 import json
 import math
@@ -239,6 +240,11 @@ _AX_CROSS_APP_MESSAGING_TIMEOUT = 0.5
 # plausibly finds -- "Allow" also finds "Don't Allow". Mirrors
 # `PressCoordinator.labelSearchLimit` in the native agent.
 _AX_LABEL_SEARCH_LIMIT = 20
+# What a wait that timed out in one app looks for instead (`_wait_clues`):
+# a few matches off screen or of another role, and the on-screen labels
+# it ranks against what the wait sought.
+_WAIT_CLUE_MATCHES = 5
+_WAIT_CLUE_LABELS = 200
 # How many apps a broad sweep asks at once whether they can answer
 # Accessibility (`MacOS._silent_pids`): enough that the few that never
 # answer cost one messaging timeout together instead of one each.
@@ -800,6 +806,45 @@ def _did_not_answer(exc: MacOSError) -> bool:
     while -- Secretive and Activity Monitor for over a second after
     ``open -a`` -- so a wait polls on (`_unanswered_search`)."""
     return exc.details.get("ax_error") == AS.kAXErrorCannotComplete
+
+
+def _wait_query(
+    *,
+    app: str | int | None,
+    search_key: str,
+    text: str | None,
+    title: str | None,
+    identifier: str | None,
+    description: str | None,
+    visible_only: bool,
+) -> dict[str, JSONValue]:
+    """What a wait looked for, as its timeout reports it."""
+    role = _role_filter(search_key) or _AX_SEARCH_ROLES.get(search_key)
+    fields: dict[str, JSONValue] = {
+        "text": text,
+        "role": role,
+        "search_key": None if role or search_key == "AXAnyTypeSearchKey" else search_key,
+        "title": title,
+        "identifier": identifier,
+        "description": description,
+        "app": app if isinstance(app, (str, int)) else None,
+    }
+    return {name: value for name, value in fields.items() if value is not None} | {
+        "visible_only": visible_only
+    }
+
+
+def _clue_summary(match: Mapping[str, JSONValue], sought: str) -> str:
+    """One match a timeout names as a clue: its role, label -- or the text
+    ``sought`` that it matched -- and place."""
+    label = next(
+        (match[field] for field in ("title", "description")
+         if isinstance(match.get(field), str) and match[field]),
+        sought,
+    )
+    frame = match.get("frame")
+    at = f" at ({frame['x']:g}, {frame['y']:g})" if isinstance(frame, Mapping) else ""
+    return f"{match.get('role')} {label!r}{at}"
 
 
 def _unanswered_search() -> SearchMatches:
@@ -3535,6 +3580,7 @@ class MacOS:
         timeout: float = 5.0,
         interval: float = 0.1,
         actionable: bool = False,
+        explain: bool = True,
     ) -> dict[str, Any]:
         """Wait for exactly one AX match and fail closed on ambiguity.
 
@@ -3545,7 +3591,9 @@ class MacOS:
         one labelled exactly ``text`` wins, and for a caller about to act
         on the match (``actionable``) the only enabled one after that
         (see `_settle_tie`). A search the app did not answer in time
-        (AXError -25204) is a poll that found nothing yet.
+        (AXError -25204) is a poll that found nothing yet. A timeout in one
+        app names the query and its poll count and, with ``explain``, what
+        the app shows instead (`_wait_clues`).
         """
         exact = _ExactSelector.parse(
             title=title, identifier=identifier, description=description
@@ -3576,7 +3624,9 @@ class MacOS:
         # text, a second match already proves ambiguity.
         limit = _AX_LABEL_SEARCH_LIMIT if text else 2
         deadline = time.monotonic() + timeout
+        polls = 0
         while True:
+            polls += 1
             try:
                 if cross_process:
                     matches = self.ax_search_all(
@@ -3655,26 +3705,117 @@ class MacOS:
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                query = _wait_query(
+                    app=app, search_key=search_key, text=text, title=title,
+                    identifier=identifier, description=description,
+                    visible_only=visible_only,
+                )
+                sought = ", ".join(
+                    f"{name}={value!r}" for name, value in query.items() if name != "visible_only"
+                )
+                tally = f" for {sought or 'any element'} after {polls} searches in {timeout:g}s"
+                details: dict[str, JSONValue] = {"timeout": timeout, "polls": polls, "query": query}
                 if matches.complete:
-                    raise MacOSError(
-                        "AX wait timed out without a match",
-                        code=ErrorCode.TIMEOUT,
-                        details={"timeout": timeout},
+                    message, note = "AX wait timed out without a match" + tally, ""
+                else:
+                    message = (
+                        "AX wait timed out before a complete search confirmed "
+                        "a unique match" + tally
+                        if matches
+                        else "AX wait timed out without a match" + tally
+                        + "; the last search was incomplete"
                     )
-                message = (
-                    "AX wait timed out before a complete search confirmed "
-                    "a unique match"
-                    if matches
-                    else "AX wait timed out without a match; the last search "
-                    "was incomplete"
-                )
-                note, gaps = _search_gaps(matches, max_nodes)
-                raise MacOSError(
-                    message + note,
-                    code=ErrorCode.TIMEOUT,
-                    details={"timeout": timeout, **gaps},
-                )
+                    note, gaps = _search_gaps(matches, max_nodes)
+                    details.update(gaps)
+                if explain and not cross_process and not matches and not matches.unanswered:
+                    hint, clues = self._wait_clues(
+                        app=app, search_key=search_key, text=text, title=title,
+                        identifier=identifier, description=description,
+                        visible_only=visible_only, max_nodes=max_nodes, enhance=enhance,
+                    )
+                    note += hint
+                    details.update(clues)
+                raise MacOSError(message + note, code=ErrorCode.TIMEOUT, details=details)
             time.sleep(min(interval, remaining))
+
+    def _wait_clues(
+        self,
+        *,
+        app: str | int | None,
+        search_key: str,
+        text: str | None,
+        title: str | None,
+        identifier: str | None,
+        description: str | None,
+        visible_only: bool,
+        max_nodes: int,
+        enhance: bool,
+    ) -> tuple[str, dict[str, JSONValue]]:
+        """What a wait in one app that found nothing could see instead, for
+        its timeout to say: the same query matching off screen or as
+        another role (``elsewhere``), and the on-screen labels nearest what
+        it sought (``nearest``), so a caller tells "not drawn yet" from
+        "wrong words" without a screenshot. A clue search that fails adds
+        nothing; labels come from titles, descriptions, and static text,
+        never from an editable field's value."""
+        role = _role_filter(search_key) or _AX_SEARCH_ROLES.get(search_key)
+        note = ""
+        clues: dict[str, JSONValue] = {}
+
+        def search(**kwargs: Any) -> SearchMatches:
+            try:
+                return self.ax_search(
+                    app=app, include_actions=False, max_nodes=max_nodes,
+                    enhance=enhance, reset_elements=False, **kwargs,
+                )
+            except MacOSError:
+                return SearchMatches(complete=False, visited=0)
+
+        sought = text or title or description or identifier
+        if sought and (visible_only or search_key != "AXAnyTypeSearchKey"):
+            wider = search(
+                text=text, title=title, identifier=identifier, description=description,
+                visible_only=False, limit=_WAIT_CLUE_MATCHES,
+                attributes=("AXRole", "AXTitle", "AXDescription", "AXFrame"),
+            )
+            if wider:
+                clues["elsewhere"] = [
+                    {name: value for name, value in match.items() if name not in {"element_index", "pid"}}
+                    for match in wider
+                ]
+                where = (
+                    f"of another role than {role}" if role and all(match.get("role") != role for match in wider)
+                    else "off screen, hidden, or of another role"
+                )
+                note += (
+                    f"; the same query matches {len(wider)} element(s) {where}: "
+                    + "; ".join(_clue_summary(match, sought) for match in wider)
+                    + ". Scroll to or reveal it, or change the role"
+                )
+        if sought:
+            labels: dict[str, str] = {}
+            for key, attributes in (
+                ("AXAnyTypeSearchKey", ("AXRole", "AXTitle", "AXDescription")),
+                ("AXStaticTextSearchKey", ("AXRole", "AXValue")),
+            ):
+                for match in search(
+                    search_key=key, visible_only=True, limit=_WAIT_CLUE_LABELS, attributes=attributes
+                ):
+                    for field in ("title", "description", "value"):
+                        label = match.get(field)
+                        if isinstance(label, str) and label.strip():
+                            labels.setdefault(label.strip()[:80], str(match.get("role")))
+            folded = {label.casefold(): label for label in labels}
+            nearest = [
+                folded[label]
+                for label in difflib.get_close_matches(sought.casefold(), folded, n=5, cutoff=0.5)
+            ]
+            if nearest:
+                clues["nearest"] = [{"role": labels[label], "label": label} for label in nearest]
+                note += "; nearest on screen: " + ", ".join(
+                    f"{labels[label]} {label!r}" for label in nearest
+                )
+        return note, clues
 
     def ax_wait_gone(
         self,
