@@ -449,6 +449,19 @@ def _on_screen_only(visible_only: bool, search_key: str) -> bool:
     return visible_only and search_key not in _AX_MENU_SEARCH_KEYS
 
 
+def _in_closed_menus(matches: SearchMatches, search_key: str) -> SearchMatches:
+    """``matches`` with each one a closed menu holds marked
+    ``in_closed_menu``: a search for menus or their items reaches closed
+    menus too, whose items AppKit keeps at zero size, and such an item
+    answers a press but cannot take a click."""
+    if search_key in _AX_MENU_SEARCH_KEYS:
+        for match in matches:
+            frame = match.get("frame")
+            if isinstance(frame, Mapping) and frame.get("width") == 0 and frame.get("height") == 0:
+                match["in_closed_menu"] = True
+    return matches
+
+
 # Where a menu path's first step is looked for, by the bar it starts in.
 _MENU_BAR_PLACES = {"AXMenuBar": "in its menu bar", "AXExtrasMenuBar": "among its status items"}
 
@@ -2468,15 +2481,58 @@ class MacOS:
         frame = match.get("frame")
         if frame is not None and (len(same) > 1 or not found.complete):
             same = [candidate for candidate in same if candidate.get("frame") == frame]
+        scope = match.get("window_id")
+        scoped = isinstance(scope, int) and not isinstance(scope, bool)
+        located: list[dict[str, JSONValue]] = []
+        if len(same) > 1 or scoped:
+            located = self._candidate_windows(pid, same)
+            if scoped:
+                kept = [index for index, window in enumerate(located) if window["window_id"] == scope]
+                same, located = [same[index] for index in kept], [located[index] for index in kept]
         if len(same) != 1:
             label = title or identifier or description or "untitled"
+            where = f" in window {scope}" if scoped else ""
+            if len(same) > 1:
+                where += " in windows " + ", ".join(
+                    f"{window['window_id'] or '(no id)'} {window['title']!r}" for window in located
+                )
             raise MacOSError(
-                f"Found {len(same)} {role} {label!r} in process {pid} where the "
-                "match needs exactly one; query it again",
+                f"Found {len(same)} {role} {label!r} in process {pid}{where} where "
+                "the match needs exactly one; add the window_id of the one you "
+                "mean to the match, or query it again",
                 code=ErrorCode.ELEMENT_UNKNOWN,
-                details={"pid": pid, "role": role, "found": len(same)},
+                details={"pid": pid, "role": role, "found": len(same), "windows": located},
             )
         return self._elements[int(same[0]["element_index"])]
+
+    def _candidate_windows(
+        self, pid: int, candidates: Sequence[Mapping[str, JSONValue]]
+    ) -> list[dict[str, JSONValue]]:
+        """The window each of ``pid``'s ``candidates`` sits in: its title,
+        and the window server's id for it, or None where no window or
+        several have its frame. AX names no window id, so the id is the
+        one window whose bounds match the AX window's frame."""
+        listed = self.windows(pid, all_layers=True)
+        located: list[dict[str, JSONValue]] = []
+        for candidate in candidates:
+            element = self._elements[int(candidate["element_index"])]
+            window = self._copy_attribute(element, "AXWindow") if self._is_ax_element(element) else None
+            raw: Mapping[str, Any] = (
+                self._copy_attributes(window, ("AXTitle", "AXFrame"))
+                if self._is_ax_element(window) else {}
+            )
+            frame = self._lenient_json(raw, "AXFrame", [])
+            ids = [
+                entry["window_id"]
+                for entry in listed
+                if isinstance(frame, Mapping)
+                and all(abs(frame[key] - entry["bounds"][key]) < 1 for key in entry["bounds"])
+            ]
+            located.append({
+                "window_id": ids[0] if len(ids) == 1 else None,
+                "title": self._lenient_json(raw, "AXTitle", []),
+            })
+        return located
 
     def _remember_element(self, element: Any) -> int:
         index = self._element_seq
@@ -2899,7 +2955,9 @@ class MacOS:
                     messaging_timeout=messaging_timeout,
                     enhance=enhance,
                 )
-                return _with_pid(found if role is None else _of_role(found, role, limit), native_pid)
+                return _with_pid(_in_closed_menus(
+                    found if role is None else _of_role(found, role, limit), search_key
+                ), native_pid)
 
         self._ensure_accessibility()
         if element_index is None:
@@ -2963,7 +3021,7 @@ class MacOS:
             root, "AXUIElementsForSearchPredicate", predicate, None
         )
         if error == AS.kAXErrorParameterizedAttributeUnsupported:
-            return _with_pid(self._bounded_ax_search(
+            return _with_pid(_in_closed_menus(self._bounded_ax_search(
                 root,
                 search_key=search_key,
                 text=text,
@@ -2975,7 +3033,7 @@ class MacOS:
                 attributes=attributes,
                 include_actions=include_actions,
                 max_nodes=max_nodes,
-            ), pid)
+            ), search_key), pid)
         if error != _AX_SUCCESS:
             raise _ax_error("AXUIElementsForSearchPredicate", error, element_index=element_index)
 
@@ -3016,9 +3074,9 @@ class MacOS:
         complete = (
             requested_limit < 0 or len(candidates) < requested_limit
         ) and not cut and read_complete
-        return _with_pid(
-            SearchMatches(matches, complete=complete, visited=len(candidates)), pid
-        )
+        return _with_pid(_in_closed_menus(
+            SearchMatches(matches, complete=complete, visited=len(candidates)), search_key
+        ), pid)
 
     def _window_search(
         self,

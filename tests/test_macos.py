@@ -1439,6 +1439,72 @@ def test_app_state_says_which_read_cut_the_tree_short(monkeypatch) -> None:
 
 
 
+def _rect(x: float, y: float, width: float, height: float) -> object:
+    return macos_module.AS.AXValueCreate(
+        macos_module.AS.kAXValueCGRectType,
+        macos_module.AS.CGRect(macos_module.AS.CGPoint(x, y), macos_module.AS.CGSize(width, height)),
+    )
+
+
+def test_ax_menu_item_search_marks_the_items_of_a_closed_menu(monkeypatch) -> None:
+    """A menu-item search reaches closed menus too; an item there sits at
+    zero size, answers a press but not a click, and says so."""
+    mac = MacOS()
+    root, bar, menu, closed, shown = (object() for _ in range(5))
+    data = {
+        root: {"AXRole": "AXApplication"},
+        bar: {"AXRole": "AXMenuBar"},
+        menu: {"AXRole": "AXMenu"},
+        closed: {"AXRole": "AXMenuItem", "AXTitle": "Close Window", "AXFrame": _rect(0, 1117, 0, 0)},
+        shown: {"AXRole": "AXMenuItem", "AXTitle": "Close Tab", "AXFrame": _rect(10, 40, 200, 22)},
+    }
+    children = {root: [bar], bar: [menu], menu: [closed, shown]}
+    _bounded_tree(monkeypatch, mac, root, children, data)
+    _app_search(monkeypatch, children, data)
+
+    found = mac.ax.query("Close", app="Demo", role="menu item", include_actions=False)
+
+    assert [(match["title"], match.get("in_closed_menu")) for match in found] == [
+        ("Close Window", True),
+        ("Close Tab", None),
+    ]
+
+
+def test_ax_match_twins_in_two_windows_name_the_windows_and_take_a_window_id(monkeypatch) -> None:
+    """Two identical Open panels each hold a Cancel: finding the match again
+    fails naming each panel's window id, and the match with one of those
+    ids added finds the Cancel in that window."""
+    mac = MacOS()
+    root, first, second, first_cancel, second_cancel = (object() for _ in range(5))
+    data = {
+        root: {"AXRole": "AXApplication"},
+        first: {"AXRole": "AXWindow", "AXTitle": "Open", "AXFrame": _rect(100, 100, 600, 400)},
+        second: {"AXRole": "AXWindow", "AXTitle": "Open", "AXFrame": _rect(300, 200, 600, 400)},
+        first_cancel: {"AXRole": "AXButton", "AXTitle": "Cancel"},
+        second_cancel: {"AXRole": "AXButton", "AXTitle": "Cancel"},
+    }
+    children = {root: [first, second], first: [first_cancel], second: [second_cancel]}
+    _bounded_tree(monkeypatch, mac, root, children, data)
+    _app_search(monkeypatch, children, data)
+    owner = {first_cancel: first, second_cancel: second}
+    monkeypatch.setattr(
+        mac,
+        "_copy_attribute",
+        lambda element, attribute, **kwargs: owner.get(element) if attribute == "AXWindow" else children.get(element, []),
+    )
+    monkeypatch.setattr(mac, "windows", lambda app, all_layers=False: [
+        {"window_id": 8652, "bounds": {"x": 100.0, "y": 100.0, "width": 600.0, "height": 400.0}},
+        {"window_id": 8875, "bounds": {"x": 300.0, "y": 200.0, "width": 600.0, "height": 400.0}},
+    ])
+    match = {"pid": 42, "role": "AXButton", "title": "Cancel"}
+
+    with pytest.raises(MacOSError, match="in windows 8652 'Open', 8875 'Open'.*add the window_id") as caught:
+        mac.ax.raw(match)
+
+    assert caught.value.code == ErrorCode.ELEMENT_UNKNOWN
+    assert mac.ax.raw({**match, "window_id": 8875}) is second_cancel
+
+
 def test_ax_app_resolution_deduplicates_pids(monkeypatch) -> None:
     mac = MacOS()
     info = {"name": "Safari", "bundle_id": "com.apple.Safari", "pid": 42}
