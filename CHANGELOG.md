@@ -7,6 +7,22 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `mac.ax` takes any AX role, by its AX name or in words (`pop up button`,
+  `AXRow`); a role Apple's search has no key for is filtered from an
+  any-role search, and `role="window"` finds the app's windows. A
+  misspelled role names the nearest one.
+- A wait that times out names its query and how many searches ran, and in
+  one app a match it found off screen or of another role, and the on-screen
+  labels nearest its text.
+- `mac.wait_for_window(app, title=, all_layers=)` waits for the app to start,
+  for a window whose title holds `title`, or for a prompt off the normal
+  layer.
+- A menu or menu-item search marks a match inside a closed menu with
+  `in_closed_menu`. Twins found again from a match are named by window id
+  and title, and a `window_id` added to the match picks one.
+- A call that takes one element takes a one-match search result.
+- `get_app_state` coverage names the read that cut the tree short under
+  `read_failure`.
 - `MACOS_HARNESS_RECEIPT_LOG=1` appends each finished `mac.do` receipt as one
   JSON line to `~/Library/Logs/macos-harness/receipts.jsonl`, without values
   or typed text, rotating at 5 MiB. It is off by default.
@@ -96,6 +112,13 @@ follows [Semantic Versioning](https://semver.org/).
   a step it is running ends, and with the step it serves; only commands the
   shell starts hold its pipes. `macos-harness skill spare` prints the setup
   lines.
+
+### Fixed
+
+- One Accessibility value that reads as infinity or NaN no longer fails
+  `get_app_state`; only that field is dropped and named under `non_finite`.
+- `mac.windows(app)` leaves out an untitled off-screen helper window, which
+  ended `launch` and `wait_for_window` before the app's real window was up.
 
 ### Changed
 

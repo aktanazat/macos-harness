@@ -10,15 +10,16 @@ mac.ax.press("Not Now", role="button", all_apps=True)
 ## Roles
 
 `query`, `query_all`, `wait`, `wait_gone`, and `press` take the search text as
-the first positional argument. Use `role=` for common targets: `any`, `button`,
-`checkbox`, `combo box`, `image`, `link`, `list`, `menu`, `menu item`,
-`radio button`, `static text`, `table`, `text area`, and `text field`, or the
-same role by the AX name a match reports (`AXButton`, `AXTextField`). An
-unknown role raises `MacOSError`. For a window, row, group, scroll bar, or any
-other kind, pass `role="any"` and read each match's `role`; `mac.windows(app)`
-lists an app's windows. Do not pass both `role` and `search_key`. A search for
-what is on screen, the default, leaves out the items of closed menus; pass
-`role="menu item"` to reach a command in a menu that is not open.
+the first positional argument. `role=` takes `any` or any AX role, by the AX
+name a match reports (`AXButton`, `AXPopUpButton`, `AXRow`) or in words
+(`pop up button`, `window`); a misspelled one raises `MacOSError` naming the
+nearest role. A role Apple's search has no key for is filtered from an
+any-role search, so its matches count against `max_nodes`. `role="window"`
+lists the app's windows, which its search never returns; `mac.windows(app)`
+lists them with window ids. Do not pass both `role` and `search_key`. A search
+for what is on screen, the default, leaves out the items of closed menus; pass
+`role="menu item"` to reach a command in a menu that is not open; such a match
+carries `in_closed_menu: true`, takes a press, and cannot take a click.
 When two menus hold an item of the same name, as File and Window both hold
 Close, `mac.do.menu("Window > Close", app=...)` follows the path instead.
 `mac.do.status_item("Quit", app=...)` does the same in the menu of an app's
@@ -75,7 +76,10 @@ did not answer.
 `wait` returns the one match; zero matches keep polling; several fail closed and
 report owner, role, title, frame, and enabled state. An app that does not
 answer in time (AXError -25204), as one still launching does for a second or
-more after `open -a`, also keeps the wait polling until its timeout.
+more after `open -a`, also keeps the wait polling until its timeout. A timeout
+names the query and how many searches ran; in one app it also names a match
+off screen or of another role under `elsewhere`, and the on-screen labels
+nearest the text under `nearest`.
 `wait_gone` needs two consecutive complete, empty searches; a named app that
 exits counts as gone. `press` waits for one match, needs `AXPress`, and returns
 the match. It never requests activation; if the target makes itself frontmost,
@@ -86,6 +90,17 @@ it raises `FocusChangedError` and cannot undo that.
 Element indexes and `mac.see()` screenshots last for one `macos-harness` run,
 and an element handle only until the next AX snapshot or search in it. The next
 run must query again, or call `mac.see()` earlier in the same program.
+
+A call that takes one element takes a one-match search result as well; one
+with several matches raises `bad_request`, so pass `matches[0]`. A match
+outlives its run by finding its element again; when that finds twins, as two
+Open panels each hold a Cancel, the error names each one's window id and
+title, and `{**match, "window_id": id}` picks the one in that window. Twin
+windows stacked at the same frame get no id.
+
+`get_app_state` drops a value that reads as infinity or NaN and lists its
+name under the node's `non_finite`. A tree cut short by a failed read names
+that read under coverage `read_failure`.
 
 An action that fails with AXError -25204 (the app did not answer in time) may
 still have taken effect, because apps often stop answering while the action
