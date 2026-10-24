@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import re
 import weakref
 from collections.abc import Iterable
@@ -10,19 +11,27 @@ from typing import TYPE_CHECKING, Any
 import ApplicationServices as AS
 
 from .errors import ErrorCode, MacOSError
-from .macos import _AX_SAFE_ATTRIBUTES, _AX_SEARCH_ROLES, ElementRef, SearchMatches
+from .macos import (
+    _AX_ROLES,
+    _AX_SAFE_ATTRIBUTES,
+    _SEARCH_KEY_OF_ROLE,
+    ElementRef,
+    SearchMatches,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from .macos import MacOS
 
-# Each role a search can target, by its friendly name ("text field" ->
-# "textfield") and by the AX name a match reports ("AXTextField" ->
-# "axtextfield"), so a role read off one match can find the next.
+# Each role a search can target, by its friendly name ("pop up button" ->
+# "popupbutton") and by the AX name a match reports ("AXPopUpButton" ->
+# "axpopupbutton"), so a role read off one match can find the next. A role
+# with an Apple search key maps to the key; any other is itself the key,
+# and the search keeps the matches of that role (`macos._role_filter`).
 _ROLE_SEARCH_KEYS = {"any": "AXAnyTypeSearchKey"} | {
-    alias: search_key
-    for search_key, ax_role in _AX_SEARCH_ROLES.items()
+    alias: _SEARCH_KEY_OF_ROLE.get(ax_role, ax_role)
+    for ax_role in _AX_ROLES
     for alias in (ax_role.casefold(), ax_role[2:].casefold())
 }
 
@@ -116,22 +125,22 @@ class Accessibility:
         if role is None:
             return search_key or "AXAnyTypeSearchKey"
         normalized = re.sub(r"[^a-z0-9]", "", role.casefold())
-        try:
+        if normalized in _ROLE_SEARCH_KEYS:
             return _ROLE_SEARCH_KEYS[normalized]
-        except KeyError as exc:
-            valid = (
-                "any, button, checkbox, combo box, image, link, list, menu, "
-                "menu item, radio button, static text, table, text area, text field"
-            )
-            raise MacOSError(
-                f"Unknown AX role {role!r}; choose one of: {valid}, or the "
-                "same role by its AX name ('AXButton'). For any other kind "
-                "(window, row, group, scroll bar, ...) pass role='any' and "
-                "read each match's 'role'; mac.windows(app) lists an app's "
-                "windows",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "role", "value": role},
-            ) from exc
+        if re.fullmatch(r"AX[A-Z][A-Za-z]*", role):
+            return role
+        named = {ax_role[2:].casefold(): ax_role for ax_role in _AX_ROLES}
+        suggestions = [
+            named[name] for name in difflib.get_close_matches(normalized, named, n=3, cutoff=0.5)
+        ]
+        hint = f"; did you mean {', '.join(suggestions)}?" if suggestions else "."
+        raise MacOSError(
+            f"Unknown AX role {role!r}{hint} A role is 'any' or any AX role, "
+            "by its AX name ('AXPopUpButton', 'AXWindow') or in words "
+            "('pop up button', 'window')",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": "role", "value": role, "suggestions": suggestions},
+        )
 
     def query(
         self,

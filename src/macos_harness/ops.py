@@ -3459,6 +3459,7 @@ class Operations:
                     timeout=effective_timeout,
                     interval=postcondition.interval,
                     enhance=enhance,
+                    explain=budget is None,
                 )
                 return _Verification(
                     state=Observation.MET, observed=self._match_summary_payload(match), error=None

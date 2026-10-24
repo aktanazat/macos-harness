@@ -597,7 +597,7 @@ def _bounded_tree(monkeypatch, mac: MacOS, root: object, children: dict, data: d
     monkeypatch.setattr(
         mac,
         "_copy_attribute",
-        lambda element, attribute: (
+        lambda element, attribute, **kwargs: (
             children.get(element, [])
             if attribute in {"AXChildren", "AXWindows"}
             else None
@@ -822,6 +822,8 @@ def test_strict_wait_never_trusts_one_match_from_a_cut_search(monkeypatch) -> No
     assert exc_info.value.code == ErrorCode.TIMEOUT
     assert exc_info.value.details == {
         "timeout": 0,
+        "polls": 1,
+        "query": {"title": "Save", "app": "Pages", "visible_only": True},
         "complete": False,
         "visited": 1,
         "max_nodes": 300,
@@ -1224,7 +1226,7 @@ def test_ax_role_aliases_and_app_selectors_fail_closed(monkeypatch) -> None:
     assert arguments["apps"] == ("Safari",)
     assert mac.ax._search_key(None, "any") == "AXAnyTypeSearchKey"
 
-    with pytest.raises(MacOSError, match="Unknown AX role"):
+    with pytest.raises(MacOSError, match="Unknown AX role 'buton'; did you mean AXButton"):
         mac.ax.query_all("Not Now", role="buton")
     with pytest.raises(MacOSError, match="role or search_key"):
         mac.ax.query_all(
@@ -1252,6 +1254,255 @@ def test_ax_role_accepts_the_ax_role_name_a_match_reports(search_key) -> None:
     mac.ax.query_all("Done", role=macos_module._AX_SEARCH_ROLES[search_key])
 
     assert arguments["search_key"] == search_key
+
+
+def _app_search(monkeypatch, children: dict, data: dict) -> None:
+    """Serve the app's own search predicate over a `_bounded_tree`: the
+    descendants of the root's windows, in order, of the role the
+    predicate's key names (any kind for the any-type key) and holding its
+    text; a visible-only search leaves out an element marked
+    ``"offscreen"``. Like a real app's search it never returns windows."""
+
+    def descendants(element):
+        for child in children.get(element, []):
+            yield child
+            yield from descendants(child)
+
+    def search(root, attribute, predicate, _):
+        role = macos_module._AX_SEARCH_ROLES.get(predicate["AXSearchKey"])
+        text = predicate.get("AXSearchText", "").casefold()
+        found = [
+            element
+            for element in descendants(root)
+            if data[element]["AXRole"] != "AXWindow"
+            and role in {None, data[element]["AXRole"]}
+            and not (predicate["AXVisibleOnly"] and data[element].get("offscreen"))
+            and any(text in value.casefold() for value in data[element].values() if isinstance(value, str))
+        ]
+        limit = predicate["AXResultsLimit"]
+        return macos_module._AX_SUCCESS, found if limit < 0 else found[:limit]
+
+    monkeypatch.setattr(macos_module.AS, "AXUIElementCopyParameterizedAttributeValue", search)
+
+
+def _settings_app(monkeypatch, *, app_search: bool) -> MacOS:
+    mac = MacOS()
+    root, settings, minimized, theme_menu, theme_button = (object() for _ in range(5))
+    children = {root: [settings, minimized], settings: [theme_menu, theme_button]}
+    data = {
+        root: {"AXRole": "AXApplication"},
+        settings: {"AXRole": "AXWindow", "AXTitle": "Settings", "AXMinimized": False},
+        minimized: {"AXRole": "AXWindow", "AXTitle": "Settings Backup", "AXMinimized": True},
+        theme_menu: {"AXRole": "AXPopUpButton", "AXTitle": "Theme"},
+        theme_button: {"AXRole": "AXButton", "AXTitle": "Theme"},
+    }
+    _bounded_tree(monkeypatch, mac, root, children, data)
+    if app_search:
+        _app_search(monkeypatch, children, data)
+    return mac
+
+
+def _meetings_app(monkeypatch) -> MacOS:
+    mac = MacOS()
+    root, window, heading, below = (object() for _ in range(4))
+    children = {root: [window], window: [heading, below]}
+    data = {
+        root: {"AXRole": "AXApplication"},
+        window: {"AXRole": "AXWindow", "AXTitle": "Calendar"},
+        heading: {"AXRole": "AXStaticText", "AXValue": "Upcoming meetings"},
+        below: {"AXRole": "AXStaticText", "AXValue": "Synthetic planning call", "offscreen": True},
+    }
+    _bounded_tree(monkeypatch, mac, root, children, data)
+    _app_search(monkeypatch, children, data)
+    return mac
+
+
+def test_ax_wait_timeout_names_a_match_that_is_only_off_screen(monkeypatch) -> None:
+    """A wait for what is on screen that times out says the same query
+    matches below the fold, so the caller scrolls instead of retrying."""
+    mac = _meetings_app(monkeypatch)
+
+    with pytest.raises(MacOSError, match="matches 1 element.*off screen.*AXStaticText 'Synthetic planning call'") as caught:
+        mac.ax.wait("Synthetic planning call", app="Demo", timeout=0)
+
+    assert caught.value.code == ErrorCode.TIMEOUT
+    assert caught.value.details["elsewhere"] == [{"role": "AXStaticText"}]
+
+
+def test_ax_wait_timeout_names_the_on_screen_labels_nearest_its_text(monkeypatch) -> None:
+    """A wait whose words are slightly off times out naming the label it
+    probably meant, so the caller fixes the text instead of the timing."""
+    mac = _meetings_app(monkeypatch)
+
+    with pytest.raises(MacOSError, match="nearest on screen: AXStaticText 'Upcoming meetings'") as caught:
+        mac.ax.wait("Upcomng meetings", app="Demo", timeout=0)
+
+    assert caught.value.details["nearest"] == [{"role": "AXStaticText", "label": "Upcoming meetings"}]
+    assert "elsewhere" not in caught.value.details
+
+
+@pytest.mark.parametrize(
+    ("role", "app_search"),
+    [("pop up button", True), ("AXPopUpButton", True), ("popup-button", False)],
+)
+def test_ax_role_without_an_apple_search_key_keeps_only_matches_of_that_role(
+    monkeypatch, role, app_search
+) -> None:
+    """Apple's search keys cover 13 roles; any other role, by its AX name
+    or in words, narrows an any-kind search to the matches of that role,
+    through the app's search or the walk that stands in for it."""
+    mac = _settings_app(monkeypatch, app_search=app_search)
+
+    found = mac.ax.query("Theme", app="Demo", role=role, include_actions=False)
+
+    assert [match["role"] for match in found] == ["AXPopUpButton"]
+    assert found.complete is True
+
+
+@pytest.mark.parametrize("role", ["AXWindow", "window"])
+def test_ax_window_role_finds_the_apps_windows_that_its_search_never_returns(
+    monkeypatch, role
+) -> None:
+    """An app's search finds what its windows hold, never the windows, so a
+    window role reads the app's window list: a wait for a Settings window
+    to appear can name it, and a minimized one is not on screen."""
+    mac = _settings_app(monkeypatch, app_search=True)
+
+    match = mac.ax.wait(app="Demo", role=role, title="Settings", timeout=0, include_actions=False)
+    found = mac.ax.query("settings", app="Demo", role=role, include_actions=False)
+
+    assert (match["role"], match["title"]) == ("AXWindow", "Settings")
+    assert [window["title"] for window in found] == ["Settings"]
+
+
+def test_ax_element_takes_a_one_match_search_result_and_names_matches0_otherwise(
+    monkeypatch,
+) -> None:
+    """Where one element is expected, a search result with one match stands
+    for it; one with several fails as a bad request that says to pass
+    matches[0] and lists them, not with a raw TypeError."""
+    mac = _settings_app(monkeypatch, app_search=True)
+    menu = mac.ax.query("Theme", app="Demo", role="pop up button", include_actions=False)
+    both = mac.ax.query("Theme", app="Demo", include_actions=False)
+
+    assert mac.ax.raw(menu) is mac.ax.raw(menu[0])
+    with pytest.raises(MacOSError, match=r"2 matches; pass matches\[0\].*AXPopUpButton") as caught:
+        mac.ax.raw(both)
+    assert caught.value.code == ErrorCode.BAD_REQUEST
+
+
+def _app_state(monkeypatch, root: object, children: dict, data: dict) -> dict:
+    mac = MacOS()
+    _bounded_tree(monkeypatch, mac, root, children, data)
+    monkeypatch.setattr(mac, "_resolve_app", lambda app: (None, {"name": "Demo", "pid": 42}))
+    monkeypatch.setattr(mac, "windows", lambda app: [])
+    return mac.get_app_state("Demo", include_actions=False, include_settable=False, include_values=False)
+
+
+def test_app_state_drops_only_the_field_that_read_as_infinity(monkeypatch) -> None:
+    """One mis-measured frame costs that field, marked as non-finite; the
+    node's other fields and the rest of the tree still come back."""
+    root, window, save, label = (object() for _ in range(4))
+    infinite = macos_module.AS.AXValueCreate(
+        macos_module.AS.kAXValueCGRectType,
+        macos_module.AS.CGRect(macos_module.AS.CGPoint(0.0, 0.0), macos_module.AS.CGSize(math.inf, 5.0)),
+    )
+    data = {
+        root: {"AXRole": "AXApplication"},
+        window: {"AXRole": "AXWindow", "AXTitle": "Demo"},
+        save: {"AXRole": "AXButton", "AXTitle": "Save", "AXFrame": infinite},
+        label: {"AXRole": "AXStaticText", "AXTitle": "Saved"},
+    }
+
+    state = _app_state(monkeypatch, root, {root: [window], window: [save, label]}, data)
+
+    assert [node["role"] for node in state["nodes"]] == ["AXApplication", "AXWindow", "AXButton", "AXStaticText"]
+    button = state["nodes"][2]
+    assert (button["title"], button["non_finite"], "frame" in button) == ("Save", ["frame"], False)
+
+
+def test_app_state_says_which_read_cut_the_tree_short(monkeypatch) -> None:
+    """A tree cut by a failed read says where and why: an app that never
+    answered the read of its root is not an app with nothing on screen."""
+    root = object()
+    data = {root: {"AXRole": _Refused(macos_module.AS.kAXErrorCannotComplete)}}
+
+    state = _app_state(monkeypatch, root, {}, data)
+
+    assert state["coverage"]["read_cut"] is True
+    assert state["coverage"]["read_failure"] == {
+        "depth": 0,
+        "attribute": "AXRole",
+        "ax_error": macos_module.AS.kAXErrorCannotComplete,
+        "meaning": "the app did not answer in time",
+    }
+
+
+
+def _rect(x: float, y: float, width: float, height: float) -> object:
+    return macos_module.AS.AXValueCreate(
+        macos_module.AS.kAXValueCGRectType,
+        macos_module.AS.CGRect(macos_module.AS.CGPoint(x, y), macos_module.AS.CGSize(width, height)),
+    )
+
+
+def test_ax_menu_item_search_marks_the_items_of_a_closed_menu(monkeypatch) -> None:
+    """A menu-item search reaches closed menus too; an item there sits at
+    zero size, answers a press but not a click, and says so."""
+    mac = MacOS()
+    root, bar, menu, closed, shown = (object() for _ in range(5))
+    data = {
+        root: {"AXRole": "AXApplication"},
+        bar: {"AXRole": "AXMenuBar"},
+        menu: {"AXRole": "AXMenu"},
+        closed: {"AXRole": "AXMenuItem", "AXTitle": "Close Window", "AXFrame": _rect(0, 1117, 0, 0)},
+        shown: {"AXRole": "AXMenuItem", "AXTitle": "Close Tab", "AXFrame": _rect(10, 40, 200, 22)},
+    }
+    children = {root: [bar], bar: [menu], menu: [closed, shown]}
+    _bounded_tree(monkeypatch, mac, root, children, data)
+    _app_search(monkeypatch, children, data)
+
+    found = mac.ax.query("Close", app="Demo", role="menu item", include_actions=False)
+
+    assert [(match["title"], match.get("in_closed_menu")) for match in found] == [
+        ("Close Window", True),
+        ("Close Tab", None),
+    ]
+
+
+def test_ax_match_twins_in_two_windows_name_the_windows_and_take_a_window_id(monkeypatch) -> None:
+    """Two identical Open panels each hold a Cancel: finding the match again
+    fails naming each panel's window id, and the match with one of those
+    ids added finds the Cancel in that window."""
+    mac = MacOS()
+    root, first, second, first_cancel, second_cancel = (object() for _ in range(5))
+    data = {
+        root: {"AXRole": "AXApplication"},
+        first: {"AXRole": "AXWindow", "AXTitle": "Open", "AXFrame": _rect(100, 100, 600, 400)},
+        second: {"AXRole": "AXWindow", "AXTitle": "Open", "AXFrame": _rect(300, 200, 600, 400)},
+        first_cancel: {"AXRole": "AXButton", "AXTitle": "Cancel"},
+        second_cancel: {"AXRole": "AXButton", "AXTitle": "Cancel"},
+    }
+    children = {root: [first, second], first: [first_cancel], second: [second_cancel]}
+    _bounded_tree(monkeypatch, mac, root, children, data)
+    _app_search(monkeypatch, children, data)
+    owner = {first_cancel: first, second_cancel: second}
+    monkeypatch.setattr(
+        mac,
+        "_copy_attribute",
+        lambda element, attribute, **kwargs: owner.get(element) if attribute == "AXWindow" else children.get(element, []),
+    )
+    monkeypatch.setattr(mac, "windows", lambda app, all_layers=False: [
+        {"window_id": 8652, "bounds": {"x": 100.0, "y": 100.0, "width": 600.0, "height": 400.0}},
+        {"window_id": 8875, "bounds": {"x": 300.0, "y": 200.0, "width": 600.0, "height": 400.0}},
+    ])
+    match = {"pid": 42, "role": "AXButton", "title": "Cancel"}
+
+    with pytest.raises(MacOSError, match="in windows 8652 'Open', 8875 'Open'.*add the window_id") as caught:
+        mac.ax.raw(match)
+
+    assert caught.value.code == ErrorCode.ELEMENT_UNKNOWN
+    assert mac.ax.raw({**match, "window_id": 8875}) is second_cancel
 
 
 def test_ax_app_resolution_deduplicates_pids(monkeypatch) -> None:
@@ -2789,6 +3040,84 @@ def test_wait_for_window_times_out_at_the_deadline_with_the_app_in_details(
     # The clock reads 0.0 at the start and 1.0 after the second poll, which
     # is the deadline; a third poll would mean the wait overshot it.
     assert polls == [42, 42]
+
+
+def _clocked(monkeypatch, mac: MacOS) -> None:
+    """Advance the waits' clock half a second per look, never sleeping."""
+    clock = iter(float(tick) * 0.5 for tick in range(100))
+    monkeypatch.setattr(mac, "_now", lambda: next(clock))
+    monkeypatch.setattr(mac, "_pause", lambda seconds: None)
+
+
+def test_wait_for_window_gives_an_app_not_yet_running_its_timeout_to_start(monkeypatch) -> None:
+    """Right after ``open -a`` the app may not be running yet: the wait
+    keeps looking for it instead of failing at once."""
+    mac = MacOS()
+    starts = iter([False, False, True])
+
+    def resolve(app):
+        if not next(starts):
+            raise macos_module.ApplicationNotFoundError("No running application matches 'Sona'")
+        return object(), {"name": "Sona", "pid": 42}
+
+    monkeypatch.setattr(mac, "_resolve_app", resolve)
+    monkeypatch.setattr(mac, "windows", lambda app: [{"window_id": 7, "title": "Sona"}])
+    _clocked(monkeypatch, mac)
+
+    assert mac.wait_for_window("Sona", timeout=5.0) == [{"window_id": 7, "title": "Sona"}]
+
+
+def test_wait_for_window_says_the_app_never_started(monkeypatch) -> None:
+    mac = MacOS()
+
+    def resolve(app):
+        raise macos_module.ApplicationNotFoundError(
+            "No running application matches 'Sona'", details={"query": "Sona"}
+        )
+
+    monkeypatch.setattr(mac, "_resolve_app", resolve)
+    _clocked(monkeypatch, mac)
+
+    with pytest.raises(macos_module.ApplicationNotFoundError, match="did not start within 1s") as caught:
+        mac.wait_for_window("Sona", timeout=1.0)
+    assert caught.value.details == {"query": "Sona", "timeout": 1.0}
+
+
+def test_wait_for_window_with_a_title_waits_past_the_apps_other_windows(monkeypatch) -> None:
+    """A Settings window opening beside the main one is the event a caller
+    waits for; the main window alone does not end that wait."""
+    mac = MacOS()
+    main, settings = {"window_id": 7, "title": "Sona"}, {"window_id": 8, "title": "Settings"}
+    looks = iter([[main], [main, settings]])
+    monkeypatch.setattr(mac, "_resolve_app", lambda app: (object(), {"name": "Sona", "pid": 42}))
+    monkeypatch.setattr(mac, "windows", lambda app: next(looks))
+    _clocked(monkeypatch, mac)
+
+    assert mac.wait_for_window("Sona", title="settings", timeout=5.0) == [settings]
+
+
+def test_windows_leaves_out_an_untitled_window_off_screen(monkeypatch) -> None:
+    """An app's untitled off-screen window is a helper surface it never
+    shows, as Xcode's 500x500 one is; a titled one off screen, minimized
+    or on another Space, is still the app's window."""
+    mac = MacOS()
+    monkeypatch.setattr(mac, "_resolve_app", lambda app: (object(), {"name": "Xcode", "pid": 42}))
+
+    def window(window_id: int, title: str, on_screen: bool) -> dict[str, object]:
+        return {
+            "kCGWindowOwnerPID": 42,
+            "kCGWindowNumber": window_id,
+            "kCGWindowName": title,
+            "kCGWindowBounds": {"X": 0, "Y": 617, "Width": 500, "Height": 500},
+            "kCGWindowIsOnscreen": on_screen,
+            "kCGWindowLayer": 0,
+        }
+
+    listed = [window(1, "Project", True), window(2, "", False), window(3, "Minimized", False)]
+    monkeypatch.setattr(macos_module.AS, "CGWindowListCopyWindowInfo", lambda options, relative: listed)
+
+    assert [entry["window_id"] for entry in mac.windows("Xcode")] == [1, 3]
+    assert sorted(entry["window_id"] for entry in mac.windows("Xcode", all_layers=True)) == [1, 2, 3]
 
 
 class _WindowlessApp(MacOS):

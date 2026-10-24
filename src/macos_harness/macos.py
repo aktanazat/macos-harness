@@ -8,6 +8,7 @@ renders a specific window (see ``capture.py``).
 from __future__ import annotations
 
 import ctypes
+import difflib
 import errno
 import json
 import math
@@ -239,6 +240,11 @@ _AX_CROSS_APP_MESSAGING_TIMEOUT = 0.5
 # plausibly finds -- "Allow" also finds "Don't Allow". Mirrors
 # `PressCoordinator.labelSearchLimit` in the native agent.
 _AX_LABEL_SEARCH_LIMIT = 20
+# What a wait that timed out in one app looks for instead (`_wait_clues`):
+# a few matches off screen or of another role, and the on-screen labels
+# it ranks against what the wait sought.
+_WAIT_CLUE_MATCHES = 5
+_WAIT_CLUE_LABELS = 200
 # How many apps a broad sweep asks at once whether they can answer
 # Accessibility (`MacOS._silent_pids`): enough that the few that never
 # answer cost one messaging timeout together instead of one each.
@@ -397,12 +403,63 @@ _AX_MENU_SEARCH_KEYS = frozenset({"AXMenuSearchKey", "AXMenuItemSearchKey"})
 # The role each role search key finds, the other way round, so a match's
 # role names the search that finds it again (`MacOS._find_again`).
 _SEARCH_KEY_OF_ROLE = {role: key for key, role in _AX_SEARCH_ROLES.items()}
+# Apple's roles (AXRoleConstants.h) and WebKit's, each by its AX name, so
+# `Accessibility._search_key` reads "pop up button" as "AXPopUpButton".
+_AX_ROLES = tuple(
+    f"AX{name}"
+    for name in (
+        "Application", "Browser", "BusyIndicator", "Button", "Cell", "CheckBox",
+        "ColorWell", "Column", "ComboBox", "DateField", "DisclosureTriangle",
+        "DockItem", "Drawer", "Grid", "Group", "GrowArea", "Handle", "Heading",
+        "HelpTag", "Image", "Incrementor", "LayoutArea", "LayoutItem",
+        "LevelIndicator", "Link", "List", "Matte", "Menu", "MenuBar", "MenuBarItem",
+        "MenuButton", "MenuItem", "Outline", "Popover", "PopUpButton",
+        "ProgressIndicator", "RadioButton", "RadioGroup", "RelevanceIndicator",
+        "Row", "Ruler", "RulerMarker", "ScrollArea", "ScrollBar", "Sheet", "Slider",
+        "SplitGroup", "Splitter", "StaticText", "TabGroup", "Table", "TextArea",
+        "TextField", "TimeField", "Toolbar", "ValueIndicator", "WebArea", "Window",
+    )
+)
+
+
+def _role_filter(search_key: str) -> str | None:
+    """The AX role a search's matches must carry when ``search_key`` names
+    a role, not one of Apple's search keys, which all end in "SearchKey".
+    Apple has keys for 13 roles only, so a search for any other role --
+    "AXWindow", "AXPopUpButton", "AXRow" -- asks the app for every kind of
+    element and keeps those of that role."""
+    return None if search_key.endswith("SearchKey") else search_key
+
+
+def _of_role(matches: SearchMatches, role: str, limit: int) -> SearchMatches:
+    """``matches`` cut to those of ``role``, at most ``limit`` of them
+    unless ``limit`` is negative."""
+    kept = [match for match in matches if match.get("role") == role]
+    cut = 0 <= limit < len(kept)
+    return SearchMatches(
+        kept[:limit] if cut else kept,
+        complete=matches.complete and not cut,
+        visited=matches.visited,
+    )
 
 
 def _on_screen_only(visible_only: bool, search_key: str) -> bool:
     """Whether a search looks only at what is on screen: ``visible_only``,
     and not a search for menus or their items (`_AX_MENU_SEARCH_KEYS`)."""
     return visible_only and search_key not in _AX_MENU_SEARCH_KEYS
+
+
+def _in_closed_menus(matches: SearchMatches, search_key: str) -> SearchMatches:
+    """``matches`` with each one a closed menu holds marked
+    ``in_closed_menu``: a search for menus or their items reaches closed
+    menus too, whose items AppKit keeps at zero size, and such an item
+    answers a press but cannot take a click."""
+    if search_key in _AX_MENU_SEARCH_KEYS:
+        for match in matches:
+            frame = match.get("frame")
+            if isinstance(frame, Mapping) and frame.get("width") == 0 and frame.get("height") == 0:
+                match["in_closed_menu"] = True
+    return matches
 
 
 # Where a menu path's first step is looked for, by the bar it starts in.
@@ -764,6 +821,45 @@ def _did_not_answer(exc: MacOSError) -> bool:
     return exc.details.get("ax_error") == AS.kAXErrorCannotComplete
 
 
+def _wait_query(
+    *,
+    app: str | int | None,
+    search_key: str,
+    text: str | None,
+    title: str | None,
+    identifier: str | None,
+    description: str | None,
+    visible_only: bool,
+) -> dict[str, JSONValue]:
+    """What a wait looked for, as its timeout reports it."""
+    role = _role_filter(search_key) or _AX_SEARCH_ROLES.get(search_key)
+    fields: dict[str, JSONValue] = {
+        "text": text,
+        "role": role,
+        "search_key": None if role or search_key == "AXAnyTypeSearchKey" else search_key,
+        "title": title,
+        "identifier": identifier,
+        "description": description,
+        "app": app if isinstance(app, (str, int)) else None,
+    }
+    return {name: value for name, value in fields.items() if value is not None} | {
+        "visible_only": visible_only
+    }
+
+
+def _clue_summary(match: Mapping[str, JSONValue], sought: str) -> str:
+    """One match a timeout names as a clue: its role, label -- or the text
+    ``sought`` that it matched -- and place."""
+    label = next(
+        (match[field] for field in ("title", "description")
+         if isinstance(match.get(field), str) and match[field]),
+        sought,
+    )
+    frame = match.get("frame")
+    at = f" at ({frame['x']:g}, {frame['y']:g})" if isinstance(frame, Mapping) else ""
+    return f"{match.get('role')} {label!r}{at}"
+
+
 def _unanswered_search() -> SearchMatches:
     """The poll a wait records for a search its app did not answer: one
     that found nothing and saw nothing, its one app unanswered."""
@@ -897,6 +993,10 @@ _EXACT_ATTRIBUTES = {
 }
 
 
+class _NonFiniteValue(MacOSError):
+    """An AX value that read as NaN or infinity, which JSON cannot carry."""
+
+
 class _TreeSnapshot(NamedTuple):
     """Visited nodes and the limits or failed reads that left gaps."""
 
@@ -904,6 +1004,8 @@ class _TreeSnapshot(NamedTuple):
     node_cut: bool
     depth_cut: bool
     read_cut: bool
+    # The first read that cut the walk: its depth, attribute, and AXError.
+    read_failure: dict[str, JSONValue] | None = None
 
 
 _BACKENDS = ("python", "native", "auto")
@@ -2010,7 +2112,7 @@ class MacOS:
         details: dict[str, object] = {"value": str(value)}
         if field is not None:
             details["field"] = field
-        raise MacOSError(
+        raise _NonFiniteValue(
             "Accessibility API returned a non-finite value with no JSON "
             "representation",
             code=ErrorCode.AX_ERROR,
@@ -2077,6 +2179,17 @@ class MacOS:
         location, length = decoded
         return {"location": int(location), "length": int(length)}
 
+    @staticmethod
+    def _lenient_json(raw: Mapping[str, object], name: str, non_finite: list[str]) -> JSONValue:
+        """``raw[name]`` as JSON, or None with ``name``'s field added to
+        ``non_finite`` when it holds a NaN or infinity: one mis-measured
+        value costs its own field, not the node or the tree around it."""
+        try:
+            return MacOS._jsonable(raw.get(name))
+        except _NonFiniteValue:
+            non_finite.append(_AX_NODE_MAPPING.get(name, name))
+            return None
+
     def _snapshot_tree(
         self,
         root: Any,
@@ -2095,6 +2208,7 @@ class MacOS:
             self._elements = {}
         nodes: list[dict[str, Any]] = []
         seen: set[Any] = set()
+        read_failure: dict[str, JSONValue] | None = None
         node_cut = depth_cut = read_cut = False
         requested_attributes = tuple(
             dict.fromkeys(
@@ -2118,7 +2232,7 @@ class MacOS:
         reads_values = len(safe_attributes) != len(requested_attributes)
 
         def visit(element: Any, depth: int) -> None:
-            nonlocal node_cut, depth_cut, read_cut
+            nonlocal node_cut, depth_cut, read_cut, read_failure
             if element in seen:
                 return
             if depth > max_depth:
@@ -2129,15 +2243,25 @@ class MacOS:
                 return
             seen.add(element)
 
+            failures: dict[str, int] = {}
             if reads_values:
                 identity = self._copy_attributes(element, _FOCUS_IDENTITY_ATTRIBUTES)
                 allowed = identity.complete and identity.get("AXSubrole") != _SECURE_SUBROLE
                 raw = self._copy_attributes(element, requested_attributes if allowed else safe_attributes)
                 # An identity that did not read in full left the values unread.
-                read_cut = read_cut or not identity.complete
+                failures.update(identity.failures)
             else:
                 raw = self._copy_attributes(element, requested_attributes)
-            read_cut = read_cut or not raw.conclusive
+            if not raw.conclusive:
+                failures.update(
+                    (name, error) for name, error in raw.failures.items() if _hides_match(error)
+                )
+            if failures and read_failure is None:
+                attribute, error = next(iter(failures.items()))
+                read_failure = {"depth": depth, "attribute": attribute, "ax_error": int(error)}
+                if int(error) in _AX_ERROR_MEANINGS:
+                    read_failure["meaning"] = _AX_ERROR_MEANINGS[int(error)]
+            read_cut = read_cut or bool(failures)
             role = raw.get("AXRole")
             if role == "AXMenuBar" and not include_menu_bar:
                 return
@@ -2146,23 +2270,27 @@ class MacOS:
             if skip_closed_menus and role == "AXMenu" and self._closed_menu(element):
                 return
             index = self._remember_element(element)
+            non_finite: list[str] = []
             node: dict[str, Any] = {
                 "element_index": index,
                 "depth": depth,
-                "role": self._jsonable(raw.get("AXRole")),
+                "role": self._lenient_json(raw, "AXRole", non_finite),
             }
             for source, target in _AX_NODE_MAPPING.items():
-                value = self._jsonable(raw.get(source))
+                value = self._lenient_json(raw, source, non_finite)
                 if value not in (None, "", [], {}):
                     node[target] = value
             extra = {
-                name: self._jsonable(raw.get(name))
+                name: value
                 for name in requested_attributes
                 if name not in standard_attributes
-                and self._jsonable(raw.get(name)) not in (None, "", [], {})
+                for value in (self._lenient_json(raw, name, non_finite),)
+                if value not in (None, "", [], {})
             }
             if extra:
                 node["attributes"] = extra
+            if non_finite:
+                node["non_finite"] = non_finite
             if include_actions:
                 actions = self._actions(element)
                 if actions:
@@ -2188,13 +2316,16 @@ class MacOS:
                         visit(child, depth + 1)
 
         visit(root, 0)
-        return _TreeSnapshot(nodes, node_cut, depth_cut, read_cut)
+        return _TreeSnapshot(nodes, node_cut, depth_cut, read_cut, read_failure)
 
     def _closed_menu(self, menu: object) -> bool:
         """Whether ``menu`` is closed: AppKit keeps a closed menu at zero
         size and gives an open one its size on screen. A menu whose size
         does not read counts as open."""
-        return self._jsonable(self._copy_attribute(menu, "AXSize")) == {"width": 0.0, "height": 0.0}
+        try:
+            return self._jsonable(self._copy_attribute(menu, "AXSize")) == {"width": 0.0, "height": 0.0}
+        except _NonFiniteValue:
+            return False
 
     @staticmethod
     def _render_tree(nodes: list[dict[str, Any]], *, truncated: bool = False) -> str:
@@ -2266,6 +2397,8 @@ class MacOS:
                          "node_cut": snapshot.node_cut, "depth_cut": snapshot.depth_cut,
                          "read_cut": snapshot.read_cut},
         }
+        if snapshot.read_failure is not None:
+            state["coverage"]["read_failure"] = snapshot.read_failure
         if screenshot:
             try:
                 self._last_screenshot = self.capture_screenshot(
@@ -2285,12 +2418,26 @@ class MacOS:
 
     def _element(self, element_index: ElementRef) -> Any:
         """The element an index from this run names, or that a match
-        describes (`_find_again`)."""
+        describes (`_find_again`); a search result stands for its one match."""
+        if isinstance(element_index, SearchMatches):
+            if len(element_index) != 1:
+                listed = "; ".join(self._match_summary(match) for match in element_index[:5])
+                raise MacOSError(
+                    f"Expected one element but got a search result with "
+                    f"{len(element_index)} matches; pass matches[0], or narrow "
+                    f"the search{': ' + listed if listed else ''}",
+                    code=ErrorCode.BAD_REQUEST,
+                    details={"parameter": "element_index", "found": len(element_index)},
+                )
+            index = element_index[0].get("element_index")
+            if isinstance(index, int) and index in self._elements:
+                return self._elements[index]
+            element_index = element_index[0]
         if isinstance(element_index, Mapping):
             return self._find_again(element_index)
         try:
             return self._elements[int(element_index)]
-        except (KeyError, ValueError) as exc:
+        except (KeyError, ValueError, TypeError) as exc:
             raise MacOSError(
                 f"Unknown element index {element_index!r}; an index lasts only "
                 "until the next search or snapshot in the same macos-harness "
@@ -2321,7 +2468,7 @@ class MacOS:
         )
         found = self.ax_search(
             app_pid=pid,
-            search_key=_SEARCH_KEY_OF_ROLE.get(role, "AXAnyTypeSearchKey"),
+            search_key=_SEARCH_KEY_OF_ROLE.get(role, role),
             title=title,
             identifier=identifier,
             description=description,
@@ -2334,15 +2481,58 @@ class MacOS:
         frame = match.get("frame")
         if frame is not None and (len(same) > 1 or not found.complete):
             same = [candidate for candidate in same if candidate.get("frame") == frame]
+        scope = match.get("window_id")
+        scoped = isinstance(scope, int) and not isinstance(scope, bool)
+        located: list[dict[str, JSONValue]] = []
+        if len(same) > 1 or scoped:
+            located = self._candidate_windows(pid, same)
+            if scoped:
+                kept = [index for index, window in enumerate(located) if window["window_id"] == scope]
+                same, located = [same[index] for index in kept], [located[index] for index in kept]
         if len(same) != 1:
             label = title or identifier or description or "untitled"
+            where = f" in window {scope}" if scoped else ""
+            if len(same) > 1:
+                where += " in windows " + ", ".join(
+                    f"{window['window_id'] or '(no id)'} {window['title']!r}" for window in located
+                )
             raise MacOSError(
-                f"Found {len(same)} {role} {label!r} in process {pid} where the "
-                "match needs exactly one; query it again",
+                f"Found {len(same)} {role} {label!r} in process {pid}{where} where "
+                "the match needs exactly one; add the window_id of the one you "
+                "mean to the match, or query it again",
                 code=ErrorCode.ELEMENT_UNKNOWN,
-                details={"pid": pid, "role": role, "found": len(same)},
+                details={"pid": pid, "role": role, "found": len(same), "windows": located},
             )
         return self._elements[int(same[0]["element_index"])]
+
+    def _candidate_windows(
+        self, pid: int, candidates: Sequence[Mapping[str, JSONValue]]
+    ) -> list[dict[str, JSONValue]]:
+        """The window each of ``pid``'s ``candidates`` sits in: its title,
+        and the window server's id for it, or None where no window or
+        several have its frame. AX names no window id, so the id is the
+        one window whose bounds match the AX window's frame."""
+        listed = self.windows(pid, all_layers=True)
+        located: list[dict[str, JSONValue]] = []
+        for candidate in candidates:
+            element = self._elements[int(candidate["element_index"])]
+            window = self._copy_attribute(element, "AXWindow") if self._is_ax_element(element) else None
+            raw: Mapping[str, object] = (
+                self._copy_attributes(window, ("AXTitle", "AXFrame"))
+                if self._is_ax_element(window) else {}
+            )
+            frame = self._lenient_json(raw, "AXFrame", [])
+            ids = [
+                entry["window_id"]
+                for entry in listed
+                if isinstance(frame, Mapping)
+                and all(abs(frame[key] - entry["bounds"][key]) < 1 for key in entry["bounds"])
+            ]
+            located.append({
+                "window_id": ids[0] if len(ids) == 1 else None,
+                "title": self._lenient_json(raw, "AXTitle", []),
+            })
+        return located
 
     def _remember_element(self, element: Any) -> int:
         index = self._element_seq
@@ -2612,25 +2802,28 @@ class MacOS:
             dict.fromkeys(("AXRole", *(str(item) for item in attributes)))
         )
         raw = self._copy_attributes(element, requested)
+        non_finite: list[str] = []
         node: dict[str, Any] = {
             "element_index": element_index,
-            "role": self._jsonable(raw.get("AXRole")),
+            "role": self._lenient_json(raw, "AXRole", non_finite),
         }
         for source, target in _AX_NODE_MAPPING.items():
             if source not in raw:
                 continue
-            value = self._jsonable(raw[source])
+            value = self._lenient_json(raw, source, non_finite)
             if value not in (None, "", [], {}):
                 node[target] = value
         extra = {
-            name: self._jsonable(value)
-            for name, value in raw.items()
-            if name not in _AX_NODE_MAPPING
-            and name != "AXRole"
-            and self._jsonable(value) not in (None, "", [], {})
+            name: value
+            for name in raw
+            if name not in _AX_NODE_MAPPING and name != "AXRole"
+            for value in (self._lenient_json(raw, name, non_finite),)
+            if value not in (None, "", [], {})
         }
         if extra:
             node["attributes"] = extra
+        if non_finite:
+            node["non_finite"] = non_finite
         if include_actions:
             actions = self._actions(element)
             if actions:
@@ -2728,6 +2921,7 @@ class MacOS:
                 details={"parameter": "app_pid"},
             )
 
+        role = _role_filter(search_key)
         if element_index is None and self._backend != "python":
             native_pid = app_pid if app_pid is not None else self._pid(app)
             if native_pid is None:
@@ -2744,14 +2938,14 @@ class MacOS:
                         code=ErrorCode.BAD_REQUEST,
                         details={"parameter": "direction", "value": direction},
                     )
-                return _with_pid(self._native_query(
+                found = self._native_query(
                     client,
                     pid=native_pid,
-                    search_key=search_key,
+                    search_key=search_key if role is None else "AXAnyTypeSearchKey",
                     text=text,
                     exact=exact,
                     visible_only=visible_only,
-                    limit=limit,
+                    limit=limit if role is None or limit < 0 else max_nodes,
                     direction=direction.casefold(),
                     immediate_descendants_only=immediate_descendants_only,
                     attributes=attributes,
@@ -2760,6 +2954,9 @@ class MacOS:
                     reset_elements=reset_elements,
                     messaging_timeout=messaging_timeout,
                     enhance=enhance,
+                )
+                return _with_pid(_in_closed_menus(
+                    found if role is None else _of_role(found, role, limit), search_key
                 ), native_pid)
 
         self._ensure_accessibility()
@@ -2794,12 +2991,25 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "direction", "value": direction},
             ) from exc
-        # With an exact selector the app's search only narrows; the
-        # judgement happens here, so ask for every candidate the walk
-        # bound allows and apply ``limit`` after judging.
-        requested_limit = max_nodes if exact.active else int(limit)
+        if role == "AXWindow" and element_index is None:
+            return _with_pid(self._window_search(
+                root,
+                text=text,
+                exact=exact,
+                visible_only=visible_only,
+                limit=limit,
+                direction=direction,
+                attributes=attributes,
+                include_actions=include_actions,
+            ), pid)
+        # With an exact selector or a role Apple has no search key for,
+        # the app's search only narrows; the judgement happens here, so
+        # ask for every candidate the walk bound allows and apply
+        # ``limit`` after judging.
+        judged = tuple(dict.fromkeys((*exact.attributes, *(() if role is None else ("AXRole",)))))
+        requested_limit = max_nodes if judged else int(limit)
         predicate: dict[str, Any] = {
-            "AXSearchKey": search_key,
+            "AXSearchKey": search_key if role is None else "AXAnyTypeSearchKey",
             "AXVisibleOnly": bool(visible_only),
             "AXResultsLimit": requested_limit,
             "AXDirection": ax_direction,
@@ -2811,7 +3021,7 @@ class MacOS:
             root, "AXUIElementsForSearchPredicate", predicate, None
         )
         if error == AS.kAXErrorParameterizedAttributeUnsupported:
-            return _with_pid(self._bounded_ax_search(
+            return _with_pid(_in_closed_menus(self._bounded_ax_search(
                 root,
                 search_key=search_key,
                 text=text,
@@ -2823,7 +3033,7 @@ class MacOS:
                 attributes=attributes,
                 include_actions=include_actions,
                 max_nodes=max_nodes,
-            ), pid)
+            ), search_key), pid)
         if error != _AX_SUCCESS:
             raise _ax_error("AXUIElementsForSearchPredicate", error, element_index=element_index)
 
@@ -2834,12 +3044,15 @@ class MacOS:
         matches: list[dict[str, Any]] = []
         read_complete = True
         for element in candidates:
-            if exact.active:
-                raw = self._copy_attributes(element, exact.attributes)
+            if judged:
+                raw = self._copy_attributes(element, judged)
                 read_complete = read_complete and raw.conclusive
+                if role is not None and raw.get("AXRole") != role:
+                    continue
                 fields = {
                     _AX_NODE_MAPPING[name]: self._jsonable(value)
                     for name, value in raw.items()
+                    if name in _AX_NODE_MAPPING
                 }
                 if not exact.matches(fields):
                     continue
@@ -2861,9 +3074,71 @@ class MacOS:
         complete = (
             requested_limit < 0 or len(candidates) < requested_limit
         ) and not cut and read_complete
-        return _with_pid(
-            SearchMatches(matches, complete=complete, visited=len(candidates)), pid
-        )
+        return _with_pid(_in_closed_menus(
+            SearchMatches(matches, complete=complete, visited=len(candidates)), search_key
+        ), pid)
+
+    def _window_search(
+        self,
+        root: object,
+        *,
+        text: str | None,
+        exact: _ExactSelector,
+        visible_only: bool,
+        limit: int,
+        direction: str,
+        attributes: Iterable[str],
+        include_actions: bool,
+    ) -> SearchMatches:
+        """The windows of the app ``root`` is that match, from its list of
+        them (``AXWindows``): an app's own search finds what its windows
+        hold, not the windows. ``text`` is a substring of a window's title,
+        description, or identifier, case ignored; ``visible_only`` leaves
+        out a minimized window."""
+        windows = [
+            window
+            for window in self._copy_attribute(root, "AXWindows", checked=True) or ()
+            if self._is_ax_element(window)
+        ]
+        if direction.casefold() == "previous":
+            windows.reverse()
+        needle = text.casefold() if text is not None else None
+        described = tuple(dict.fromkeys((*attributes, *exact.attributes)))
+        result_limit = len(windows) if limit < 0 else int(limit)
+        matches: list[dict[str, JSONValue]] = []
+        read_complete = True
+        cut = False
+        for window in windows:
+            raw = self._copy_attributes(
+                window, ("AXMinimized", "AXTitle", "AXDescription", "AXIdentifier")
+            )
+            read_complete = read_complete and raw.conclusive
+            fields = {
+                _AX_NODE_MAPPING[name]: self._jsonable(value)
+                for name, value in raw.items()
+                if name in _AX_NODE_MAPPING
+            }
+            if (
+                (visible_only and bool(raw.get("AXMinimized")))
+                or (needle is not None and not any(
+                    isinstance(value, str) and needle in value.casefold()
+                    for value in fields.values()
+                ))
+                or not exact.matches(fields)
+            ):
+                continue
+            if len(matches) >= result_limit:
+                cut = True
+                break
+            matches.append(
+                self._describe_element(
+                    window,
+                    self._remember_element(window),
+                    attributes=described,
+                    include_actions=include_actions,
+                )
+            )
+        return SearchMatches(matches, complete=read_complete and not cut, visited=len(windows))
 
     def _bounded_ax_search(
         self,
@@ -2897,7 +3172,7 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "max_nodes", "value": max_nodes},
             )
-        role = _AX_SEARCH_ROLES.get(search_key)
+        role = _AX_SEARCH_ROLES.get(search_key, _role_filter(search_key))
         if role is None and search_key != "AXAnyTypeSearchKey":
             raise MacOSError(
                 f"AX fallback does not support {search_key!r}",
@@ -3363,6 +3638,7 @@ class MacOS:
         timeout: float = 5.0,
         interval: float = 0.1,
         actionable: bool = False,
+        explain: bool = True,
     ) -> dict[str, Any]:
         """Wait for exactly one AX match and fail closed on ambiguity.
 
@@ -3373,7 +3649,9 @@ class MacOS:
         one labelled exactly ``text`` wins, and for a caller about to act
         on the match (``actionable``) the only enabled one after that
         (see `_settle_tie`). A search the app did not answer in time
-        (AXError -25204) is a poll that found nothing yet.
+        (AXError -25204) is a poll that found nothing yet. A timeout in one
+        app names the query and its poll count and, with ``explain``, what
+        the app shows instead (`_wait_clues`).
         """
         exact = _ExactSelector.parse(
             title=title, identifier=identifier, description=description
@@ -3404,7 +3682,9 @@ class MacOS:
         # text, a second match already proves ambiguity.
         limit = _AX_LABEL_SEARCH_LIMIT if text else 2
         deadline = time.monotonic() + timeout
+        polls = 0
         while True:
+            polls += 1
             try:
                 if cross_process:
                     matches = self.ax_search_all(
@@ -3483,26 +3763,130 @@ class MacOS:
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                query = _wait_query(
+                    app=app, search_key=search_key, text=text, title=title,
+                    identifier=identifier, description=description,
+                    visible_only=visible_only,
+                )
+                sought = ", ".join(
+                    f"{name}={value!r}" for name, value in query.items() if name != "visible_only"
+                )
+                tally = f" for {sought or 'any element'} after {polls} searches in {timeout:g}s"
+                details: dict[str, JSONValue] = {"timeout": timeout, "polls": polls, "query": query}
                 if matches.complete:
-                    raise MacOSError(
-                        "AX wait timed out without a match",
-                        code=ErrorCode.TIMEOUT,
-                        details={"timeout": timeout},
+                    message, note = "AX wait timed out without a match" + tally, ""
+                else:
+                    message = (
+                        "AX wait timed out before a complete search confirmed "
+                        "a unique match" + tally
+                        if matches
+                        else "AX wait timed out without a match" + tally
+                        + "; the last search was incomplete"
                     )
-                message = (
-                    "AX wait timed out before a complete search confirmed "
-                    "a unique match"
-                    if matches
-                    else "AX wait timed out without a match; the last search "
-                    "was incomplete"
-                )
-                note, gaps = _search_gaps(matches, max_nodes)
-                raise MacOSError(
-                    message + note,
-                    code=ErrorCode.TIMEOUT,
-                    details={"timeout": timeout, **gaps},
-                )
+                    note, gaps = _search_gaps(matches, max_nodes)
+                    details.update(gaps)
+                if explain and not cross_process and not matches and not matches.unanswered:
+                    hint, clues = self._wait_clues(
+                        app=app, search_key=search_key, text=text, title=title,
+                        identifier=identifier, description=description,
+                        visible_only=visible_only, max_nodes=max_nodes, enhance=enhance,
+                    )
+                    note += hint
+                    details.update(clues)
+                raise MacOSError(message + note, code=ErrorCode.TIMEOUT, details=details)
             time.sleep(min(interval, remaining))
+
+    def _wait_clues(
+        self,
+        *,
+        app: str | int | None,
+        search_key: str,
+        text: str | None,
+        title: str | None,
+        identifier: str | None,
+        description: str | None,
+        visible_only: bool,
+        max_nodes: int,
+        enhance: bool,
+    ) -> tuple[str, dict[str, JSONValue]]:
+        """What a wait in one app that found nothing could see instead, for
+        its timeout to say: the same query matching off screen or as
+        another role (``elsewhere``), and the on-screen labels nearest what
+        it sought (``nearest``), so a caller tells "not drawn yet" from
+        "wrong words" without a screenshot. A clue search that fails adds
+        nothing; labels come from titles, descriptions, and static text,
+        never from an editable field's value."""
+        role = _role_filter(search_key) or _AX_SEARCH_ROLES.get(search_key)
+        note = ""
+        clues: dict[str, JSONValue] = {}
+
+        def search(
+            *,
+            search_key: str = "AXAnyTypeSearchKey",
+            text: str | None = None,
+            title: str | None = None,
+            identifier: str | None = None,
+            description: str | None = None,
+            visible_only: bool,
+            limit: int,
+            attributes: tuple[str, ...],
+        ) -> SearchMatches:
+            try:
+                return self.ax_search(
+                    app=app, search_key=search_key, text=text, title=title,
+                    identifier=identifier, description=description,
+                    visible_only=visible_only, limit=limit, attributes=attributes,
+                    include_actions=False, max_nodes=max_nodes,
+                    enhance=enhance, reset_elements=False,
+                )
+            except MacOSError:
+                return SearchMatches(complete=False, visited=0)
+
+        sought = text or title or description or identifier
+        if sought and (visible_only or search_key != "AXAnyTypeSearchKey"):
+            wider = search(
+                text=text, title=title, identifier=identifier, description=description,
+                visible_only=False, limit=_WAIT_CLUE_MATCHES,
+                attributes=("AXRole", "AXTitle", "AXDescription", "AXFrame"),
+            )
+            if wider:
+                clues["elsewhere"] = [
+                    {name: value for name, value in match.items() if name not in {"element_index", "pid"}}
+                    for match in wider
+                ]
+                where = (
+                    f"of another role than {role}" if role and all(match.get("role") != role for match in wider)
+                    else "off screen, hidden, or of another role"
+                )
+                note += (
+                    f"; the same query matches {len(wider)} element(s) {where}: "
+                    + "; ".join(_clue_summary(match, sought) for match in wider)
+                    + ". Scroll to or reveal it, or change the role"
+                )
+        if sought:
+            labels: dict[str, str] = {}
+            for key, attributes in (
+                ("AXAnyTypeSearchKey", ("AXRole", "AXTitle", "AXDescription")),
+                ("AXStaticTextSearchKey", ("AXRole", "AXValue")),
+            ):
+                for match in search(
+                    search_key=key, visible_only=True, limit=_WAIT_CLUE_LABELS, attributes=attributes
+                ):
+                    for field in ("title", "description", "value"):
+                        label = match.get(field)
+                        if isinstance(label, str) and label.strip():
+                            labels.setdefault(label.strip()[:80], str(match.get("role")))
+            folded = {label.casefold(): label for label in labels}
+            nearest = [
+                folded[label]
+                for label in difflib.get_close_matches(sought.casefold(), folded, n=5, cutoff=0.5)
+            ]
+            if nearest:
+                clues["nearest"] = [{"role": labels[label], "label": label} for label in nearest]
+                note += "; nearest on screen: " + ", ".join(
+                    f"{labels[label]} {label!r}" for label in nearest
+                )
+        return note, clues
 
     def ax_wait_gone(
         self,
@@ -3667,7 +4051,7 @@ class MacOS:
         single_attempt = _deadline is None and timeout == 0
         deadline = _deadline if _deadline is not None else _Deadline(timeout, time.monotonic)
         targeted = not cross_process
-        if targeted and self._backend != "python":
+        if targeted and self._backend != "python" and _role_filter(search_key) is None:
             if direction.casefold() not in {"next", "previous"}:
                 raise MacOSError(
                     "AX search direction must be 'next' or 'previous'",
@@ -3942,9 +4326,12 @@ class MacOS:
         every app's windows on screen now, front to back.
 
         Only a normal window of at least 40pt counts, the kind `see` and
-        pointer input pick by themselves; ``all_layers`` adds menus,
-        panels, the menu bar's items, and every other surface, any size,
-        which `see` and pointer input reach through ``window_id``.
+        pointer input pick by themselves, and of an app's windows off
+        screen only the titled ones, minimized or on another Space: an
+        untitled one off screen is a helper surface the app never shows.
+        ``all_layers`` adds menus, panels, the menu bar's items, and every
+        other surface, any size, which `see` and pointer input reach
+        through ``window_id``.
         """
         if app is None:
             return [
@@ -3962,6 +4349,7 @@ class MacOS:
                 int(value.get(AS.kCGWindowOwnerPID, -1)) == pid
                 if all_layers
                 else self._is_content_window(pid, value)
+                and (value.get(AS.kCGWindowIsOnscreen) or value.get(AS.kCGWindowName))
             )
         ]
         return sorted(
@@ -3974,16 +4362,39 @@ class MacOS:
         )
 
     def wait_for_window(
-        self, app: str | int | None = None, *, timeout: float = 2.0
+        self,
+        app: str | int | None = None,
+        *,
+        title: str | None = None,
+        timeout: float = 2.0,
+        all_layers: bool = False,
     ) -> list[dict[str, Any]]:
-        """Return ``windows(app)`` once it is non-empty, polling until ``timeout``.
+        """Return ``windows(app)`` once it holds a window, polling until
+        ``timeout``: one whose title holds ``title``, case ignored, when
+        given, and any surface with ``all_layers``, as a SecurityAgent
+        prompt needs. An app not running yet has the same ``timeout`` to
+        start.
 
         ``open -a`` returns before the app draws anything: TextEdit's first
         window appeared 335ms after launch and Notes' 792ms, so a capture
         issued straight after a launch finds nothing.
         """
-        _, info = self._resolve_app(app)
-        return self._wait_for_windows(info, timeout=timeout)
+        deadline = self._now() + max(0.0, timeout)
+        while True:
+            try:
+                _, info = self._resolve_app(app)
+                break
+            except ApplicationNotFoundError as exc:
+                remaining = deadline - self._now()
+                if remaining <= 0:
+                    raise ApplicationNotFoundError(
+                        f"{exc}; it did not start within {timeout:g}s",
+                        details={**exc.details, "timeout": timeout},
+                    ) from exc
+                self._pause(min(0.05, remaining))
+        return self._wait_for_windows(
+            info, timeout=timeout, deadline=deadline, title=title, all_layers=all_layers
+        )
 
     @staticmethod
     def _now() -> float:
@@ -3996,17 +4407,36 @@ class MacOS:
         time.sleep(seconds)
 
     def _wait_for_windows(
-        self, info: dict[str, JSONValue], *, timeout: float, deadline: float | None = None
+        self,
+        info: dict[str, JSONValue],
+        *,
+        timeout: float,
+        deadline: float | None = None,
+        title: str | None = None,
+        all_layers: bool = False,
     ) -> list[dict[str, Any]]:
         if deadline is None:
             deadline = self._now() + max(0.0, timeout)
         while True:
-            windows = self.windows(int(info["pid"]))
+            pid = int(info["pid"])
+            listed = self.windows(pid, all_layers=True) if all_layers else self.windows(pid)
+            windows = listed if title is None else [
+                window for window in listed
+                if title.casefold() in str(window.get("title") or "").casefold()
+            ]
             if windows:
                 return windows
             remaining = deadline - self._now()
             if remaining <= 0:
-                raise _no_window_error(info, timeout=timeout)
+                if title is None:
+                    raise _no_window_error(info, timeout=timeout)
+                titles = [str(window.get("title") or "") for window in listed]
+                raise MacOSError(
+                    f"{info['name']} showed no window titled {title!r} within "
+                    f"{timeout:g}s; its windows: {', '.join(map(repr, titles)) or 'none'}",
+                    code=ErrorCode.TIMEOUT,
+                    details={"app": info, "timeout": timeout, "title": title, "titles": titles},
+                )
             self._pause(min(0.05, remaining))
 
     def _ready_windows(

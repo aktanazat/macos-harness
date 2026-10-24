@@ -43,7 +43,7 @@ mac.quit(app, *, timeout=10.0, force=False)
 mac.relaunch(app, *, timeout=15.0, window=True)
 mac.frontmost()
 mac.windows(app=None, *, all_layers=False)
-mac.wait_for_window(app=None, *, timeout=2.0)
+mac.wait_for_window(app=None, *, title=None, timeout=2.0, all_layers=False)
 mac.place(app=None, *, window_index=0, x=None, y=None, width=None, height=None, display=None)
 mac.list_apps()
 mac.show_pointer()
@@ -55,7 +55,10 @@ mac.handoff(*, reason, app)
 
 `mac.windows()` lists every app's normal windows on screen, front to back;
 `all_layers=True` adds menus, popovers, panels, prompts, and the menu bar.
-Each entry has `window_id`, `pid`, `owner`, and `layer`. `see(window_id=N)`
+Each entry has `window_id`, `pid`, `owner`, and `layer`. `mac.windows(app)`
+leaves out an untitled window off screen, a helper surface the app never
+shows. `mac.wait_for_window(app, title="Settings")` waits for the app to
+start and for a window whose title holds `title`. `see(window_id=N)`
 captures any of them and reports its `layer` and owner `pid`. A window's
 picture shows the sheets, popovers, and tips attached to it where they
 cover it; what hangs past the window's edge is cut off there, and
