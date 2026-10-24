@@ -15,8 +15,9 @@ name a match reports (`AXButton`, `AXPopUpButton`, `AXRow`) or in words
 (`pop up button`, `window`); a misspelled one raises `MacOSError` naming the
 nearest role. A role Apple's search has no key for is filtered from an
 any-role search, so its matches count against `max_nodes`. `role="window"`
-lists the app's windows, which its search never returns; `mac.windows(app)`
-lists them with window ids. Do not pass both `role` and `search_key`. A search
+lists the app's windows, which its search never returns, read in this process
+even with the native backend; `mac.windows(app)` lists them with window ids.
+Do not pass both `role` and `search_key`. A search
 for what is on screen, the default, leaves out the items of closed menus; pass
 `role="menu item"` to reach a command in a menu that is not open; such a match
 carries `in_closed_menu: true`, takes a press, and cannot take a click.

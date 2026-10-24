@@ -791,7 +791,7 @@ class SearchMatches(list[dict[str, JSONValue]]):
     disappearance waits require it before accepting an empty search.
     """
 
-    __slots__ = ("complete", "partial", "unanswered", "visited")
+    __slots__ = ("complete", "owner", "partial", "unanswered", "visited")
 
     def __init__(
         self,
@@ -807,6 +807,9 @@ class SearchMatches(list[dict[str, JSONValue]]):
         # name, and how many apps did not answer at all.
         self.partial: list[str] = []
         self.unanswered = 0
+        # The `MacOS` whose element indices the matches carry, once a
+        # search hands them out; another instance numbers its own.
+        self.owner: object | None = None
 
 
 # An element: an index this run's last search or snapshot handed out, or
@@ -815,12 +818,14 @@ class SearchMatches(list[dict[str, JSONValue]]):
 ElementRef = int | Mapping[str, JSONValue]
 
 
-def _with_pid(matches: SearchMatches, pid: int | None) -> SearchMatches:
+def _with_pid(matches: SearchMatches, pid: int | None, owner: object) -> SearchMatches:
     """``matches``, each naming the process its one searched app runs as,
-    so that a later run can find it again (`MacOS._find_again`)."""
+    so that a later run can find it again (`MacOS._find_again`), and
+    marked as ``owner``'s, whose element indices they carry."""
     if pid is not None:
         for match in matches:
             match["pid"] = pid
+    matches.owner = owner
     return matches
 
 
@@ -2486,7 +2491,7 @@ class MacOS:
                     details={"parameter": "element_index", "found": len(element_index)},
                 )
             index = element_index[0].get("element_index")
-            if isinstance(index, int) and index in self._elements:
+            if element_index.owner is self and isinstance(index, int) and index in self._elements:
                 return self._elements[index]
             element_index = element_index[0]
         if isinstance(element_index, Mapping):
@@ -2981,7 +2986,7 @@ class MacOS:
             )
 
         role = _role_filter(search_key)
-        if element_index is None and self._backend != "python":
+        if element_index is None and self._backend != "python" and role != "AXWindow":
             native_pid = app_pid if app_pid is not None else self._pid(app)
             if native_pid is None:
                 raise MacOSError(
@@ -3016,7 +3021,7 @@ class MacOS:
                 )
                 return _with_pid(_in_closed_menus(
                     found if role is None else _of_role(found, role, limit), search_key
-                ), native_pid)
+                ), native_pid, self)
 
         self._ensure_accessibility()
         if element_index is None:
@@ -3060,7 +3065,7 @@ class MacOS:
                 direction=direction,
                 attributes=attributes,
                 include_actions=include_actions,
-            ), pid)
+            ), pid, self)
         # With an exact selector or a role Apple has no search key for,
         # the app's search only narrows; the judgement happens here, so
         # ask for every candidate the walk bound allows and apply
@@ -3092,7 +3097,7 @@ class MacOS:
                 attributes=attributes,
                 include_actions=include_actions,
                 max_nodes=max_nodes,
-            ), search_key), pid)
+            ), search_key), pid, self)
         if error != _AX_SUCCESS:
             raise _ax_error("AXUIElementsForSearchPredicate", error, element_index=element_index)
 
@@ -3135,7 +3140,7 @@ class MacOS:
         ) and not cut and read_complete
         return _with_pid(_in_closed_menus(
             SearchMatches(matches, complete=complete, visited=len(candidates)), search_key
-        ), pid)
+        ), pid, self)
 
     def _window_search(
         self,
@@ -3474,6 +3479,7 @@ class MacOS:
         showing = self._onscreen_window_owners() if on_screen else frozenset()
         self._elements = {}
         matches = SearchMatches(complete=True, visited=0)
+        matches.owner = self
         first_error: MacOSError | None = None
         searched = False
 
