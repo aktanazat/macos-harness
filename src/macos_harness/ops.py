@@ -145,10 +145,14 @@ def _args_summary(argv: Sequence[str]) -> list[JSONValue]:
 _ELEMENT_IDENTITY = ("pid", "role", "title", "identifier", "description", "frame")
 
 
-def _element_request(element: int | Mapping[str, JSONValue]) -> JSONValue:
+def _element_request(element: int | Mapping[str, JSONValue] | list[dict[str, JSONValue]]) -> JSONValue:
     """The element a click aimed at, as its receipt records it: an index
-    as given, a match by what finds it again -- never its value, which
-    for a text field is what the user wrote."""
+    as given, a match -- or a search result's one match -- by what finds
+    it again, never its value, which for a text field is what the user
+    wrote."""
+    if isinstance(element, list):
+        identities = [_element_request(match) for match in element]
+        return identities[0] if len(identities) == 1 else identities
     if isinstance(element, Mapping):
         return {key: element.get(key) for key in _ELEMENT_IDENTITY}
     return element

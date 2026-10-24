@@ -149,13 +149,20 @@ def test_do_click_on_an_element_posts_at_the_point_its_receipt_reports(
     assert receipt.to_json()["target"]["point"] == {"x": center[0], "y": center[1]}
 
 
-def test_a_receipt_names_the_clicked_element_but_never_its_value() -> None:
+@pytest.mark.parametrize(
+    "wrap",
+    [lambda match: match, lambda match: SearchMatches([match], complete=True, visited=1)],
+    ids=["match", "one-match-search-result"],
+)
+def test_a_receipt_names_the_clicked_element_but_never_its_value(
+    wrap: Callable[[dict[str, object]], object],
+) -> None:
     mac = _Sona()
 
-    receipt = mac.do.click(element={**_EARLIER, "value": "a private note"}, app="Sona")
+    receipt = mac.do.click(element=wrap({**_EARLIER, "value": "a private note"}), app="Sona")
 
     assert receipt.to_json()["request"]["element"]["title"] == "Settings"
-    assert "a private note" not in json.dumps(receipt.to_json())
+    assert "a private note" not in json.dumps([receipt.to_json(), mac.timeline()])
 
 
 @pytest.mark.parametrize(

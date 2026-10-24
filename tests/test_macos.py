@@ -26,6 +26,7 @@ from macos_harness.macos import (
     SearchMatches,
     _split_scroll_delta,
 )
+from macos_harness.native import NativeQueryResult
 from macos_harness.ops import Operations
 from macos_harness.receipts import Acted, Postcondition, equals, gone, present
 
@@ -1359,20 +1360,47 @@ def test_ax_role_without_an_apple_search_key_keeps_only_matches_of_that_role(
     assert found.complete is True
 
 
+class _WindowlessAgent:
+    """The native agent's search, which like the app's never returns a window."""
+
+    def query(self, params: dict) -> NativeQueryResult:
+        return NativeQueryResult([], True, 0)
+
+
+@pytest.mark.parametrize("backend", ["python", "native"])
 @pytest.mark.parametrize("role", ["AXWindow", "window"])
 def test_ax_window_role_finds_the_apps_windows_that_its_search_never_returns(
-    monkeypatch, role
+    monkeypatch, role, backend
 ) -> None:
     """An app's search finds what its windows hold, never the windows, so a
     window role reads the app's window list: a wait for a Settings window
     to appear can name it, and a minimized one is not on screen."""
     mac = _settings_app(monkeypatch, app_search=True)
+    if backend == "native":
+        mac._backend = "native"
+        monkeypatch.setattr(mac, "_acquire_native", lambda: _WindowlessAgent())
 
     match = mac.ax.wait(app="Demo", role=role, title="Settings", timeout=0, include_actions=False)
     found = mac.ax.query("settings", app="Demo", role=role, include_actions=False)
 
     assert (match["role"], match["title"]) == ("AXWindow", "Settings")
     assert [window["title"] for window in found] == ["Settings"]
+
+
+def test_ax_search_result_from_another_instance_finds_its_element_again(monkeypatch) -> None:
+    """Each MacOS numbers its elements from zero, so a result handed to an
+    instance that did not search it is found again, never read as that
+    instance's own element at the same number."""
+    searched = _settings_app(monkeypatch, app_search=True)
+    menu = searched.ax.query("Theme", app="Demo", role="pop up button", include_actions=False)
+    other = _settings_app(monkeypatch, app_search=True)
+    other.ax.query("Theme", app="Demo", role="button", include_actions=False)
+
+    found_again = other.ax.raw(menu)
+
+    assert found_again is other.ax.raw(
+        other.ax.query("Theme", app="Demo", role="pop up button", include_actions=False)
+    )
 
 
 def test_ax_element_takes_a_one_match_search_result_and_names_matches0_otherwise(
