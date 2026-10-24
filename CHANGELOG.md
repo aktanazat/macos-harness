@@ -28,7 +28,9 @@ follows [Semantic Versioning](https://semver.org/).
   names a menu, not an item, points at it.
 - `mac.do.window("close" | "minimize" | "zoom", app=)` presses a window's
   title bar button and waits until the window is gone, off screen or
-  resized. `mac.do.reveal(match, app=)` scrolls a match into view, a native
+  resized; a close a save prompt stops fails with `timeout`, naming the
+  prompt's buttons in the message and `details["buttons"]`.
+  `mac.do.reveal(match, app=)` scrolls a match into view, a native
   backend's match included, and returns its frame. `mac.place` takes
   `window_id=`; it and `do.window` tell windows sharing one frame apart by
   window number and refuse twins they cannot.
