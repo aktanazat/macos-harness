@@ -2180,7 +2180,7 @@ class MacOS:
         return {"location": int(location), "length": int(length)}
 
     @staticmethod
-    def _lenient_json(raw: Mapping[str, Any], name: str, non_finite: list[str]) -> Any:
+    def _lenient_json(raw: Mapping[str, object], name: str, non_finite: list[str]) -> JSONValue:
         """``raw[name]`` as JSON, or None with ``name``'s field added to
         ``non_finite`` when it holds a NaN or infinity: one mis-measured
         value costs its own field, not the node or the tree around it."""
@@ -2517,7 +2517,7 @@ class MacOS:
         for candidate in candidates:
             element = self._elements[int(candidate["element_index"])]
             window = self._copy_attribute(element, "AXWindow") if self._is_ax_element(element) else None
-            raw: Mapping[str, Any] = (
+            raw: Mapping[str, object] = (
                 self._copy_attributes(window, ("AXTitle", "AXFrame"))
                 if self._is_ax_element(window) else {}
             )
@@ -3080,7 +3080,7 @@ class MacOS:
 
     def _window_search(
         self,
-        root: Any,
+        root: object,
         *,
         text: str | None,
         exact: _ExactSelector,
@@ -3105,7 +3105,7 @@ class MacOS:
         needle = text.casefold() if text is not None else None
         described = tuple(dict.fromkeys((*attributes, *exact.attributes)))
         result_limit = len(windows) if limit < 0 else int(limit)
-        matches: list[dict[str, Any]] = []
+        matches: list[dict[str, JSONValue]] = []
         read_complete = True
         cut = False
         for window in windows:
@@ -3820,11 +3820,24 @@ class MacOS:
         note = ""
         clues: dict[str, JSONValue] = {}
 
-        def search(**kwargs: Any) -> SearchMatches:
+        def search(
+            *,
+            search_key: str = "AXAnyTypeSearchKey",
+            text: str | None = None,
+            title: str | None = None,
+            identifier: str | None = None,
+            description: str | None = None,
+            visible_only: bool,
+            limit: int,
+            attributes: tuple[str, ...],
+        ) -> SearchMatches:
             try:
                 return self.ax_search(
-                    app=app, include_actions=False, max_nodes=max_nodes,
-                    enhance=enhance, reset_elements=False, **kwargs,
+                    app=app, search_key=search_key, text=text, title=title,
+                    identifier=identifier, description=description,
+                    visible_only=visible_only, limit=limit, attributes=attributes,
+                    include_actions=False, max_nodes=max_nodes,
+                    enhance=enhance, reset_elements=False,
                 )
             except MacOSError:
                 return SearchMatches(complete=False, visited=0)

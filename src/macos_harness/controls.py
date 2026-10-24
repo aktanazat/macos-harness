@@ -11,7 +11,13 @@ from typing import TYPE_CHECKING, Any
 import ApplicationServices as AS
 
 from .errors import ErrorCode, MacOSError
-from .macos import _AX_ROLES, _AX_SAFE_ATTRIBUTES, _SEARCH_KEY_OF_ROLE, ElementRef, SearchMatches
+from .macos import (
+    _AX_ROLES,
+    _AX_SAFE_ATTRIBUTES,
+    _SEARCH_KEY_OF_ROLE,
+    ElementRef,
+    SearchMatches,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
