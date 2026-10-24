@@ -286,20 +286,16 @@ def test_a_display_or_region_shot_maps_screenshot_clicks_for_any_app(
     assert mac.clicks == [(_FINDER, (origin[0] + 20, origin[1] + 10), _DOC, (0.0, 0.0))]
 
 
-@pytest.mark.parametrize(
-    ("window_id", "routed", "origin"),
-    [(None, _DOC, (0.0, 0.0)), (_PANEL, _PANEL, (300.0, 100.0))],
-    ids=["content-rule", "named-panel"],
-)
-def test_a_click_lands_in_a_panel_only_when_window_id_names_it(
-    tmp_path: Path, window_id, routed, origin
-) -> None:
+@pytest.mark.parametrize("window_id", [None, _PANEL], ids=["read-off-its-picture", "named"])
+def test_a_click_read_off_a_panels_picture_lands_in_the_panel(tmp_path: Path, window_id) -> None:
+    """The pixels came from the panel's picture, so the window behind it
+    never takes the click, named or not."""
     mac = _Desk()
     mac.see(window_id=_PANEL, path=tmp_path / "panel.png")
 
     mac.click(50, 40, window_id=window_id)
 
-    assert mac.clicks == [(_FINDER, (325.0, 120.0), routed, origin)]
+    assert mac.clicks == [(_FINDER, (325.0, 120.0), _PANEL, (300.0, 100.0))]
 
 
 def test_window_id_alone_names_the_app_a_click_goes_to() -> None:

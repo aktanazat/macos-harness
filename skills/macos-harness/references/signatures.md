@@ -33,10 +33,10 @@ nodes unless `--max-nodes` says more, and says on stderr where it stopped.
 ## Primitives
 
 ```text
-mac.see(app=None, *, window_index=0, window_id=None, display=None, region=None, path=None, max_width=1280, max_height=1280, show_pointer=False, after_change=False, timeout=10.0, settle=0.15)
+mac.see(app=None, *, window_index=0, window_id=None, display=None, region=None, path=None, max_width=1280, max_height=1280, crop=None, zoom=1.0, show_pointer=False, after_change=False, timeout=10.0, settle=0.15)
 mac.wait_change(app=None, *, window_index=0, window_id=None, region=None, by="pixels", timeout=30.0, settle=0.15)
-mac.key(key, *, app=None)
-mac.type(text, *, app=None)
+mac.key(key, *, app=None, window_id=None)
+mac.type(text, *, app=None, window_id=None)
 mac.click(x=None, y=None, *, element=None, app=None, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot")
 mac.scroll(delta_y, delta_x=0, *, app=None, window_id=None, screenshot=None, unit="pixel", x=None, y=None, coordinate_space="screenshot")
 mac.drag(from_x, from_y, to_x, to_y, *, app=None, window_id=None, screenshot=None, button="left", coordinate_space="screenshot", duration=0.25, steps=12)
@@ -56,6 +56,47 @@ mac.show_pointer()
 mac.hide_pointer()
 mac.handoff(*, reason, app)
 ```
+
+## AppleScript
+
+`osascript` in a shell borrows that shell's permissions; where the shell's
+app lacks Accessibility, a System Events call fails with `osascript is not
+allowed assistive access (-25211)`. Run the same source through
+`mac.script`, which carries the harness's permission:
+
+```python
+mac.activate(4242)  # bring a pid forward; falls back to System Events itself
+mac.script('tell application "System Events" to set frontmost of (first process whose unix id is 4242) to true')
+mac.script('tell application "System Events" to get name of every window of (first process whose unix id is 4242)')
+mac.script('tell application "System Events" to click button "OK" of window 1 of (first process whose unix id is 4242)')
+```
+
+Name a process by `unix id`, not by name: one name such as `wine` can
+cover several processes.
+
+## Aiming input
+
+`app` takes a name or a pid; `window_id` alone names its owner too. A name
+that fits several processes, such as `"wine"`, adds a `warning` naming
+the other pids to the result of `see`, `click`, `key`, `type`, and
+`activate`; `see`, `key`, and `type` also warn when the app shows several
+windows and the call let one be picked. Pass the pid or `window_id`.
+
+A screenshot point outside the picture raises before anything is sent,
+and a click read off a picture goes to the window it shows. A click at
+`element=` returns `miss` when accessibility finds something else over
+the element's center, which then took the click.
+
+`key` and `type` return `pid`, `window_id` (the window that took the keys,
+None where accessibility cannot say), `target_is_frontmost`, and a `note`
+when the app was in the background, where some apps ignore posted keys.
+With `window_id`, that window becomes the app's focused window first,
+without bringing the app forward.
+
+`see(app, crop=(x, y, w, h))` captures that part of the window, in window
+points; `zoom=2` draws it at twice the screen's pixels per point, still
+inside `max_width` and `max_height`. Click its pixels with
+`screenshot=` as any picture's.
 
 ## Menus, panels, and the screen
 

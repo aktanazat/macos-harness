@@ -189,6 +189,48 @@ def _rendered(
     )
 
 
+def reframed(
+    capture: WindowCapture,
+    area: Mapping[str, float],
+    *,
+    zoom: float,
+    max_width: int | None,
+    max_height: int | None,
+) -> WindowCapture:
+    """The part of ``capture`` that shows ``area`` (screen points inside
+    its bounds), drawn at ``zoom`` times the capture's pixels per point,
+    then shrunk to fit ``max_width`` x ``max_height``. ``bounds`` is the
+    area the whole pixels cut cover, under a pixel wider than ``area``."""
+    bounds = capture.bounds
+    scale_x = capture.width / bounds["width"]
+    scale_y = capture.height / bounds["height"]
+    left = max(0, math.floor((area["x"] - bounds["x"]) * scale_x))
+    top = max(0, math.floor((area["y"] - bounds["y"]) * scale_y))
+    right = min(capture.width, math.ceil((area["x"] + area["width"] - bounds["x"]) * scale_x))
+    bottom = min(
+        capture.height, math.ceil((area["y"] + area["height"] - bounds["y"]) * scale_y)
+    )
+    cut = Quartz.CGImageCreateWithImageInRect(
+        capture.image, Quartz.CGRectMake(left, top, right - left, bottom - top)
+    )
+    width, height = _output_size(
+        (right - left) * zoom, (bottom - top) * zoom, max_width, max_height
+    )
+    return WindowCapture(
+        image=_resized(cut, width, height),
+        width=width,
+        height=height,
+        bounds={
+            "x": bounds["x"] + left / scale_x,
+            "y": bounds["y"] + top / scale_y,
+            "width": (right - left) / scale_x,
+            "height": (bottom - top) / scale_y,
+        },
+        on_screen=capture.on_screen,
+        captured_at=capture.captured_at,
+    )
+
+
 def _sck_error(operation: str, error: Any, **details: Any) -> MacOSError:
     domain = str(error.domain())
     code = int(error.code())

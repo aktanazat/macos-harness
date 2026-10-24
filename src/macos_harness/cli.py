@@ -279,6 +279,14 @@ def _build_parser() -> argparse.ArgumentParser:
     see.add_argument("--max-width", type=int, default=1280)
     see.add_argument("--max-height", type=int, default=1280)
     see.add_argument(
+        "--crop", type=float, nargs=4, metavar=("X", "Y", "WIDTH", "HEIGHT"),
+        help="capture only this part of the window, in window points",
+    )
+    see.add_argument(
+        "--zoom", type=float, default=1.0,
+        help="draw the picture at this many times the screen's pixels per point",
+    )
+    see.add_argument(
         "--pointer", action="store_true", help="draw the virtual pointer onto the image"
     )
     state = subparsers.add_parser(
@@ -399,6 +407,8 @@ def main(argv: list[str] | None = None) -> int:
                     path=args.path,
                     max_width=args.max_width,
                     max_height=args.max_height,
+                    crop=tuple(args.crop) if args.crop else None,
+                    zoom=args.zoom,
                     show_pointer=args.pointer,
                 )
             print(json.dumps(result, indent=2, ensure_ascii=False))

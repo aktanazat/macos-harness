@@ -7,6 +7,19 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `see(crop=(x, y, w, h), zoom=)` captures part of a window, in window
+  points, and draws it at `zoom` times the screen's pixels per point, so
+  small text in a large window reads; clicks map through the cut picture.
+- `mac.key` and `mac.type` take `window_id=`, make that window the app's
+  focused one without bringing the app forward, and return the `pid`,
+  the `window_id` that took the keys, `target_is_frontmost`, and a `note`
+  when the app was in the background. They returned `None` before.
+- `mac.click(element=...)` returns `miss` when accessibility finds
+  something else over the element's center, which then took the click.
+- A name that fits several processes, such as `wine`, adds a `warning`
+  naming the other pids to `see`, `click`, `key`, `type`, and `activate`;
+  `see`, `key`, and `type` also warn when one of several windows was
+  picked for the caller.
 - `mac.activate` asks once more through Accessibility when macOS declines
   the ordinary request, as it does for Wine apps, and says which request
   worked under `via` (`appkit`, `accessibility`, or `None`).
@@ -155,6 +168,12 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A screenshot point outside the picture raises before any input is
+  sent, and a click, drag, or scroll read off a window's picture goes to
+  that window rather than whichever of the app's windows lies on top, so
+  a game window off the normal layer takes a drag without `window_id`.
+- The spare shell sizes output buffers as Python 3.14 does, which had
+  failed the 3.14 test job since the spare was added.
 - One Accessibility value that reads as infinity or NaN no longer fails
   `get_app_state`; only that field is dropped and named under `non_finite`.
 - An untitled off-screen helper window no longer ends `launch` and

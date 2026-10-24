@@ -51,6 +51,11 @@ def _on_screen_windows(monkeypatch, *windows: tuple[int | float, ...]) -> None:
     monkeypatch.setattr(
         macos_module.AS, "CGWindowListCopyWindowInfo", lambda options, relative: described
     )
+    monkeypatch.setattr(
+        macos_module.AS,
+        "CGWindowListCreateDescriptionFromArray",
+        lambda numbers: [entry for entry in described if entry["kCGWindowNumber"] in numbers],
+    )
 
 
 def _found(*matches: dict[str, object], complete: bool = True) -> SearchMatches:
@@ -2643,6 +2648,8 @@ def test_screen_point_converts_retina_pixels() -> None:
         "bounds": {"x": -100.0, "y": 50.0, "width": 800.0, "height": 600.0},
         "scale_x": 2.0,
         "scale_y": 2.0,
+        "width": 1600,
+        "height": 1200,
     }
     assert mac._screen_point(400, 200, "screenshot") == (100.0, 150.0)
     assert mac._screen_point(400, 200, "window") == (300.0, 250.0)
@@ -2814,7 +2821,9 @@ def _fake_app(mac: MacOS, monkeypatch) -> None:
         mac, "_resolve_app", lambda app: (object(), {"name": "Test", "pid": 42})
     )
     monkeypatch.setattr(
-        mac, "windows", lambda app: [{"window_id": 7, "title": "Doc", "pid": 42, "layer": 0}]
+        mac,
+        "windows",
+        lambda app: [{"window_id": 7, "title": "Doc", "pid": 42, "layer": 0, "on_screen": True}],
     )
     monkeypatch.setattr(
         mac,
@@ -2839,6 +2848,47 @@ def _fake_window_capture(mac: MacOS, monkeypatch) -> None:
         )
 
     monkeypatch.setattr(macos_module, "capture_window", capture_window)
+
+
+def _cropped_window_shot(mac: MacOS, monkeypatch, tmp_path: Path) -> dict[str, object]:
+    """`see` a 200x100pt part of the 400x300pt window at (100, 200), drawn at
+    twice its 2x pixels, with clicks routed as `_routed` records them."""
+    _fake_window_capture(mac, monkeypatch)
+    _on_screen_windows(monkeypatch, (42, 7, 100, 200, 400, 300))
+    return mac.see("Test", path=tmp_path / "part.png", crop=(100, 50, 200, 100), zoom=2)
+
+
+def test_a_cropped_zoomed_picture_maps_its_pixels_back_to_the_window(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A game window shrunk to fit a picture had text too small to read;
+    a cut drawn larger must still map its pixels to the right point."""
+    mac = MacOS()
+    routed = _routed(monkeypatch, mac)
+    shot = _cropped_window_shot(mac, monkeypatch, tmp_path)
+
+    mac.click(400, 200, app="Test")
+
+    assert (shot["width"], shot["height"]) == (800, 400)
+    assert shot["bounds"] == {"x": 200.0, "y": 250.0, "width": 200.0, "height": 100.0}
+    assert routed[0] == (42, 7, (200.0, 100.0))
+
+
+def test_a_point_outside_the_picture_is_refused_before_any_click(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A point misread off a picture landed beside its button while the
+    result said it was inside; a point past the picture's edge must not
+    reach the app at all."""
+    mac = MacOS()
+    routed = _routed(monkeypatch, mac)
+    _cropped_window_shot(mac, monkeypatch, tmp_path)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.click(801, 200, app="Test")
+
+    assert refused.value.code == ErrorCode.BAD_REQUEST
+    assert routed == []
 
 
 def test_see_reports_pointer_position_and_draws_it_only_on_request(

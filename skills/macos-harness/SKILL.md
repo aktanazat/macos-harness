@@ -31,7 +31,7 @@ identity, an irreversible action, or unexpected state.
 - `mac.type(text, app=...)`: typed text.
 - `mac.click(x, y, app=...)`: a raw click at screenshot points, or `element=match`.
 - `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, or press a control; a match outlives its run, an index does not.
-- `mac.script(source)`: AppleScript for an exact, focus-safe command.
+- `mac.script(source)`: AppleScript with the harness's Accessibility.
 
 `mac.windows(all_layers=True)` lists menus and panels for `window_id=`;
 `see(display=0)` or `see(region=(x, y, w, h))` replaces `screencapture`.

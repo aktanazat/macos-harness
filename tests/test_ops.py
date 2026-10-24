@@ -198,6 +198,9 @@ class FakeHost:
             return float(x), float(y)
         return float(x) + 100.0, float(y) + 200.0
 
+    def _pictured_window(self, window_id: int | None, coordinate_space: str) -> int | None:
+        return window_id
+
     def _target_window(
         self, pid: int, point: tuple[float, float], window_id: int | None = None
     ) -> _Window:

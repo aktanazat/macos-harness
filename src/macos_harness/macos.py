@@ -37,6 +37,7 @@ from .capture import (
     displays,
     draw_pointer,
     gray_print,
+    reframed,
     write_png,
 )
 from .errors import (
@@ -1843,23 +1844,7 @@ class MacOS:
             return app, info
 
         needle = str(query).casefold()
-        candidates: list[tuple[Any, dict[str, Any]]] = []
-        exact: list[tuple[Any, dict[str, Any]]] = []
-        for app in self._running_applications():
-            info = self._app_info(app)
-            # A pid names one process exactly. Substring-matching it lets a pid
-            # that is no longer running match an unrelated app that is, and the
-            # caller then posts events at that app without ever being told.
-            if needle == str(info["pid"]):
-                exact.append((app, info))
-                continue
-            values = [info["name"], info["bundle_id"], info["path"]]
-            lowered = [str(value).casefold() for value in values if value]
-            if needle in lowered:
-                exact.append((app, info))
-            elif any(needle in value for value in lowered):
-                candidates.append((app, info))
-
+        exact, candidates = self._app_matches(needle)
         matches = exact or candidates
         if len(exact) > 1:
             # Extensions can inherit their containing app's localized name.
@@ -1924,6 +1909,65 @@ class MacOS:
                 details={"query": query, "matches": ranked},
             )
         return matches[0]
+
+    def _app_matches(
+        self, needle: str
+    ) -> tuple[list[tuple[Any, dict[str, Any]]], list[tuple[Any, dict[str, Any]]]]:
+        """The running apps ``needle`` names exactly, by name, bundle ID,
+        path, or pid, and those whose name, bundle ID, or path holds it."""
+        candidates: list[tuple[Any, dict[str, Any]]] = []
+        exact: list[tuple[Any, dict[str, Any]]] = []
+        for app in self._running_applications():
+            info = self._app_info(app)
+            # A pid names one process exactly. Substring-matching it lets a pid
+            # that is no longer running match an unrelated app that is, and the
+            # caller then posts events at that app without ever being told.
+            if needle == str(info["pid"]):
+                exact.append((app, info))
+                continue
+            values = [info["name"], info["bundle_id"], info["path"]]
+            lowered = [str(value).casefold() for value in values if value]
+            if needle in lowered:
+                exact.append((app, info))
+            elif any(needle in value for value in lowered):
+                candidates.append((app, info))
+        return exact, candidates
+
+    def _name_warning(
+        self,
+        app: str | int | None,
+        pid: int,
+        window_id: int | None = None,
+        windows: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        """What a call that named its app by name should hear: the other
+        processes that name also fits besides ``pid``, and, when the call
+        let ``window_id`` be picked for it, ``pid``'s other windows on
+        screen, from ``windows`` when the caller already listed them."""
+        if not isinstance(app, str):
+            return None
+        parts = []
+        twins = sorted(
+            int(info["pid"])
+            for _, info in self._app_matches(app.casefold())[0]
+            if int(info["pid"]) not in (pid, -1)
+        )
+        if twins:
+            parts.append(
+                f"{app!r} also names pid{'s' if len(twins) > 1 else ''} "
+                f"{', '.join(map(str, twins))}; this went to pid {pid}. Pass app=<pid> "
+                "to choose"
+            )
+        if window_id is not None:
+            listed_windows = self.windows(pid) if windows is None else windows
+            shown = [window for window in listed_windows if window["on_screen"]]
+            if len(shown) > 1:
+                listed = ", ".join(f"{window['window_id']} {window['title']!r}" for window in shown)
+                parts.append(
+                    f"pid {pid} shows {len(shown)} windows ({listed}); this went to "
+                    f"{window_id}. Pass window_id= to choose"
+                )
+        return "; ".join(parts) or None
 
     @staticmethod
     def _launched_seconds_ago(app: Any) -> float | None:
@@ -4976,6 +5020,8 @@ class MacOS:
         path: str | Path | None = None,
         max_width: int = 1280,
         max_height: int = 1280,
+        crop: tuple[float, float, float, float] | None = None,
+        zoom: float = 1.0,
         show_pointer: bool = False,
         after_change: bool = False,
         timeout: float = 10.0,
@@ -4997,6 +5043,14 @@ class MacOS:
         The result's ``on_screen`` is the only freshness signal: an
         off-screen window (minimized, hidden, or on another Space) still
         renders, but from whatever the app last drew.
+
+        ``crop`` (x, y, width, height in window points, the space
+        ``coordinate_space="window"`` uses) captures only that part of the
+        window. ``zoom`` draws the picture at that many times the screen's
+        pixels per point, so small text reads; ``max_width`` and
+        ``max_height`` still bound it. A cut or zoomed picture's
+        ``bounds``, ``scale_x`` and ``scale_y`` describe it, so its pixels
+        map back through ``screenshot=`` as any picture's do.
         """
         if max_width <= 0 or max_height <= 0:
             raise MacOSError(
@@ -5004,9 +5058,15 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"max_width": max_width, "max_height": max_height},
             )
+        if not math.isfinite(zoom) or zoom <= 0:
+            raise MacOSError(
+                f"zoom must be a positive number, not {zoom!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "zoom", "value": zoom},
+            )
         self._check_surface(
             app=app, window_index=window_index, window_id=window_id, display=display,
-            region=region, after_change=after_change,
+            region=region, crop=crop, after_change=after_change,
         )
         change = None
         if after_change:
@@ -5020,6 +5080,8 @@ class MacOS:
             window_id=window_id,
             display=display,
             region=region,
+            crop=crop,
+            zoom=zoom,
             path=path,
             max_width=max_width,
             max_height=max_height,
@@ -5040,6 +5102,7 @@ class MacOS:
         window_id: int | None,
         display: int | None,
         region: tuple[float, float, float, float] | None,
+        crop: tuple[float, float, float, float] | None = None,
         after_change: bool,
     ) -> None:
         """Refuse a `see` that names more than one thing to capture."""
@@ -5060,6 +5123,9 @@ class MacOS:
         elif window_id is not None and window_index != 0:
             problem = "window_id names one window and window_index picks among an app's; pass one"
             parameter = "window_index"
+        elif crop is not None and (display is not None or region is not None):
+            problem = "crop cuts a window; region already names the part of the screen to capture"
+            parameter = "crop"
         else:
             return
         raise MacOSError(problem, code=ErrorCode.BAD_REQUEST, details={"parameter": parameter})
@@ -5076,16 +5142,22 @@ class MacOS:
         window_id: int | None = None,
         display: int | None = None,
         region: tuple[float, float, float, float] | None = None,
+        crop: tuple[float, float, float, float] | None = None,
+        zoom: float = 1.0,
     ) -> dict[str, Any]:
         self._ensure_screen_recording()
         window: dict[str, JSONValue] | None = None
         running: NSRunningApplication | None = None
         info: dict[str, JSONValue] | None = None
+        reframe = crop is not None or zoom != 1
+        fit_width, fit_height = (None, None) if reframe else (max_width, max_height)
+        window_bounds: dict[str, float] | None = None
+        warning: str | None = None
         if display is not None or region is not None:
             index, display_id, frame, area = self._screen_area(display, region)
             output = _png_output(path)
             captured = self._screen_image(
-                display_id, area, frame, max_width=max_width, max_height=max_height
+                display_id, area, frame, max_width=fit_width, max_height=fit_height
             )
             screenshot: dict[str, Any] = {
                 "path": str(output), "app": None, "pid": None, "window_id": None,
@@ -5096,11 +5168,17 @@ class MacOS:
                 running, info = self._resolve_app(app)
                 windows = self._ready_windows(running, info, timeout=_LAUNCH_WINDOW_TIMEOUT)
                 window = self._indexed_window(windows, window_index)
+                warning = self._name_warning(
+                    app,
+                    int(info["pid"]),
+                    window["window_id"] if window_index == 0 else None,
+                    windows,
+                )
             else:
                 window, running, info = self._named_window(app, window_id)
             output = _png_output(path)
             captured = self._window_image(
-                window["window_id"], max_width=max_width, max_height=max_height
+                window["window_id"], max_width=fit_width, max_height=fit_height
             )
             screenshot = {
                 "path": str(output),
@@ -5110,6 +5188,15 @@ class MacOS:
                 "title": window["title"],
                 "layer": window["layer"],
             }
+        if warning is not None:
+            screenshot["warning"] = warning
+        if reframe:
+            if window is not None:
+                window_bounds = captured.bounds
+            captured = reframed(
+                captured, self._crop_area(captured.bounds, crop), zoom=zoom,
+                max_width=max_width, max_height=max_height,
+            )
         bounds = captured.bounds
         frontmost = self._frontmost_app()
         focus: dict[str, JSONValue] = {"frontmost": frontmost}
@@ -5128,6 +5215,8 @@ class MacOS:
             virtual_pointer=None,
             focus=focus,
         )
+        if window_bounds is not None:
+            screenshot["window_bounds"] = window_bounds
 
         image = captured.image
         if self._pointer_position is not None:
@@ -5144,18 +5233,20 @@ class MacOS:
                 scale = (screenshot["scale_x"] + screenshot["scale_y"]) / 2
                 image = draw_pointer(image, image_x, image_y, scale)
         write_png(image, output)
-        _record_path(output).write_text(
-            json.dumps({key: screenshot[key] for key in _CAPTURE_RECORD_KEYS}), encoding="utf-8"
-        )
+        record = {key: screenshot[key] for key in _CAPTURE_RECORD_KEYS}
+        if window_bounds is not None:
+            record["window_bounds"] = window_bounds
+        _record_path(output).write_text(json.dumps(record), encoding="utf-8")
 
         if window is not None:
             if running is not None:
                 self._last_app = info
-            seen = int(window["window_id"])
-            first_of = int(info["pid"]) if window_id is None and window_index == 0 else None
-            self._last_capture = _Picture(seen, captured, first_of)
-            if self._before_input is not None and self._before_input.window_id == seen:
-                self._before_input = None
+            if not reframe:
+                seen = int(window["window_id"])
+                first_of = int(info["pid"]) if window_id is None and window_index == 0 else None
+                self._last_capture = _Picture(seen, captured, first_of)
+                if self._before_input is not None and self._before_input.window_id == seen:
+                    self._before_input = None
         self._last_screenshot = screenshot
         return screenshot
 
@@ -5212,6 +5303,39 @@ class MacOS:
                     "pid": pid,
                 },
             )
+
+    @staticmethod
+    def _require_on_screen(window: Mapping[str, JSONValue]) -> None:
+        """Refuse input to a window that is not on screen now."""
+        if not window["on_screen"]:
+            raise MacOSError(
+                f"Window {window['window_id']} is not on screen (minimized, hidden, or on "
+                "another Space); input there cannot land",
+                code=ErrorCode.WINDOW_CHANGED,
+                details={"window_id": window["window_id"], "reason": "off_screen"},
+            )
+
+    @staticmethod
+    def _crop_area(
+        window: dict[str, float], crop: tuple[float, float, float, float] | None
+    ) -> dict[str, float]:
+        """The screen area ``crop``, in points of the window at ``window``,
+        covers; the whole window without one."""
+        if crop is None:
+            return window
+        x, y, width, height = (float(value) for value in crop)
+        if (
+            width <= 0 or height <= 0 or x < 0 or y < 0
+            or x + width > window["width"] or y + height > window["height"]
+        ):
+            raise MacOSError(
+                f"crop {tuple(crop)} is not inside the window, which is "
+                f"{window['width']:g} x {window['height']:g} points; crop is x, y, "
+                "width, height in window points",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "crop", "crop": list(crop), "window": window},
+            )
+        return {"x": window["x"] + x, "y": window["y"] + y, "width": width, "height": height}
 
     def _screen_area(
         self, display: int | None, region: tuple[float, float, float, float] | None
@@ -5671,6 +5795,108 @@ class MacOS:
             )
         return pid
 
+    def _keyboard_target(
+        self, app: str | int | None, window_id: int | None
+    ) -> tuple[int, int | None]:
+        """The pid keyboard input goes to, and the window that takes it:
+        ``window_id``'s, made the app's focused window first when it is
+        not, else the app's focused window, None where accessibility
+        cannot name it."""
+        pid = self._input_pid(app, window_id, "Keyboard input")
+        if window_id is None:
+            return pid, self._focused_window_id(pid)
+        window = self._described_window(window_id)
+        self._require_owner(window, pid)
+        self._require_on_screen(window)
+        if self._focused_window_id(pid) != window_id:
+            self._focus_window(pid, window_id)
+        return pid, window_id
+
+    def _focused_window_id(self, pid: int) -> int | None:
+        """The window ``pid``'s keys go to, None when accessibility cannot say."""
+        focused = self._copy_attribute(
+            self._application_element(pid, enhance=False), "AXFocusedWindow"
+        )
+        return None if focused is None else self._ax_window_id(focused)
+
+    def _focus_window(self, pid: int, window_id: int) -> None:
+        """Make ``window_id`` the window ``pid``'s keys go to, raised among
+        the app's own windows, without bringing the app forward."""
+        window = next(
+            (item for item in self._ax_windows(pid) if self._ax_window_id(item) == window_id),
+            None,
+        )
+        if window is not None:
+            AS.AXUIElementSetAttributeValue(window, "AXMain", True)
+            AS.AXUIElementPerformAction(window, "AXRaise")
+            deadline = self._now() + 0.5
+            while self._focused_window_id(pid) != window_id and self._now() < deadline:
+                self._pause(0.02)
+        focused = self._focused_window_id(pid)
+        if focused != window_id:
+            raise MacOSError(
+                f"Keys to pid {pid} go to window {focused}, and accessibility could not "
+                f"make window {window_id} the one that takes them; nothing was sent. "
+                f"A mac.click in window {window_id} focuses it as a person would",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"pid": pid, "window_id": window_id, "focused_window_id": focused},
+            )
+
+    def _keyboard_result(
+        self,
+        app: str | int | None,
+        pid: int,
+        window_id: int | None,
+        *,
+        named_window: bool,
+        in_front: bool,
+    ) -> dict[str, JSONValue]:
+        """What `key` and `type` report: the window that took the keys,
+        whether its app was in front, and what to do when it was not."""
+        result: dict[str, JSONValue] = {
+            "pid": pid,
+            "window_id": window_id,
+            "target_is_frontmost": in_front,
+        }
+        if not in_front:
+            watch = f"window_id={window_id}" if window_id is not None else str(pid)
+            result["note"] = (
+                f"pid {pid} was in the background, where some apps ignore posted keys: "
+                f"mac.wait_change({watch}) says whether the window changed, and "
+                f"mac.activate({pid}) first brings it forward"
+            )
+        warning = self._name_warning(app, pid, None if named_window else window_id)
+        if warning is not None:
+            result["warning"] = warning
+        return result
+
+    def _hit(
+        self, pid: int, point: tuple[float, float]
+    ) -> tuple[object | None, dict[str, JSONValue] | None]:
+        """What accessibility finds in ``pid`` at screen ``point``: the
+        element and its role, title, and description; None for both where
+        the app shows it nothing, as a game that draws its own buttons."""
+        root = self._application_element(pid, messaging_timeout=0.5, enhance=False)
+        error, element = AS.AXUIElementCopyElementAtPosition(root, point[0], point[1], None)
+        if error != _AX_SUCCESS or element is None:
+            return None, None
+        values = self._copy_attributes(element, ("AXRole", "AXTitle", "AXDescription"))
+        return element, {
+            name: str(values.get(attribute)) if values.get(attribute) else None
+            for name, attribute in (
+                ("role", "AXRole"), ("title", "AXTitle"), ("description", "AXDescription")
+            )
+        }
+
+    def _within(self, element: object, ancestor: object) -> bool:
+        """Whether ``element`` is ``ancestor`` or lies inside it."""
+        node = element
+        while node is not None:
+            if node == ancestor:
+                return True
+            node = self._copy_attribute(node, "AXParent")
+        return False
+
     @staticmethod
     def _post(event: Any, pid: int | None) -> None:
         if pid is None:
@@ -5709,13 +5935,7 @@ class MacOS:
             window = self._described_window(window_id)
             self._require_owner(window, pid)
             bounds = window["bounds"]
-            if not window["on_screen"]:
-                raise MacOSError(
-                    f"Window {window_id} is not on screen (minimized, hidden, or on "
-                    "another Space); input there cannot land",
-                    code=ErrorCode.WINDOW_CHANGED,
-                    details={"window_id": window_id, "reason": "off_screen"},
-                )
+            self._require_on_screen(window)
             if not (
                 bounds["x"] <= x < bounds["x"] + bounds["width"]
                 and bounds["y"] <= y < bounds["y"] + bounds["height"]
@@ -5769,8 +5989,22 @@ class MacOS:
         if record["app"] is not None:
             self._last_app = record["app"]
 
+    def _pictured_window(self, window_id: int | None, coordinate_space: str) -> int | None:
+        """``window_id``, else the window shown in the picture coordinates
+        were read off, so input lands in the window seen there and not in
+        another of the app's windows over it or a surface beside it."""
+        if window_id is not None or coordinate_space == "screen" or self._last_screenshot is None:
+            return window_id
+        return self._last_screenshot["window_id"]
+
     def _screen_point(
-        self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
+        self,
+        x: float,
+        y: float,
+        coordinate_space: str,
+        *,
+        pid: int | None = None,
+        bounded: bool = True,
     ) -> tuple[float, float]:
         """Resolve a coordinate to a screen point, bound to ``pid`` when given.
 
@@ -5781,6 +6015,8 @@ class MacOS:
         since. A hit test across all apps has no ``pid`` and skips both
         checks. A display or region screenshot belongs to no app: it maps
         any app's coordinates, and it has no window that could move.
+        ``bounded`` refuses a screenshot point outside the picture, which
+        only a drag's end may name.
         """
         if coordinate_space == "screen":
             return float(x), float(y)
@@ -5810,6 +6046,20 @@ class MacOS:
             self._require_window_unchanged(shot)
         bounds = shot["bounds"]
         if coordinate_space == "screenshot":
+            width, height = float(shot["width"]), float(shot["height"])
+            if bounded and not (0 <= float(x) < width and 0 <= float(y) < height):
+                raise MacOSError(
+                    f"({float(x):g}, {float(y):g}) is outside the picture, which is "
+                    f"{width:g} x {height:g} pixels; read the point off that picture "
+                    "at its own size",
+                    code=ErrorCode.BAD_REQUEST,
+                    details={
+                        "parameter": "x/y",
+                        "point": {"x": float(x), "y": float(y)},
+                        "width": width,
+                        "height": height,
+                    },
+                )
             x = float(x) / float(shot["scale_x"])
             y = float(y) / float(shot["scale_y"])
         elif coordinate_space != "window":
@@ -5844,7 +6094,8 @@ class MacOS:
             "width": float(raw.get("Width", 0)),
             "height": float(raw.get("Height", 0)),
         }
-        if bounds != shot["bounds"]:
+        was = shot.get("window_bounds", shot["bounds"])
+        if bounds != was:
             raise MacOSError(
                 f"Window {window_id} moved or resized since the last screenshot; "
                 "take a fresh screenshot",
@@ -5852,7 +6103,7 @@ class MacOS:
                 details={
                     "window_id": window_id,
                     "reason": "moved",
-                    "was": shot["bounds"],
+                    "was": was,
                     "now": bounds,
                 },
             )
@@ -5990,7 +6241,7 @@ class MacOS:
             frontmost, activated = self._await_frontmost(pid, timeout)
             via = "accessibility" if activated else None
         self._last_app = info
-        return {
+        result = {
             "app": info,
             "activated": activated,
             "via": via,
@@ -5998,6 +6249,10 @@ class MacOS:
             "frontmost": self._mark_owned(frontmost),
             "elapsed_ms": round((time.monotonic() - started) * 1000),
         }
+        warning = self._name_warning(app, pid)
+        if warning is not None:
+            result["warning"] = warning
+        return result
 
     def _await_frontmost(
         self, pid: int, timeout: float
@@ -6301,12 +6556,14 @@ class MacOS:
         an inactive app's view only where that view accepts first mouse;
         elsewhere it is dropped, and ``activate`` first is the cure.
         ``screenshot`` names the PNG of an earlier `see`, maybe from an
-        earlier run, whose pixels ``x`` and ``y`` are.
+        earlier run, whose pixels ``x`` and ``y`` are; a point outside that
+        picture is refused, and the click goes to the window it shows.
 
         ``element``, a match or index a search returned, aims the click
         instead of ``x`` and ``y``: at the center of the element's frame
         as it is now, in the element's own process -- for a control that
-        ignores ``AXPress``, as a SwiftUI row can.
+        ignores ``AXPress``, as a SwiftUI row can. When something else is
+        found there, ``miss`` says what took the click.
         """
         validate_click_aim(x, y, element)
         self._ensure_accessibility()
@@ -6318,16 +6575,28 @@ class MacOS:
             self._use_screenshot(screenshot)
             pid = self._input_pid(app, window_id, "Pointer input")
             point = self._screen_point(x, y, coordinate_space, pid=pid)
+            window_id = self._pictured_window(window_id, coordinate_space)
         else:
             owner = self._element_pid(element) if app is None else app
             pid = self._input_pid(owner, window_id, "Pointer input")
             point = self._element_point(element, pid)
         window = self._target_window(pid, point, window_id)
+        hit_element, hit = (None, None) if element is None else self._hit(pid, point)
         in_front = self._post_click(pid, point, window, button=button, clicks=clicks)
         pointer = self._pointer_info(pid=pid)
         assert pointer is not None
         pointer["window_id"] = window.window_id
         pointer["target_is_frontmost"] = in_front
+        if hit is not None:
+            aimed = self._element(element)
+            if self._is_ax_element(aimed) and not (
+                self._within(hit_element, aimed) or self._within(aimed, hit_element)
+            ):
+                named = hit["title"] or hit["description"]
+                pointer["miss"] = (
+                    f"accessibility finds {hit['role']}{f' {named!r}' if named else ''} at "
+                    "the element's center, not the element, so the click went there"
+                )
         if not in_front:
             pointer["note"] = (
                 f"pid {pid} was in the background, where AppKit passes a first click "
@@ -6335,6 +6604,9 @@ class MacOS:
                 f"dropped: mac.wait_change(window_id={window.window_id}) says whether "
                 f"the window changed, and mac.activate({pid}) first makes a click land"
             )
+        warning = self._name_warning(app, pid)
+        if warning is not None:
+            pointer["warning"] = warning
         return pointer
 
     def _element_pid(self, element: ElementRef) -> int | None:
@@ -6441,10 +6713,12 @@ class MacOS:
         self._use_screenshot(screenshot)
         pid = self._input_pid(app, window_id, "Pointer input")
         start = self._screen_point(from_x, from_y, coordinate_space, pid=pid)
-        end = self._screen_point(to_x, to_y, coordinate_space, pid=pid)
+        end = self._screen_point(to_x, to_y, coordinate_space, pid=pid, bounded=False)
         # AppKit keeps a drag on the window that took the mouse-down, so
         # every event is routed there even once the point leaves it.
-        window = self._target_window(pid, start, window_id)
+        window = self._target_window(
+            pid, start, self._pictured_window(window_id, coordinate_space)
+        )
         self._hold_before_input(pid, window.window_id)
         focus_before = self._frontmost_app()
         self._pointer_position = start
@@ -6544,7 +6818,9 @@ class MacOS:
                 y = float(front.get("Y", 0)) + float(front.get("Height", 0)) / 2
                 coordinate_space = "screen"
         point = self._screen_point(x, y, coordinate_space, pid=pid)
-        window = self._target_window(pid, point, window_id)
+        window = self._target_window(
+            pid, point, self._pictured_window(window_id, coordinate_space)
+        )
         self._hold_before_input(pid, window.window_id)
         self._pointer_position = point
         self._overlay.move(*point)
@@ -6568,7 +6844,9 @@ class MacOS:
             time.sleep(0.01)
             self._guard_focus(focus_before, pid, "scroll")
 
-    def type(self, text: str, *, app: str | int | None = None) -> None:
+    def type(
+        self, text: str, *, app: str | int | None = None, window_id: int | None = None
+    ) -> dict[str, JSONValue]:
         """Type ``text`` into ``app`` as keyboard events.
 
         When ``app`` is frontmost the text goes in packed: each key event
@@ -6581,17 +6859,17 @@ class MacOS:
         more than one unit. Newline, carriage return and tab always
         travel alone as Return and Tab key events, so the app sees the
         key rather than a pasted character.
+
+        ``window_id`` names the window to type into, and its owner is the
+        app: it becomes the app's focused window first, as a click on it
+        would make it, without bringing the app forward. The result names
+        the window that took the keys, None where accessibility cannot
+        say, and whether the app was in front.
         """
         self._ensure_accessibility()
         self._ensure_post_events()
-        pid = self._pid(app)
-        if pid is None:
-            raise MacOSError(
-                "Keyboard input requires an app or prior app snapshot",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "app"},
-            )
-        self._hold_before_input(pid)
+        pid, target = self._keyboard_target(app, window_id)
+        self._hold_before_input(pid, window_id)
         focus_before = self._frontmost_app()
         packed = focus_before is not None and int(focus_before["pid"]) == pid
         for chunk in _typing_chunks(text, packed=packed):
@@ -6613,23 +6891,26 @@ class MacOS:
                 # stops when the target steals it has nothing to catch.
                 time.sleep(0.01)
                 self._guard_focus(focus_before, pid, "typing")
+        return self._keyboard_result(
+            app, pid, target, named_window=window_id is not None, in_front=packed
+        )
 
     @staticmethod
     def _validate_key(key: str) -> None:
         _parse_key(key)
 
-    def key(self, key: str, *, app: str | int | None = None) -> None:
+    def key(
+        self, key: str, *, app: str | int | None = None, window_id: int | None = None
+    ) -> dict[str, JSONValue]:
+        """Press ``key``, with any modifiers it names, in ``app``.
+
+        ``window_id`` names the window to press it in, as `type` takes it;
+        the result says the same as `type`'s."""
         self._ensure_accessibility()
         self._ensure_post_events()
         keycode, parsed_modifiers = _parse_key(key)
-        pid = self._pid(app)
-        if pid is None:
-            raise MacOSError(
-                "Keyboard input requires an app or prior app snapshot",
-                code=ErrorCode.BAD_REQUEST,
-                details={"parameter": "app"},
-            )
-        self._hold_before_input(pid)
+        pid, target = self._keyboard_target(app, window_id)
+        self._hold_before_input(pid, window_id)
         focus_before = self._frontmost_app()
         active_flags = 0
         pressed: list[tuple[int, int]] = []
@@ -6660,6 +6941,13 @@ class MacOS:
                 self._post(event, pid)
         time.sleep(0.01)
         self._guard_focus(focus_before, pid, f"key {key!r}")
+        return self._keyboard_result(
+            app,
+            pid,
+            target,
+            named_window=window_id is not None,
+            in_front=focus_before is not None and int(focus_before["pid"]) == pid,
+        )
 
     # --- Apple Events escape hatch --------------------------------------
 
