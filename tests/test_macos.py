@@ -32,7 +32,7 @@ from macos_harness.ops import Operations
 from macos_harness.receipts import Acted, Postcondition, equals, gone, present
 
 
-def _on_screen_windows(monkeypatch, *windows: tuple[int | float, ...]) -> None:
+def _on_screen_windows(monkeypatch, *windows: tuple[int | float, ...]) -> list[dict[str, object]]:
     """Fake the window server's front-to-back on-screen list.
 
     Each entry is ``(pid, window_id, x, y, width, height)``, frontmost
@@ -51,11 +51,21 @@ def _on_screen_windows(monkeypatch, *windows: tuple[int | float, ...]) -> None:
     monkeypatch.setattr(
         macos_module.AS, "CGWindowListCopyWindowInfo", lambda options, relative: described
     )
-    monkeypatch.setattr(
-        macos_module.AS,
-        "CGWindowListCreateDescriptionFromArray",
-        lambda numbers: [entry for entry in described if entry["kCGWindowNumber"] in numbers],
-    )
+    return described
+
+
+class _Described(MacOS):
+    """`MacOS` whose window server describes a window by its number from
+    ``described``, the list `_on_screen_windows` returns."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.described: list[dict[str, object]] = []
+
+    def _window_description(self, window_id: int) -> dict[str, object] | None:
+        return next(
+            (entry for entry in self.described if entry["kCGWindowNumber"] == window_id), None
+        )
 
 
 def _found(*matches: dict[str, object], complete: bool = True) -> SearchMatches:
@@ -2295,9 +2305,9 @@ def test_drag_keeps_every_event_on_the_window_that_took_the_mouse_down(monkeypat
 
 
 def test_scroll_without_a_point_targets_the_screenshot_window_center(monkeypatch) -> None:
-    mac = MacOS()
+    mac = _Described()
     routed = _routed(monkeypatch, mac)
-    _on_screen_windows(monkeypatch, (42, 7, 100, 50, 800, 600))
+    mac.described = _on_screen_windows(monkeypatch, (42, 7, 100, 50, 800, 600))
     mac._last_screenshot = {
         "pid": 42,
         "window_id": 7,
@@ -2850,11 +2860,11 @@ def _fake_window_capture(mac: MacOS, monkeypatch) -> None:
     monkeypatch.setattr(macos_module, "capture_window", capture_window)
 
 
-def _cropped_window_shot(mac: MacOS, monkeypatch, tmp_path: Path) -> dict[str, object]:
+def _cropped_window_shot(mac: _Described, monkeypatch, tmp_path: Path) -> dict[str, object]:
     """`see` a 200x100pt part of the 400x300pt window at (100, 200), drawn at
     twice its 2x pixels, with clicks routed as `_routed` records them."""
     _fake_window_capture(mac, monkeypatch)
-    _on_screen_windows(monkeypatch, (42, 7, 100, 200, 400, 300))
+    mac.described = _on_screen_windows(monkeypatch, (42, 7, 100, 200, 400, 300))
     return mac.see("Test", path=tmp_path / "part.png", crop=(100, 50, 200, 100), zoom=2)
 
 
@@ -2863,7 +2873,7 @@ def test_a_cropped_zoomed_picture_maps_its_pixels_back_to_the_window(
 ) -> None:
     """A game window shrunk to fit a picture had text too small to read;
     a cut drawn larger must still map its pixels to the right point."""
-    mac = MacOS()
+    mac = _Described()
     routed = _routed(monkeypatch, mac)
     shot = _cropped_window_shot(mac, monkeypatch, tmp_path)
 
@@ -2880,7 +2890,7 @@ def test_a_point_outside_the_picture_is_refused_before_any_click(
     """A point misread off a picture landed beside its button while the
     result said it was inside; a point past the picture's edge must not
     reach the app at all."""
-    mac = MacOS()
+    mac = _Described()
     routed = _routed(monkeypatch, mac)
     _cropped_window_shot(mac, monkeypatch, tmp_path)
 
@@ -3519,7 +3529,7 @@ def test_click_rejects_a_screenshot_from_a_different_app(monkeypatch) -> None:
 
 
 def test_click_accepts_a_screenshot_from_the_same_app(monkeypatch) -> None:
-    mac = MacOS()
+    mac = _Described()
     posted = []
     monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
     monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
@@ -3536,7 +3546,7 @@ def test_click_accepts_a_screenshot_from_the_same_app(monkeypatch) -> None:
         "scale_y": 1.0,
     }
     monkeypatch.setattr(mac, "_require_window_unchanged", lambda shot: None)
-    _on_screen_windows(monkeypatch, (42, 7, 100, 200, 400, 300))
+    mac.described = _on_screen_windows(monkeypatch, (42, 7, 100, 200, 400, 300))
 
     mac.click(10, 20, app="SameApp")
 

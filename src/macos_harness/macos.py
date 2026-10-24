@@ -1912,11 +1912,11 @@ class MacOS:
 
     def _app_matches(
         self, needle: str
-    ) -> tuple[list[tuple[Any, dict[str, Any]]], list[tuple[Any, dict[str, Any]]]]:
+    ) -> tuple[list[tuple[Any, dict[str, JSONValue]]], list[tuple[Any, dict[str, JSONValue]]]]:
         """The running apps ``needle`` names exactly, by name, bundle ID,
         path, or pid, and those whose name, bundle ID, or path holds it."""
-        candidates: list[tuple[Any, dict[str, Any]]] = []
-        exact: list[tuple[Any, dict[str, Any]]] = []
+        candidates: list[tuple[Any, dict[str, JSONValue]]] = []
+        exact: list[tuple[Any, dict[str, JSONValue]]] = []
         for app in self._running_applications():
             info = self._app_info(app)
             # A pid names one process exactly. Substring-matching it lets a pid
@@ -1938,7 +1938,7 @@ class MacOS:
         app: str | int | None,
         pid: int,
         window_id: int | None = None,
-        windows: list[dict[str, Any]] | None = None,
+        windows: Sequence[Mapping[str, JSONValue]] | None = None,
     ) -> str | None:
         """What a call that named its app by name should hear: the other
         processes that name also fits besides ``pid``, and, when the call
