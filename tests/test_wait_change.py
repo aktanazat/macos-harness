@@ -431,6 +431,18 @@ def test_see_after_change_captures_once_the_wait_ends(
     assert _png_gray(shot["path"], 400, 240) == gray
 
 
+def test_see_after_change_gives_up_in_ten_seconds_and_says_so(tmp_path: Path) -> None:
+    """Its 30-second default cost agents half a minute per unchanged
+    window, and `changed: false` alone read like a failed capture."""
+    mac = _Screen(_BLANK, _BLANK)
+    mac.see("Test", path=tmp_path / "before.png")
+
+    shot = mac.see("Test", path=tmp_path / "after.png", after_change=True)
+
+    assert (shot["changed"], shot["note"]) == (False, "no change in 10s")
+    assert mac.clock <= 10.5
+
+
 def test_wait_change_by_ax_compares_text_and_keeps_element_indexes() -> None:
     """The text changes on the second look and holds; the tree walks do
     not cost the caller the element index it already holds."""

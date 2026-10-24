@@ -11,17 +11,24 @@ import pytest
 from macos_harness.errors import ApplicationNotFoundError, ErrorCode
 from macos_harness.macos import MacOS, MacOSError
 from macos_harness.ops import Operations
-from macos_harness.receipts import Outcome, Receipt
+from macos_harness.receipts import OperationError, Outcome, Receipt
 
 _SONA = 4512
 _INFO = {"name": "Sona", "bundle_id": "app.sona", "pid": _SONA, "path": None}
 # Each entry is a name and the entries of the menu it opens.
 _Entries = tuple[tuple[str, "_Entries"], ...]
 _MENU_BAR: _Entries = (
-    ("Sona", (("About Sona", ()), ("Settings…", ()))),
-    ("File", (("New Note", ()), ("Export", (("PDF", ()), ("Markdown", ()))), ("Close", ()))),
+    ("Sona", (("About Sona", ()), ("Settings…", ()), ("Sona beenden", ()))),
+    (
+        "File",
+        (("New Note", ()), ("", ()), ("Export", (("PDF", ()), ("Markdown", ()))), ("Close", ())),
+    ),
     ("Window", (("Minimize", ()), ("Close", ()), ("Untitled", ()), ("Untitled", ()))),
 )
+# Keyboard shortcuts as AX reports them: the key, and modifier bits (1
+# shift, 2 option, 4 control, 8 no Command). A German Sona quits on "Sona
+# beenden", which only its Command-Q names as Quit.
+_SHORTCUTS = {"Sona > Sona beenden": ("Q", 0), "File > New Note": ("N", 0), "File > Export > PDF": ("P", 3)}
 # One icon with no title or description, as many status items are.
 _ICON: _Entries = (("", (("Open Sona", ()), ("Settings…", ()))),)
 _ICONS: _Entries = (("Sona", (("Open Sona", ()),)), ("Sona Timer", (("Start", ()),)))
@@ -71,6 +78,8 @@ class _Sona(MacOS):
     ) -> object:
         joined = " > ".join(path)
         attributes: dict[str, object] = {"AXRole": role, label: path[-1], "AXEnabled": joined != self.disabled}
+        if joined in _SHORTCUTS:
+            attributes["AXMenuItemCmdChar"], attributes["AXMenuItemCmdModifiers"] = _SHORTCUTS[joined]
         if children:
             menu = {"AXRole": "AXMenu", "AXChildren": self._items(bar, path, children, "AXTitle", "AXMenuItem")}
             attributes["AXChildren"] = [self._node(menu, (bar, joined))]
@@ -192,3 +201,69 @@ def test_a_dry_run_names_the_item_a_menu_path_leads_to_and_presses_nothing() -> 
     assert (receipt.outcome, receipt.to_json()["target"]["title"], mac.pressed) == (
         Outcome.PLANNED, "Close", []
     )
+
+
+class _Quitting(_Sona):
+    """Sona exiting once its Quit is pressed or Command-Q reaches it, or,
+    with ``exits_on``, once that other item is pressed."""
+
+    def __init__(self, *, exits_on: str = "Sona > Sona beenden") -> None:
+        super().__init__()
+        self.exits_on = exits_on
+        self.gone = False
+
+    def perform_action(self, element_index: int, action: str = "AXPress") -> None:
+        super().perform_action(element_index, action)
+        self.gone = self.pressed[-1] == ("AXMenuBar", self.exits_on)
+
+    def key(self, key: str, *, app: str | int | None = None) -> None:
+        self.gone = key == "cmd+q"
+
+    def _identity_from_info(self, info: object) -> object:
+        return info
+
+    def _observe_process(self, expected: object) -> dict[str, object]:
+        return {"pid": _SONA, "state": "exited" if self.gone else "running"}
+
+    def _exited(self, pid: int) -> bool:
+        return self.gone
+
+
+@pytest.mark.parametrize(
+    "choose",
+    [lambda do: do.menu("Sona > Sona beenden", app="Sona"), lambda do: do.key("cmd+q", app="Sona")],
+    ids=["quit-item-by-its-shortcut", "command-q"],
+)
+def test_an_app_that_exits_on_its_own_quit_is_the_quit_done(
+    choose: Callable[[Operations], Receipt],
+) -> None:
+    """Agents read a menu Quit that worked as a failure and retried it."""
+    mac = _Quitting()
+
+    receipt = choose(mac.do)
+
+    assert (receipt.outcome, receipt.changed, receipt.verified) == (Outcome.DONE, True, True)
+
+
+def test_an_app_that_exits_on_another_item_fails_naming_mac_quit() -> None:
+    mac = _Quitting(exits_on="File > Close")
+
+    with pytest.raises(OperationError, match=r"mac\.quit\(app\)") as caught:
+        mac.do.menu("File > Close", app="Sona")
+
+    assert caught.value.code == ErrorCode.APP_EXITED
+
+
+def test_menus_lists_a_menus_items_as_do_menu_presses_them() -> None:
+    mac = _Sona(disabled="File > Close")
+
+    items = mac.menus("Sona", "file")
+
+    assert items == [
+        {"title": "New Note", "enabled": True, "checked": False, "path": "File > New Note", "shortcut": "cmd+n"},
+        {"title": "Export", "enabled": True, "checked": False, "path": "File > Export", "submenu": True},
+        {"title": "Close", "enabled": False, "checked": False, "path": "File > Close"},
+    ]
+    assert mac.menus("Sona", "File > Export")[0]["shortcut"] == "alt+shift+cmd+p"
+    mac.do.menu(items[0]["path"], app="Sona")
+    assert mac.pressed == [("AXMenuBar", "File > New Note")]

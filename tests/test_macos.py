@@ -2003,15 +2003,31 @@ def test_scroll_without_a_point_targets_the_screenshot_window_center(monkeypatch
     assert routed == [(42, 7, (400.0, 300.0))]
 
 
-def test_scroll_without_a_point_or_a_screenshot_of_the_app_is_refused(monkeypatch) -> None:
+def test_scroll_without_a_point_or_a_screenshot_of_the_app_targets_its_frontmost_window(
+    monkeypatch,
+) -> None:
+    """A fresh process has no screenshot of the app, and agents there
+    had to compute a point by hand before they could scroll at all."""
     mac = MacOS()
     routed = _routed(monkeypatch, mac)
+    _on_screen_windows(monkeypatch, (42, 7, 100, 50, 800, 600))
     mac._last_screenshot = {"pid": 11, "bounds": {"x": 0.0, "y": 0.0, "width": 8.0, "height": 6.0}}
+
+    mac.scroll(-3, app="Demo", unit="line")
+
+    assert routed == [(42, 7, (400.0, 300.0))]
+
+
+def test_scroll_without_a_point_at_an_app_with_no_window_is_refused(monkeypatch) -> None:
+    mac = MacOS()
+    routed = _routed(monkeypatch, mac)
+    _on_screen_windows(monkeypatch)
 
     with pytest.raises(MacOSError) as excinfo:
         mac.scroll(-3, app="Demo")
 
     assert excinfo.value.code == ErrorCode.BAD_REQUEST.value
+    assert "window_id=" in str(excinfo.value)
     assert routed == []
 
 
@@ -2834,6 +2850,33 @@ def test_see_names_the_call_that_opens_a_window_for_a_running_app_with_none(
         """mac.script('tell application id "com.maxgoedjen.Secretive.Host" to reopen')"""
         in str(caught.value)
     )
+
+
+def test_a_script_that_never_returns_is_stopped_naming_the_app_it_addressed(monkeypatch) -> None:
+    """A script waiting on a dialog or a permission prompt hung the whole
+    step until the agent's own timeout killed it."""
+
+    def hang(command, **options):
+        raise subprocess.TimeoutExpired(command, options["timeout"])
+
+    monkeypatch.setattr(macos_module.subprocess, "run", hang)
+
+    with pytest.raises(MacOSError) as caught:
+        MacOS().script('tell application "Sona" to activate')
+
+    assert caught.value.code == ErrorCode.TIMEOUT
+    assert "within 15s" in str(caught.value)
+    assert "Sona may be showing a dialog" in str(caught.value)
+
+
+@pytest.mark.parametrize(("own", "flagged"), [(True, True), (False, None)], ids=["harness", "an-app"])
+def test_frontmost_flags_the_harness_own_process(monkeypatch, own, flagged) -> None:
+    """Agents read the harness's own Python in front as an app that had
+    stolen focus."""
+    pid = os.getpid() if own else os.getpid() + 1
+    monkeypatch.setattr(MacOS, "_frontmost_app", classmethod(lambda cls: {"name": "Python", "pid": pid}))
+
+    assert MacOS().frontmost().get("harness_owned") is flagged
 
 
 def test_ax_wait_ambiguous_and_timeout_carry_machine_readable_codes(monkeypatch) -> None:

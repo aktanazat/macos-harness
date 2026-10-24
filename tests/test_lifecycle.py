@@ -25,9 +25,12 @@ class _Process:
     quit request is recorded; the process leaves the table
     ``exits_after`` looks after a polite or forced request."""
 
-    def __init__(self, pid: int, *, name: str, path: str, exits_after: int | None) -> None:
+    def __init__(
+        self, pid: int, *, name: str, path: str, exits_after: int | None, policy: int = 0
+    ) -> None:
         self.pid, self.name, self.path = pid, name, path
         self.exits_after = exits_after
+        self.policy = policy
         self.requests: list[str] = []
 
     def localizedName(self) -> str:
@@ -44,6 +47,9 @@ class _Process:
 
     def isTerminated(self) -> bool:
         return False
+
+    def activationPolicy(self) -> int:
+        return self.policy
 
     def launchDate(self) -> None:
         return None
@@ -132,7 +138,9 @@ class _ScriptedOS(MacOS):
             raise ApplicationNotFoundError(f"No running application matches {query!r}")
         return process, self._app_info(process)
 
-    def windows(self, app: str | int | None = None) -> list[dict[str, object]]:
+    def windows(
+        self, app: str | int | None = None, *, all_layers: bool = False
+    ) -> list[dict[str, object]]:
         self.looks += 1
         if self.window_on is not None and self.looks >= self.window_on:
             return [_WINDOW]
@@ -205,6 +213,18 @@ def test_launch_times_out_at_its_deadline_when_no_window_appears() -> None:
 
     assert caught.value.code == ErrorCode.TIMEOUT
     assert sum(mac.pauses) == pytest.approx(1.0)
+
+
+def test_launch_of_a_running_menu_bar_app_without_a_window_points_at_its_status_item() -> None:
+    """An accessory app opens from its menu bar icon, which reopen never
+    reaches; the error names the call that does."""
+    running = _Process(11, name="Sona", path=_TEXTEDIT, exits_after=0, policy=1)
+    mac = _ScriptedOS(running=running, window_on=None)
+
+    with pytest.raises(MacOSError, match=r"menu bar app .*mac\.do\.status_item\(app=11\)") as caught:
+        mac.launch("TextEdit")
+
+    assert caught.value.code == ErrorCode.ELEMENT_UNKNOWN
 
 
 def test_launch_without_window_returns_once_the_process_runs() -> None:

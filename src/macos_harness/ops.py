@@ -163,11 +163,33 @@ def _menu_steps(path: str, *, least: int) -> list[str]:
     if len(steps) < least or not all(steps):
         raise MacOSError(
             f"{path!r} is not a menu path: name each step down to the item "
-            "to press, '>' between them, as in 'View > Reload Page'",
+            "to press, '>' between them, as in 'View > Reload Page'; "
+            f"mac.menus(app, {path.strip() or 'View'!r}) lists a menu's items",
             code=ErrorCode.BAD_REQUEST,
             details={"parameter": "path"},
         )
     return steps
+
+
+def _is_quit_key(key: str) -> bool:
+    """Whether ``key`` is Command-Q, the shortcut every app quits on."""
+    parts = [part.casefold() for part in key.replace("-", "+").split("+") if part]
+    return parts[-1:] == ["q"] and len(parts) > 1 and set(parts[:-1]) <= {"cmd", "command", "super"}
+
+
+def _is_quit_item(match: Mapping[str, JSONValue]) -> bool:
+    """Whether a menu item is its app's Quit command: the item on
+    Command-Q, or, where it has no shortcut, as in a status item's menu,
+    one whose title starts with Quit."""
+    attributes = match.get("attributes")
+    shortcut = (
+        (attributes.get("AXMenuItemCmdChar"), attributes.get("AXMenuItemCmdModifiers"))
+        if isinstance(attributes, Mapping) else (None, None)
+    )
+    title = match.get("title")
+    return shortcut == ("Q", 0) or (
+        isinstance(title, str) and title.casefold().split(" ", 1)[0] == "quit"
+    )
 
 
 def _validate_interval(interval: float) -> None:
@@ -304,6 +326,10 @@ def _changed_after_dispatch(postcondition: Postcondition | None, verified: _Veri
 _FOCUS_POLL_SECONDS = 0.01
 _FOCUS_POLLS = 10
 _FOCUS_WATCH_SECONDS = 0.1
+# How often a receipt looks for the effect its verb waits on itself: an
+# app's exit after its Quit (one app `mac.quit` asked exited 235ms after
+# the request), a window closed, minimized, or zoomed.
+_EFFECT_POLL_SECONDS = 0.05
 
 
 def _sample_focus(host: _Host, pid: int) -> dict[str, JSONValue] | None:
@@ -1230,6 +1256,17 @@ class _Host(Protocol):
     def _validate_button(self, button: str) -> str: ...
     def _validate_clicks(self, clicks: int) -> int: ...
     def _focus_sample(self, pid: int) -> dict[str, JSONValue]: ...
+    def _exited(self, pid: int) -> bool: ...
+    def _window_button(
+        self, pid: int, action: str, *, window_id: int | None, window_index: int
+    ) -> tuple[int, dict[str, JSONValue]]: ...
+    def _window_done(self, window: Mapping[str, JSONValue], action: str) -> bool: ...
+    def _reveal_target(
+        self, element: int | Mapping[str, JSONValue], pid: int
+    ) -> tuple[int, int | None]: ...
+    def _reveal(
+        self, node: int, area: int | None, pid: int, deadline: _Deadline
+    ) -> dict[str, JSONValue] | None: ...
     def _use_screenshot(self, screenshot: str | Path | None) -> None: ...
     def _screen_point(
         self, x: float, y: float, coordinate_space: str, *, pid: int | None = None
@@ -1284,6 +1321,7 @@ class _ReceiptBuilder:
     identity: _AppIdentity | None = None
     app_info: Mapping[str, JSONValue] | None = None
     process: JSONValue = None
+    quits: bool = False
 
     def bind_app(self, info: Mapping[str, JSONValue]) -> None:
         self.app_info = info
@@ -1308,11 +1346,16 @@ class _ReceiptBuilder:
         duration_s: float | None = None,
     ) -> Receipt:
         process = self.process if self.identity is None else self.host._observe_process(self.identity)
-        if (isinstance(process, Mapping) and process.get("state") == "exited"
-                and outcome is Outcome.DONE and acted is Acted.YES and not verified):
-            outcome = Outcome.FAILED
-            error = MacOSError("The target app exited before its effect was confirmed",
-                               code=ErrorCode.APP_EXITED).to_json()
+        if isinstance(process, Mapping) and process.get("state") == "exited" and acted is Acted.YES:
+            if self.quits and outcome is Outcome.DONE:
+                changed, verified = True, True
+            elif outcome is Outcome.DONE and not verified:
+                outcome = Outcome.FAILED
+                error = MacOSError(
+                    "The target app exited before its effect was confirmed; to quit an "
+                    "app, mac.quit(app) asks it to and waits until it exits",
+                    code=ErrorCode.APP_EXITED,
+                ).to_json()
         if target is None and self.app_info is not None:
             target = {"app": self.app_info}
         return Receipt(
@@ -2573,13 +2616,17 @@ class Operations:
         key combo always targets one exact process, so ``app`` is required.
         """
 
+        quits = _is_quit_key(key)
+
         def prepare(host: _Host, pid: int, deadline: _Deadline) -> None:
             del pid, deadline
             host._validate_key(key)
 
-        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
-            del deadline
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
             host.key(key, app=pid)
+            if quits and postcondition is None:
+                return self._await_effect(deadline, lambda: host._exited(pid), {"exited": True})
+            return None
 
         return self._input_verb(
             op="key",
@@ -2591,6 +2638,7 @@ class Operations:
             dry_run=dry_run,
             prepare=prepare,
             dispatch=dispatch,
+            quits=lambda: quits,
         )
 
     def click(
@@ -2645,10 +2693,14 @@ class Operations:
                 screen = host._element_point(element, pid)
             window = host._target_window(pid, screen, window_id)
             resolved = (normalized_button, normalized_clicks, screen, window)
-            return {
+            extras: dict[str, JSONValue] = {
                 "point": {"x": screen[0], "y": screen[1]},
                 "window_id": window.window_id,
             }
+            frontmost = host._frontmost_app()
+            if frontmost is None or frontmost.get("pid") != pid:
+                extras["background"] = True
+            return extras
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
             del deadline
@@ -2772,11 +2824,15 @@ class Operations:
         def require(
             deadline: _Deadline, read: Callable[[], object], expected: object, stage: str,
         ) -> None:
-            _, ok = self._read_until(deadline, interval, read, lambda result: result == expected)
+            read_back, ok = self._read_until(deadline, interval, read, lambda result: result == expected)
             if not ok or deadline.exhausted():
                 raise MacOSError(
                     f"fill could not confirm {stage} within its deadline",
-                    code=ErrorCode.TIMEOUT, details={"stage": stage},
+                    code=ErrorCode.TIMEOUT,
+                    details={
+                        "stage": stage,
+                        "read": _value_summary(read_back) if isinstance(read_back, str) else read_back,
+                    },
                 )
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
@@ -2875,6 +2931,88 @@ class Operations:
             app=app, timeout=timeout, postcondition=postcondition, once=once, dry_run=dry_run,
         )
 
+    def window(
+        self,
+        action: str,
+        *,
+        app: str | int,
+        window_id: int | None = None,
+        window_index: int = 0,
+        timeout: float = 5.0,
+        postcondition: Postcondition | None = None,
+        once: str | None = None,
+        dry_run: bool = False,
+    ) -> Receipt:
+        """Close, minimize, or zoom one of ``app``'s windows -- the one
+        ``window_id`` names, else its window ``window_index`` -- by
+        pressing its title bar button through Accessibility, then wait
+        until the window is gone or off screen, or for a zoom has a new
+        frame. A window still there, as one asking to save is, leaves the
+        receipt unverified. Close only a window this task opened.
+        """
+        pressed: tuple[int, dict[str, JSONValue]] | None = None
+
+        def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
+            nonlocal pressed
+            del deadline
+            pressed = host._window_button(
+                pid, action, window_id=window_id, window_index=window_index
+            )
+            return {"window_id": pressed[1]["window_id"]}
+
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            assert pressed is not None
+            index, window = pressed
+            _perform_guarded(host, index, "AXPress", pid, "mac.do.window", host._frontmost_app())
+            if postcondition is not None:
+                return None
+            return self._await_effect(
+                deadline, lambda: host._window_done(window, action), {"window": action}
+            )
+
+        request: dict[str, JSONValue] = {"action": action, "window_index": window_index}
+        if window_id is not None:
+            request["window_id"] = window_id
+        return self._input_verb(
+            op="window", app=app, request=request, timeout=timeout,
+            postcondition=postcondition, once=once, dry_run=dry_run,
+            prepare=prepare, dispatch=dispatch, executor=Executor.PYTHON,
+        )
+
+    def reveal(
+        self,
+        element: int | Mapping[str, JSONValue],
+        *,
+        app: str | int,
+        timeout: float = 5.0,
+        once: str | None = None,
+        dry_run: bool = False,
+    ) -> Receipt:
+        """Scroll ``element``, a match or index a search returned, into
+        view in ``app``: by its own AXScrollToVisible when it has one,
+        else by scrolling the scroll area that holds it toward it. The
+        receipt is verified once the element's center is inside that
+        area, and ``observed`` carries its frame then, for a click.
+        """
+        targets: tuple[int, int | None] | None = None
+
+        def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
+            nonlocal targets
+            del deadline
+            targets = host._reveal_target(element, pid)
+            return {"scroll_area": targets[1] is not None}
+
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            assert targets is not None
+            frame = host._reveal(*targets, pid, deadline)
+            return None if frame is None else {"frame": frame}
+
+        return self._input_verb(
+            op="reveal", app=app, request={"element": _element_request(element)},
+            timeout=timeout, postcondition=None, once=once, dry_run=dry_run,
+            prepare=prepare, dispatch=dispatch, executor=Executor.PYTHON,
+        )
+
     def _menu_verb(
         self,
         op: str,
@@ -2891,9 +3029,10 @@ class Operations:
         """`menu` and `status_item`: find the item ``steps`` lead to under
         ``app``'s ``bar``, then press it."""
         element_index: int | None = None
+        quits = False
 
         def prepare(host: _Host, pid: int, deadline: _Deadline) -> JSONValue:
-            nonlocal element_index
+            nonlocal element_index, quits
             del deadline
             match = host._menu_item(pid, steps, bar=bar)
             if match.get("enabled") is False:
@@ -2903,14 +3042,17 @@ class Operations:
                     details={"parameter": "path"},
                 )
             element_index = int(match["element_index"])
+            quits = _is_quit_item(match)
             return self._match_summary_payload(match)
 
-        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
-            del deadline
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
             assert element_index is not None
             _perform_guarded(
                 host, element_index, "AXPress", pid, f"mac.do.{op}", host._frontmost_app()
             )
+            if quits and postcondition is None:
+                return self._await_effect(deadline, lambda: host._exited(pid), {"exited": True})
+            return None
 
         return self._input_verb(
             op=op,
@@ -2923,6 +3065,7 @@ class Operations:
             prepare=prepare,
             dispatch=dispatch,
             executor=Executor.PYTHON,
+            quits=lambda: quits,
         )
 
     def _input_verb(
@@ -2938,12 +3081,14 @@ class Operations:
         prepare: Callable[[_Host, int, _Deadline], JSONValue],
         dispatch: Callable[[_Host, int, _Deadline], dict[str, JSONValue] | None],
         executor: Executor = Executor.INPUT,
+        quits: Callable[[], bool] | None = None,
     ) -> Receipt:
         """The pipeline every verb aimed at one exact ``app`` shares: the
         input verbs (``key``, ``click``, ``type``, ``fill``) and the menu
         verbs, which press the item a path leads to. The receipt names
         ``executor``, and ``acted`` is judged from whether ``dispatch``
-        raised.
+        raised. ``quits`` says, once ``prepare`` has run, whether the
+        dispatch is the app's own Quit, whose exit is then its effect.
 
         ``prepare`` runs once the app is resolved and before anything is
         reserved or dispatched: it validates what is about to be sent and
@@ -3027,6 +3172,7 @@ class Operations:
                         verified=False, target=target, error=exc.to_json(),
                     )
                 )
+            builder.quits = quits is not None and quits()
             if isinstance(extras, Mapping):
                 target.update(extras)
 
@@ -3102,6 +3248,19 @@ class Operations:
             if once is not None:
                 self._ledger.finalize(once, receipt)
             return self._finish(receipt)
+
+    def _await_effect(
+        self, deadline: _Deadline, done: Callable[[], bool], observed: dict[str, JSONValue]
+    ) -> dict[str, JSONValue] | None:
+        """Wait, within ``deadline``, until ``done()``: ``observed`` once
+        it is, `None` when it never was -- an app asked to quit that asks
+        to save first, a window asked to close that does the same."""
+        while not done():
+            pause = min(_EFFECT_POLL_SECONDS, deadline.remaining())
+            if pause <= 0:
+                return None
+            self._sleep(pause)
+        return observed
 
     def _focus_effect(
         self,
