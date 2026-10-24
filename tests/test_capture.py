@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -205,6 +206,8 @@ sys.stdin.read()
 
 @pytest.mark.smoke
 def test_a_window_captures_while_another_live_process_has_captured(monkeypatch) -> None:
+    if os.environ.get("MACOS_HARNESS_RUN_NATIVE_SMOKE") != "1":
+        pytest.skip("set MACOS_HARNESS_RUN_NATIVE_SMOKE=1 to run live smoke tests")
     monkeypatch.setattr(capture_module, "user_temp_dir", user_temp_dir)
     window_id = next(
         int(each[Quartz.kCGWindowNumber])
