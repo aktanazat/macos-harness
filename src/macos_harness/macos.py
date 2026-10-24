@@ -397,6 +397,44 @@ _AX_MENU_SEARCH_KEYS = frozenset({"AXMenuSearchKey", "AXMenuItemSearchKey"})
 # The role each role search key finds, the other way round, so a match's
 # role names the search that finds it again (`MacOS._find_again`).
 _SEARCH_KEY_OF_ROLE = {role: key for key, role in _AX_SEARCH_ROLES.items()}
+# Apple's roles (AXRoleConstants.h) and WebKit's, each by its AX name, so
+# `Accessibility._search_key` reads "pop up button" as "AXPopUpButton".
+_AX_ROLES = tuple(
+    f"AX{name}"
+    for name in (
+        "Application", "Browser", "BusyIndicator", "Button", "Cell", "CheckBox",
+        "ColorWell", "Column", "ComboBox", "DateField", "DisclosureTriangle",
+        "DockItem", "Drawer", "Grid", "Group", "GrowArea", "Handle", "Heading",
+        "HelpTag", "Image", "Incrementor", "LayoutArea", "LayoutItem",
+        "LevelIndicator", "Link", "List", "Matte", "Menu", "MenuBar", "MenuBarItem",
+        "MenuButton", "MenuItem", "Outline", "Popover", "PopUpButton",
+        "ProgressIndicator", "RadioButton", "RadioGroup", "RelevanceIndicator",
+        "Row", "Ruler", "RulerMarker", "ScrollArea", "ScrollBar", "Sheet", "Slider",
+        "SplitGroup", "Splitter", "StaticText", "TabGroup", "Table", "TextArea",
+        "TextField", "TimeField", "Toolbar", "ValueIndicator", "WebArea", "Window",
+    )
+)
+
+
+def _role_filter(search_key: str) -> str | None:
+    """The AX role a search's matches must carry when ``search_key`` names
+    a role, not one of Apple's search keys, which all end in "SearchKey".
+    Apple has keys for 13 roles only, so a search for any other role --
+    "AXWindow", "AXPopUpButton", "AXRow" -- asks the app for every kind of
+    element and keeps those of that role."""
+    return None if search_key.endswith("SearchKey") else search_key
+
+
+def _of_role(matches: SearchMatches, role: str, limit: int) -> SearchMatches:
+    """``matches`` cut to those of ``role``, at most ``limit`` of them
+    unless ``limit`` is negative."""
+    kept = [match for match in matches if match.get("role") == role]
+    cut = 0 <= limit < len(kept)
+    return SearchMatches(
+        kept[:limit] if cut else kept,
+        complete=matches.complete and not cut,
+        visited=matches.visited,
+    )
 
 
 def _on_screen_only(visible_only: bool, search_key: str) -> bool:
@@ -2285,12 +2323,26 @@ class MacOS:
 
     def _element(self, element_index: ElementRef) -> Any:
         """The element an index from this run names, or that a match
-        describes (`_find_again`)."""
+        describes (`_find_again`); a search result stands for its one match."""
+        if isinstance(element_index, SearchMatches):
+            if len(element_index) != 1:
+                listed = "; ".join(self._match_summary(match) for match in element_index[:5])
+                raise MacOSError(
+                    f"Expected one element but got a search result with "
+                    f"{len(element_index)} matches; pass matches[0], or narrow "
+                    f"the search{': ' + listed if listed else ''}",
+                    code=ErrorCode.BAD_REQUEST,
+                    details={"parameter": "element_index", "found": len(element_index)},
+                )
+            index = element_index[0].get("element_index")
+            if isinstance(index, int) and index in self._elements:
+                return self._elements[index]
+            element_index = element_index[0]
         if isinstance(element_index, Mapping):
             return self._find_again(element_index)
         try:
             return self._elements[int(element_index)]
-        except (KeyError, ValueError) as exc:
+        except (KeyError, ValueError, TypeError) as exc:
             raise MacOSError(
                 f"Unknown element index {element_index!r}; an index lasts only "
                 "until the next search or snapshot in the same macos-harness "
@@ -2321,7 +2373,7 @@ class MacOS:
         )
         found = self.ax_search(
             app_pid=pid,
-            search_key=_SEARCH_KEY_OF_ROLE.get(role, "AXAnyTypeSearchKey"),
+            search_key=_SEARCH_KEY_OF_ROLE.get(role, role),
             title=title,
             identifier=identifier,
             description=description,
@@ -2728,6 +2780,7 @@ class MacOS:
                 details={"parameter": "app_pid"},
             )
 
+        role = _role_filter(search_key)
         if element_index is None and self._backend != "python":
             native_pid = app_pid if app_pid is not None else self._pid(app)
             if native_pid is None:
@@ -2744,14 +2797,14 @@ class MacOS:
                         code=ErrorCode.BAD_REQUEST,
                         details={"parameter": "direction", "value": direction},
                     )
-                return _with_pid(self._native_query(
+                found = self._native_query(
                     client,
                     pid=native_pid,
-                    search_key=search_key,
+                    search_key=search_key if role is None else "AXAnyTypeSearchKey",
                     text=text,
                     exact=exact,
                     visible_only=visible_only,
-                    limit=limit,
+                    limit=limit if role is None or limit < 0 else max_nodes,
                     direction=direction.casefold(),
                     immediate_descendants_only=immediate_descendants_only,
                     attributes=attributes,
@@ -2760,7 +2813,8 @@ class MacOS:
                     reset_elements=reset_elements,
                     messaging_timeout=messaging_timeout,
                     enhance=enhance,
-                ), native_pid)
+                )
+                return _with_pid(found if role is None else _of_role(found, role, limit), native_pid)
 
         self._ensure_accessibility()
         if element_index is None:
@@ -2794,12 +2848,25 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "direction", "value": direction},
             ) from exc
-        # With an exact selector the app's search only narrows; the
-        # judgement happens here, so ask for every candidate the walk
-        # bound allows and apply ``limit`` after judging.
-        requested_limit = max_nodes if exact.active else int(limit)
+        if role == "AXWindow" and element_index is None:
+            return _with_pid(self._window_search(
+                root,
+                text=text,
+                exact=exact,
+                visible_only=visible_only,
+                limit=limit,
+                direction=direction,
+                attributes=attributes,
+                include_actions=include_actions,
+            ), pid)
+        # With an exact selector or a role Apple has no search key for,
+        # the app's search only narrows; the judgement happens here, so
+        # ask for every candidate the walk bound allows and apply
+        # ``limit`` after judging.
+        judged = tuple(dict.fromkeys((*exact.attributes, *(() if role is None else ("AXRole",)))))
+        requested_limit = max_nodes if judged else int(limit)
         predicate: dict[str, Any] = {
-            "AXSearchKey": search_key,
+            "AXSearchKey": search_key if role is None else "AXAnyTypeSearchKey",
             "AXVisibleOnly": bool(visible_only),
             "AXResultsLimit": requested_limit,
             "AXDirection": ax_direction,
@@ -2834,12 +2901,15 @@ class MacOS:
         matches: list[dict[str, Any]] = []
         read_complete = True
         for element in candidates:
-            if exact.active:
-                raw = self._copy_attributes(element, exact.attributes)
+            if judged:
+                raw = self._copy_attributes(element, judged)
                 read_complete = read_complete and raw.conclusive
+                if role is not None and raw.get("AXRole") != role:
+                    continue
                 fields = {
                     _AX_NODE_MAPPING[name]: self._jsonable(value)
                     for name, value in raw.items()
+                    if name in _AX_NODE_MAPPING
                 }
                 if not exact.matches(fields):
                     continue
@@ -2864,6 +2934,68 @@ class MacOS:
         return _with_pid(
             SearchMatches(matches, complete=complete, visited=len(candidates)), pid
         )
+
+    def _window_search(
+        self,
+        root: Any,
+        *,
+        text: str | None,
+        exact: _ExactSelector,
+        visible_only: bool,
+        limit: int,
+        direction: str,
+        attributes: Iterable[str],
+        include_actions: bool,
+    ) -> SearchMatches:
+        """The windows of the app ``root`` is that match, from its list of
+        them (``AXWindows``): an app's own search finds what its windows
+        hold, not the windows. ``text`` is a substring of a window's title,
+        description, or identifier, case ignored; ``visible_only`` leaves
+        out a minimized window."""
+        windows = [
+            window
+            for window in self._copy_attribute(root, "AXWindows", checked=True) or ()
+            if self._is_ax_element(window)
+        ]
+        if direction.casefold() == "previous":
+            windows.reverse()
+        needle = text.casefold() if text is not None else None
+        described = tuple(dict.fromkeys((*attributes, *exact.attributes)))
+        result_limit = len(windows) if limit < 0 else int(limit)
+        matches: list[dict[str, Any]] = []
+        read_complete = True
+        cut = False
+        for window in windows:
+            raw = self._copy_attributes(
+                window, ("AXMinimized", "AXTitle", "AXDescription", "AXIdentifier")
+            )
+            read_complete = read_complete and raw.conclusive
+            fields = {
+                _AX_NODE_MAPPING[name]: self._jsonable(value)
+                for name, value in raw.items()
+                if name in _AX_NODE_MAPPING
+            }
+            if (
+                (visible_only and bool(raw.get("AXMinimized")))
+                or (needle is not None and not any(
+                    isinstance(value, str) and needle in value.casefold()
+                    for value in fields.values()
+                ))
+                or not exact.matches(fields)
+            ):
+                continue
+            if len(matches) >= result_limit:
+                cut = True
+                break
+            matches.append(
+                self._describe_element(
+                    window,
+                    self._remember_element(window),
+                    attributes=described,
+                    include_actions=include_actions,
+                )
+            )
+        return SearchMatches(matches, complete=read_complete and not cut, visited=len(windows))
 
     def _bounded_ax_search(
         self,
@@ -2897,7 +3029,7 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "max_nodes", "value": max_nodes},
             )
-        role = _AX_SEARCH_ROLES.get(search_key)
+        role = _AX_SEARCH_ROLES.get(search_key, _role_filter(search_key))
         if role is None and search_key != "AXAnyTypeSearchKey":
             raise MacOSError(
                 f"AX fallback does not support {search_key!r}",
@@ -3667,7 +3799,7 @@ class MacOS:
         single_attempt = _deadline is None and timeout == 0
         deadline = _deadline if _deadline is not None else _Deadline(timeout, time.monotonic)
         targeted = not cross_process
-        if targeted and self._backend != "python":
+        if targeted and self._backend != "python" and _role_filter(search_key) is None:
             if direction.casefold() not in {"next", "previous"}:
                 raise MacOSError(
                     "AX search direction must be 'next' or 'previous'",

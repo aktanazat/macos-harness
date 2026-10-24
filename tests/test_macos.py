@@ -597,7 +597,7 @@ def _bounded_tree(monkeypatch, mac: MacOS, root: object, children: dict, data: d
     monkeypatch.setattr(
         mac,
         "_copy_attribute",
-        lambda element, attribute: (
+        lambda element, attribute, **kwargs: (
             children.get(element, [])
             if attribute in {"AXChildren", "AXWindows"}
             else None
@@ -1224,7 +1224,7 @@ def test_ax_role_aliases_and_app_selectors_fail_closed(monkeypatch) -> None:
     assert arguments["apps"] == ("Safari",)
     assert mac.ax._search_key(None, "any") == "AXAnyTypeSearchKey"
 
-    with pytest.raises(MacOSError, match="Unknown AX role"):
+    with pytest.raises(MacOSError, match="Unknown AX role 'buton'; did you mean AXButton"):
         mac.ax.query_all("Not Now", role="buton")
     with pytest.raises(MacOSError, match="role or search_key"):
         mac.ax.query_all(
@@ -1252,6 +1252,100 @@ def test_ax_role_accepts_the_ax_role_name_a_match_reports(search_key) -> None:
     mac.ax.query_all("Done", role=macos_module._AX_SEARCH_ROLES[search_key])
 
     assert arguments["search_key"] == search_key
+
+
+def _app_search(monkeypatch, children: dict, data: dict) -> None:
+    """Serve the app's own search predicate over a `_bounded_tree`: the
+    descendants of the root's windows, in order, of the role the
+    predicate's key names (any kind for the any-type key) and holding its
+    text. Like a real app's search it never returns the windows."""
+
+    def descendants(element):
+        for child in children.get(element, []):
+            yield child
+            yield from descendants(child)
+
+    def search(root, attribute, predicate, _):
+        role = macos_module._AX_SEARCH_ROLES.get(predicate["AXSearchKey"])
+        text = predicate.get("AXSearchText", "").casefold()
+        found = [
+            element
+            for element in descendants(root)
+            if data[element]["AXRole"] != "AXWindow"
+            and role in {None, data[element]["AXRole"]}
+            and any(text in str(value).casefold() for name, value in data[element].items() if name != "AXRole")
+        ]
+        limit = predicate["AXResultsLimit"]
+        return macos_module._AX_SUCCESS, found if limit < 0 else found[:limit]
+
+    monkeypatch.setattr(macos_module.AS, "AXUIElementCopyParameterizedAttributeValue", search)
+
+
+def _settings_app(monkeypatch, *, app_search: bool) -> MacOS:
+    mac = MacOS()
+    root, settings, minimized, theme_menu, theme_button = (object() for _ in range(5))
+    children = {root: [settings, minimized], settings: [theme_menu, theme_button]}
+    data = {
+        root: {"AXRole": "AXApplication"},
+        settings: {"AXRole": "AXWindow", "AXTitle": "Settings", "AXMinimized": False},
+        minimized: {"AXRole": "AXWindow", "AXTitle": "Settings Backup", "AXMinimized": True},
+        theme_menu: {"AXRole": "AXPopUpButton", "AXTitle": "Theme"},
+        theme_button: {"AXRole": "AXButton", "AXTitle": "Theme"},
+    }
+    _bounded_tree(monkeypatch, mac, root, children, data)
+    if app_search:
+        _app_search(monkeypatch, children, data)
+    return mac
+
+
+@pytest.mark.parametrize(
+    ("role", "app_search"),
+    [("pop up button", True), ("AXPopUpButton", True), ("popup-button", False)],
+)
+def test_ax_role_without_an_apple_search_key_keeps_only_matches_of_that_role(
+    monkeypatch, role, app_search
+) -> None:
+    """Apple's search keys cover 13 roles; any other role, by its AX name
+    or in words, narrows an any-kind search to the matches of that role,
+    through the app's search or the walk that stands in for it."""
+    mac = _settings_app(monkeypatch, app_search=app_search)
+
+    found = mac.ax.query("Theme", app="Demo", role=role, include_actions=False)
+
+    assert [match["role"] for match in found] == ["AXPopUpButton"]
+    assert found.complete is True
+
+
+@pytest.mark.parametrize("role", ["AXWindow", "window"])
+def test_ax_window_role_finds_the_apps_windows_that_its_search_never_returns(
+    monkeypatch, role
+) -> None:
+    """An app's search finds what its windows hold, never the windows, so a
+    window role reads the app's window list: a wait for a Settings window
+    to appear can name it, and a minimized one is not on screen."""
+    mac = _settings_app(monkeypatch, app_search=True)
+
+    match = mac.ax.wait(app="Demo", role=role, title="Settings", timeout=0, include_actions=False)
+    found = mac.ax.query("settings", app="Demo", role=role, include_actions=False)
+
+    assert (match["role"], match["title"]) == ("AXWindow", "Settings")
+    assert [window["title"] for window in found] == ["Settings"]
+
+
+def test_ax_element_takes_a_one_match_search_result_and_names_matches0_otherwise(
+    monkeypatch,
+) -> None:
+    """Where one element is expected, a search result with one match stands
+    for it; one with several fails as a bad request that says to pass
+    matches[0] and lists them, not with a raw TypeError."""
+    mac = _settings_app(monkeypatch, app_search=True)
+    menu = mac.ax.query("Theme", app="Demo", role="pop up button", include_actions=False)
+    both = mac.ax.query("Theme", app="Demo", include_actions=False)
+
+    assert mac.ax.raw(menu) is mac.ax.raw(menu[0])
+    with pytest.raises(MacOSError, match=r"2 matches; pass matches\[0\].*AXPopUpButton") as caught:
+        mac.ax.raw(both)
+    assert caught.value.code == ErrorCode.BAD_REQUEST
 
 
 def test_ax_app_resolution_deduplicates_pids(monkeypatch) -> None:
