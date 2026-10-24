@@ -1348,6 +1348,54 @@ def test_ax_element_takes_a_one_match_search_result_and_names_matches0_otherwise
     assert caught.value.code == ErrorCode.BAD_REQUEST
 
 
+def _app_state(monkeypatch, root: object, children: dict, data: dict) -> dict:
+    mac = MacOS()
+    _bounded_tree(monkeypatch, mac, root, children, data)
+    monkeypatch.setattr(mac, "_resolve_app", lambda app: (None, {"name": "Demo", "pid": 42}))
+    monkeypatch.setattr(mac, "windows", lambda app: [])
+    return mac.get_app_state("Demo", include_actions=False, include_settable=False, include_values=False)
+
+
+def test_app_state_drops_only_the_field_that_read_as_infinity(monkeypatch) -> None:
+    """One mis-measured frame costs that field, marked as non-finite; the
+    node's other fields and the rest of the tree still come back."""
+    root, window, save, label = (object() for _ in range(4))
+    infinite = macos_module.AS.AXValueCreate(
+        macos_module.AS.kAXValueCGRectType,
+        macos_module.AS.CGRect(macos_module.AS.CGPoint(0.0, 0.0), macos_module.AS.CGSize(math.inf, 5.0)),
+    )
+    data = {
+        root: {"AXRole": "AXApplication"},
+        window: {"AXRole": "AXWindow", "AXTitle": "Demo"},
+        save: {"AXRole": "AXButton", "AXTitle": "Save", "AXFrame": infinite},
+        label: {"AXRole": "AXStaticText", "AXTitle": "Saved"},
+    }
+
+    state = _app_state(monkeypatch, root, {root: [window], window: [save, label]}, data)
+
+    assert [node["role"] for node in state["nodes"]] == ["AXApplication", "AXWindow", "AXButton", "AXStaticText"]
+    button = state["nodes"][2]
+    assert (button["title"], button["non_finite"], "frame" in button) == ("Save", ["frame"], False)
+
+
+def test_app_state_says_which_read_cut_the_tree_short(monkeypatch) -> None:
+    """A tree cut by a failed read says where and why: an app that never
+    answered the read of its root is not an app with nothing on screen."""
+    root = object()
+    data = {root: {"AXRole": _Refused(macos_module.AS.kAXErrorCannotComplete)}}
+
+    state = _app_state(monkeypatch, root, {}, data)
+
+    assert state["coverage"]["read_cut"] is True
+    assert state["coverage"]["read_failure"] == {
+        "depth": 0,
+        "attribute": "AXRole",
+        "ax_error": macos_module.AS.kAXErrorCannotComplete,
+        "meaning": "the app did not answer in time",
+    }
+
+
+
 def test_ax_app_resolution_deduplicates_pids(monkeypatch) -> None:
     mac = MacOS()
     info = {"name": "Safari", "bundle_id": "com.apple.Safari", "pid": 42}

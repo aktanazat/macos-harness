@@ -935,6 +935,10 @@ _EXACT_ATTRIBUTES = {
 }
 
 
+class _NonFiniteValue(MacOSError):
+    """An AX value that read as NaN or infinity, which JSON cannot carry."""
+
+
 class _TreeSnapshot(NamedTuple):
     """Visited nodes and the limits or failed reads that left gaps."""
 
@@ -942,6 +946,8 @@ class _TreeSnapshot(NamedTuple):
     node_cut: bool
     depth_cut: bool
     read_cut: bool
+    # The first read that cut the walk: its depth, attribute, and AXError.
+    read_failure: dict[str, JSONValue] | None = None
 
 
 _BACKENDS = ("python", "native", "auto")
@@ -2048,7 +2054,7 @@ class MacOS:
         details: dict[str, object] = {"value": str(value)}
         if field is not None:
             details["field"] = field
-        raise MacOSError(
+        raise _NonFiniteValue(
             "Accessibility API returned a non-finite value with no JSON "
             "representation",
             code=ErrorCode.AX_ERROR,
@@ -2115,6 +2121,17 @@ class MacOS:
         location, length = decoded
         return {"location": int(location), "length": int(length)}
 
+    @staticmethod
+    def _lenient_json(raw: Mapping[str, Any], name: str, non_finite: list[str]) -> Any:
+        """``raw[name]`` as JSON, or None with ``name``'s field added to
+        ``non_finite`` when it holds a NaN or infinity: one mis-measured
+        value costs its own field, not the node or the tree around it."""
+        try:
+            return MacOS._jsonable(raw.get(name))
+        except _NonFiniteValue:
+            non_finite.append(_AX_NODE_MAPPING.get(name, name))
+            return None
+
     def _snapshot_tree(
         self,
         root: Any,
@@ -2133,6 +2150,7 @@ class MacOS:
             self._elements = {}
         nodes: list[dict[str, Any]] = []
         seen: set[Any] = set()
+        read_failure: dict[str, JSONValue] | None = None
         node_cut = depth_cut = read_cut = False
         requested_attributes = tuple(
             dict.fromkeys(
@@ -2156,7 +2174,7 @@ class MacOS:
         reads_values = len(safe_attributes) != len(requested_attributes)
 
         def visit(element: Any, depth: int) -> None:
-            nonlocal node_cut, depth_cut, read_cut
+            nonlocal node_cut, depth_cut, read_cut, read_failure
             if element in seen:
                 return
             if depth > max_depth:
@@ -2167,15 +2185,25 @@ class MacOS:
                 return
             seen.add(element)
 
+            failures: dict[str, int] = {}
             if reads_values:
                 identity = self._copy_attributes(element, _FOCUS_IDENTITY_ATTRIBUTES)
                 allowed = identity.complete and identity.get("AXSubrole") != _SECURE_SUBROLE
                 raw = self._copy_attributes(element, requested_attributes if allowed else safe_attributes)
                 # An identity that did not read in full left the values unread.
-                read_cut = read_cut or not identity.complete
+                failures.update(identity.failures)
             else:
                 raw = self._copy_attributes(element, requested_attributes)
-            read_cut = read_cut or not raw.conclusive
+            if not raw.conclusive:
+                failures.update(
+                    (name, error) for name, error in raw.failures.items() if _hides_match(error)
+                )
+            if failures and read_failure is None:
+                attribute, error = next(iter(failures.items()))
+                read_failure = {"depth": depth, "attribute": attribute, "ax_error": int(error)}
+                if int(error) in _AX_ERROR_MEANINGS:
+                    read_failure["meaning"] = _AX_ERROR_MEANINGS[int(error)]
+            read_cut = read_cut or bool(failures)
             role = raw.get("AXRole")
             if role == "AXMenuBar" and not include_menu_bar:
                 return
@@ -2184,23 +2212,27 @@ class MacOS:
             if skip_closed_menus and role == "AXMenu" and self._closed_menu(element):
                 return
             index = self._remember_element(element)
+            non_finite: list[str] = []
             node: dict[str, Any] = {
                 "element_index": index,
                 "depth": depth,
-                "role": self._jsonable(raw.get("AXRole")),
+                "role": self._lenient_json(raw, "AXRole", non_finite),
             }
             for source, target in _AX_NODE_MAPPING.items():
-                value = self._jsonable(raw.get(source))
+                value = self._lenient_json(raw, source, non_finite)
                 if value not in (None, "", [], {}):
                     node[target] = value
             extra = {
-                name: self._jsonable(raw.get(name))
+                name: value
                 for name in requested_attributes
                 if name not in standard_attributes
-                and self._jsonable(raw.get(name)) not in (None, "", [], {})
+                for value in (self._lenient_json(raw, name, non_finite),)
+                if value not in (None, "", [], {})
             }
             if extra:
                 node["attributes"] = extra
+            if non_finite:
+                node["non_finite"] = non_finite
             if include_actions:
                 actions = self._actions(element)
                 if actions:
@@ -2226,13 +2258,16 @@ class MacOS:
                         visit(child, depth + 1)
 
         visit(root, 0)
-        return _TreeSnapshot(nodes, node_cut, depth_cut, read_cut)
+        return _TreeSnapshot(nodes, node_cut, depth_cut, read_cut, read_failure)
 
     def _closed_menu(self, menu: object) -> bool:
         """Whether ``menu`` is closed: AppKit keeps a closed menu at zero
         size and gives an open one its size on screen. A menu whose size
         does not read counts as open."""
-        return self._jsonable(self._copy_attribute(menu, "AXSize")) == {"width": 0.0, "height": 0.0}
+        try:
+            return self._jsonable(self._copy_attribute(menu, "AXSize")) == {"width": 0.0, "height": 0.0}
+        except _NonFiniteValue:
+            return False
 
     @staticmethod
     def _render_tree(nodes: list[dict[str, Any]], *, truncated: bool = False) -> str:
@@ -2304,6 +2339,8 @@ class MacOS:
                          "node_cut": snapshot.node_cut, "depth_cut": snapshot.depth_cut,
                          "read_cut": snapshot.read_cut},
         }
+        if snapshot.read_failure is not None:
+            state["coverage"]["read_failure"] = snapshot.read_failure
         if screenshot:
             try:
                 self._last_screenshot = self.capture_screenshot(
@@ -2664,25 +2701,28 @@ class MacOS:
             dict.fromkeys(("AXRole", *(str(item) for item in attributes)))
         )
         raw = self._copy_attributes(element, requested)
+        non_finite: list[str] = []
         node: dict[str, Any] = {
             "element_index": element_index,
-            "role": self._jsonable(raw.get("AXRole")),
+            "role": self._lenient_json(raw, "AXRole", non_finite),
         }
         for source, target in _AX_NODE_MAPPING.items():
             if source not in raw:
                 continue
-            value = self._jsonable(raw[source])
+            value = self._lenient_json(raw, source, non_finite)
             if value not in (None, "", [], {}):
                 node[target] = value
         extra = {
-            name: self._jsonable(value)
-            for name, value in raw.items()
-            if name not in _AX_NODE_MAPPING
-            and name != "AXRole"
-            and self._jsonable(value) not in (None, "", [], {})
+            name: value
+            for name in raw
+            if name not in _AX_NODE_MAPPING and name != "AXRole"
+            for value in (self._lenient_json(raw, name, non_finite),)
+            if value not in (None, "", [], {})
         }
         if extra:
             node["attributes"] = extra
+        if non_finite:
+            node["non_finite"] = non_finite
         if include_actions:
             actions = self._actions(element)
             if actions:
