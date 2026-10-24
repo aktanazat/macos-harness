@@ -4809,6 +4809,8 @@ class MacOS:
         and of the scroll area that holds it, None when none does. An
         element no scroll area holds, and that cannot scroll itself into
         view, refuses."""
+        from .native import _NativeHandle
+
         owner = self._element_pid(element)
         if owner not in (None, pid):
             raise MacOSError(
@@ -4817,6 +4819,8 @@ class MacOS:
                 details={"parameter": "element", "pid": owner, "target_pid": pid},
             )
         node = self._element(element)
+        if isinstance(node, _NativeHandle):
+            node = self._local_twin(node, pid)
         area = self._copy_attribute(node, "AXParent")
         while area is not None and self._copy_attribute(area, "AXRole") != "AXScrollArea":
             area = self._copy_attribute(area, "AXParent")
@@ -4828,6 +4832,43 @@ class MacOS:
                 details={"parameter": "element"},
             )
         return self._remember_element(node), None if area is None else self._remember_element(area)
+
+    def _local_twin(self, handle: Any, pid: int) -> Any:
+        """The local AX element that the agent's ``handle`` names in
+        ``pid``: the one element of its role and labels at its frame. The
+        agent reads no element's parent, which finding a scroll area takes."""
+        read = handle.client.get_attributes(
+            handle, ("AXRole", "AXTitle", "AXIdentifier", "AXDescription", "AXFrame")
+        )
+        role = read.get("AXRole")
+        same: list[dict[str, JSONValue]] = []
+        if isinstance(role, str):
+            title, identifier, description = (
+                value if isinstance(value, str) and value else None
+                for value in (read.get("AXTitle"), read.get("AXIdentifier"), read.get("AXDescription"))
+            )
+            found = self.ax_search(
+                element_index=self._remember_element(self._application_element(pid)),
+                search_key=_SEARCH_KEY_OF_ROLE.get(role, role),
+                title=title,
+                identifier=identifier,
+                description=description,
+                attributes=("AXRole", "AXFrame"),
+                include_actions=False,
+                reset_elements=False,
+            )
+            same = [
+                match for match in found
+                if match.get("role") == role and match.get("frame") == read.get("AXFrame")
+            ]
+        if len(same) != 1:
+            raise MacOSError(
+                f"Found {len(same)} {role} at the native agent's element's frame in "
+                f"process {pid} where reveal needs exactly one; query it again",
+                code=ErrorCode.ELEMENT_UNKNOWN,
+                details={"pid": pid, "role": role, "found": len(same)},
+            )
+        return self._elements[int(same[0]["element_index"])]
 
     def _reveal(
         self, node: int, area: int | None, pid: int, deadline: _Deadline

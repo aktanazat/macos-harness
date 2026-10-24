@@ -7,7 +7,8 @@ from __future__ import annotations
 import pytest
 
 from macos_harness.errors import ErrorCode, MacOSError
-from macos_harness.macos import MacOS
+from macos_harness.macos import MacOS, SearchMatches
+from macos_harness.native import _NativeHandle
 from macos_harness.receipts import Outcome
 
 _PID = 4512
@@ -146,3 +147,45 @@ def test_reveal_stops_once_the_list_scrolls_no_further() -> None:
     receipt = mac.do.reveal(row, app="Sona")
 
     assert (receipt.outcome, receipt.verified, mac.scrolls) == (Outcome.DONE, False, 2)
+
+
+class _Agent:
+    """The native agent: it reads a handle's attributes, never its
+    parent, so it cannot say which scroll area holds the row."""
+
+    generation = 1
+
+    def get_attributes(self, handle: _NativeHandle, attributes: tuple[str, ...]) -> dict[str, object]:
+        row = {"AXRole": "AXRow", "AXTitle": "Plan", "AXIdentifier": None, "AXDescription": None,
+               "AXFrame": {"x": 10.0, "y": 1200.0, "width": 380.0, "height": 20.0}}
+        return {name: row.get(name) for name in attributes}
+
+
+class _NativeSona(_Sona):
+    """Sona searched through the native agent; a search from the app's
+    own element runs here and finds two Plan rows."""
+
+    def _application_element(self, pid: int, **_: object) -> str:
+        return "app"
+
+    def ax_search(self, *, element_index: int | None = None, **_: object) -> SearchMatches:
+        assert self._element(element_index) == "app"
+        return SearchMatches(
+            [
+                {"element_index": self._remember_element("other"), "role": "AXRow",
+                 "frame": {"x": 10.0, "y": 60.0, "width": 380.0, "height": 20.0}},
+                {"element_index": self._remember_element("row"), "role": "AXRow",
+                 "frame": {"x": 10.0, "y": 1200.0, "width": 380.0, "height": 20.0}},
+            ],
+            complete=True,
+            visited=2,
+        )
+
+
+def test_reveal_scrolls_a_row_the_native_agent_found() -> None:
+    mac = _NativeSona(below=1200)
+    row = mac._remember_element(_NativeHandle(_Agent(), 3, 1))
+
+    receipt = mac.do.reveal(row, app="Sona")
+
+    assert (receipt.outcome, receipt.verified, mac.scrolls) == (Outcome.DONE, True, 3)
