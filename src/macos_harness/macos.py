@@ -4255,9 +4255,12 @@ class MacOS:
         every app's windows on screen now, front to back.
 
         Only a normal window of at least 40pt counts, the kind `see` and
-        pointer input pick by themselves; ``all_layers`` adds menus,
-        panels, the menu bar's items, and every other surface, any size,
-        which `see` and pointer input reach through ``window_id``.
+        pointer input pick by themselves, and of an app's windows off
+        screen only the titled ones, minimized or on another Space: an
+        untitled one off screen is a helper surface the app never shows.
+        ``all_layers`` adds menus, panels, the menu bar's items, and every
+        other surface, any size, which `see` and pointer input reach
+        through ``window_id``.
         """
         if app is None:
             return [
@@ -4275,6 +4278,7 @@ class MacOS:
                 int(value.get(AS.kCGWindowOwnerPID, -1)) == pid
                 if all_layers
                 else self._is_content_window(pid, value)
+                and (value.get(AS.kCGWindowIsOnscreen) or value.get(AS.kCGWindowName))
             )
         ]
         return sorted(
@@ -4287,16 +4291,39 @@ class MacOS:
         )
 
     def wait_for_window(
-        self, app: str | int | None = None, *, timeout: float = 2.0
+        self,
+        app: str | int | None = None,
+        *,
+        title: str | None = None,
+        timeout: float = 2.0,
+        all_layers: bool = False,
     ) -> list[dict[str, Any]]:
-        """Return ``windows(app)`` once it is non-empty, polling until ``timeout``.
+        """Return ``windows(app)`` once it holds a window, polling until
+        ``timeout``: one whose title holds ``title``, case ignored, when
+        given, and any surface with ``all_layers``, as a SecurityAgent
+        prompt needs. An app not running yet has the same ``timeout`` to
+        start.
 
         ``open -a`` returns before the app draws anything: TextEdit's first
         window appeared 335ms after launch and Notes' 792ms, so a capture
         issued straight after a launch finds nothing.
         """
-        _, info = self._resolve_app(app)
-        return self._wait_for_windows(info, timeout=timeout)
+        deadline = self._now() + max(0.0, timeout)
+        while True:
+            try:
+                _, info = self._resolve_app(app)
+                break
+            except ApplicationNotFoundError as exc:
+                remaining = deadline - self._now()
+                if remaining <= 0:
+                    raise ApplicationNotFoundError(
+                        f"{exc}; it did not start within {timeout:g}s",
+                        details={**exc.details, "timeout": timeout},
+                    ) from exc
+                self._pause(min(0.05, remaining))
+        return self._wait_for_windows(
+            info, timeout=timeout, deadline=deadline, title=title, all_layers=all_layers
+        )
 
     @staticmethod
     def _now() -> float:
@@ -4309,17 +4336,36 @@ class MacOS:
         time.sleep(seconds)
 
     def _wait_for_windows(
-        self, info: dict[str, JSONValue], *, timeout: float, deadline: float | None = None
+        self,
+        info: dict[str, JSONValue],
+        *,
+        timeout: float,
+        deadline: float | None = None,
+        title: str | None = None,
+        all_layers: bool = False,
     ) -> list[dict[str, Any]]:
         if deadline is None:
             deadline = self._now() + max(0.0, timeout)
         while True:
-            windows = self.windows(int(info["pid"]))
+            pid = int(info["pid"])
+            listed = self.windows(pid, all_layers=True) if all_layers else self.windows(pid)
+            windows = listed if title is None else [
+                window for window in listed
+                if title.casefold() in str(window.get("title") or "").casefold()
+            ]
             if windows:
                 return windows
             remaining = deadline - self._now()
             if remaining <= 0:
-                raise _no_window_error(info, timeout=timeout)
+                if title is None:
+                    raise _no_window_error(info, timeout=timeout)
+                titles = [str(window.get("title") or "") for window in listed]
+                raise MacOSError(
+                    f"{info['name']} showed no window titled {title!r} within "
+                    f"{timeout:g}s; its windows: {', '.join(map(repr, titles)) or 'none'}",
+                    code=ErrorCode.TIMEOUT,
+                    details={"app": info, "timeout": timeout, "title": title, "titles": titles},
+                )
             self._pause(min(0.05, remaining))
 
     def _ready_windows(

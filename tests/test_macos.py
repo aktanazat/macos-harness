@@ -2976,6 +2976,84 @@ def test_wait_for_window_times_out_at_the_deadline_with_the_app_in_details(
     assert polls == [42, 42]
 
 
+def _clocked(monkeypatch, mac: MacOS) -> None:
+    """Advance the waits' clock half a second per look, never sleeping."""
+    clock = iter(float(tick) * 0.5 for tick in range(100))
+    monkeypatch.setattr(mac, "_now", lambda: next(clock))
+    monkeypatch.setattr(mac, "_pause", lambda seconds: None)
+
+
+def test_wait_for_window_gives_an_app_not_yet_running_its_timeout_to_start(monkeypatch) -> None:
+    """Right after ``open -a`` the app may not be running yet: the wait
+    keeps looking for it instead of failing at once."""
+    mac = MacOS()
+    starts = iter([False, False, True])
+
+    def resolve(app):
+        if not next(starts):
+            raise macos_module.ApplicationNotFoundError("No running application matches 'Sona'")
+        return object(), {"name": "Sona", "pid": 42}
+
+    monkeypatch.setattr(mac, "_resolve_app", resolve)
+    monkeypatch.setattr(mac, "windows", lambda app: [{"window_id": 7, "title": "Sona"}])
+    _clocked(monkeypatch, mac)
+
+    assert mac.wait_for_window("Sona", timeout=5.0) == [{"window_id": 7, "title": "Sona"}]
+
+
+def test_wait_for_window_says_the_app_never_started(monkeypatch) -> None:
+    mac = MacOS()
+
+    def resolve(app):
+        raise macos_module.ApplicationNotFoundError(
+            "No running application matches 'Sona'", details={"query": "Sona"}
+        )
+
+    monkeypatch.setattr(mac, "_resolve_app", resolve)
+    _clocked(monkeypatch, mac)
+
+    with pytest.raises(macos_module.ApplicationNotFoundError, match="did not start within 1s") as caught:
+        mac.wait_for_window("Sona", timeout=1.0)
+    assert caught.value.details == {"query": "Sona", "timeout": 1.0}
+
+
+def test_wait_for_window_with_a_title_waits_past_the_apps_other_windows(monkeypatch) -> None:
+    """A Settings window opening beside the main one is the event a caller
+    waits for; the main window alone does not end that wait."""
+    mac = MacOS()
+    main, settings = {"window_id": 7, "title": "Sona"}, {"window_id": 8, "title": "Settings"}
+    looks = iter([[main], [main, settings]])
+    monkeypatch.setattr(mac, "_resolve_app", lambda app: (object(), {"name": "Sona", "pid": 42}))
+    monkeypatch.setattr(mac, "windows", lambda app: next(looks))
+    _clocked(monkeypatch, mac)
+
+    assert mac.wait_for_window("Sona", title="settings", timeout=5.0) == [settings]
+
+
+def test_windows_leaves_out_an_untitled_window_off_screen(monkeypatch) -> None:
+    """An app's untitled off-screen window is a helper surface it never
+    shows, as Xcode's 500x500 one is; a titled one off screen, minimized
+    or on another Space, is still the app's window."""
+    mac = MacOS()
+    monkeypatch.setattr(mac, "_resolve_app", lambda app: (object(), {"name": "Xcode", "pid": 42}))
+
+    def window(window_id: int, title: str, on_screen: bool) -> dict[str, object]:
+        return {
+            "kCGWindowOwnerPID": 42,
+            "kCGWindowNumber": window_id,
+            "kCGWindowName": title,
+            "kCGWindowBounds": {"X": 0, "Y": 617, "Width": 500, "Height": 500},
+            "kCGWindowIsOnscreen": on_screen,
+            "kCGWindowLayer": 0,
+        }
+
+    listed = [window(1, "Project", True), window(2, "", False), window(3, "Minimized", False)]
+    monkeypatch.setattr(macos_module.AS, "CGWindowListCopyWindowInfo", lambda options, relative: listed)
+
+    assert [entry["window_id"] for entry in mac.windows("Xcode")] == [1, 3]
+    assert sorted(entry["window_id"] for entry in mac.windows("Xcode", all_layers=True)) == [1, 2, 3]
+
+
 class _WindowlessApp(MacOS):
     """Secretive running with no window, launched ``launched_seconds_ago``."""
 
