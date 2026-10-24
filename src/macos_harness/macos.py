@@ -63,7 +63,7 @@ if TYPE_CHECKING:
     # `from __future__ import annotations` (above) already makes every
     # annotation in this file a deferred string, so this import never
     # needs to run outside a type checker.
-    from .native import NativeClient
+    from .native import NativeClient, _NativeHandle
     from .routes import Routes
 
 try:
@@ -4839,7 +4839,7 @@ class MacOS:
             )
         return self._remember_element(node), None if area is None else self._remember_element(area)
 
-    def _local_twin(self, handle: Any, pid: int) -> Any:
+    def _local_twin(self, handle: _NativeHandle, pid: int) -> object:
         """The local AX element that the agent's ``handle`` names in
         ``pid``: the one element of its role and labels at its frame. The
         agent reads no element's parent, which finding a scroll area takes."""
