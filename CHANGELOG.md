@@ -28,8 +28,10 @@ follows [Semantic Versioning](https://semver.org/).
   names a menu, not an item, points at it.
 - `mac.do.window("close" | "minimize" | "zoom", app=)` presses a window's
   title bar button and waits until the window is gone, off screen or
-  resized. `mac.do.reveal(match, app=)` scrolls a match into view and
-  returns its frame. `mac.place` takes `window_id=`.
+  resized. `mac.do.reveal(match, app=)` scrolls a match into view, a native
+  backend's match included, and returns its frame. `mac.place` takes
+  `window_id=`; it and `do.window` tell windows sharing one frame apart by
+  window number and refuse twins they cannot.
 - `macos-harness -c CODE` runs one line with the stdin namespace, served by
   the shell's spare like stdin; `--json-errors` goes after any command;
   `apps [NAME]` prints one JSON line per app and filters by name or bundle

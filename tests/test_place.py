@@ -20,7 +20,8 @@ _Point = tuple[float, float]
 
 class _Window:
     """One AX window; its app keeps it at least ``min_width`` wide and
-    will not let the attributes in ``fixed`` change."""
+    will not let the attributes in ``fixed`` change. ``number`` is the
+    window server's number for it, None when it cannot be read."""
 
     def __init__(
         self,
@@ -32,11 +33,13 @@ class _Window:
         minimized: bool = False,
         min_width: float = 0.0,
         fixed: tuple[str, ...] = (),
+        number: int | None = None,
     ) -> None:
         self.frame = {"x": x, "y": y, "width": width, "height": height}
         self.minimized = minimized
         self.min_width = min_width
         self.fixed = fixed
+        self.number = number
 
 
 class _Desk(MacOS):
@@ -77,11 +80,21 @@ class _Desk(MacOS):
             if not (on_screen_only and window.minimized)
         ]
 
+    def _window_description(self, window_id: int) -> dict[str, object] | None:
+        return next(
+            (entry for entry in self._server_windows(on_screen_only=False)
+             if entry["kCGWindowNumber"] == window_id),
+            None,
+        )
+
     def _ax_windows(self, pid: int) -> list[_Window]:
         return self.reachable
 
     def _window_geometry(self, window: _Window) -> tuple[dict[str, float], bool]:
         return dict(window.frame), window.minimized
+
+    def _ax_window_id(self, window: _Window) -> int | None:
+        return window.number
 
     def _settable(self, element: _Window, attribute: str) -> bool:
         return attribute not in element.fixed
@@ -184,6 +197,29 @@ def test_place_moves_the_window_that_see_numbers_window_index(
     assert {
         name: (window.frame["x"], window.frame["y"]) for name, window in windows.items()
     } == corners
+
+
+def test_place_moves_the_window_window_id_names_when_another_shares_its_frame() -> None:
+    """Two maximized documents share bounds; the frame alone picked the
+    first of them whichever window_id was asked for."""
+    first = _Window(0, 30, 1512, 952, number=100)
+    second = _Window(0, 30, 1512, 952, number=101)
+    mac = _Desk(first, second)
+
+    mac.place("Archives", window_id=101, x=40, y=60)
+
+    assert ((first.frame["x"], first.frame["y"]), (second.frame["x"], second.frame["y"])) == (
+        (0, 30), (40, 60),
+    )
+
+
+def test_place_refuses_windows_sharing_a_frame_it_cannot_tell_apart() -> None:
+    mac = _Desk(_Window(0, 30, 1512, 952), _Window(0, 30, 1512, 952))
+
+    with pytest.raises(MacOSError, match="cannot tell which") as error:
+        mac.place("Archives", window_id=101, x=40, y=60)
+
+    assert (error.value.code, mac.writes) == (ErrorCode.UNSUPPORTED_OP, [])
 
 
 @pytest.mark.parametrize(

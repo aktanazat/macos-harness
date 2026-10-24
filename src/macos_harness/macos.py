@@ -179,6 +179,23 @@ def _load_process_info() -> Callable[[int, int, int, object, int], int] | None:
 _process_info = _load_process_info() if AS else None
 
 
+def _load_window_number_reader() -> Callable[[int, object], int] | None:
+    """Resolve the private ``_AXUIElementGetWindow``; ``None`` on a macOS
+    that dropped it."""
+    try:
+        function = ctypes.CDLL(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )._AXUIElementGetWindow
+    except (OSError, AttributeError):
+        return None
+    function.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+    function.restype = ctypes.c_int32
+    return function
+
+
+_window_number = _load_window_number_reader() if AS else None
+
+
 def _process_start_time(pid: int) -> float:
     if _process_info is None:
         raise MacOSError("Process start identity is unavailable", code=ErrorCode.UNSUPPORTED_OP)
@@ -4660,19 +4677,47 @@ class MacOS:
         self, info: dict[str, JSONValue], target: dict[str, JSONValue], window_index: int
     ) -> tuple[object, dict[str, float], bool]:
         """The AX element of ``target``, one of `windows`, with its frame
-        and whether it is minimized. AX names no window id, so the element
-        is the one whose frame matches the window server's bounds."""
+        and whether it is minimized: the one whose frame matches the window
+        server's bounds, and among windows sharing those bounds, the one
+        whose window number is ``target``'s. Twins it cannot tell apart
+        refuse."""
         bounds = target["bounds"]
+        found = []
         for window in self._ax_windows(int(info["pid"])):
             frame, minimized = self._window_geometry(window)
             if frame is not None and all(abs(frame[key] - bounds[key]) < 1 for key in bounds):
-                return window, frame, minimized
-        raise MacOSError(
-            f"{info['name']} shows no Accessibility window where window "
-            f"{target['window_id']} is; a window on another Space cannot be reached",
-            code=ErrorCode.UNSUPPORTED_OP,
-            details={"window_index": window_index, "window_id": target["window_id"]},
-        )
+                found.append((window, frame, minimized))
+        details = {"window_index": window_index, "window_id": target["window_id"]}
+        if not found:
+            raise MacOSError(
+                f"{info['name']} shows no Accessibility window where window "
+                f"{target['window_id']} is; a window on another Space cannot be reached",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details=details,
+            )
+        if len(found) > 1:
+            found = [
+                match for match in found if self._ax_window_id(match[0]) == target["window_id"]
+            ]
+        if len(found) != 1:
+            raise MacOSError(
+                f"{info['name']} has other windows at window {target['window_id']}'s exact "
+                "frame and Accessibility cannot tell which is it; nothing was changed",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details=details,
+            )
+        return found[0]
+
+    @staticmethod
+    def _ax_window_id(window: object) -> int | None:
+        """The window server's number for AX ``window``, None when it
+        cannot be read."""
+        number = ctypes.c_uint32()
+        if _window_number is None or _window_number(
+            objc.pyobjc_id(window), ctypes.byref(number)
+        ) != _AX_SUCCESS:
+            return None
+        return number.value
 
     def _ax_windows(self, pid: int) -> list[object]:
         """The AX elements of ``pid``'s windows on this Space."""
@@ -4770,6 +4815,8 @@ class MacOS:
         and of the scroll area that holds it, None when none does. An
         element no scroll area holds, and that cannot scroll itself into
         view, refuses."""
+        from .native import _NativeHandle
+
         owner = self._element_pid(element)
         if owner not in (None, pid):
             raise MacOSError(
@@ -4778,6 +4825,8 @@ class MacOS:
                 details={"parameter": "element", "pid": owner, "target_pid": pid},
             )
         node = self._element(element)
+        if isinstance(node, _NativeHandle):
+            node = self._local_twin(node, pid)
         area = self._copy_attribute(node, "AXParent")
         while area is not None and self._copy_attribute(area, "AXRole") != "AXScrollArea":
             area = self._copy_attribute(area, "AXParent")
@@ -4789,6 +4838,43 @@ class MacOS:
                 details={"parameter": "element"},
             )
         return self._remember_element(node), None if area is None else self._remember_element(area)
+
+    def _local_twin(self, handle: Any, pid: int) -> Any:
+        """The local AX element that the agent's ``handle`` names in
+        ``pid``: the one element of its role and labels at its frame. The
+        agent reads no element's parent, which finding a scroll area takes."""
+        read = handle.client.get_attributes(
+            handle, ("AXRole", "AXTitle", "AXIdentifier", "AXDescription", "AXFrame")
+        )
+        role = read.get("AXRole")
+        same: list[dict[str, JSONValue]] = []
+        if isinstance(role, str):
+            title, identifier, description = (
+                value if isinstance(value, str) and value else None
+                for value in (read.get("AXTitle"), read.get("AXIdentifier"), read.get("AXDescription"))
+            )
+            found = self.ax_search(
+                element_index=self._remember_element(self._application_element(pid)),
+                search_key=_SEARCH_KEY_OF_ROLE.get(role, role),
+                title=title,
+                identifier=identifier,
+                description=description,
+                attributes=("AXRole", "AXFrame"),
+                include_actions=False,
+                reset_elements=False,
+            )
+            same = [
+                match for match in found
+                if match.get("role") == role and match.get("frame") == read.get("AXFrame")
+            ]
+        if len(same) != 1:
+            raise MacOSError(
+                f"Found {len(same)} {role} at the native agent's element's frame in "
+                f"process {pid} where reveal needs exactly one; query it again",
+                code=ErrorCode.ELEMENT_UNKNOWN,
+                details={"pid": pid, "role": role, "found": len(same)},
+            )
+        return self._elements[int(same[0]["element_index"])]
 
     def _reveal(
         self, node: int, area: int | None, pid: int, deadline: _Deadline
