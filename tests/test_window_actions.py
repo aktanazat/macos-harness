@@ -9,7 +9,7 @@ import pytest
 from macos_harness.errors import ErrorCode, MacOSError
 from macos_harness.macos import MacOS, SearchMatches
 from macos_harness.native import _NativeHandle
-from macos_harness.receipts import Outcome
+from macos_harness.receipts import Acted, OperationError, Outcome
 
 _PID = 4512
 _INFO = {"name": "Sona", "bundle_id": "app.sona", "pid": _PID, "path": None}
@@ -35,7 +35,7 @@ class _Sona(MacOS):
         self.scrolls = 0
         self.attributes: dict[str, dict[str, object]] = {
             "window": {"AXCloseButton": "close", "AXZoomButton": "zoom"},
-            "close": {"AXEnabled": True},
+            "close": {"AXEnabled": True, "AXWindow": "window"},
             "zoom": {"AXEnabled": True},
             "row": {"AXParent": "list", "AXRole": "AXRow"},
             "list": {"AXParent": "area", "AXRole": "AXList"},
@@ -112,6 +112,28 @@ def test_window_close_presses_the_close_button_and_waits_for_the_window_to_go(
     receipt = mac.do.window("close", app="Sona", timeout=0.2)
 
     assert (receipt.outcome, receipt.verified, mac.pressed) == (Outcome.DONE, verified, ["close"])
+
+
+def test_window_close_stopped_by_a_save_prompt_names_its_buttons() -> None:
+    """The receipt said only unverified; agents searched for the sheet
+    themselves to learn why the window stayed and what to press."""
+    mac = _Sona(stays=True)
+    mac.attributes["window"]["AXChildren"] = ["sheet"]
+    mac.attributes |= {
+        "sheet": {"AXRole": "AXSheet", "AXDescription": "save", "AXChildren": ["text", "choices"]},
+        "text": {"AXRole": "AXStaticText"},
+        "choices": {"AXRole": "AXGroup", "AXChildren": ["delete", "cancel", "save"]},
+        "delete": {"AXRole": "AXButton", "AXTitle": "Delete"},
+        "cancel": {"AXRole": "AXButton", "AXTitle": "Cancel"},
+        "save": {"AXRole": "AXButton", "AXTitle": "Save"},
+    }
+
+    with pytest.raises(OperationError, match=r"a save prompt is open \(Delete, Cancel, Save\)") as caught:
+        mac.do.window("close", app="Sona", timeout=0.2)
+
+    assert (caught.value.code, caught.value.details["buttons"], caught.value.receipt.acted) == (
+        ErrorCode.TIMEOUT, ["Delete", "Cancel", "Save"], Acted.YES,
+    )
 
 
 @pytest.mark.parametrize(

@@ -167,10 +167,12 @@ its effect prints which postcondition would.
 
 `do.window("close" | "minimize" | "zoom", app=)` presses that title bar
 button of window `window_index` or `window_id`, then waits until the window
-is gone, off screen, or resized; a window still there, as one asking to
-save is, leaves the receipt unverified. `do.reveal(match, app=)` scrolls a
-search match into view and puts its `frame` in `observed["input"]`, ready
-for `click(element=match)`.
+is gone, off screen, or resized. A close a sheet stops fails with `timeout`:
+"The window stayed: a save prompt is open (Delete, Cancel, Save)", with the
+buttons in `exc.details["buttons"]` for the `do.press` that answers it; any
+other window still there leaves the receipt unverified.
+`do.reveal(match, app=)` scrolls a search match into view and puts its
+`frame` in `observed["input"]`, ready for `click(element=match)`.
 
 ## Routes and diagnostics
 

@@ -336,6 +336,12 @@ _FOCUS_WATCH_SECONDS = 0.1
 _EFFECT_POLL_SECONDS = 0.05
 
 
+class _BlockedEffect(MacOSError):
+    """What a verb waits for after its input landed was stopped, as a
+    window asked to close is by the prompt its app shows."""
+
+
+
 def _sample_focus(host: _Host, pid: int) -> dict[str, JSONValue] | None:
     """`MacOS._focus_sample`, or `None` when the app's AX tree would not
     answer (a non-finite geometry raises ``ax_error``, for one). The
@@ -1265,6 +1271,7 @@ class _Host(Protocol):
         self, pid: int, action: str, *, window_id: int | None, window_index: int
     ) -> tuple[int, dict[str, JSONValue]]: ...
     def _window_done(self, window: Mapping[str, JSONValue], action: str) -> bool: ...
+    def _window_sheet(self, button: int) -> dict[str, JSONValue] | None: ...
     def _reveal_target(
         self, element: int | Mapping[str, JSONValue], pid: int
     ) -> tuple[int, int | None]: ...
@@ -2951,8 +2958,10 @@ class Operations:
         ``window_id`` names, else its window ``window_index`` -- by
         pressing its title bar button through Accessibility, then wait
         until the window is gone or off screen, or for a zoom has a new
-        frame. A window still there, as one asking to save is, leaves the
-        receipt unverified. Close only a window this task opened.
+        frame. A close a sheet stops, as one asking to save, fails with
+        `timeout` naming the sheet's buttons, also in its details; a window
+        otherwise still there leaves the receipt unverified. Close only a
+        window this task opened.
         """
         pressed: tuple[int, dict[str, JSONValue]] | None = None
 
@@ -2970,9 +2979,19 @@ class Operations:
             _perform_guarded(host, index, "AXPress", pid, "mac.do.window", host._frontmost_app())
             if postcondition is not None:
                 return None
-            return self._await_effect(
+            effect = self._await_effect(
                 deadline, lambda: host._window_done(window, action), {"window": action}
             )
+            sheet = host._window_sheet(index) if effect is None and action == "close" else None
+            if sheet is not None:
+                kind = f"{sheet['description']} " if sheet["description"] else ""
+                raise _BlockedEffect(
+                    f"The window stayed: a {kind}prompt is open ({', '.join(sheet['buttons'])}); "
+                    'mac.do.press(title, app=app, role="button") answers it',
+                    code=ErrorCode.TIMEOUT,
+                    details={"window_id": window["window_id"], **sheet},
+                )
+            return effect
 
         request: dict[str, JSONValue] = {"action": action, "window_index": window_index}
         if window_id is not None:
@@ -3216,7 +3235,7 @@ class Operations:
 
             try:
                 input_observed = dispatch(host, pid, deadline)
-            except FocusChangedError as exc:
+            except (FocusChangedError, _BlockedEffect) as exc:
                 receipt = builder.build(
                     outcome=Outcome.FAILED, acted=Acted.YES, changed=None, verified=False,
                     target=target, error=exc.to_json(),

@@ -4821,6 +4821,31 @@ class MacOS:
             return now["bounds"] != window["bounds"]
         return not now["on_screen"]
 
+    def _window_sheet(self, button: int) -> dict[str, JSONValue] | None:
+        """The sheet on the window whose title bar button is element
+        ``button``: its description and its buttons' titles, in the order
+        its tree holds them; None when no sheet is attached."""
+        window = self._copy_attribute(self._element(button), "AXWindow")
+        sheet = next(
+            (
+                child for child in self._copy_attribute(window, "AXChildren") or ()
+                if self._copy_attribute(child, "AXRole") == "AXSheet"
+            ),
+            None,
+        ) if window is not None else None
+        if sheet is None:
+            return None
+        buttons: list[JSONValue] = []
+        pending = [sheet]
+        while pending:
+            for child in self._copy_attribute(pending.pop(0), "AXChildren") or ():
+                if self._copy_attribute(child, "AXRole") != "AXButton":
+                    pending.append(child)
+                elif title := self._copy_attribute(child, "AXTitle"):
+                    buttons.append(str(title))
+        description = self._copy_attribute(sheet, "AXDescription")
+        return {"description": str(description) if description else None, "buttons": buttons}
+
     def _reveal_target(self, element: ElementRef, pid: int) -> tuple[int, int | None]:
         """The element index of ``element``, which must be ``pid``'s own,
         and of the scroll area that holds it, None when none does. An
