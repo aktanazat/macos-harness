@@ -8,7 +8,6 @@ renders a specific window (see ``capture.py``).
 from __future__ import annotations
 
 import ctypes
-import difflib
 import errno
 import json
 import math
@@ -2512,26 +2511,29 @@ class MacOS:
         and the window server's id for it, or None where no window or
         several have its frame. AX names no window id, so the id is the
         one window whose bounds match the AX window's frame."""
-        listed = self.windows(pid, all_layers=True)
-        located: list[dict[str, JSONValue]] = []
+        read: list[tuple[JSONValue, JSONValue]] = []
         for candidate in candidates:
             element = self._elements[int(candidate["element_index"])]
             window = self._copy_attribute(element, "AXWindow") if self._is_ax_element(element) else None
             raw: Mapping[str, object] = (
                 self._copy_attributes(window, ("AXTitle", "AXFrame"))
-                if self._is_ax_element(window) else {}
+                if window is not None and self._is_ax_element(window) else {}
             )
-            frame = self._lenient_json(raw, "AXFrame", [])
+            read.append((self._lenient_json(raw, "AXTitle", []), self._lenient_json(raw, "AXFrame", [])))
+        listed = [
+            self._window_entry(value)
+            for value in self._server_windows(on_screen_only=False)
+            if int(value.get(AS.kCGWindowOwnerPID, -1)) == pid
+        ] if any(isinstance(frame, Mapping) for _, frame in read) else []
+        located: list[dict[str, JSONValue]] = []
+        for title, frame in read:
             ids = [
                 entry["window_id"]
                 for entry in listed
                 if isinstance(frame, Mapping)
                 and all(abs(frame[key] - entry["bounds"][key]) < 1 for key in entry["bounds"])
             ]
-            located.append({
-                "window_id": ids[0] if len(ids) == 1 else None,
-                "title": self._lenient_json(raw, "AXTitle", []),
-            })
+            located.append({"window_id": ids[0] if len(ids) == 1 else None, "title": title})
         return located
 
     def _remember_element(self, element: Any) -> int:
@@ -3864,6 +3866,8 @@ class MacOS:
                     + ". Scroll to or reveal it, or change the role"
                 )
         if sought:
+            import difflib
+
             labels: dict[str, str] = {}
             for key, attributes in (
                 ("AXAnyTypeSearchKey", ("AXRole", "AXTitle", "AXDescription")),
@@ -4326,12 +4330,9 @@ class MacOS:
         every app's windows on screen now, front to back.
 
         Only a normal window of at least 40pt counts, the kind `see` and
-        pointer input pick by themselves, and of an app's windows off
-        screen only the titled ones, minimized or on another Space: an
-        untitled one off screen is a helper surface the app never shows.
-        ``all_layers`` adds menus, panels, the menu bar's items, and every
-        other surface, any size, which `see` and pointer input reach
-        through ``window_id``.
+        pointer input pick by themselves; ``all_layers`` adds menus,
+        panels, the menu bar's items, and every other surface, any size,
+        which `see` and pointer input reach through ``window_id``.
         """
         if app is None:
             return [
@@ -4349,7 +4350,6 @@ class MacOS:
                 int(value.get(AS.kCGWindowOwnerPID, -1)) == pid
                 if all_layers
                 else self._is_content_window(pid, value)
-                and (value.get(AS.kCGWindowIsOnscreen) or value.get(AS.kCGWindowName))
             )
         ]
         return sorted(
@@ -4372,8 +4372,9 @@ class MacOS:
         """Return ``windows(app)`` once it holds a window, polling until
         ``timeout``: one whose title holds ``title``, case ignored, when
         given, and any surface with ``all_layers``, as a SecurityAgent
-        prompt needs. An app not running yet has the same ``timeout`` to
-        start.
+        prompt needs. An untitled window off screen, a helper surface the
+        app never shows, does not end the wait. An app not running yet has
+        the same ``timeout`` to start.
 
         ``open -a`` returns before the app draws anything: TextEdit's first
         window appeared 335ms after launch and Notes' 792ms, so a capture
@@ -4424,7 +4425,7 @@ class MacOS:
                 window for window in listed
                 if title.casefold() in str(window.get("title") or "").casefold()
             ]
-            if windows:
+            if any(window.get("on_screen") or window.get("title") for window in windows):
                 return windows
             remaining = deadline - self._now()
             if remaining <= 0:

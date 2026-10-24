@@ -1492,9 +1492,11 @@ def test_ax_match_twins_in_two_windows_name_the_windows_and_take_a_window_id(mon
         "_copy_attribute",
         lambda element, attribute, **kwargs: owner.get(element) if attribute == "AXWindow" else children.get(element, []),
     )
-    monkeypatch.setattr(mac, "windows", lambda app, all_layers=False: [
-        {"window_id": 8652, "bounds": {"x": 100.0, "y": 100.0, "width": 600.0, "height": 400.0}},
-        {"window_id": 8875, "bounds": {"x": 300.0, "y": 200.0, "width": 600.0, "height": 400.0}},
+    monkeypatch.setattr(mac, "_server_windows", lambda *, on_screen_only: [
+        {"kCGWindowNumber": 8652, "kCGWindowOwnerPID": 42,
+         "kCGWindowBounds": {"X": 100, "Y": 100, "Width": 600, "Height": 400}},
+        {"kCGWindowNumber": 8875, "kCGWindowOwnerPID": 42,
+         "kCGWindowBounds": {"X": 300, "Y": 200, "Width": 600, "Height": 400}},
     ])
     match = {"pid": 42, "role": "AXButton", "title": "Cancel"}
 
@@ -3096,28 +3098,18 @@ def test_wait_for_window_with_a_title_waits_past_the_apps_other_windows(monkeypa
     assert mac.wait_for_window("Sona", title="settings", timeout=5.0) == [settings]
 
 
-def test_windows_leaves_out_an_untitled_window_off_screen(monkeypatch) -> None:
-    """An app's untitled off-screen window is a helper surface it never
-    shows, as Xcode's 500x500 one is; a titled one off screen, minimized
-    or on another Space, is still the app's window."""
+def test_wait_for_window_is_not_ended_by_an_untitled_window_off_screen(monkeypatch) -> None:
+    """Xcode keeps an untitled 500x500 helper window off screen from its
+    first moment; the wait still waits for the window the app shows."""
     mac = MacOS()
+    helper = {"window_id": 2, "title": "", "on_screen": False}
+    project = {"window_id": 1, "title": "Project", "on_screen": True}
+    looks = iter([[helper], [project, helper]])
     monkeypatch.setattr(mac, "_resolve_app", lambda app: (object(), {"name": "Xcode", "pid": 42}))
+    monkeypatch.setattr(mac, "windows", lambda app: next(looks))
+    _clocked(monkeypatch, mac)
 
-    def window(window_id: int, title: str, on_screen: bool) -> dict[str, object]:
-        return {
-            "kCGWindowOwnerPID": 42,
-            "kCGWindowNumber": window_id,
-            "kCGWindowName": title,
-            "kCGWindowBounds": {"X": 0, "Y": 617, "Width": 500, "Height": 500},
-            "kCGWindowIsOnscreen": on_screen,
-            "kCGWindowLayer": 0,
-        }
-
-    listed = [window(1, "Project", True), window(2, "", False), window(3, "Minimized", False)]
-    monkeypatch.setattr(macos_module.AS, "CGWindowListCopyWindowInfo", lambda options, relative: listed)
-
-    assert [entry["window_id"] for entry in mac.windows("Xcode")] == [1, 3]
-    assert sorted(entry["window_id"] for entry in mac.windows("Xcode", all_layers=True)) == [1, 2, 3]
+    assert mac.wait_for_window("Xcode", timeout=5.0) == [project, helper]
 
 
 class _WindowlessApp(MacOS):
