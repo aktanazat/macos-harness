@@ -7,6 +7,30 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `mac.menus(app, "File")` lists a menu's items with their state, full
+  path and keyboard shortcut, without opening it; a `do.menu` path that
+  names a menu, not an item, points at it.
+- `mac.do.window("close" | "minimize" | "zoom", app=)` presses a window's
+  title bar button and waits until the window is gone, off screen or
+  resized. `mac.do.reveal(match, app=)` scrolls a match into view and
+  returns its frame. `mac.place` takes `window_id=`.
+- `macos-harness -c CODE` runs one line with the stdin namespace, served by
+  the shell's spare like stdin; `--json-errors` goes after any command;
+  `apps [NAME]` prints one JSON line per app and filters by name or bundle
+  ID; `state` reads 400 nodes by default and says where it stopped.
+  Programs get `present`, `gone` and `equals` preloaded.
+- A menu Quit item or `cmd+q` that makes the app exit is a verified
+  receipt, not `app.exited`. A printed receipt whose effect nothing
+  confirmed names the postcondition that would, and a click on a
+  background app names `mac.activate(app)` or `mac.do.press`.
+- `mac.script` stops a script after 15 seconds (`timeout=`) and names the
+  dialog or permission prompt it is likely waiting on. `see(after_change=True)`
+  waits 10 seconds by default, not 30, and adds a `note` when nothing
+  changed. `scroll` with no point aims at the app's frontmost window.
+- A menu bar app with no window, a `.app` name that is not running, and a
+  `fill` that cannot read its text back now say what to call or what was
+  read. `frontmost`, `activate` and `launch` flag the harness's own process
+  with `harness_owned`.
 - `MACOS_HARNESS_RECEIPT_LOG=1` appends each finished `mac.do` receipt as one
   JSON line to `~/Library/Logs/macos-harness/receipts.jsonl`, without values
   or typed text, rotating at 5 MiB. It is off by default.
