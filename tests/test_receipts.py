@@ -367,6 +367,20 @@ def test_receipt_changed_accepts_none_for_an_unconfirmed_effect() -> None:
             "press done acted=yes changed=yes verified=yes 0.12s replayed",
             id="replayed",
         ),
+        pytest.param(
+            {"changed": None, "verified": False},
+            "press done acted=yes changed=unknown verified=no 0.12s; "
+            "postcondition=present(...) or gone(...) confirms it",
+            id="unconfirmed-names-the-check",
+        ),
+        pytest.param(
+            {"op": "click", "changed": None, "verified": False,
+             "target": {"point": {"x": 1, "y": 2}, "window_id": 7, "background": True}},
+            "click done acted=yes changed=unknown verified=no 0.12s; "
+            "postcondition=present(...) or gone(...) confirms it; "
+            "a background app can drop a click: mac.activate(app) first, or mac.do.press",
+            id="background-click-names-the-cure",
+        ),
     ],
 )
 def test_printed_receipt_is_one_line_of_what_happened(overrides, line) -> None:
@@ -376,7 +390,7 @@ def test_printed_receipt_is_one_line_of_what_happened(overrides, line) -> None:
     receipt = _make_receipt(**overrides)
 
     assert str(receipt) == line
-    assert repr(receipt).startswith("Receipt(op='press', outcome=")
+    assert repr(receipt).startswith(f"Receipt(op='{receipt.op}', outcome=")
 
 
 def test_receipt_canonicalizes_request_target_observed_on_construction() -> None:
