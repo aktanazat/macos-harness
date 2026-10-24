@@ -5,9 +5,11 @@ description: "Read when a task has to drive a native or Electron macOS app: a wi
 
 # macOS Harness
 
-One CLI call per decision point, not per primitive. `mac`, `Path`, and
-`subprocess` are preloaded; `--json-errors` prints failures as JSON;
-`macos-harness run flow.py --arg pid=42` reruns a saved program with `args`.
+One CLI call per decision point; a step takes about a second, so run it
+synchronously. `mac`, `Path`, `subprocess`, `present` and `gone` are
+preloaded; `-c CODE` runs one line; `--json-errors` prints failures as
+JSON; `run flow.py --arg pid=42` reruns a saved program with `args`. After
+compaction, run `macos-harness skill signatures`.
 
 ```bash
 macos-harness <<'PY'
@@ -27,33 +29,29 @@ identity, an irreversible action, or unexpected state.
 - `mac.see(app)`: capture a window; clicks map through the latest or `screenshot=<png>`.
 - `mac.key("cmd+k", app=...)`: a key or combo.
 - `mac.type(text, app=...)`: typed text.
-- `mac.click(x, y, app=...)`: a raw click at screenshot coordinates; `element=match` clicks its center.
-- `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, or press a control (`role` is any AX role); a match outlives its run, an index does not.
+- `mac.click(x, y, app=...)`: a raw click at screenshot points, or `element=match`.
+- `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, or press a control; a match outlives its run, an index does not.
 - `mac.script(source)`: AppleScript for an exact, focus-safe command.
 
 `mac.windows(all_layers=True)` lists menus and panels for `window_id=`;
 `see(display=0)` or `see(region=(x, y, w, h))` replaces `screencapture`.
-`mac.place(app, x=, y=, width=)` moves a window; `display=0` brings it to
-the main one.
+`mac.place(app, x=, y=, width=)` moves a window.
 
-`mac.launch(app)` opens an app in the background and waits for a window.
+`mac.launch(app)` opens an app unfocused and waits for its window.
 Never `sleep`: `mac.wait_change(app)` returns once the window changed and
 settled; `see(app, after_change=True)` waits first.
 
 ## Receipts
 
 For a change, use
-`mac.do.press/set/fill/toggle/key/click/type/run/menu/status_item`. Each
-returns a `Receipt` or raises `OperationError` with `exc.receipt`.
-`postcondition=` proves the effect; `once=` guards an action you cannot
-repeat. Await the next control in the same program:
+`mac.do.press/set/fill/toggle/key/click/type/run/menu/status_item/window/reveal`;
+`mac.menus(app, "Edit")` lists a menu. Each returns a `Receipt` or raises
+`OperationError` with `exc.receipt`. `postcondition=` proves the effect;
+`once=` guards an action you cannot repeat. Await the next control in one
+program:
 
 ```python
-from macos_harness import OperationError
-try:
-    mac.do.menu("Product > Archive", app="Xcode")
-except OperationError as exc:
-    print(exc.receipt)
+mac.do.menu("Product > Archive", app="Xcode")
 mac.ax.wait("Distribute App", role="button", app="Xcode", timeout=600)
 ```
 

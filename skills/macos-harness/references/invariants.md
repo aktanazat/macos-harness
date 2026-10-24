@@ -10,14 +10,17 @@ only when needed and can be shown again explicitly after cleanup.
 
 App windows do not become caller-owned when the harness reads or changes
 them. Do not automatically close documents, existing windows, or human
-handoffs. A receipt does not prove window ownership or saved-state safety.
+handoffs; `mac.do.window("close", ...)` is for a window the task opened. A
+receipt does not prove window ownership or saved-state safety.
 Reopening a saved document does not restore unsaved edits. Retain only safe
 task context and observe the app again when resuming; never save credentials
 or unsent form values.
 
 Quit only an app the task launched. `mac.quit(app)` waits until it exits; an
 app still open at the timeout is usually showing a save prompt, which
-`force=True` would discard.
+`force=True` would discard. A `do.menu` Quit item or `do.key("cmd+q")` that
+makes the app exit is a verified receipt; an app exiting on any other input
+fails with `app.exited`.
 
 ## Choose the lowest useful mode
 
@@ -53,8 +56,9 @@ with repeated keys, clicks, deletion loops, or bulk input.
   About one changed word of text counts; a blinking caret does not.
   `region=(x, y, w, h)` in that `see`'s pixels watches a smaller change, and
   `by="ax"` the app's text. Nothing changing by `timeout` raises `timeout` with
-  `details["changed"]` False; `mac.see(app, after_change=True)` reports
-  `changed` instead and captures. When quick visible feedback, such as a
+  `details["changed"]` False; `mac.see(app, after_change=True)` waits 10
+  seconds by default, then reports `changed`, with `note` when it is false,
+  and captures. When quick visible feedback, such as a
   pressed button or a spinner, comes before a slower answer, pass a `settle=`
   longer than the gap, or wait on the answer's text with `by="ax"` or
   `mac.ax.wait`.
@@ -82,7 +86,12 @@ with repeated keys, clicks, deletion loops, or bulk input.
 - An inactive app takes scrolls, plain keys, and typed text, but AppKit drops a
   menu shortcut (`cmd+a`) sent to it and passes a first click only to a view
   that accepts first mouse; text views do not. The receipt then says
-  `changed=None`; `mac.activate(app)` first is the cure.
+  `changed=None`, and a printed `do.click` receipt on an app in the
+  background names the cure: `mac.activate(app)` first, or `mac.do.press`.
+- `mac.frontmost()`, and `activate`'s and `launch`'s `previous` or
+  `frontmost`, carry `harness_owned: true` when the app in front is the
+  harness itself, its pointer or the Python running the step, never an app
+  the user had in front.
 - Never launch a closed app or use a custom URL scheme when focus is forbidden.
 - `mac.ax.query_all/wait/press/wait_gone` never get past Touch ID, passkeys,
   CAPTCHA, account recovery, or other checks that need the user present; call

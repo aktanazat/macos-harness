@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import ClassVar, Self
 
 import pytest
 
@@ -262,7 +263,14 @@ def test_stdin_abbreviated_keyword_is_pointed_at_the_parameter_it_means(program,
         ),
         pytest.param(
             'mac.ax.windows("Finder")\n',
-            ["mac.windows(app=None, *, all_layers=False)", "mac.diff_windows(before, after)"],
+            [
+                "mac.windows(app=None, *, all_layers=False)",
+                (
+                    "mac.do.window(action, *, app, window_id=None, window_index=0, "
+                    "timeout=5.0, postcondition=None, once=None, dry_run=False)"
+                ),
+                "mac.diff_windows(before, after)",
+            ],
             id="other-namespace",
         ),
         pytest.param('mac.ax.route.list(app="Finder")\n', ["mac.route"], id="not-a-method"),
@@ -347,24 +355,107 @@ def test_run_refuses_a_bad_invocation_before_running(tmp_path: Path, program, ar
     assert result.stdout == ""
 
 
+_STOP = "from macos_harness import ErrorCode, MacOSError\nraise MacOSError('stop', code=ErrorCode.TIMEOUT)\n"
+
+
 @pytest.mark.parametrize(
-    "argv",
-    [["--json-errors", "run", "FLOW"], ["run", "FLOW", "--json-errors"]],
-    ids=["before-run", "after-the-file"],
+    ("argv", "code"),
+    [
+        (["--json-errors", "run", "FLOW"], "timeout"),
+        (["run", "FLOW", "--json-errors"], "timeout"),
+        (["-c", _STOP, "--json-errors"], "timeout"),
+        (["skill", "no-such-page", "--json-errors"], "bad_request"),
+    ],
+    ids=["before-run", "after-the-file", "after-c-code", "after-another-subcommand"],
 )
-def test_run_writes_json_errors_wherever_the_flag_goes(tmp_path: Path, argv) -> None:
+def test_json_errors_go_to_stderr_wherever_the_flag_goes(tmp_path: Path, argv, code) -> None:
+    """Agents put the flag after `see` and were told it was unrecognized."""
     flow = tmp_path / "flow.py"
-    flow.write_text(
-        "from macos_harness import ErrorCode, MacOSError\n"
-        "raise MacOSError('stop', code=ErrorCode.TIMEOUT)\n",
-        encoding="utf-8",
-    )
+    flow.write_text(_STOP, encoding="utf-8")
 
     result = _harness(*[str(flow) if part == "FLOW" else part for part in argv])
 
     assert result.returncode == 1
-    error = json.loads(result.stderr.splitlines()[-1])
-    assert (error["code"], error["message"]) == ("timeout", "stop")
+    assert json.loads(result.stderr.splitlines()[-1])["code"] == code
+
+
+def test_c_runs_one_line_with_the_stdin_namespace() -> None:
+    """`-c` was "invalid choice", so agents wrapped one-liners in
+    subprocess calls that piped them to stdin."""
+    result = _harness("-c", "print(args, Path.__name__, present.__name__)")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "{} Path present\n"
+
+
+def test_c_with_a_subcommand_is_refused_before_running() -> None:
+    result = _harness("-c", "print('ran')", "skill")
+
+    assert result.returncode == 2
+    assert "drop -c or skill" in result.stderr
+    assert result.stdout == ""
+
+
+class _FakeMac:
+    """`MacOS` as the `apps` and `state` commands use it."""
+
+    asked: ClassVar[dict[str, object]] = {}
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def list_apps(self) -> list[dict[str, object]]:
+        return [
+            {"name": "Finder", "bundle_id": "com.apple.finder", "pid": 501, "path": "/System/Finder.app"},
+            {"name": "Safari", "bundle_id": "com.apple.Safari", "pid": 502, "path": "/Applications/Safari.app"},
+            {"name": "node", "bundle_id": None, "pid": 503, "path": None},
+        ]
+
+    def get_app_state(self, app: object, **budget: object) -> dict[str, object]:
+        _FakeMac.asked = {"app": app, **budget}
+        return {"nodes": [], "coverage": {"complete": False, "node_cut": True}}
+
+
+@pytest.fixture
+def fake_mac(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DO_NOT_TRACK", "1")
+    monkeypatch.setattr("macos_harness.macos.MacOS", _FakeMac)
+
+
+@pytest.mark.parametrize(
+    ("argv", "pids"),
+    [(["apps", "SAFARI"], [502]), (["apps", "com.apple"], [501, 502]), (["apps"], [501, 502, 503])],
+    ids=["name-any-case", "bundle-id", "all"],
+)
+def test_apps_prints_one_line_per_app_whose_name_or_bundle_id_matches(
+    fake_mac, capsys: pytest.CaptureFixture[str], argv, pids
+) -> None:
+    """Each `apps` call printed every app indented, 28K characters."""
+    assert cli.main(argv) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    assert [json.loads(line)["pid"] for line in lines] == pids
+
+
+def test_apps_with_no_match_says_so(fake_mac, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["apps", "Xcode"]) == 1
+
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "contains 'Xcode'" in err
+
+
+def test_state_reads_a_small_tree_and_says_where_it_stopped(
+    fake_mac, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`state` printed 48,550 characters by default; agents chose 100-420 nodes."""
+    assert cli.main(["state", "Finder"]) == 0
+
+    assert _FakeMac.asked["max_nodes"] == 400
+    assert "--max-nodes 400" in capsys.readouterr().err
 
 
 def test_run_traceback_names_the_saved_file_and_line(tmp_path: Path) -> None:

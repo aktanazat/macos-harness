@@ -263,6 +263,13 @@ def test_a_saved_program_is_served_with_its_arguments(shell: _Shell, tmp_path: P
     assert step.returncode == 0
 
 
+def test_a_one_line_program_is_served(shell: _Shell) -> None:
+    step, out, _err = shell.served(None, _cli("-c", "import os\nprint(os.getpid())"))
+
+    assert int(out) != step.pid
+    assert step.returncode == 0
+
+
 def test_a_served_step_keeps_the_order_of_output_and_errors_sent_to_one_place(
     shell: _Shell,
 ) -> None:

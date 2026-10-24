@@ -263,17 +263,20 @@ def _channel() -> tuple[int, int] | None:
 
 def _shape(args: list[str]) -> str | None:
     """How a spare can take this invocation: ``stdin`` for a program on
-    stdin, ``run`` for a saved one with nothing on stdin, else None. A
-    terminal keeps its own process, whose output it sees line by line."""
+    stdin, ``run`` for a saved one or ``-c`` for one in the arguments with
+    nothing on stdin, else None. A terminal keeps its own process, whose
+    output it sees line by line."""
     command = next((i for i, arg in enumerate(args) if not arg.startswith("-")), len(args))
-    if any(arg != "--json-errors" for arg in args[:command]):
+    if any(arg not in ("--json-errors", "-c") for arg in args[:command]):
         return None
     try:
         if os.isatty(1) or os.isatty(2):
             return None
         if command == len(args):
             return None if os.isatty(0) else "stdin"
-        if args[command] == "run" and os.path.samestat(os.fstat(0), os.stat(os.devnull)):
+        if (args[command] == "run" or "-c" in args[:command]) and os.path.samestat(
+            os.fstat(0), os.stat(os.devnull)
+        ):
             return "run"
     except OSError:
         return None

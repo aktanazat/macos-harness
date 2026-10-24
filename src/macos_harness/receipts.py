@@ -806,6 +806,8 @@ class Receipt:
         """One line for ``print(receipt)``: the verb, its outcome, whether
         it acted, changed, and verified, its seconds, and a failure's code,
         such as ``press done acted=yes changed=yes verified=yes 0.31s``.
+        An effect nothing confirmed ends with the postcondition that
+        would, and a click on a background app with its usual cure.
         ``repr`` and `to_json` keep the whole record."""
         line = (
             f"{self.op} {self.outcome.value} acted={self.acted.value} "
@@ -816,6 +818,10 @@ class Receipt:
             line += " replayed"
         if self.error is not None:
             line += f" error={self.error['code']}"
+        elif self.outcome is Outcome.DONE and self.changed is None and not self.verified:
+            line += "; postcondition=present(...) or gone(...) confirms it"
+            if isinstance(self.target, Mapping) and self.target.get("background"):
+                line += "; a background app can drop a click: mac.activate(app) first, or mac.do.press"
         return line
 
     def to_json(self) -> dict[str, JSONValue]:

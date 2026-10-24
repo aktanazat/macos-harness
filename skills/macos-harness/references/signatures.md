@@ -20,15 +20,20 @@ Without a program, `macos-harness see APP_OR_PID --path out.png --window-index 0
 captures one window and prints the same result as `mac.see`;
 `macos-harness see --window-id N` captures any window.
 
-`macos-harness run FILE.py [--arg NAME=VALUE ...] [--json-errors]` runs a
-saved program the way stdin runs one, with each `--arg` as a string in the
-`args` dict: `pid = int(args["pid"])`. A malformed `--arg`, a name given
-twice, or an unreadable or empty file exits 2 before anything runs.
+`macos-harness run FILE.py [--arg NAME=VALUE ...]` runs a saved program the
+way stdin runs one, with each `--arg` as a string in the `args` dict:
+`pid = int(args["pid"])`. A malformed `--arg`, a name given twice, or an
+unreadable or empty file exits 2 before anything runs.
+`macos-harness -c 'print(mac.windows())'` runs one line the same way.
+`--json-errors` goes before or after any command. `macos-harness apps
+[NAME]` prints one JSON line per running app, only those whose name or
+bundle ID contains NAME in any case. `macos-harness state APP` reads 400
+nodes unless `--max-nodes` says more, and says on stderr where it stopped.
 
 ## Primitives
 
 ```text
-mac.see(app=None, *, window_index=0, window_id=None, display=None, region=None, path=None, max_width=1280, max_height=1280, show_pointer=False, after_change=False, timeout=30.0, settle=0.15)
+mac.see(app=None, *, window_index=0, window_id=None, display=None, region=None, path=None, max_width=1280, max_height=1280, show_pointer=False, after_change=False, timeout=10.0, settle=0.15)
 mac.wait_change(app=None, *, window_index=0, window_id=None, region=None, by="pixels", timeout=30.0, settle=0.15)
 mac.key(key, *, app=None)
 mac.type(text, *, app=None)
@@ -36,7 +41,7 @@ mac.click(x=None, y=None, *, element=None, app=None, window_id=None, screenshot=
 mac.scroll(delta_y, delta_x=0, *, app=None, window_id=None, screenshot=None, unit="pixel", x=None, y=None, coordinate_space="screenshot")
 mac.drag(from_x, from_y, to_x, to_y, *, app=None, window_id=None, screenshot=None, button="left", coordinate_space="screenshot", duration=0.25, steps=12)
 mac.move(x, y, *, app=None, screenshot=None, coordinate_space="screenshot", duration=0.16)
-mac.script(source, *, language="AppleScript")
+mac.script(source, *, language="AppleScript", timeout=15.0)
 mac.activate(app=None, *, timeout=0.5)
 mac.launch(app, *, timeout=15.0, window=True)
 mac.quit(app, *, timeout=10.0, force=False)
@@ -44,7 +49,8 @@ mac.relaunch(app, *, timeout=15.0, window=True)
 mac.frontmost()
 mac.windows(app=None, *, all_layers=False)
 mac.wait_for_window(app=None, *, title=None, timeout=2.0, all_layers=False)
-mac.place(app=None, *, window_index=0, x=None, y=None, width=None, height=None, display=None)
+mac.place(app=None, *, window_index=0, window_id=None, x=None, y=None, width=None, height=None, display=None)
+mac.menus(app, path=None)
 mac.list_apps()
 mac.show_pointer()
 mac.hide_pointer()
@@ -67,6 +73,11 @@ Pointer input picks only a normal window under the point unless
 `window_id=N` names the surface, so a click meant for a panel never lands
 in the window behind it.
 
+`mac.menus(app, "File")` lists the items of the menu a path names, `"File >
+Export"` for a submenu, or with no path the menus in the menu bar: each has
+`title`, `enabled`, `checked`, its full `path` for `do.menu`, and a
+`shortcut` such as `"shift+cmd+s"` when it has one, for `do.key`.
+
 `see(display=0)` (0 is the main display) or `see(region=(x, y, w, h))` in
 screen points captures the screen as it shows, every window composited.
 The result has no `app` or `pid`, and its pixels map a later
@@ -74,13 +85,14 @@ The result has no `app` or `pid`, and its pixels map a later
 there.
 
 `place(app, x=, y=, width=, height=)` moves or resizes window
-`window_index` through Accessibility, without bringing it forward, and
-returns the `frame` the window reports afterwards; an app's own limits can
-make it differ from `requested`. `x` and `y` count from the top-left of
-`display` (0 is the main one). With `display` and no `x` or `y`, a window
-that does not fit on that display, such as one at negative coordinates on
-another, is centered there. A minimized window, or one its app will not
-move or resize, raises `unsupported_op` and nothing changes.
+`window_index`, or the one `window_id=` names, through Accessibility,
+without bringing it forward, and returns the `frame` the window reports
+afterwards; an app's own limits can make it differ from `requested`. `x`
+and `y` count from the top-left of `display` (0 is the main one). With
+`display` and no `x` or `y`, a window that does not fit on that display,
+such as one at negative coordinates on another, is centered there. A
+minimized window, or one its app will not move or resize, raises
+`unsupported_op` and nothing changes.
 
 ## Across runs
 
@@ -137,6 +149,8 @@ mac.do.type(text, *, app, timeout=5.0, postcondition=None, once=None, dry_run=Fa
 mac.do.click(x=None, y=None, *, element=None, app, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.menu(path, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.status_item(path=None, *, app, name=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.window(action, *, app, window_id=None, window_index=0, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.reveal(element, *, app, timeout=5.0, once=None, dry_run=False)
 mac.do.run(source, *, language="AppleScript", args=(), timeout=5.0, postcondition=None, once=None, dry_run=False, capture_output=False)
 mac.do.expect(condition)
 mac.do.expect_any(outcomes, *, timeout=5.0, interval=0.1)
@@ -146,8 +160,17 @@ mac.timeline()
 ```
 
 Conditions come from `macos_harness.receipts`: `present(...)`, `gone(...)`,
-and `equals(..., value=, attribute="AXValue")`. They take the same selectors
-as `mac.ax.wait` plus their own `timeout` and `interval`.
+and `equals(..., value=, attribute="AXValue")`, all three preloaded in a
+program. They take the same selectors as `mac.ax.wait` plus their
+own `timeout` and `interval`. A receipt that acted with nothing confirming
+its effect prints which postcondition would.
+
+`do.window("close" | "minimize" | "zoom", app=)` presses that title bar
+button of window `window_index` or `window_id`, then waits until the window
+is gone, off screen, or resized; a window still there, as one asking to
+save is, leaves the receipt unverified. `do.reveal(match, app=)` scrolls a
+search match into view and puts its `frame` in `observed["input"]`, ready
+for `click(element=match)`.
 
 ## Routes and diagnostics
 
@@ -172,7 +195,7 @@ cap, and the result's `capped` says what was asked and used.
 
 `mac.scroll` moves pixels unless `unit="line"`; a negative `delta_y` scrolls
 down. With no `x`/`y` it scrolls the center of the window in the app's last
-screenshot:
+screenshot, else of the app's frontmost window:
 
 ```python
 mac.see("Finder")

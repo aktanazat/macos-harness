@@ -88,9 +88,10 @@ PY
   condition needs an explicit app scope. One cooperative deadline covers all
   checks; an AX read already in progress can overrun it. Timeout receipts keep
   each outcome's latest state and reason. No input or activation is sent.
-- Run stdin programs with `macos-harness --json-errors` for uncaught harness
-  errors as JSON on stderr. Operation failures include their receipt. The
-  nonzero exit status and the default text error format are unchanged.
+- Run programs with `macos-harness --json-errors` (before or after any
+  command, `-c CODE` included) for uncaught harness errors as JSON on
+  stderr. Operation failures include their receipt. The nonzero exit status
+  and the default text error format are unchanged.
 - Every call returns an immutable, JSON-safe `Receipt` on success, or
   raises `OperationError` on failure — `exc.receipt` is the exact same
   `Receipt` a success would have had, so you never have to choose between
@@ -326,8 +327,10 @@ App-bound receipts retain process evidence from completion. Replays keep the
 original evidence.
 
 If input returned successfully but its effect was not verified, an observed exit
-fails with `app.exited`. An exit that satisfies a verified postcondition can
-succeed. An existing action error and its `acted` classification stay intact.
+fails with `app.exited`, unless the input was the app's own Quit menu item or
+`cmd+q`, which makes the exit the verified effect. An exit that satisfies a
+verified postcondition can succeed. An existing action error and its `acted`
+classification stay intact.
 Missing process metadata does not turn a successful action into a failure.
 
 For a failed app-scoped operation, retain `OperationError.receipt` and inspect it:

@@ -48,7 +48,7 @@ from .errors import (
     MacOSError,
 )
 from .handoff import HandoffReason, HumanHandoff
-from .ops import _Deadline, _utc_timestamp
+from .ops import _Deadline, _menu_steps, _utc_timestamp
 from .overlay import LivePointerOverlay
 from .receipts import (
     JSONValue,
@@ -77,11 +77,15 @@ try:
         NSWorkspace,
         NSWorkspaceOpenConfiguration,
     )
+    from AppKit import (
+        NSApplicationActivationPolicyAccessory as _ACCESSORY_POLICY,
+    )
 except ImportError as exc:  # pragma: no cover - exercised on non-macOS hosts
     AS = None  # type: ignore[assignment]
     objc = None  # type: ignore[assignment]
     NSURL = None  # type: ignore[assignment]
     NSApplicationActivateIgnoringOtherApps = 0
+    _ACCESSORY_POLICY = 1
     NSRunningApplication = None  # type: ignore[assignment]
     NSWorkspace = None  # type: ignore[assignment]
     NSWorkspaceOpenConfiguration = None  # type: ignore[assignment]
@@ -470,6 +474,41 @@ def _menu_label(text: str) -> str:
     """``text`` as a menu path step compares it: case and runs of spaces
     ignored, and "..." read as the "…" menus use."""
     return " ".join(text.replace("...", "…").split()).casefold()
+
+
+# The title bar button `mac.do.window` presses for each action.
+_WINDOW_BUTTONS = {"close": "AXCloseButton", "minimize": "AXMinimizeButton", "zoom": "AXZoomButton"}
+# How many scrolls `mac.do.reveal` posts toward an element at most; each
+# aims the element's center at its scroll area's.
+_REVEAL_SCROLLS = 6
+
+# What `MacOS.menus` reads of each item, in one batch.
+_MENU_LISTING_ATTRIBUTES = (
+    "AXTitle", "AXDescription", "AXEnabled", "AXMenuItemMarkChar",
+    "AXMenuItemCmdChar", "AXMenuItemCmdModifiers", "AXChildren",
+)
+# AXMenuItemCmdModifiers' bits, as `key` names them; Command is held
+# unless the 8 bit says it is not.
+_MENU_MODIFIER_BITS = ((4, "ctrl"), (2, "alt"), (1, "shift"))
+
+
+def _menu_shortcut(character: object, modifiers: object) -> str | None:
+    """A menu item's keyboard shortcut in `MacOS.key`'s syntax, such as
+    ``"cmd+shift+n"``; None for an item without one, or one on a key
+    with no character to name it by."""
+    if not isinstance(character, str) or len(character) != 1:
+        return None
+    if character.isspace() or not character.isprintable():
+        return None
+    bits = modifiers if isinstance(modifiers, int) else 0
+    names = [name for bit, name in _MENU_MODIFIER_BITS if bits & bit]
+    if not bits & 8:
+        names.append("cmd")
+    return "+".join((*names, character.casefold()))
+
+
+# The app an AppleScript addresses, by name or bundle ID.
+_SCRIPT_TARGET = re.compile(r'\btell application (?:id )?"([^"]+)"', re.IGNORECASE)
 
 
 def _menu_miss(
@@ -869,13 +908,19 @@ def _unanswered_search() -> SearchMatches:
 
 
 def _no_window_error(
-    info: Mapping[str, object], *, timeout: float | None = None, surfaces: Sequence[int] = ()
+    info: Mapping[str, object],
+    *,
+    timeout: float | None = None,
+    surfaces: Sequence[int] = (),
+    menu_bar: bool = False,
 ) -> MacOSError:
     """A running app with no window to capture, and the call that opens
     one. An app such as Secretive keeps running with no window until its
     Dock icon is clicked; AppleScript's ``reopen`` is that click, and
     TextEdit answered it without coming forward. An app that shows only
-    a panel or prompt off the normal layer names those by window id."""
+    a panel or prompt off the normal layer names those by window id. A
+    ``menu_bar`` app (accessory, no Dock icon) opens from its status
+    item instead."""
     target = (
         f'id "{info["bundle_id"]}"' if info.get("bundle_id") else f'"{info["name"]}"'
     )
@@ -893,6 +938,14 @@ def _no_window_error(
         if timeout is None
         else f"showed no window within {timeout:g}s"
     )
+    if menu_bar:
+        return MacOSError(
+            f"{info['name']} is a menu bar app and {state}; "
+            f"mac.do.status_item(app={info['pid']}) opens its menu in the menu bar, "
+            "and mac.launch(..., window=False) starts one without waiting for a window",
+            code=ErrorCode.ELEMENT_UNKNOWN if timeout is None else ErrorCode.TIMEOUT,
+            details={"app": info, "menu_bar": True, "timeout": timeout},
+        )
     return MacOSError(
         f"{info['name']} is running but {state}; "
         f"mac.script('tell application {target} to reopen') asks it to open "
@@ -1798,8 +1851,12 @@ class MacOS:
                     )
                 ]
         if not matches:
+            hint = (
+                f"; mac.launch({query!r}) starts it and waits for its window"
+                if needle.rstrip("/").endswith(".app") else ""
+            )
             raise ApplicationNotFoundError(
-                f"No running application matches {query!r}",
+                f"No running application matches {query!r}{hint}",
                 details={"query": query},
             )
         ready = [match for match in matches if match[1]["pid"] != -1]
@@ -4227,8 +4284,25 @@ class MacOS:
         description (`_menu_label`), among the items under the step
         before; a ``None`` step takes the only item there.
         """
+        node, _ = self._menu_node(pid, steps, bar=bar)
+        return self._describe_element(
+            node,
+            self._remember_element(node),
+            attributes=(
+                "AXTitle", "AXDescription", "AXEnabled",
+                "AXMenuItemCmdChar", "AXMenuItemCmdModifiers",
+            ),
+            include_actions=False,
+        )
+
+    def _menu_node(
+        self, pid: int, steps: Sequence[str | None], *, bar: str
+    ) -> tuple[object, list[str]]:
+        """The element `_menu_item` describes, no steps being ``bar``
+        itself, with the title or description of each item on the way."""
         root = self._application_element(pid, enhance=False)
         node = self._copy_attributes(root, (bar,), checked=True).get(bar)
+        names: list[str] = []
         for depth, step in enumerate(steps):
             entries = self._menu_entries(node)
             found = entries if step is None else [
@@ -4241,12 +4315,42 @@ class MacOS:
                     details={"pid": pid, "step": depth, "found": len(found)},
                 )
             node = found[0]
-        return self._describe_element(
-            node,
-            self._remember_element(node),
-            attributes=("AXTitle", "AXDescription", "AXEnabled"),
-            include_actions=False,
-        )
+            labels = self._copy_attributes(node, ("AXTitle", "AXDescription"))
+            names.append(str(labels["AXTitle"] or labels["AXDescription"] or ""))
+        return node, names
+
+    def menus(self, app: str | int, path: str | None = None) -> list[dict[str, JSONValue]]:
+        """The items of ``app``'s menu that ``path`` names, as in ``"Edit"``
+        or ``"File > Export"``; with no ``path``, the menus in its menu bar.
+
+        Each item has its ``title``, ``enabled``, ``checked`` (a check mark
+        beside it), ``shortcut`` in `key`'s syntax when it has one,
+        ``submenu`` when it opens one, and the ``path`` `do.menu` presses.
+        Separators are left out. Nothing opens, and nothing is pressed.
+        """
+        self._ensure_accessibility()
+        _, info = self._resolve_app(app)
+        steps = [] if path is None else _menu_steps(path, least=1)
+        node, names = self._menu_node(int(info["pid"]), steps, bar="AXMenuBar")
+        items: list[dict[str, JSONValue]] = []
+        for entry in self._menu_entries(node):
+            values = self._copy_attributes(entry, _MENU_LISTING_ATTRIBUTES)
+            title = values["AXTitle"] or values["AXDescription"]
+            if not isinstance(title, str) or not title:
+                continue
+            item: dict[str, JSONValue] = {
+                "title": title,
+                "enabled": values["AXEnabled"] is not False,
+                "checked": bool(values["AXMenuItemMarkChar"]),
+                "path": " > ".join((*names, title)),
+            }
+            shortcut = _menu_shortcut(values["AXMenuItemCmdChar"], values["AXMenuItemCmdModifiers"])
+            if shortcut is not None:
+                item["shortcut"] = shortcut
+            if values["AXChildren"]:
+                item["submenu"] = True
+            items.append(item)
+        return items
 
     def _menu_labels(self, item: object) -> set[str]:
         """``item``'s title and description as `_menu_label` compares them."""
@@ -4467,15 +4571,16 @@ class MacOS:
         app: str | int | None = None,
         *,
         window_index: int = 0,
+        window_id: int | None = None,
         x: float | None = None,
         y: float | None = None,
         width: float | None = None,
         height: float | None = None,
         display: int | None = None,
     ) -> dict[str, JSONValue]:
-        """Move or resize window ``window_index`` of ``app`` through
-        Accessibility, without bringing it forward, and return the frame
-        the window reports afterwards.
+        """Move or resize window ``window_index`` of ``app``, or the window
+        ``window_id`` names, through Accessibility, without bringing it
+        forward, and return the frame the window reports afterwards.
 
         ``x`` and ``y`` are screen points from the top-left of ``display``
         (0 is the main one), or of the main display when none is given.
@@ -4493,11 +4598,11 @@ class MacOS:
         self._ensure_accessibility()
         _, info = self._resolve_app(app)
         self._last_app = info
-        target = self._indexed_window(self.windows(int(info["pid"])), window_index)
+        target = self._app_window(info, window_id, window_index)
         window, before, minimized = self._ax_window(info, target, window_index)
         if minimized:
             raise MacOSError(
-                f"{info['name']}'s window {window_index} is minimized; restore it "
+                f"{info['name']}'s window {target['window_id']} is minimized; restore it "
                 "before placing it",
                 code=ErrorCode.UNSUPPORTED_OP,
                 details={"window_index": window_index, "window_id": target["window_id"]},
@@ -4556,8 +4661,8 @@ class MacOS:
             if frame is not None and all(abs(frame[key] - bounds[key]) < 1 for key in bounds):
                 return window, frame, minimized
         raise MacOSError(
-            f"{info['name']} shows no Accessibility window where window {window_index} "
-            "is; a window on another Space cannot be placed",
+            f"{info['name']} shows no Accessibility window where window "
+            f"{target['window_id']} is; a window on another Space cannot be reached",
             code=ErrorCode.UNSUPPORTED_OP,
             details={"window_index": window_index, "window_id": target["window_id"]},
         )
@@ -4601,6 +4706,118 @@ class MacOS:
             if error != _AX_SUCCESS:
                 raise _ax_error(f"Set the window's {attribute}", error, attribute=attribute)
 
+    def _app_window(
+        self, info: dict[str, JSONValue], window_id: int | None, window_index: int
+    ) -> dict[str, JSONValue]:
+        """`windows`' entry for the window ``window_id`` names, which
+        ``info``'s app must own, else for its window ``window_index``."""
+        if window_id is None:
+            return self._indexed_window(self.windows(int(info["pid"])), window_index)
+        target = self._described_window(window_id)
+        self._require_owner(target, int(info["pid"]), str(info["name"]))
+        return target
+
+    def _window_button(
+        self, pid: int, action: str, *, window_id: int | None, window_index: int
+    ) -> tuple[int, dict[str, JSONValue]]:
+        """The element index of the title bar button that does ``action``
+        -- close, minimize, or zoom -- to ``pid``'s window ``window_id``,
+        else its window ``window_index``, with that window's `windows`
+        entry. A window without that button, or with it disabled, refuses."""
+        attribute = _WINDOW_BUTTONS.get(action)
+        if attribute is None:
+            raise MacOSError(
+                f"Window action must be one of {', '.join(_WINDOW_BUTTONS)}, not {action!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "action", "value": action},
+            )
+        _, info = self._resolve_app(pid)
+        target = self._app_window(info, window_id, window_index)
+        window, _, minimized = self._ax_window(info, target, window_index)
+        button = self._copy_attribute(window, attribute)
+        if button is None or self._copy_attribute(button, "AXEnabled") is False or (
+            minimized and action != "close"
+        ):
+            raise MacOSError(
+                f"{info['name']}'s window {target['window_id']} has no {action} button "
+                "to press" + (" while it is minimized" if minimized else ""),
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"action": action, "window_id": target["window_id"]},
+            )
+        return self._remember_element(button), target
+
+    def _window_done(self, window: Mapping[str, JSONValue], action: str) -> bool:
+        """Whether ``window``, a `windows` entry from before its title bar
+        button was pressed, now shows ``action`` done: closed is gone or
+        off screen, minimized is off screen, zoomed has a new frame."""
+        value = self._window_description(int(window["window_id"]))
+        if value is None:
+            return action == "close"
+        now = self._window_entry(value)
+        if action == "zoom":
+            return now["bounds"] != window["bounds"]
+        return not now["on_screen"]
+
+    def _reveal_target(self, element: ElementRef, pid: int) -> tuple[int, int | None]:
+        """The element index of ``element``, which must be ``pid``'s own,
+        and of the scroll area that holds it, None when none does. An
+        element no scroll area holds, and that cannot scroll itself into
+        view, refuses."""
+        owner = self._element_pid(element)
+        if owner not in (None, pid):
+            raise MacOSError(
+                f"The element is in process {owner}, not {pid}; name its own app",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "element", "pid": owner, "target_pid": pid},
+            )
+        node = self._element(element)
+        area = self._copy_attribute(node, "AXParent")
+        while area is not None and self._copy_attribute(area, "AXRole") != "AXScrollArea":
+            area = self._copy_attribute(area, "AXParent")
+        if area is None and "AXScrollToVisible" not in self._actions(node):
+            raise MacOSError(
+                "No scroll area holds the element, and it cannot scroll itself "
+                "into view; it is already where its window shows it",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"parameter": "element"},
+            )
+        return self._remember_element(node), None if area is None else self._remember_element(area)
+
+    def _reveal(
+        self, node: int, area: int | None, pid: int, deadline: _Deadline
+    ) -> dict[str, JSONValue] | None:
+        """Scroll element ``node`` into view -- by its own
+        AXScrollToVisible when it has one, then by scrolling ``area``,
+        its scroll area, toward it until its center is inside -- and
+        return its frame once it is; None when it never got there."""
+        if "AXScrollToVisible" in self._actions(self._element(node)):
+            self.perform_action(node, "AXScrollToVisible")
+        view = area if area is not None else self._remember_element(
+            self._copy_attribute(self._element(node), "AXWindow")
+        )
+        frame = self.get(node, "AXFrame")
+        for _ in range(_REVEAL_SCROLLS):
+            bounds = self.get(view, "AXFrame")
+            center = (frame["x"] + frame["width"] / 2, frame["y"] + frame["height"] / 2)
+            middle = (bounds["x"] + bounds["width"] / 2, bounds["y"] + bounds["height"] / 2)
+            if (
+                bounds["x"] <= center[0] <= bounds["x"] + bounds["width"]
+                and bounds["y"] <= center[1] <= bounds["y"] + bounds["height"]
+            ):
+                return frame
+            if area is None or deadline.exhausted():
+                return None
+            self.scroll(
+                round(middle[1] - center[1]), round(middle[0] - center[0]),
+                app=pid, x=middle[0], y=middle[1], coordinate_space="screen",
+            )
+            self._pause(_CHANGE_SETTLE_SECONDS)
+            moved = self.get(node, "AXFrame")
+            if moved == frame:
+                return None
+            frame = moved
+        return None
+
     def capture_screenshot(
         self,
         app: str | None = None,
@@ -4631,7 +4848,7 @@ class MacOS:
         max_height: int = 1280,
         show_pointer: bool = False,
         after_change: bool = False,
-        timeout: float = 30.0,
+        timeout: float = 10.0,
         settle: float = _CHANGE_SETTLE_SECONDS,
     ) -> dict[str, Any]:
         """Capture a bounded window image; ``show_pointer`` draws the pointer onto it.
@@ -4644,7 +4861,8 @@ class MacOS:
         window's do. ``after_change`` first waits up to ``timeout``
         seconds for the window to change from where `wait_change` would
         measure and hold still ``settle`` seconds; the result's
-        ``changed`` says whether it did, and no change is no error here.
+        ``changed`` says whether it did, and no change is no error here:
+        the result then opens with a ``note``, "no change in 10s".
         The result's ``on_screen`` is the only freshness signal: an
         off-screen window (minimized, hidden, or on another Space) still
         renders, but from whatever the app last drew.
@@ -4676,8 +4894,11 @@ class MacOS:
             max_height=max_height,
             show_pointer=show_pointer,
         )
-        if change is not None:
-            screenshot["changed"] = change["changed"]
+        if change is None:
+            return screenshot
+        if not change["changed"]:
+            screenshot = {"note": f"no change in {timeout:g}s", **screenshot}
+        screenshot["changed"] = change["changed"]
         return screenshot
 
     @staticmethod
@@ -5591,14 +5812,23 @@ class MacOS:
         return {
             "app": info,
             "activated": activated,
-            "previous": previous,
-            "frontmost": frontmost,
+            "previous": self._mark_owned(previous),
+            "frontmost": self._mark_owned(frontmost),
             "elapsed_ms": round((time.monotonic() - started) * 1000),
         }
 
     def frontmost(self) -> dict[str, JSONValue] | None:
-        """The app in front now: its name, bundle ID, pid, and path."""
-        return self._frontmost_app()
+        """The app in front now: its name, bundle ID, pid, and path;
+        ``harness_owned`` when it is this process or its pointer helper."""
+        return self._mark_owned(self._frontmost_app())
+
+    def _mark_owned(self, app: dict[str, JSONValue] | None) -> dict[str, JSONValue] | None:
+        """``app`` flagged ``harness_owned`` when it is this process or
+        the pointer helper it started, so a focus report never passes the
+        harness's own Python off as an app the person brought forward."""
+        if app is not None and app.get("pid") in (os.getpid(), self._overlay.pid):
+            return {**app, "harness_owned": True}
+        return app
 
     def launch(
         self, app: str, *, timeout: float = 15.0, window: bool = True
@@ -5608,7 +5838,8 @@ class MacOS:
         ``app`` is a name, bundle ID, or ``.app`` path. A copy already
         running from that bundle is used, not started again.
         ``window=False`` returns once the process runs, for an app that
-        never shows a window. Only `activate` brings an app forward.
+        never shows a window; a menu bar app with none fails pointing at
+        `do.status_item`. Only `activate` brings an app forward.
         """
         started = self._now()
         deadline = started + max(0.0, timeout)
@@ -5631,16 +5862,26 @@ class MacOS:
             running = self._running_copy(url) or running
             info = self._app_info(running)
         windows: list[dict[str, JSONValue]] = []
-        if window and launched:
-            windows = self._wait_for_windows(info, timeout=timeout, deadline=deadline)
-        elif window:
-            windows = self._ready_windows(running, info, timeout=timeout, deadline=deadline)
+        try:
+            if window and launched:
+                windows = self._wait_for_windows(info, timeout=timeout, deadline=deadline)
+            elif window:
+                windows = self._ready_windows(running, info, timeout=timeout, deadline=deadline)
+        except MacOSError as exc:
+            timed_out = exc.code == ErrorCode.TIMEOUT.value
+            if not (timed_out or exc.code == ErrorCode.ELEMENT_UNKNOWN.value):
+                raise
+            if exc.details.get("window_ids") or running.activationPolicy() != _ACCESSORY_POLICY:
+                raise
+            raise _no_window_error(
+                info, timeout=timeout if timed_out else None, menu_bar=True
+            ) from None
         self._last_app = info
         return {
             "app": info,
             "launched": launched,
             "windows": windows,
-            "frontmost": self._frontmost_app(),
+            "frontmost": self._mark_owned(self._frontmost_app()),
             "elapsed_ms": round((self._now() - started) * 1000),
         }
 
@@ -6038,8 +6279,9 @@ class MacOS:
         coordinate_space: str = "screenshot",
     ) -> None:
         """Scroll ``app`` at ``x``/``y``; with no point, at the center of the
-        window ``window_id`` names or the last screenshot of ``app`` shows,
-        or the one ``screenshot`` names.
+        window ``window_id`` names, else of the window in ``app``'s last
+        screenshot or the one ``screenshot`` names, else of ``app``'s
+        frontmost window.
 
         A scroll event only lands in the window it is routed to, so the
         point decides which window scrolls; there is no app-wide scroll.
@@ -6072,16 +6314,30 @@ class MacOS:
             coordinate_space = "screen"
         elif x is None or y is None:
             shot = self._last_screenshot
-            if shot is None or shot["pid"] != pid:
-                raise MacOSError(
-                    "Scroll needs x/y, or a prior screenshot of this app to "
-                    "scroll at the center of",
-                    code=ErrorCode.BAD_REQUEST,
-                    details={"parameter": "x/y"},
+            if shot is not None and shot["pid"] == pid:
+                bounds = shot["bounds"]
+                x, y = bounds["width"] / 2, bounds["height"] / 2
+                coordinate_space = "window"
+            else:
+                front = next(
+                    (
+                        value.get(AS.kCGWindowBounds) or {}
+                        for value in self._server_windows(on_screen_only=True)
+                        if self._is_content_window(pid, value)
+                    ),
+                    None,
                 )
-            bounds = shot["bounds"]
-            x, y = bounds["width"] / 2, bounds["height"] / 2
-            coordinate_space = "window"
+                if front is None:
+                    raise MacOSError(
+                        f"Scroll needs a point, and process {pid} shows no window to "
+                        "scroll the center of: pass x/y, window_id= from "
+                        "mac.windows(all_layers=True), or screenshot= of an earlier see",
+                        code=ErrorCode.BAD_REQUEST,
+                        details={"parameter": "x/y", "pid": pid},
+                    )
+                x = float(front.get("X", 0)) + float(front.get("Width", 0)) / 2
+                y = float(front.get("Y", 0)) + float(front.get("Height", 0)) / 2
+                coordinate_space = "screen"
         point = self._screen_point(x, y, coordinate_space, pid=pid)
         window = self._target_window(pid, point, window_id)
         self._hold_before_input(pid, window.window_id)
@@ -6202,14 +6458,32 @@ class MacOS:
 
     # --- Apple Events escape hatch --------------------------------------
 
-    def script(self, source: str, *, language: str = "AppleScript") -> str:
-        result = subprocess.run(
-            ["/usr/bin/osascript", "-l", language, "-"],
-            input=source,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+    def script(
+        self, source: str, *, language: str = "AppleScript", timeout: float = 15.0
+    ) -> str:
+        """Run ``source`` with osascript and return what it printed; stop it
+        after ``timeout`` seconds, since a script that waits on an app's
+        dialog or a permission prompt never returns on its own."""
+        try:
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-l", language, "-"],
+                input=source,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            target = _SCRIPT_TARGET.search(source)
+            addressed = f"{target[1]} " if target else "the app it addresses "
+            raise MacOSError(
+                f"The script did not finish within {timeout:g}s and was stopped. "
+                f"{addressed}may be showing a dialog, or macOS may be asking "
+                "whether this terminal may control it: mac.windows(all_layers=True) "
+                "lists both. Pass a longer timeout= for a script that runs long",
+                code=ErrorCode.TIMEOUT,
+                details={"timeout": timeout, "language": language},
+            ) from None
         if result.returncode != 0:
             raise MacOSError(
                 (result.stderr or result.stdout).strip(),
