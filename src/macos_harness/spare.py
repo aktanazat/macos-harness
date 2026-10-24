@@ -768,7 +768,7 @@ def _rebuffered(old: TextIO, blksize: int) -> io.TextIOWrapper:
     raw = io.FileIO(old.fileno(), "w", closefd=False)
     raw.name = old.name
     stream = io.TextIOWrapper(
-        io.BufferedWriter(raw, blksize if blksize > 1 else io.DEFAULT_BUFFER_SIZE),
+        io.BufferedWriter(raw, _buffer_size(blksize)),
         encoding=old.encoding,
         errors=old.errors,
         newline="\n",
@@ -776,3 +776,10 @@ def _rebuffered(old: TextIO, blksize: int) -> io.TextIOWrapper:
     )
     stream.mode = "w"
     return stream
+
+
+def _buffer_size(blksize: int) -> int:
+    """The buffer size `open` picks for a file whose block size is ``blksize``."""
+    if sys.version_info >= (3, 14):
+        return max(min(blksize, 8192 * 1024), io.DEFAULT_BUFFER_SIZE)
+    return blksize if blksize > 1 else io.DEFAULT_BUFFER_SIZE
