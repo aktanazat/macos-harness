@@ -808,7 +808,7 @@ class SearchMatches(list[dict[str, JSONValue]]):
     disappearance waits require it before accepting an empty search.
     """
 
-    __slots__ = ("complete", "owner", "partial", "unanswered", "visited")
+    __slots__ = ("complete", "partial", "unanswered", "visited")
 
     def __init__(
         self,
@@ -824,9 +824,18 @@ class SearchMatches(list[dict[str, JSONValue]]):
         # name, and how many apps did not answer at all.
         self.partial: list[str] = []
         self.unanswered = 0
-        # The `MacOS` whose element indices the matches carry, once a
-        # search hands them out; another instance numbers its own.
-        self.owner: object | None = None
+
+
+class _OwnedMatch(dict[str, JSONValue]):
+    """One match as a search hands it out: a plain mapping that also
+    knows the `MacOS` whose element index it carries, since every
+    instance numbers its elements from zero."""
+
+    __slots__ = ("owner",)
+
+    def __init__(self, match: Mapping[str, JSONValue], owner: object) -> None:
+        super().__init__(match)
+        self.owner = owner
 
 
 # An element: an index this run's last search or snapshot handed out, or
@@ -842,7 +851,7 @@ def _with_pid(matches: SearchMatches, pid: int | None, owner: object) -> SearchM
     if pid is not None:
         for match in matches:
             match["pid"] = pid
-    matches.owner = owner
+    matches[:] = [_OwnedMatch(match, owner) for match in matches]
     return matches
 
 
@@ -2507,11 +2516,14 @@ class MacOS:
                     code=ErrorCode.BAD_REQUEST,
                     details={"parameter": "element_index", "found": len(element_index)},
                 )
-            index = element_index[0].get("element_index")
-            if element_index.owner is self and isinstance(index, int) and index in self._elements:
-                return self._elements[index]
             element_index = element_index[0]
         if isinstance(element_index, Mapping):
+            index = element_index.get("element_index")
+            if (
+                isinstance(element_index, _OwnedMatch) and element_index.owner is self
+                and isinstance(index, int) and index in self._elements
+            ):
+                return self._elements[index]
             return self._find_again(element_index)
         try:
             return self._elements[int(element_index)]
@@ -3496,7 +3508,6 @@ class MacOS:
         showing = self._onscreen_window_owners() if on_screen else frozenset()
         self._elements = {}
         matches = SearchMatches(complete=True, visited=0)
-        matches.owner = self
         first_error: MacOSError | None = None
         searched = False
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import subprocess
@@ -1387,20 +1388,44 @@ def test_ax_window_role_finds_the_apps_windows_that_its_search_never_returns(
     assert [window["title"] for window in found] == ["Settings"]
 
 
-def test_ax_search_result_from_another_instance_finds_its_element_again(monkeypatch) -> None:
-    """Each MacOS numbers its elements from zero, so a result handed to an
-    instance that did not search it is found again, never read as that
-    instance's own element at the same number."""
+@pytest.mark.parametrize(
+    "taken", [lambda found: found, lambda found: found[0]], ids=["result", "match-taken-out"]
+)
+def test_ax_search_result_from_another_instance_finds_its_element_again(monkeypatch, taken) -> None:
+    """Each MacOS numbers its elements from zero, so a result or a match
+    handed to an instance that did not search it is found again, never
+    read as that instance's own element at the same number."""
     searched = _settings_app(monkeypatch, app_search=True)
     menu = searched.ax.query("Theme", app="Demo", role="pop up button", include_actions=False)
     other = _settings_app(monkeypatch, app_search=True)
     other.ax.query("Theme", app="Demo", role="button", include_actions=False)
 
-    found_again = other.ax.raw(menu)
+    found_again = other.ax.raw(taken(menu))
 
     assert found_again is other.ax.raw(
         other.ax.query("Theme", app="Demo", role="pop up button", include_actions=False)
     )
+
+
+def test_ax_match_taken_out_of_a_result_is_its_own_element_in_the_same_instance(monkeypatch) -> None:
+    """System Settings' sidebar rows carry no label and shift between reads,
+    so searching again finds none of them; a match this instance handed
+    out still names its element, as its index does."""
+    mac = MacOS()
+    root, window, first, last = (object() for _ in range(4))
+    children = {root: [window], window: [first, last]}
+    data = {
+        root: {"AXRole": "AXApplication"},
+        window: {"AXRole": "AXWindow", "AXTitle": "System Settings"},
+        first: {"AXRole": "AXRow"},
+        last: {"AXRole": "AXRow"},
+    }
+    _bounded_tree(monkeypatch, mac, root, children, data)
+    _app_search(monkeypatch, children, data)
+    rows = mac.ax.query(app="Demo", role="AXRow", include_actions=False)
+
+    assert mac.ax.raw(rows[-1]) is last
+    assert json.loads(json.dumps(rows[-1])) == rows[-1]
 
 
 def test_ax_element_takes_a_one_match_search_result_and_names_matches0_otherwise(
