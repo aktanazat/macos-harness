@@ -117,8 +117,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 - One Accessibility value that reads as infinity or NaN no longer fails
   `get_app_state`; only that field is dropped and named under `non_finite`.
-- `mac.windows(app)` leaves out an untitled off-screen helper window, which
-  ended `launch` and `wait_for_window` before the app's real window was up.
+- An untitled off-screen helper window no longer ends `launch` and
+  `wait_for_window` before the app's real window is up.
 
 ### Changed
 

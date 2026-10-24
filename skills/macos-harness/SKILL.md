@@ -28,7 +28,7 @@ identity, an irreversible action, or unexpected state.
 - `mac.key("cmd+k", app=...)`: a key or combo.
 - `mac.type(text, app=...)`: typed text.
 - `mac.click(x, y, app=...)`: a raw click at screenshot coordinates; `element=match` clicks its center.
-- `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, or press a control (`role` is any AX role); a match outlives its run, an index does not.
+- `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, or press a control; a match outlives its run, an index does not.
 - `mac.script(source)`: AppleScript for an exact, focus-safe command.
 
 `mac.windows(all_layers=True)` lists menus and panels for `window_id=`;
