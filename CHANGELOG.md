@@ -168,6 +168,10 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Text searches with values omitted from their results still match native
+  static-text labels stored only in `AXValue`, in both backends. Before,
+  a wait could time out and name the exact label as its nearest match.
+  Editable values stay unread and app/visibility filters are unchanged.
 - A screenshot point outside the picture raises before any input is
   sent, and a click, drag, or scroll read off a window's picture goes to
   that window rather than whichever of the app's windows lies on top, so

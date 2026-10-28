@@ -442,9 +442,10 @@ final class AXExecutor {
   /// and `previous` walks the flattened traversal in reverse. The result is complete only when
   /// the walk saw the whole tree and the limit did not stop it before a further match. The walk
   /// reads only what judging a node takes -- its role, whether it is hidden, and the requested
-  /// attributes a match can rest on -- and describes each match afresh. A search for what is
-  /// visible, unless it is for menus or menu items, leaves out what closed menus hold, matching
-  /// `_on_screen_only` in `macos.py`.
+  /// attributes a match can rest on. A static text's value is its label, so a text search reads
+  /// it when needed even if returned attributes omit values. Each match is described afresh.
+  /// A search for what is visible, unless it is for menus or menu items, leaves out
+  /// closed-menu contents, matching `_on_screen_only` in `macos.py`.
   private static func boundedSearch(
     root: AXUIElement, searchKey: String, text: String?, exact: ExactSelector, visibleOnly: Bool,
     limit: Int, direction: String, immediateDescendantsOnly: Bool, attributes: [String],
@@ -491,13 +492,22 @@ final class AXExecutor {
 
     var matches: [ElementDescriptor] = []
     var cut = false
+    var readComplete = true
+    let readStaticLabels = needle != nil && !traversalAttributes.contains("AXValue")
     for node in nodes {
+      // Static text keeps its visible label in AXValue, not AXTitle. Read only that role's
+      // value for matching, without adding values to the caller's returned fields.
       guard role == nil || node.role == role else { continue }
       guard !visibleOnly || !node.hidden else { continue }
-      if let needle {
-        guard node.matchText.contains(where: { $0.lowercased().contains(needle) }) else { continue }
-      }
       guard exact.matches(node.fields) else { continue }
+      if let needle, !node.matchText.contains(where: { $0.lowercased().contains(needle) }) {
+        guard readStaticLabels && node.role == "AXStaticText" else { continue }
+        let reading = copyAttributes(node.element, ["AXValue"])
+        readComplete = readComplete && reading.conclusive
+        guard let value = reading.values["AXValue"],
+          pythonLikeString(jsonable(value)).lowercased().contains(needle)
+        else { continue }
+      }
       if matches.count >= resultLimit {
         cut = true
         break
@@ -510,7 +520,7 @@ final class AXExecutor {
     // A depth cut only matters when the walk was meant to go deep: an immediate-descendants
     // search stops at depth 1 by design.
     let complete =
-      !cut && !snapshot.nodeCut && !snapshot.readCut
+      !cut && readComplete && !snapshot.nodeCut && !snapshot.readCut
       && (immediateDescendantsOnly || !snapshot.depthCut)
     return QueryResult(matches: matches, complete: complete, visited: visited)
   }

@@ -3296,13 +3296,14 @@ class MacOS:
         """Search a small ordinary AX tree when optimized search is unavailable.
 
         The walk reads only what judging a node takes -- its role, whether
-        it is hidden, and the requested attributes a match can rest on --
-        and describes each match afresh, so the rest of ``attributes``
-        costs nothing per node. A search for what is on screen
-        (`_on_screen_only`) leaves out what closed menus hold. The walk
-        numbers nodes into a table of its own; only the matches get
-        handles, as on the optimized path, so a search that keeps earlier
-        handles grows the registry by what it returns.
+        it is hidden, and the requested attributes a match can rest on.
+        A static text's value is its label, so a text search reads it when
+        needed even if the returned attributes omit values. Each match is
+        described afresh, so the remaining attributes cost nothing per node.
+        A search for what is on screen (`_on_screen_only`) leaves out
+        what closed menus hold. The walk numbers nodes into a table of its
+        own; only matches get handles, as on the optimized path, so a search
+        that keeps earlier handles grows the registry by what it returns.
         """
         if max_nodes <= 0:
             raise MacOSError(
@@ -3355,35 +3356,45 @@ class MacOS:
 
         matches: list[dict[str, Any]] = []
         cut = False
+        read_complete = True
+        read_static_labels = needle is not None and "AXValue" not in traversal_attributes
         for node in nodes:
+            if (
+                (role is not None and node.get("role") != role)
+                or (visible_only and bool(node.get("hidden")))
+                or not exact.matches(node)
+            ):
+                continue
             values = tuple(node.get(_AX_NODE_MAPPING[name]) for name in _AX_MATCH_ATTRIBUTES)
             text_matches = needle is None or any(
                 needle in str(value).casefold()
                 for value in values
                 if value not in (None, "")
             )
-            if (
-                (role is None or node.get("role") == role)
-                and (not visible_only or not bool(node.get("hidden")))
-                and text_matches
-                and exact.matches(node)
-            ):
-                if len(matches) >= result_limit:
-                    cut = True
-                    break
-                element = walked[int(node["element_index"])]
-                matches.append(
-                    self._describe_element(
-                        element,
-                        self._remember_element(element),
-                        attributes=described,
-                        include_actions=include_actions,
-                    )
+            if not text_matches and read_static_labels and node.get("role") == "AXStaticText":
+                reading = self._copy_attributes(walked[int(node["element_index"])], ("AXValue",))
+                read_complete = read_complete and reading.conclusive
+                value = reading.get("AXValue")
+                text_matches = needle is not None and value not in (None, "") and needle in str(value).casefold()
+            if not text_matches:
+                continue
+            if len(matches) >= result_limit:
+                cut = True
+                break
+            element = walked[int(node["element_index"])]
+            matches.append(
+                self._describe_element(
+                    element,
+                    self._remember_element(element),
+                    attributes=described,
+                    include_actions=include_actions,
                 )
+            )
         # A depth cut only matters when the walk was meant to go deep: an
         # immediate-descendants search stops at depth 1 by design.
         complete = (
             not cut
+            and read_complete
             and not snapshot.node_cut
             and not snapshot.read_cut
             and (immediate_descendants_only or not snapshot.depth_cut)

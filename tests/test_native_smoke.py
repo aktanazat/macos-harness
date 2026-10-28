@@ -1407,6 +1407,58 @@ def test_a_search_for_what_is_on_screen_leaves_out_closed_menus_bar_one_for_menu
         helper.wait()
 
 
+_STATIC_LABEL_HELPER = r'''
+import os
+from AppKit import (
+    NSApplication, NSApplicationActivationPolicyAccessory,
+    NSApplicationActivationPolicyProhibited, NSBackingStoreBuffered,
+    NSMakeRect, NSObject, NSTextField, NSWindow, NSWindowStyleMaskTitled,
+)
+
+class Ready(NSObject):
+    def applicationDidFinishLaunching_(self, notification):
+        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        window.orderFrontRegardless()
+        print(f"READY {os.getpid()}", flush=True)
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+    NSMakeRect(120, 120, 460, 130), NSWindowStyleMaskTitled, NSBackingStoreBuffered, False
+)
+for index, text in enumerate(("Finish the assistant redesign", "Pick a transcription model")):
+    label = NSTextField.labelWithString_(text)
+    label.setFrame_(NSMakeRect(20, 65 - index * 40, 410, 30))
+    window.contentView().addSubview_(label)
+target = Ready.alloc().init()
+app.setDelegate_(target)
+app.run()
+'''
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("backend", ["python", pytest.param("native", marks=pytest.mark.native)])
+def test_wait_finds_visible_static_labels_without_returning_values(backend: str) -> None:
+    _require_live_ax(backend)
+    helper = subprocess.Popen(
+        [sys.executable, "-c", _STATIC_LABEL_HELPER],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        pid = int(_read_ready_line(helper).split(" ", 1)[1])
+        with MacOS(backend=backend) as mac:
+            for text in ("Finish the assistant redesign", "Pick a transcription model"):
+                found = mac.ax.wait(text, app=pid, timeout=2)
+                assert found["role"] == "AXStaticText"
+                assert found["pid"] == pid
+                assert "value" not in found
+    finally:
+        helper.kill()
+        helper.wait()
+
+
 def test_native_press_retries_only_on_delayed_appearance(monkeypatch) -> None:
     """A native targeted press that finds no unique match yet -- the
     agent's own ``PressCoordinator`` always reports this as
