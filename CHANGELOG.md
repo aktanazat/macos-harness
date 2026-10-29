@@ -176,6 +176,10 @@ follows [Semantic Versioning](https://semver.org/).
 - `see(after_change=True)` reports `settled`, and a change still going
   at `timeout` opens with the note "changed but did not settle in 10s"
   instead of reading as a finished change.
+- `see(display=)` and `see(region=)` leave the virtual pointer out in a
+  second harness process too, which captures through `screencapture`:
+  the pointer's helper closes for the capture and the pointer shows
+  again after. Before, it appeared in the picture.
 - Text searches with values omitted from their results still match native
   static-text labels stored only in `AXValue`, in both backends. Before,
   a wait could time out and name the exact label as its nearest match.

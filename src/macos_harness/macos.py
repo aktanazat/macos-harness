@@ -31,6 +31,7 @@ from .capture import (
     GrayPrint,
     WindowCapture,
     WindowCatalog,
+    _owns_capture,
     capture_screen,
     capture_window,
     changed_area,
@@ -5405,11 +5406,23 @@ class MacOS:
         max_width: int | None,
         max_height: int | None,
     ) -> WindowCapture:
-        """Render ``area`` of a display as it shows, without the virtual pointer."""
-        return capture_screen(
-            display_id, area, frame, max_width=max_width, max_height=max_height,
-            hide_pid=self._overlay.pid,
-        )
+        """Render ``area`` of a display as it shows, without the virtual
+        pointer. ``screencapture``, which renders for a process that does
+        not own capture, cannot leave a window out as ScreenCaptureKit
+        does, so the pointer's helper closes for it and the pointer shows
+        again after."""
+        shown_at = None
+        if self._overlay.running and not _owns_capture():
+            shown_at = self._pointer_position if self._overlay.visible else None
+            self._overlay.close()
+        try:
+            return capture_screen(
+                display_id, area, frame, max_width=max_width, max_height=max_height,
+                hide_pid=self._overlay.pid,
+            )
+        finally:
+            if shown_at is not None:
+                self._overlay.show(*shown_at)
 
     def _windows_in_area(self, area: Mapping[str, float]) -> list[dict[str, JSONValue]]:
         """The windows that show in screen ``area``, of every layer, front

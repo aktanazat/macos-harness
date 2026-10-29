@@ -557,7 +557,8 @@ def capture_screen(
 ) -> WindowCapture:
     """Render ``area`` (screen points inside the display at
     ``display_bounds``) as it shows on screen: every window there,
-    composited, except those of ``hide_pid``."""
+    composited, except those of ``hide_pid``. A process that does not
+    own capture renders through ``screencapture``, which leaves out none."""
     if not _owns_capture():
         return _rendered(
             _screencapture(
