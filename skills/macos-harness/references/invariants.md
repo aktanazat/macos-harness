@@ -57,8 +57,8 @@ with repeated keys, clicks, deletion loops, or bulk input.
   `region=(x, y, w, h)` in that `see`'s pixels watches a smaller change, and
   `by="ax"` the app's text. Nothing changing by `timeout` raises `timeout` with
   `details["changed"]` False; `mac.see(app, after_change=True)` waits 10
-  seconds by default, then reports `changed`, with `note` when it is false,
-  and captures. When quick visible feedback, such as a
+  seconds by default, then reports `changed` and `settled`, with a `note`
+  when either is false, and captures. When quick visible feedback, such as a
   pressed button or a spinner, comes before a slower answer, pass a `settle=`
   longer than the gap, or wait on the answer's text with `by="ax"` or
   `mac.ax.wait`.

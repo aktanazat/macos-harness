@@ -5049,8 +5049,9 @@ class MacOS:
         the most visible first. ``after_change`` first waits up to ``timeout``
         seconds for the window to change from where `wait_change` would
         measure and hold still ``settle`` seconds; the result's
-        ``changed`` says whether it did, and no change is no error here:
-        the result then opens with a ``note``, "no change in 10s".
+        ``changed`` and ``settled`` say whether it did each, and neither
+        is an error here: the result then opens with a ``note``, "no
+        change in 10s" or "changed but did not settle in 10s".
         The result's ``on_screen`` is the only freshness signal: an
         off-screen window (minimized, hidden, or on another Space) still
         renders, but from whatever the app last drew.
@@ -5102,7 +5103,9 @@ class MacOS:
             return screenshot
         if not change["changed"]:
             screenshot = {"note": f"no change in {timeout:g}s", **screenshot}
-        screenshot["changed"] = change["changed"]
+        elif not change["settled"]:
+            screenshot = {"note": f"changed but did not settle in {timeout:g}s", **screenshot}
+        screenshot.update(changed=change["changed"], settled=change["settled"])
         return screenshot
 
     @staticmethod

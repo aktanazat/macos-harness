@@ -448,6 +448,19 @@ def test_see_after_change_gives_up_in_ten_seconds_and_says_so(tmp_path: Path) ->
     assert mac.clock <= 10.5
 
 
+def test_see_after_change_says_when_the_change_did_not_settle(tmp_path: Path) -> None:
+    """A window still changing when the wait ran out read as a finished
+    change: the result carried `changed` alone."""
+    mac = _Screen(_BLANK, _RESULT)
+    mac.see("Test", path=tmp_path / "before.png")
+
+    shot = mac.see("Test", path=tmp_path / "after.png", after_change=True, timeout=0.5, settle=1.0)
+
+    assert (shot["changed"], shot.get("settled"), shot.get("note")) == (
+        True, False, "changed but did not settle in 0.5s",
+    )
+
+
 def test_wait_change_by_ax_compares_text_and_keeps_element_indexes() -> None:
     """The text changes on the second look and holds; the tree walks do
     not cost the caller the element index it already holds."""
