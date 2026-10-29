@@ -168,6 +168,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `wait_change(by="ax")` skips a read of the app's accessibility tree
+  that was cut short instead of comparing it: unreadable reads had
+  reported `changed` and `settled` with nothing changed. The result, or
+  the timeout's message and details, counts them in `failed_reads` with
+  the last `read_failure`.
 - Text searches with values omitted from their results still match native
   static-text labels stored only in `AXValue`, in both backends. Before,
   a wait could time out and name the exact label as its nearest match.

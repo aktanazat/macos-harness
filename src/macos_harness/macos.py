@@ -5514,8 +5514,10 @@ class MacOS:
         earlier input made does not. ``region`` (x, y, width, height in
         that `see`'s pixels) watches part of the window;
         ``by="ax"`` compares the app's accessibility text instead of
-        pixels. A blinking caret is no change. Raises TIMEOUT, with
-        ``details["changed"]`` False, when nothing changed in time.
+        pixels; a read the app cuts short is no look at all, and the
+        result counts those in ``failed_reads`` with the last
+        ``read_failure``. A blinking caret is no change. Raises TIMEOUT,
+        with ``details["changed"]`` False, when nothing changed in time.
         """
         self._check_surface(
             app=app, window_index=window_index, window_id=window_id, display=None,
@@ -5526,8 +5528,13 @@ class MacOS:
             timeout=timeout, settle=settle,
         )
         if not watched["changed"]:
+            failure = watched.get("read_failure")
+            unread = "" if failure is None else (
+                f"; {watched['failed_reads']} of {watched['polls'] + 1} reads of its"
+                f" accessibility tree failed, the last with AXError {failure['ax_error']}"
+            )
             raise MacOSError(
-                f"{watched['app']['name']} did not change in {timeout:g}s",
+                f"{watched['app']['name']} did not change in {timeout:g}s{unread}",
                 code=ErrorCode.TIMEOUT,
                 details={**watched, "timeout": timeout},
             )
@@ -5575,11 +5582,14 @@ class MacOS:
         if by == "ax":
             self._ensure_accessibility()
             pid = int(info["pid"])
+            failures: list[JSONValue] = []
             changed, settled, polls = self._until_settled(
-                lambda: self._ax_look(pid), self._ax_look(pid), operator.ne,
+                lambda: self._ax_look(pid, failures), self._ax_look(pid, failures), operator.ne,
                 look_now=False, deadline=deadline, settle=settle,
             )
             watched["baseline"] = "now"
+            if failures:
+                watched.update(failed_reads=len(failures), read_failure=failures[-1])
         else:
             self._ensure_screen_recording()
             if window_id is None:
@@ -5672,9 +5682,11 @@ class MacOS:
             )
         return x, y, w, h
 
-    def _ax_look(self, pid: int) -> tuple[str, ...]:
+    def _ax_look(self, pid: int, failures: list[JSONValue]) -> tuple[str, ...] | None:
         """``pid``'s accessibility text, one entry per element, for
-        `wait_change(by="ax")`; the caller's element indexes stay valid."""
+        `wait_change(by="ax")`; the caller's element indexes stay valid.
+        None when a read cut the tree short, its ``read_failure`` added
+        to ``failures``."""
         held = self._elements
         try:
             snapshot = self._snapshot_tree(
@@ -5685,6 +5697,9 @@ class MacOS:
             )
         finally:
             self._elements = held
+        if snapshot.read_cut:
+            failures.append(snapshot.read_failure)
+            return None
         return tuple(
             json.dumps({key: value for key, value in node.items() if key != "element_index"},
                        sort_keys=True, ensure_ascii=False)
@@ -5693,8 +5708,8 @@ class MacOS:
 
     def _until_settled(
         self,
-        look: Callable[[], _Look],
-        baseline: _Look,
+        look: Callable[[], _Look | None],
+        baseline: _Look | None,
         differs: Callable[[_Look, _Look], bool],
         *,
         look_now: bool,
@@ -5704,7 +5719,9 @@ class MacOS:
         """Look until a look unlike ``baseline`` has held for ``settle``
         seconds or ``deadline`` passes: (changed, settled, looks taken).
         ``look_now`` takes the first look at once, for a baseline taken
-        before the change could have happened."""
+        before the change could have happened. A look of None could not
+        be read and counts for nothing; with a baseline of None, the
+        first look read becomes it."""
         looks, previous, since = 0, baseline, None
         while True:
             if looks or not look_now:
@@ -5714,6 +5731,11 @@ class MacOS:
                 self._pause(min(_CHANGE_POLL_SECONDS, remaining))
             current = look()
             looks += 1
+            if current is None:
+                continue
+            if baseline is None:
+                baseline = previous = current
+                continue
             now = self._now()
             if not differs(baseline, current):
                 since = None

@@ -47,7 +47,7 @@ _DOT = _frame((200, 140, 6, 6))
 class _Screen(MacOS):
     """`MacOS` over one window whose captures follow ``frames``."""
 
-    def __init__(self, *frames: object, texts: tuple[str, ...] = ()) -> None:
+    def __init__(self, *frames: object, texts: tuple[str | None, ...] = ()) -> None:
         super().__init__()
         self.frames = frames
         self.sizes: list[tuple[int, int] | None] = []
@@ -97,10 +97,15 @@ class _Screen(MacOS):
 
     def _snapshot_tree(self, root: object, **options: object) -> _TreeSnapshot:
         """A tree walk as the real one does it: it forgets every earlier
-        element index and numbers the one text element it finds anew."""
+        element index and numbers the one text element it finds anew. A
+        text of None is a walk a failed read cut short at the root."""
         self._elements = {}
         text = self.texts[min(self.walks, len(self.texts) - 1)]
         self.walks += 1
+        if text is None:
+            return _TreeSnapshot(
+                [], False, False, True, {"depth": 0, "attribute": "AXRole", "ax_error": -25204}
+            )
         index = self._remember_element(object())
         node = {"element_index": index, "depth": 0, "role": "AXStaticText", "value": text}
         return _TreeSnapshot([node], False, False, False)
@@ -453,6 +458,21 @@ def test_wait_change_by_ax_compares_text_and_keeps_element_indexes() -> None:
 
     assert (result["changed"], result["settled"]) == (True, True)
     assert mac._element(held) == "button"
+
+
+def test_wait_change_by_ax_counts_no_read_the_app_cut_short_as_a_change() -> None:
+    """Every read after the first fails partway, as when the app stops
+    answering: they had compared as a settled change to an empty tree."""
+    mac = _Screen(texts=("Idle", None))
+
+    with pytest.raises(MacOSError) as raised:
+        mac.wait_change("Test", by="ax", timeout=1.0)
+
+    details = raised.value.details
+    assert (raised.value.code, details["changed"], details["read_failure"]["ax_error"]) == (
+        ErrorCode.TIMEOUT, False, -25204,
+    )
+    assert details["failed_reads"] == details["polls"]
 
 
 @pytest.mark.parametrize(
