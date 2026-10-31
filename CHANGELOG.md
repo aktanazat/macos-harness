@@ -155,6 +155,9 @@ follows [Semantic Versioning](https://semver.org/).
   first matched the target. A hit in another of the app's windows, such as
   a floating panel, does not block input routed here. The receipt names
   the element by its role and labels, never its value.
+  Geometry and cover checks hold the same app-input turn as the click,
+  so another harness call cannot change the target while it waits.
+  An unrelated hit with an unreadable window is still refused.
 - `mac.do.key` and `mac.do.type` check the shared deadline again after
   their final field and focus reads. If those reads use up the budget,
   nothing is sent and the `once` token remains available for another try.

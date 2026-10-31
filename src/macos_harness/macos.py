@@ -6808,11 +6808,13 @@ class MacOS:
         else:
             owner = self._element_pid(element) if app is None else app
             pid = self._input_pid(owner, window_id, "Pointer input")
-            point = self._element_point(element, pid)
-        window = self._target_window(pid, point, window_id)
-        if element is not None:
-            self._require_uncovered(element, pid, point, window.window_id)
-        in_front = self._post_click(pid, point, window, button=button, clicks=clicks)
+        with app_input(pid, _INPUT_WAIT):
+            if element is not None:
+                point = self._element_point(element, pid)
+            window = self._target_window(pid, point, window_id)
+            if element is not None:
+                self._require_uncovered(element, pid, point, window.window_id)
+            in_front = self._post_click(pid, point, window, button=button, clicks=clicks)
         pointer = self._pointer_info(pid=pid)
         assert pointer is not None
         pointer["window_id"] = window.window_id
@@ -6905,12 +6907,10 @@ class MacOS:
         self._hit(pid, point)
         self._pause(_HIT_AGAIN_SECONDS)
         found, hit = self._hit(pid, point)
-        if (
-            hit is None
-            or self._within(found, aimed)
-            or self._within(aimed, found)
-            or self._ax_window_id(self._copy_attribute(found, "AXWindow")) != window_id
-        ):
+        if hit is None or self._within(found, aimed) or self._within(aimed, found):
+            return
+        found_window = self._ax_window_id(self._copy_attribute(found, "AXWindow"))
+        if found_window is not None and found_window != window_id:
             return
         named = hit["title"] or hit["description"]
         raise MacOSError(

@@ -16,7 +16,7 @@ import pytest
 
 from macos_harness.errors import ApplicationNotFoundError, ErrorCode
 from macos_harness.macos import MacOS, MacOSError, SearchMatches, _TargetWindow
-from macos_harness.receipts import Acted, OperationError
+from macos_harness.receipts import Acted, OperationError, Outcome
 
 _SONA, _NOTES = 4512, 4600
 _WINDOW = 31
@@ -124,7 +124,7 @@ class _Node:
     """An element accessibility answers for: its frame, its parent, and
     the number of the window it lies in."""
 
-    def __init__(self, parent: _Node | None = None, window: int = _WINDOW) -> None:
+    def __init__(self, parent: _Node | None = None, window: int | None = _WINDOW) -> None:
         self.parent = parent
         self.window = window
         self.frame = _ROW
@@ -168,6 +168,25 @@ class _Covered(_Sona):
         if found is None:
             return None, None
         return found, {"role": "AXButton", "title": "Cover", "description": None}
+
+
+class _SerializedClick(_Covered):
+    def __init__(self, input_free: Callable[[int], bool]) -> None:
+        super().__init__(lambda row, window: row)
+        self.input_free = input_free
+        self.free_reads: list[bool] = []
+
+    def get(self, element_index: object, attribute: str = "AXValue", *, missing_ok: bool = False) -> object:
+        self.free_reads.append(self.input_free(_SONA))
+        return super().get(element_index, attribute, missing_ok=missing_ok)
+
+    def _hit(self, pid: int, point: tuple[float, float]) -> tuple[object | None, dict[str, object] | None]:
+        self.free_reads.append(self.input_free(pid))
+        return super()._hit(pid, point)
+
+    def _post_click(self, pid: int, point: tuple[float, float], window: _TargetWindow, *, button: str, clicks: int) -> None:
+        self.free_reads.append(self.input_free(pid))
+        super()._post_click(pid, point, window, button=button, clicks=clicks)
 
 
 class _SlidingRow(_Row):
@@ -320,9 +339,10 @@ def test_a_click_on_an_element_it_cannot_land_on_posts_nothing(
     [
         (lambda: _Covered(lambda row, window: _Node(_Node())), ErrorCode.UNSUPPORTED_OP),
         (lambda: _Covered(lambda row, window: row, lambda row, window: _Node(_Node())), ErrorCode.UNSUPPORTED_OP),
+        (lambda: _Covered(lambda row, window: _Node(window=None)), ErrorCode.UNSUPPORTED_OP),
         (lambda: _Sliding(_SLIDING), ErrorCode.TIMEOUT),
     ],
-    ids=["another-element-over-it", "cached-match-now-covered", "still-moving"],
+    ids=["another-element-over-it", "cached-match-now-covered", "unreadable-hit-window", "still-moving"],
 )
 def test_a_click_that_would_land_on_something_else_posts_nothing(
     click: Callable[[_Sona], object], make: Callable[[], _Sona], code: ErrorCode,
@@ -371,3 +391,27 @@ def test_a_click_lands_where_accessibility_finds_the_element_once_still(
     click(mac)
 
     assert mac.posted == [(_SONA, center, _WINDOW)]
+
+
+@pytest.mark.parametrize("verb", ["click", "do.click"])
+def test_another_run_cannot_change_a_target_between_its_checks_and_click(
+    verb: str, app_input_free: Callable[[int], bool],
+) -> None:
+    mac = _SerializedClick(app_input_free)
+
+    click = mac.click if verb == "click" else mac.do.click
+    click(element=_EARLIER, app="Sona")
+
+    assert mac.posted == [(_SONA, (250.0, 220.0), _WINDOW)]
+    assert not any(mac.free_reads)
+
+
+def test_an_element_click_dry_run_needs_no_input_turn(hold_app_input) -> None:
+    mac = _Covered(lambda row, window: row)
+    hold_app_input(_SONA)
+
+    receipt = mac.do.click(element=_EARLIER, app="Sona", dry_run=True, timeout=0.05)
+
+    assert receipt.outcome is Outcome.PLANNED
+    assert receipt.acted is Acted.NO
+    assert mac.posted == []

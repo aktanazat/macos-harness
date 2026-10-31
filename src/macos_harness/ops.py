@@ -2863,6 +2863,7 @@ class Operations:
             dry_run=dry_run,
             prepare=prepare,
             dispatch=dispatch,
+            prepare_under_input=element is not None,
         )
 
     def type(
@@ -3283,6 +3284,7 @@ class Operations:
         settle: Callable[[_Host, int, _Deadline], dict[str, JSONValue] | None] | None = None,
         executor: Executor = Executor.INPUT,
         quits: Callable[[], bool] | None = None,
+        prepare_under_input: bool = False,
     ) -> Receipt:
         """The pipeline every verb aimed at one exact ``app`` shares: the
         input verbs (``key``, ``click``, ``type``, ``fill``) and the menu
@@ -3297,7 +3299,10 @@ class Operations:
         ``prepare`` runs once the app is resolved and before anything is
         reserved or dispatched: it validates what is about to be sent and
         may return extra ``target`` fields (a click's resolved screen
-        point), so a dry run reports them too. ``dispatch`` acts on
+        point), so a dry run reports them too. Element clicks prepare
+        under the app's input lock so another call cannot change the
+        target between its geometry and cover checks and dispatch.
+        ``dispatch`` acts on
         ``pid`` holding the app's input; ``settle`` then waits, with that
         input free for other calls, for what the input did -- a quit's
         exit, a window's close, typed text showing in its field -- and
@@ -3373,6 +3378,8 @@ class Operations:
 
             builder.bind_app(info)
             try:
+                if prepare_under_input and not dry_run:
+                    turn.enter_context(app_input(pid, deadline.remaining()))
                 extras = prepare(host, pid, deadline)
             except MacOSError as exc:
                 return self._finish(
@@ -3394,7 +3401,8 @@ class Operations:
                 )
 
             try:
-                turn.enter_context(app_input(pid, deadline.remaining()))
+                if not prepare_under_input:
+                    turn.enter_context(app_input(pid, deadline.remaining()))
             except MacOSError as exc:
                 return self._finish(
                     builder.build(
