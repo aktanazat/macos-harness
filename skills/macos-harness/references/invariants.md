@@ -92,8 +92,11 @@ with repeated keys, clicks, deletion loops, or bulk input.
   sends that app input, up to 60s for the raw verbs or the `mac.do` call's
   `timeout`, then raises `timeout` with `reason: "app_input_busy"` having sent
   nothing. A lock file that will not open raises `ax.error` with `reason:
-  "app_input_lock_unavailable"`, also having sent nothing. Runs aimed at
-  different apps never wait for each other.
+  "app_input_lock_unavailable"`, also having sent nothing. A `mac.do` call
+  keeps its turn only while it sends: what it waits for after, a
+  postcondition, a quit, a window closing, or `fill` reading its text back,
+  leaves the app's input free. Runs aimed at different apps never wait for
+  each other.
 - An inactive app takes scrolls, plain keys, and typed text, but AppKit drops a
   menu shortcut (`cmd+a`) sent to it and passes a first click only to a view
   that accepts first mouse; text views do not. The click result says

@@ -245,6 +245,38 @@ def test_an_app_that_exits_on_its_own_quit_is_the_quit_done(
     assert (receipt.outcome, receipt.changed, receipt.verified) == (Outcome.DONE, True, True)
 
 
+class _QuittingWatched(_Quitting):
+    """Sona that, each time the harness looks whether it has exited,
+    notes whether another harness run could send it input then."""
+
+    def __init__(self, app_input_free: Callable[[int], bool]) -> None:
+        super().__init__()
+        self.app_input_free = app_input_free
+        self.input_free: list[bool] = []
+
+    def _exited(self, pid: int) -> bool:
+        self.input_free.append(self.app_input_free(pid))
+        return super()._exited(pid)
+
+
+@pytest.mark.parametrize(
+    "choose",
+    [lambda do: do.menu("Sona > Sona beenden", app="Sona"), lambda do: do.key("cmd+q", app="Sona")],
+    ids=["quit-item-by-its-shortcut", "command-q"],
+)
+def test_other_runs_send_an_app_input_while_its_quit_waits_for_it_to_exit(
+    choose: Callable[[Operations], Receipt], app_input_free
+) -> None:
+    """An app asking to save before it quits keeps the wait going until
+    the deadline, and the answer to that prompt is input to the app."""
+    mac = _QuittingWatched(app_input_free)
+
+    receipt = choose(mac.do)
+
+    assert receipt.outcome is Outcome.DONE
+    assert mac.input_free == [True]
+
+
 def test_an_app_that_exits_on_another_item_fails_naming_mac_quit() -> None:
     mac = _Quitting(exits_on="File > Close")
 

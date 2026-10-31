@@ -1786,9 +1786,22 @@ def test_key_sends_nothing_when_the_apps_input_lock_will_not_open(tmp_path) -> N
     assert host.key_calls == []
 
 
+def test_other_runs_send_the_app_input_while_a_key_waits_on_its_postcondition(app_input_free) -> None:
+    """A postcondition can wait out the whole deadline, and while it did,
+    every other run's input to the app waited too."""
+    host, operations = _ops()
+    free: list[bool] = []
+    host.wait_hook = lambda: free.append(app_input_free(41))
+
+    receipt = operations.key("return", app="Demo", postcondition=present(identifier="save"))
+
+    assert receipt.outcome is Outcome.DONE
+    assert free == [True]
+
+
 def test_a_call_holding_an_apps_input_takes_it_again_to_send_more() -> None:
-    """``mac.do`` holds the app's input from dispatch on and sends it
-    through the raw verbs, which take that input themselves."""
+    """``mac.do`` holds the app's input while dispatch sends it through
+    the raw verbs, which take that input themselves."""
     with app_input(41, 0.05), app_input(41, 0.05):
         pass
 
@@ -2329,6 +2342,40 @@ def _form_ops() -> tuple[FormHost, Operations]:
     host = FormHost()
     clock = _SleepClock()
     return host, Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+
+
+class _ReadBackHost(FormHost):
+    """A form that, once typed into, notes on each read of its value
+    whether another harness run could send the app input then."""
+
+    def __init__(self, app_input_free: Callable[[int], bool]) -> None:
+        super().__init__()
+        self.app_input_free = app_input_free
+        self.typed = False
+        self.input_free: list[bool] = []
+
+    def get(
+        self, element_index: int, attribute: str = "AXValue", *, missing_ok: bool = False
+    ) -> object:
+        if self.typed and attribute == "AXValue":
+            self.input_free.append(self.app_input_free(41))
+        return super().get(element_index, attribute, missing_ok=missing_ok)
+
+    def type(self, text: str, *, app: str | int | None = None) -> None:
+        super().type(text, app=app)
+        self.typed = True
+
+
+def test_other_runs_send_the_app_input_while_fill_reads_its_value_back(app_input_free) -> None:
+    host = _ReadBackHost(app_input_free)
+    clock = _SleepClock()
+    operations = Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+
+    receipt = operations.fill("example.org", app="Demo", identifier="domain")
+
+    assert receipt.outcome is Outcome.DONE
+    assert host.input_free
+    assert all(host.input_free)
 
 
 def test_fill_updates_the_app_model_even_when_visible_text_matches() -> None:

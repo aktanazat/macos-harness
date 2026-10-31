@@ -2646,8 +2646,11 @@ class Operations:
             del pid, deadline
             host._validate_key(key)
 
-        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            del deadline
             host.key(key, app=pid)
+
+        def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
             if quits and postcondition is None:
                 return self._await_effect(deadline, lambda: host._exited(pid), {"exited": True})
             return None
@@ -2662,6 +2665,7 @@ class Operations:
             dry_run=dry_run,
             prepare=prepare,
             dispatch=dispatch,
+            settle=settle,
             quits=lambda: quits,
         )
 
@@ -2861,7 +2865,10 @@ class Operations:
                     },
                 )
 
-        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
+        before: str | None = None
+
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            nonlocal before
             assert element_index is not None
             frontmost = host._frontmost_app()
             if deadline.exhausted():
@@ -2889,6 +2896,10 @@ class Operations:
                 host.type(value, app=pid)
             else:
                 host.key("backspace", app=pid)
+
+        def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
+            del pid
+            assert element_index is not None and before is not None
             require(deadline, lambda: host.get(element_index), value, "text readback")
             return {"before": _value_summary(before), "after": _value_summary(value)}
 
@@ -2900,7 +2911,7 @@ class Operations:
                 "interval": interval,
             },
             timeout=timeout, postcondition=postcondition, once=once, dry_run=dry_run,
-            prepare=prepare, dispatch=dispatch,
+            prepare=prepare, dispatch=dispatch, settle=settle,
         )
 
     def menu(
@@ -2988,10 +2999,15 @@ class Operations:
             )
             return {"window_id": pressed[1]["window_id"]}
 
-        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            del deadline
+            assert pressed is not None
+            _perform_guarded(host, pressed[0], "AXPress", pid, "mac.do.window", host._frontmost_app())
+
+        def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            del pid
             assert pressed is not None
             index, window = pressed
-            _perform_guarded(host, index, "AXPress", pid, "mac.do.window", host._frontmost_app())
             if postcondition is not None:
                 return None
             effect = self._await_effect(
@@ -3014,7 +3030,7 @@ class Operations:
         return self._input_verb(
             op="window", app=app, request=request, timeout=timeout,
             postcondition=postcondition, once=once, dry_run=dry_run,
-            prepare=prepare, dispatch=dispatch, executor=Executor.PYTHON,
+            prepare=prepare, dispatch=dispatch, settle=settle, executor=Executor.PYTHON,
         )
 
     def reveal(
@@ -3083,11 +3099,14 @@ class Operations:
             quits = _is_quit_item(match)
             return self._match_summary_payload(match)
 
-        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            del deadline
             assert element_index is not None
             _perform_guarded(
                 host, element_index, "AXPress", pid, f"mac.do.{op}", host._frontmost_app()
             )
+
+        def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
             if quits and postcondition is None:
                 return self._await_effect(deadline, lambda: host._exited(pid), {"exited": True})
             return None
@@ -3102,6 +3121,7 @@ class Operations:
             dry_run=dry_run,
             prepare=prepare,
             dispatch=dispatch,
+            settle=settle,
             executor=Executor.PYTHON,
             quits=lambda: quits,
         )
@@ -3118,6 +3138,7 @@ class Operations:
         dry_run: bool,
         prepare: Callable[[_Host, int, _Deadline], JSONValue],
         dispatch: Callable[[_Host, int, _Deadline], dict[str, JSONValue] | None],
+        settle: Callable[[_Host, int, _Deadline], dict[str, JSONValue] | None] | None = None,
         executor: Executor = Executor.INPUT,
         quits: Callable[[], bool] | None = None,
     ) -> Receipt:
@@ -3132,7 +3153,10 @@ class Operations:
         reserved or dispatched: it validates what is about to be sent and
         may return extra ``target`` fields (a click's resolved screen
         point), so a dry run reports them too. ``dispatch`` acts on
-        ``pid``.
+        ``pid`` holding the app's input; ``settle`` then waits, with that
+        input free for other calls, for what the input did -- a quit's
+        exit, a window's close -- and what it saw replaces what
+        ``dispatch`` returned.
         """
         self._check_owner()
         host = self._host
@@ -3168,9 +3192,10 @@ class Operations:
             if action == "in_flight":
                 return self._finish(self._in_flight_receipt(builder, target=None))
 
-        # Resolve -> precheck -> reserve -> dispatch -> verify, serialized
-        # against every other mutating call on this one `Operations`, and
-        # from dispatch on against input to the app from any other call.
+        # Resolve -> precheck -> reserve -> dispatch -> settle -> verify,
+        # serialized against every other mutating call on this one
+        # `Operations`, and from the focus reading before dispatch until
+        # dispatch returns against input to the app from any other call.
         with self._dispatch_lock, contextlib.ExitStack() as turn:
             try:
                 host._ensure_accessibility()
@@ -3260,7 +3285,12 @@ class Operations:
                     return self._finish(self._in_flight_receipt(builder, target=target))
 
             try:
-                input_observed = dispatch(host, pid, deadline)
+                try:
+                    input_observed = dispatch(host, pid, deadline)
+                finally:
+                    turn.close()
+                if settle is not None:
+                    input_observed = settle(host, pid, deadline)
             except (FocusChangedError, _BlockedEffect) as exc:
                 receipt = builder.build(
                     outcome=Outcome.FAILED, acted=Acted.YES, changed=None, verified=False,

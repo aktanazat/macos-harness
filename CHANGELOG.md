@@ -183,7 +183,10 @@ follows [Semantic Versioning](https://semver.org/).
   the `mac.do` call's `timeout`, then raises `timeout` with `reason:
   "app_input_busy"` having sent nothing; a lock file that will not open
   raises `ax.error` with `reason: "app_input_lock_unavailable"`, also
-  having sent nothing. Input to different apps still runs at once.
+  having sent nothing. A `mac.do` call keeps its turn only while it
+  sends, not while it waits for a postcondition, a quit, a window to
+  close, or `fill`'s read back. Input to different apps still runs at
+  once.
 - `wait_change(by="ax")` skips a read of the app's accessibility tree
   that was cut short instead of comparing it: unreadable reads had
   reported `changed` and `settled` with nothing changed. The result, or

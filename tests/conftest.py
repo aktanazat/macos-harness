@@ -32,6 +32,17 @@ _HOLD_INPUT = (
     "sys.stdin.read()\n"
 )
 
+_TRY_INPUT = (
+    "import fcntl, os, sys\n"
+    "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+    "try:\n"
+    "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+    "except BlockingIOError:\n"
+    "    print('busy')\n"
+    "else:\n"
+    "    print('free')\n"
+)
+
 
 @pytest.fixture
 def hold_app_input(tmp_path):
@@ -59,6 +70,24 @@ def hold_app_input(tmp_path):
         holder.wait(timeout=5)
         assert holder.stdout is not None
         holder.stdout.close()
+
+
+@pytest.fixture
+def app_input_free(tmp_path):
+    """Whether another harness run could send an app input right now."""
+
+    def free(pid: int) -> bool:
+        probe = subprocess.run(
+            [sys.executable, "-c", _TRY_INPUT, str(tmp_path / f"macos-harness-input-{pid}.lock")],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        return probe.stdout == "free\n"
+
+    return free
+
 
 @pytest.fixture
 def pointer_children(monkeypatch):
