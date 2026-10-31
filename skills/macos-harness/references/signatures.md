@@ -127,7 +127,8 @@ shows: each has the `app` that sent it, its `title`, `subtitle`, and
 it, in this run or a later one, and brings nothing forward; `"Show"` and
 `"AXPress"` open the app that sent it. Only the newest banner shows at a
 time, for about five seconds; a closed one leaves the list within a
-second.
+second. A read Notification Center cuts short raises `ax.error` rather
+than list less: read again.
 
 `see(display=0)` (0 is the main display) or `see(region=(x, y, w, h))` in
 screen points captures the screen as it shows, every window composited.

@@ -4472,18 +4472,32 @@ class MacOS:
         and its ``element``, the match `ax.perform` takes in this run or
         a later one: ``ax.perform(note["element"], "Close")`` dismisses
         it and brings nothing forward, while "Show" and "AXPress" open
-        the app that sent it. Reading opens nothing.
+        the app that sent it. Reading opens nothing. A read Notification
+        Center cut short raises `ax.error`: a banner it left out may be on
+        screen, so read again.
         """
         self._ensure_accessibility()
         _, info = self._resolve_app(_NOTIFICATION_CENTER)
         pid = int(info["pid"])
-        nodes = self._snapshot_tree(
+        snapshot = self._snapshot_tree(
             self._application_element(pid, enhance=False),
             max_depth=_INSPECT_MAX_DEPTH,
             max_nodes=_INSPECT_MAX_NODES,
             include_menu_bar=False,
             include_settable=False,
-        ).nodes
+        )
+        if snapshot.node_cut or snapshot.depth_cut or snapshot.read_cut:
+            raise MacOSError(
+                "Notification Center did not read in full, so a banner may be missing; read again",
+                code=ErrorCode.AX_ERROR,
+                details={
+                    "node_cut": snapshot.node_cut,
+                    "depth_cut": snapshot.depth_cut,
+                    "read_cut": snapshot.read_cut,
+                    "read_failure": snapshot.read_failure,
+                },
+            )
+        nodes = snapshot.nodes
         found: list[dict[str, JSONValue]] = []
         for position, node in enumerate(nodes):
             if node.get("subrole") not in _NOTIFICATION_SUBROLES:

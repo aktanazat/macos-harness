@@ -11,6 +11,7 @@ import json
 
 import pytest
 
+from macos_harness.errors import ErrorCode, MacOSError
 from macos_harness.macos import MacOS, SearchMatches, _TreeSnapshot
 
 _CENTER = 974
@@ -24,10 +25,12 @@ _BUILD = (
 
 class _Center(MacOS):
     """`MacOS` over Notification Center showing one banner with
-    ``description`` and, under it, the ``texts`` by identifier."""
+    ``description`` and, under it, the ``texts`` by identifier; ``cut``
+    says how the read of it fell short."""
 
-    def __init__(self, description: str, texts: dict[str, str]) -> None:
+    def __init__(self, description: str, texts: dict[str, str], **cut: object) -> None:
         super().__init__()
+        self.cut = cut
         banner = {
             "role": "AXGroup",
             "subrole": "AXNotificationCenterBanner",
@@ -72,7 +75,9 @@ class _Center(MacOS):
             {"element_index": self._remember_element(node), "depth": depth, **fields}
             for node, (depth, fields) in zip(self.nodes, self.tree, strict=True)
         ]
-        return _TreeSnapshot(nodes, False, False, False)
+        return _TreeSnapshot(
+            nodes, **{"node_cut": False, "depth_cut": False, "read_cut": False, **self.cut}
+        )
 
     def ax_search(self, **query: object) -> SearchMatches:
         labels = {key: query[key] for key in ("title", "identifier", "description") if query.get(key) is not None}
@@ -124,3 +129,23 @@ def test_a_later_run_finds_a_notification_again_by_its_element() -> None:
     later = _Center(*_BUILD)
 
     assert later.ax.actions(saved)[-1] == _CLOSE
+
+
+@pytest.mark.parametrize(
+    "cut",
+    [
+        {"node_cut": True},
+        {"depth_cut": True},
+        {"read_cut": True, "read_failure": {"depth": 6, "attribute": "AXValue", "ax_error": -25204}},
+    ],
+)
+def test_notifications_raise_when_notification_center_did_not_read_in_full(
+    cut: dict[str, object],
+) -> None:
+    """A banner the read left out may still be on screen, so an empty or
+    short list would claim what nobody saw."""
+    with pytest.raises(MacOSError) as raised:
+        _Center(*_BUILD, **cut).notifications()
+
+    assert raised.value.code == ErrorCode.AX_ERROR
+    assert {key: raised.value.details[key] for key in cut} == cut
