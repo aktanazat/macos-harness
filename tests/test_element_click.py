@@ -1,18 +1,21 @@
 """A click aimed at an element instead of a point, for a control that
-ignores AXPress. It lands on the center of the element's frame as the
-element is now, in the element's own process. One app's row and window
-are fakes; each test asserts where a click was posted, or that none was."""
+ignores AXPress. It lands on the center of the element's frame once the
+frame holds still, in the element's own process, and only where
+accessibility finds that element. One app's row and window are fakes;
+each test asserts where a click was posted, or that none was."""
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Sequence
 from typing import NoReturn
 
 import pytest
 
 from macos_harness.errors import ApplicationNotFoundError, ErrorCode
 from macos_harness.macos import MacOS, MacOSError, SearchMatches, _TargetWindow
+from macos_harness.receipts import Acted, OperationError
 
 _SONA, _NOTES = 4512, 4600
 _WINDOW = 31
@@ -27,6 +30,10 @@ _COLLAPSED = {"x": 100.0, "y": 200.0, "width": 0.0, "height": 0.0}
 _EARLIER = {
     "element_index": 176, "pid": _SONA, "role": "AXRow", "title": "Settings", "frame": _ROW,
 }
+# The row sliding down a point at every reading, for longer than a click
+# waits for it to hold still, and the same row holding still after three.
+_SLIDING = [{**_ROW, "y": _ROW["y"] + step} for step in range(100)]
+_SETTLING = _SLIDING[:4]
 
 
 class _Row:
@@ -110,6 +117,75 @@ class _Sona(MacOS):
     ) -> None:
         self._pointer_position = point
         self.posted.append((pid, point, window.window_id))
+
+
+class _Node:
+    """An element accessibility answers for: its frame and its parent."""
+
+    def __init__(self, parent: _Node | None = None) -> None:
+        self.parent = parent
+        self.frame = _ROW
+
+
+class _Covered(_Sona):
+    """Sona read through accessibility instead of the agent: its row sits
+    in its window, and at the row's center accessibility finds the
+    element ``found`` picks, or nothing."""
+
+    def __init__(self, found: Callable[[_Node, _Node], _Node | None]) -> None:
+        super().__init__()
+        window = _Node()
+        self.row = _Node(window)
+        self.row_index = self._remember_element(self.row)
+        self.found = found(self.row, window)
+
+    def _is_ax_element(self, value: object) -> bool:
+        return isinstance(value, _Node)
+
+    def get(self, element_index: object, attribute: str = "AXValue", *, missing_ok: bool = False) -> object:
+        assert attribute == "AXFrame"
+        return self._element(element_index).frame
+
+    @staticmethod
+    def _copy_attribute(element: object, attribute: str, *, checked: bool = False) -> object:
+        return element.parent if isinstance(element, _Node) and attribute == "AXParent" else None
+
+    def _hit(self, pid: int, point: tuple[float, float]) -> tuple[object | None, dict[str, object] | None]:
+        if self.found is None:
+            return None, None
+        return self.found, {"role": "AXButton", "title": "Cover", "description": None}
+
+
+class _SlidingRow(_Row):
+    """Sona's row sliding into place: each reading of its frame is the
+    next of ``frames``, until the last holds."""
+
+    def __init__(self, frames: Sequence[dict[str, float]]) -> None:
+        super().__init__(frames[0])
+        self.later = deque(frames[1:])
+
+    def get(self, element: _Row, attribute: str) -> dict[str, float]:
+        frame = super().get(element, attribute)
+        if self.later:
+            self.frame = self.later.popleft()
+        return frame
+
+
+class _Sliding(_Sona):
+    """Sona whose row slides through ``frames`` before it holds still, on
+    a clock only the click's own pauses move."""
+
+    def __init__(self, frames: Sequence[dict[str, float]]) -> None:
+        super().__init__(frames[0])
+        self.row = _SlidingRow(frames)
+        self.row_index = self._remember_element(self.row)
+        self.clock = 0.0
+
+    def _now(self) -> float:
+        return self.clock
+
+    def _pause(self, seconds: float) -> None:
+        self.clock += seconds
 
 
 @pytest.mark.parametrize(
@@ -215,3 +291,51 @@ def test_a_click_on_an_element_it_cannot_land_on_posts_nothing(
         click(mac, element)
 
     assert (caught.value.code, mac.posted) == (code, [])
+
+
+@pytest.mark.parametrize(
+    "click",
+    [
+        lambda mac: mac.click(element=_EARLIER, app="Sona"),
+        lambda mac: mac.do.click(element=_EARLIER, app="Sona"),
+    ],
+    ids=["click", "do-click"],
+)
+@pytest.mark.parametrize(
+    ("make", "code"),
+    [
+        (lambda: _Covered(lambda row, window: _Node(_Node())), ErrorCode.UNSUPPORTED_OP),
+        (lambda: _Sliding(_SLIDING), ErrorCode.TIMEOUT),
+    ],
+    ids=["another-element-over-it", "still-moving"],
+)
+def test_a_click_that_would_land_on_something_else_posts_nothing(
+    click: Callable[[_Sona], object], make: Callable[[], _Sona], code: ErrorCode,
+) -> None:
+    mac = make()
+
+    with pytest.raises(MacOSError) as caught:
+        click(mac)
+
+    assert (caught.value.code, mac.posted) == (code, [])
+    assert not isinstance(caught.value, OperationError) or caught.value.receipt.acted is Acted.NO
+
+
+@pytest.mark.parametrize(
+    ("make", "center"),
+    [
+        (lambda: _Covered(lambda row, window: _Node(row)), (250.0, 220.0)),
+        (lambda: _Covered(lambda row, window: window), (250.0, 220.0)),
+        (lambda: _Covered(lambda row, window: None), (250.0, 220.0)),
+        (lambda: _Sliding(_SETTLING), (250.0, 223.0)),
+    ],
+    ids=["a-part-of-it", "what-holds-it", "nothing-named", "held-still-after-sliding"],
+)
+def test_a_click_lands_where_accessibility_finds_the_element_once_still(
+    make: Callable[[], _Sona], center: tuple[float, float],
+) -> None:
+    mac = make()
+
+    mac.click(element=_EARLIER, app="Sona")
+
+    assert mac.posted == [(_SONA, center, _WINDOW)]

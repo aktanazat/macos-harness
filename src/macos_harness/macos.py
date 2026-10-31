@@ -679,6 +679,11 @@ _MAX_CLICKS = 3
 # The longest raw input waits while another call sends input to the same
 # app: `do.type`'s 4096 characters into an inactive app take about 41s.
 _INPUT_WAIT = 60.0
+# An element click reads the frame again a display frame later and goes
+# only once two readings agree, waiting at most this long for a target
+# still sliding into place.
+_FRAME_SECONDS = 1 / 60
+_STILL_SECONDS = 0.5
 
 
 def _character_key(character: str) -> tuple[int, int]:
@@ -6767,9 +6772,10 @@ class MacOS:
 
         ``element``, a match or index a search returned, aims the click
         instead of ``x`` and ``y``: at the center of the element's frame
-        as it is now, in the element's own process -- for a control that
-        ignores ``AXPress``, as a SwiftUI row can. When something else is
-        found there, ``miss`` says what took the click.
+        once it holds still, in the element's own process -- for a
+        control that ignores ``AXPress``, as a SwiftUI row can. An element
+        still moving after half a second, or one where accessibility finds
+        another element over its center, is refused and nothing is clicked.
         """
         validate_click_aim(x, y, element)
         self._ensure_accessibility()
@@ -6787,22 +6793,11 @@ class MacOS:
             pid = self._input_pid(owner, window_id, "Pointer input")
             point = self._element_point(element, pid)
         window = self._target_window(pid, point, window_id)
-        hit_element, hit = (None, None) if element is None else self._hit(pid, point)
         in_front = self._post_click(pid, point, window, button=button, clicks=clicks)
         pointer = self._pointer_info(pid=pid)
         assert pointer is not None
         pointer["window_id"] = window.window_id
         pointer["target_is_frontmost"] = in_front
-        if hit is not None:
-            aimed = self._element(element)
-            if self._is_ax_element(aimed) and not (
-                self._within(hit_element, aimed) or self._within(aimed, hit_element)
-            ):
-                named = hit["title"] or hit["description"]
-                pointer["miss"] = (
-                    f"accessibility finds {hit['role']}{f' {named!r}' if named else ''} at "
-                    "the element's center, not the element, so the click went there"
-                )
         if not in_front:
             pointer["note"] = (
                 f"pid {pid} was in the background, where AppKit passes a first click "
@@ -6828,11 +6823,21 @@ class MacOS:
         error, pid = AS.AXUIElementGetPid(resolved, None)
         return int(pid) if error == _AX_SUCCESS else None
 
-    def _element_point(self, element: ElementRef, pid: int) -> tuple[float, float]:
-        """The center of ``element``'s frame as it is now, in screen
-        points, for a click posted to process ``pid``, which must be the
-        element's own: a click meant for one app never lands in another
-        app's window that happens to lie under the same point."""
+    def _element_point(
+        self, element: ElementRef, pid: int, *, within: float = _STILL_SECONDS
+    ) -> tuple[float, float]:
+        """The center of ``element``'s frame once it holds still, in
+        screen points, for a click posted to process ``pid``, which must
+        be the element's own: a click meant for one app never lands in
+        another app's window that happens to lie under the same point.
+
+        The frame is read again a display frame later, and again until
+        two readings agree, for at most `_STILL_SECONDS` and never past
+        ``within`` seconds. An element still moving then is refused, and
+        so is a center where accessibility finds an element that neither
+        holds nor lies inside this one: nothing is clicked either way. A
+        center where the app names nothing, as a game that draws its own
+        buttons, keeps the click."""
         owner = self._element_pid(element)
         if owner not in (None, pid):
             raise MacOSError(
@@ -6840,14 +6845,42 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "element", "pid": owner, "target_pid": pid},
             )
+        if not isinstance(element, int):
+            element = self._remember_element(self._element(element))
+        bound = min(_STILL_SECONDS, within)
+        settled = self._now() + bound
         frame = self.get(element, "AXFrame")
+        while True:
+            self._pause(max(0.0, min(_FRAME_SECONDS, settled - self._now())))
+            again = self.get(element, "AXFrame")
+            if again == frame:
+                break
+            if self._now() >= settled:
+                raise MacOSError(
+                    f"The element was still moving after {bound:.2f}s; nothing was clicked",
+                    code=ErrorCode.TIMEOUT,
+                    details={"reason": "still_moving", "frame": again},
+                )
+            frame = again
         if not frame or frame["width"] <= 0 or frame["height"] <= 0:
             raise MacOSError(
                 f"The element has no area on screen to click: its frame is {frame}",
                 code=ErrorCode.UNSUPPORTED_OP,
                 details={"frame": frame},
             )
-        return frame["x"] + frame["width"] / 2, frame["y"] + frame["height"] / 2
+        point = frame["x"] + frame["width"] / 2, frame["y"] + frame["height"] / 2
+        aimed = self._element(element)
+        if self._is_ax_element(aimed):
+            found, hit = self._hit(pid, point)
+            if hit is not None and not (self._within(found, aimed) or self._within(aimed, found)):
+                named = hit["title"] or hit["description"]
+                raise MacOSError(
+                    f"Accessibility finds {hit['role']}{f' {named!r}' if named else ''} at the "
+                    "element's center, not the element; nothing was clicked",
+                    code=ErrorCode.UNSUPPORTED_OP,
+                    details={"point": {"x": point[0], "y": point[1]}, "found": hit},
+                )
+        return point
 
     def _post_click(
         self,

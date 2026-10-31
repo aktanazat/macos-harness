@@ -25,8 +25,6 @@ follows [Semantic Versioning](https://semver.org/).
   be the app's and on screen, checked before anything is reserved, and
   it becomes the app's focused window in the same turn that sends the
   keys, so a window another run focused since cannot take them.
-- `mac.click(element=...)` returns `miss` when accessibility finds
-  something else over the element's center, which then took the click.
 - A name that fits several processes, such as `wine`, adds a `warning`
   naming the other pids to `see`, `click`, `key`, `type`, and `activate`;
   `see`, `key`, and `type` also warn when one of several windows was
@@ -147,12 +145,14 @@ follows [Semantic Versioning](https://semver.org/).
   there. A minimized window, or one its app will not move or resize, raises
   `unsupported_op` before anything changes.
 - `mac.click(element=match)` and `mac.do.click(element=match, app=...)`
-  click the center of an element's frame as it is now, in the element's
-  own process, for a control that ignores `AXPress`, as SwiftUI rows can.
-  The element may be a match from any run or an index from this one. An
-  element of another app, or one with no area on screen, is refused before
-  anything is posted, and the receipt names the element by its role and
-  labels, never its value.
+  click the center of an element's frame once it holds still, in the
+  element's own process, for a control that ignores `AXPress`, as SwiftUI
+  rows can. The element may be a match from any run or an index from this
+  one. An element of another app, one with no area on screen, one still
+  moving half a second on, or one whose center accessibility finds another
+  element over, named in the error, is refused before anything is posted,
+  and the receipt names the element by its role and labels, never its
+  value.
 - `mac.do.menu("View > Reload Page", app=...)` chooses a menu command by its
   path, each step found only under the one before, so an item two menus
   share, such as Close under File and under Window, is never ambiguous.

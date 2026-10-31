@@ -1334,7 +1334,7 @@ class _Host(Protocol):
         clicks: int,
     ) -> None: ...
     def _element_point(
-        self, element: int | Mapping[str, JSONValue], pid: int
+        self, element: int | Mapping[str, JSONValue], pid: int, *, within: float
     ) -> tuple[float, float]: ...
     def _menu_item(
         self, pid: int, steps: Sequence[str | None], *, bar: str
@@ -2734,15 +2734,16 @@ class Operations:
         and ``y`` are.
 
         ``element``, a match or index a search returned, aims the click
-        instead of ``x`` and ``y``: at the center of its frame as it is
-        now, and only when it is ``app``'s own element.
+        instead of ``x`` and ``y``: at the center of its frame once it
+        holds still, and only when it is ``app``'s own element and
+        accessibility finds no other element there. An element still
+        moving, or one another element covers, fails with ``acted=NO``.
         """
         validate_click_aim(x, y, element)
         resolved: tuple[str, int, tuple[float, float], _RoutedWindow] | None = None
 
         def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
             nonlocal resolved
-            del deadline
             normalized_button = host._validate_button(button)
             normalized_clicks = host._validate_clicks(clicks)
             aimed_window = window_id
@@ -2752,7 +2753,7 @@ class Operations:
                 screen = host._screen_point(x, y, coordinate_space, pid=pid)
                 aimed_window = host._pictured_window(window_id, coordinate_space)
             else:
-                screen = host._element_point(element, pid)
+                screen = host._element_point(element, pid, within=deadline.remaining())
             window = host._target_window(pid, screen, aimed_window)
             resolved = (normalized_button, normalized_clicks, screen, window)
             extras: dict[str, JSONValue] = {

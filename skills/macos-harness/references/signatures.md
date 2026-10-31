@@ -84,9 +84,7 @@ the other pids to the result of `see`, `click`, `key`, `type`, and
 windows and the call let one be picked. Pass the pid or `window_id`.
 
 A screenshot point outside the picture raises before anything is sent,
-and a click read off a picture goes to the window it shows. A click at
-`element=` returns `miss` when accessibility finds something else over
-the element's center, which then took the click.
+and a click read off a picture goes to the window it shows.
 
 `key` and `type` return `pid`, `window_id` (the window that took the keys,
 None where accessibility cannot say), `target_is_frontmost`, and a `note`
@@ -178,9 +176,11 @@ mac.ax.perform(match, "AXPress")
 
 A control that ignores `AXPress`, as a SwiftUI row can, takes a click:
 `click(element=match)` and `do.click(element=match, app=...)` click the
-center of the element's frame as it is now, in the element's own process,
-in place of `x` and `y`. An element of another app, or one with no area on
-screen, is refused before anything is posted.
+center of the element's frame once it holds still, in the element's own
+process, in place of `x` and `y`. An element of another app, one with no
+area on screen, one still moving half a second on, or one whose center
+accessibility finds another element over is refused before anything is
+posted; the error names what is there.
 
 ## Accessibility
 
