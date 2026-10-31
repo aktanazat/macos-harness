@@ -337,6 +337,10 @@ _FOCUS_WATCH_SECONDS = 0.1
 # the request), a window closed, minimized, or zoomed, typed text showing
 # in its field.
 _EFFECT_POLL_SECONDS = 0.05
+# How long typed text that came out different -- an inline completion, a
+# smart quote, an input mask -- must hold still before `do.type` stops
+# waiting for its own text.
+_TEXT_STILL_SECONDS = 0.3
 
 
 class _BlockedEffect(MacOSError):
@@ -376,12 +380,13 @@ def _require_focus(
         )
 
 
-def _typed_value(host: _Host, field: int, text: str) -> str | None:
-    """What plain text control ``field`` holds once ``text`` is typed in
-    place of its selection, counted in UTF-16 units as accessibility
-    counts them; None where that cannot be told: another kind of
-    element, a secure field, a control character in ``text``, or a value
-    or selection that does not read as text."""
+def _typed_change(host: _Host, field: int, text: str) -> tuple[str, str] | None:
+    """What plain text control ``field`` holds now and once ``text`` is
+    typed in place of its selection, counted in UTF-16 units as
+    accessibility counts them; None where that cannot be told -- another
+    kind of element, a secure field, a control character in ``text``, or
+    a value or selection that does not read as text -- or where typing
+    would leave the field as it is, so its reading proves nothing."""
     if _has_control_character(text):
         return None
     try:
@@ -401,15 +406,8 @@ def _typed_value(host: _Host, field: int, text: str) -> str | None:
         return None
     units = value.encode("utf-16-le", "surrogatepass")
     typed = units[: 2 * start] + text.encode("utf-16-le", "surrogatepass") + units[2 * (start + length) :]
-    return typed.decode("utf-16-le", "surrogatepass")
-
-
-def _holds(host: _Host, field: int, expected: str) -> bool:
-    """Whether ``field`` holds ``expected`` now; a refused read says no."""
-    try:
-        return host.get(field) == expected
-    except MacOSError:
-        return False
+    after = typed.decode("utf-16-le", "surrogatepass")
+    return None if after == value else (value, after)
 
 
 def _changed_focus_fields(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> list[str]:
@@ -2907,24 +2905,22 @@ class Operations:
             field = host._focused_element(pid, window_id)
             return named
 
-        expected: str | None = None
+        change: tuple[str, str] | None = None
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
-            nonlocal expected
+            nonlocal change
             del deadline
             if field is not None and postcondition is None:
-                expected = _typed_value(host, field, text)
+                change = _typed_change(host, field, text)
             _require_focus(host, pid, field, window_id, "type")
             host.type(text, app=pid, window_id=window_id)
 
         def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
             del pid
-            aimed, typed = field, expected
+            aimed, typed = field, change
             if aimed is None or typed is None:
                 return None
-            return self._await_effect(
-                deadline, lambda: _holds(host, aimed, typed), {"landed": True}
-            )
+            return self._await_typed(host, aimed, typed, deadline)
 
         request: dict[str, JSONValue] = {"text": _value_summary(text)}
         if window_id is not None:
@@ -3492,6 +3488,35 @@ class Operations:
                 return None
             self._sleep(pause)
         return observed
+
+    def _await_typed(
+        self, host: _Host, field: int, change: tuple[str, str], deadline: _Deadline
+    ) -> dict[str, JSONValue] | None:
+        """Wait, within ``deadline``, until ``field`` holds the second of
+        ``change``, the text typed in place of its selection:
+        ``{"landed": True}`` once it does. A field whose text changed and
+        then held other text still for `_TEXT_STILL_SECONDS` -- an inline
+        completion, a smart quote, an input mask -- ends the wait with
+        `None` as soon, and so does the deadline; a refused read counts
+        as other text."""
+        last, typed = change
+        still_since: float | None = None
+        while True:
+            try:
+                value = host.get(field)
+            except MacOSError:
+                value = None
+            if value == typed:
+                return {"landed": True}
+            now = self._monotonic()
+            if value != last:
+                last, still_since = value, now
+            elif still_since is not None and now - still_since >= _TEXT_STILL_SECONDS:
+                return None
+            pause = min(_EFFECT_POLL_SECONDS, deadline.remaining())
+            if pause <= 0:
+                return None
+            self._sleep(pause)
 
     def _focus_effect(
         self,

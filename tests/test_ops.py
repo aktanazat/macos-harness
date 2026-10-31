@@ -2470,6 +2470,46 @@ def test_type_stays_unverified_and_is_never_repeated_when_the_field_misses_the_t
     assert "input" not in receipt.to_json()["observed"]
 
 
+class _CurlingHost(FormHost):
+    """A form whose app curls each straight quote typed into it, as
+    macOS smart quotes do."""
+
+    def type(self, text: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
+        super().type(text.replace("'", "\u2019"), app=app, window_id=window_id)
+
+
+def test_type_stops_waiting_once_its_field_holds_other_text_still() -> None:
+    host = _CurlingHost()
+    clock = _SleepClock()
+    operations = Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+    host.focused = True
+    host.selection = {"location": len(host.value), "length": 0}
+    host.keyboard_focus.extend([7, 7])
+
+    receipt = operations.type(" it's", app="Demo", timeout=5.0)
+
+    assert host.value == "doubleclick.net it\u2019s"
+    assert receipt.verified is False
+    assert "input" not in receipt.to_json()["observed"]
+    assert sum(clock.sleeps) < 1.0
+
+
+def test_type_of_the_text_its_selection_holds_is_never_verified_by_the_field() -> None:
+    """Typed over a selection of itself, text leaves the field as it was,
+    so keys the app dropped read the same as keys it took."""
+    host, operations = _form_ops()
+    host.focused = True
+    host.selection = {"location": 0, "length": len(host.value)}
+    host.reject_text = True
+    host.keyboard_focus.extend([7, 7])
+
+    receipt = operations.type(host.value, app="Demo", timeout=0.5)
+
+    assert receipt.verified is False
+    assert "input" not in receipt.to_json()["observed"]
+
+
+
 def test_other_runs_send_the_app_input_while_type_reads_its_text_back(app_input_free) -> None:
     host = _ReadBackHost(app_input_free)
     host.focused = True
