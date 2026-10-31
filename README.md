@@ -502,7 +502,8 @@ target.
 `mac.notifications()` lists the banners and alerts on screen, each with the
 `app` that sent it, its `title`, `subtitle`, `body`, `actions`, and `element`.
 `mac.ax.perform(note["element"], "Close")` dismisses one without bringing
-anything forward; `"Show"` opens the app that sent it.
+anything forward; `"Show"` opens the app that sent it, and the name of an
+alert's own button, such as `"Snooze"`, presses that button.
 
 These calls act only on accessible UI that macOS already rendered. They cannot
 make secure UI appear in an inactive app. They cannot bypass Touch ID, passkeys,

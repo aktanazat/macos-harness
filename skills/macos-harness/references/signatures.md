@@ -122,13 +122,15 @@ Export"` for a submenu, or with no path the menus in the menu bar: each has
 
 `mac.notifications()` lists the banners and alerts Notification Center
 shows: each has the `app` that sent it, its `title`, `subtitle`, and
-`body` (None where it has none), the `actions` it takes, and its
-`element`, a match: `mac.ax.perform(note["element"], "Close")` dismisses
-it, in this run or a later one, and brings nothing forward; `"Show"` and
-`"AXPress"` open the app that sent it. Only the newest banner shows at a
-time, for about five seconds; a closed one leaves the list within a
-second. A read Notification Center cuts short raises `ax.error` rather
-than list less: read again.
+`body` (None where it shows none as a text of its own; the `description`
+of its `element` joins them all), the `actions` it takes, an alert's
+buttons such as `"Snooze"` among them, and its `element`, a match:
+`mac.ax.perform(note["element"], "Close")` dismisses it, in this run or a
+later one, and brings nothing forward; `"Show"` and `"AXPress"` open the
+app that sent it, and a button's name presses that button. Only the
+newest banner shows at a time, for about five seconds; a closed one
+leaves the list within a second. A read Notification Center cuts short
+raises `ax.error` rather than list less: read again.
 
 `see(display=0)` (0 is the main display) or `see(region=(x, y, w, h))` in
 screen points captures the screen as it shows, every window composited.

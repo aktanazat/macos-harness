@@ -364,6 +364,7 @@ _ACTION_ALIASES = {
 _NOTIFICATION_CENTER = "com.apple.notificationcenterui"
 _NOTIFICATION_SUBROLES = frozenset({"AXNotificationCenterBanner", "AXNotificationCenterAlert"})
 _NOTIFICATION_TEXTS = ("title", "subtitle", "body")
+_NOTIFICATION_BUTTON = "action_button"
 _BUTTONS = {
     "left": (AS.kCGMouseButtonLeft if AS else 0),
     "right": (AS.kCGMouseButtonRight if AS else 1),
@@ -462,6 +463,40 @@ def _action_name(action: str) -> str:
     """The name ``action`` goes by: an app's own action reads
     "Name:Close\\nTarget:0x0\\nSelector:(null)" and goes by "Close"."""
     return action.removeprefix("Name:").partition("\n")[0] if action.startswith("Name:") else action
+
+
+def _button_name(title: object, description: object) -> str:
+    """What a notification's button is called: its title, else its
+    description, as agent-desktop names it."""
+    return next((name for name in (title, description) if isinstance(name, str) and name), "")
+
+
+def _notification_texts(
+    description: str, children: Sequence[Mapping[str, object]]
+) -> tuple[str | None, dict[str, str]]:
+    """The app that sent a notification and its texts by part. Its
+    ``description`` reads "<app>, <title>, <subtitle>, <body>", so the app
+    is what comes before the first of its text ``children`` that the
+    description names. A text without a ``title``, ``subtitle``, or
+    ``body`` identifier is read as agent-desktop reads one: that first
+    text is the title and the rest of the description the body, or with
+    nothing after it, the app shows as the title and the text is the body.
+    """
+    shown = [
+        (child.get("identifier"), value)
+        for child in children
+        if child.get("role") == "AXStaticText" and isinstance(value := child.get("value"), str)
+    ]
+    texts = {part: value for part, value in shown if isinstance(part, str) and part in _NOTIFICATION_TEXTS}
+    named = sorted((start, value) for _, value in shown if (start := description.find(f", {value}")) > 0)
+    if not named:
+        return None, texts
+    start, first = named[0]
+    app = description[:start]
+    if not texts:
+        rest = description[start + len(first) + 2:].removeprefix(", ")
+        texts = {"title": first, "body": rest} if rest else {"title": app, "body": first}
+    return app, texts
 
 
 def _of_role(matches: SearchMatches, role: str, limit: int) -> SearchMatches:
@@ -4337,15 +4372,18 @@ class MacOS:
             if len(named) == 1:
                 normalized = named[0]
         if normalized not in available:
-            raise MacOSError(
-                f"Element {element_index} does not expose {normalized!r}; available actions: {available}",
-                code=ErrorCode.UNSUPPORTED_OP,
-                details={
-                    "element_index": element_index,
-                    "action": normalized,
-                    "available_actions": available,
-                },
-            )
+            button = self._action_button(element, normalized)
+            if button is None:
+                raise MacOSError(
+                    f"Element {element_index} does not expose {normalized!r}; available actions: {available}",
+                    code=ErrorCode.UNSUPPORTED_OP,
+                    details={
+                        "element_index": element_index,
+                        "action": normalized,
+                        "available_actions": available,
+                    },
+                )
+            element, normalized = button, "AXPress"
         error = AS.AXUIElementPerformAction(element, normalized)
         if error == _AX_SUCCESS or self._gone_after_action(element, error):
             return
@@ -4362,6 +4400,19 @@ class MacOS:
             element_index=element_index,
             action=normalized,
         )
+
+    def _action_button(self, element: object, name: str) -> object | None:
+        """The one button among ``element``'s children that a notification
+        shows for an action its app added, as "Snooze", called ``name``."""
+        found = [
+            child
+            for child in self._copy_attribute(element, "AXChildren") or ()
+            for values in (self._copy_attributes(child, ("AXRole", "AXIdentifier", "AXTitle", "AXDescription")),)
+            if values["AXRole"] == "AXButton"
+            and str(values["AXIdentifier"]).casefold() == _NOTIFICATION_BUTTON
+            and _button_name(values["AXTitle"], values["AXDescription"]).casefold() == name.casefold()
+        ]
+        return found[0] if len(found) == 1 else None
 
     @staticmethod
     def _gone_after_action(element: object, error: int) -> bool:
@@ -4468,7 +4519,9 @@ class MacOS:
         """The banners and alerts Notification Center shows on screen now.
 
         Each has the ``app`` that sent it, its ``title``, ``subtitle``,
-        and ``body`` (None where it has none), the ``actions`` it takes,
+        and ``body`` (None where it shows none as a text of its own; the
+        ``description`` of its ``element`` joins them all), the
+        ``actions`` it takes, an alert's buttons, as "Snooze", among them,
         and its ``element``, the match `ax.perform` takes in this run or
         a later one: ``ax.perform(note["element"], "Close")`` dismisses
         it and brings nothing forward, while "Show" and "AXPress" open
@@ -4484,6 +4537,7 @@ class MacOS:
             max_depth=_INSPECT_MAX_DEPTH,
             max_nodes=_INSPECT_MAX_NODES,
             include_menu_bar=False,
+            extra_attributes=("AXStackingIdentifier",),
             include_settable=False,
         )
         if snapshot.node_cut or snapshot.depth_cut or snapshot.read_cut:
@@ -4500,17 +4554,23 @@ class MacOS:
         nodes = snapshot.nodes
         found: list[dict[str, JSONValue]] = []
         for position, node in enumerate(nodes):
-            if node.get("subrole") not in _NOTIFICATION_SUBROLES:
+            stacked = node.get("attributes", {}).get("AXStackingIdentifier")
+            if node.get("subrole") not in _NOTIFICATION_SUBROLES and not stacked:
                 continue
-            texts: dict[str, str] = {}
+            children = []
             for child in nodes[position + 1:]:
                 if child["depth"] <= node["depth"]:
                     break
-                part, value = child.get("identifier"), child.get("value")
-                if child["depth"] == node["depth"] + 1 and part in _NOTIFICATION_TEXTS and isinstance(value, str):
-                    texts[part] = value
-            # The description reads "<app>, <title>, <subtitle>, <body>".
-            app = str(node.get("description", "")).partition(", ")[0]
+                if child["depth"] == node["depth"] + 1:
+                    children.append(child)
+            app, texts = _notification_texts(str(node.get("description", "")), children)
+            buttons = [
+                name
+                for child in children
+                if child.get("role") == "AXButton"
+                and str(child.get("identifier", "")).casefold() == _NOTIFICATION_BUTTON
+                and (name := _button_name(child.get("title"), child.get("description")))
+            ]
             element: dict[str, JSONValue] = {
                 "element_index": node["element_index"],
                 "pid": pid,
@@ -4518,9 +4578,9 @@ class MacOS:
             }
             found.append(
                 {
-                    "app": app or None,
+                    "app": app,
                     **{part: texts.get(part) for part in _NOTIFICATION_TEXTS},
-                    "actions": [_action_name(action) for action in node.get("actions", [])],
+                    "actions": [*(_action_name(action) for action in node.get("actions", [])), *buttons],
                     "element": _OwnedMatch(element, self),
                 }
             )

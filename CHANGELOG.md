@@ -10,9 +10,10 @@ follows [Semantic Versioning](https://semver.org/).
 - `mac.notifications()` lists the banners and alerts on screen, each with
   the `app` that sent it, its `title`, `subtitle`, `body`, `actions`, and
   `element`. `mac.ax.perform(note["element"], "Close")` dismisses one and
-  brings nothing forward. `ax.perform` takes any action an app names
-  itself, listed as `"Name:Close\nTarget:0x0\nSelector:(null)"`, by that
-  name.
+  brings nothing forward; an alert's own buttons, such as `"Snooze"`, are
+  among its `actions` and press by name the same way. `ax.perform` takes
+  any action an app names itself, listed as
+  `"Name:Close\nTarget:0x0\nSelector:(null)"`, by that name.
 - `see(crop=(x, y, w, h), zoom=)` captures part of a window, in window
   points, and draws it at `zoom` times the screen's pixels per point, so
   small text in a large window reads; clicks map through the cut picture.
