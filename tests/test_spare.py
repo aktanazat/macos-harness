@@ -263,8 +263,13 @@ def test_a_saved_program_is_served_with_its_arguments(shell: _Shell, tmp_path: P
     assert step.returncode == 0
 
 
-def test_a_one_line_program_is_served(shell: _Shell) -> None:
-    step, out, _err = shell.served(None, _cli("-c", "import os\nprint(os.getpid())"))
+@pytest.mark.parametrize(
+    "agent_options", [(), ("--agent-id", "research"), ("--agent-id=research",)]
+)
+def test_a_one_line_program_is_served(shell: _Shell, agent_options: tuple[str, ...]) -> None:
+    step, out, _err = shell.served(
+        None, _cli(*agent_options, "-c", "import os\nprint(os.getpid())")
+    )
 
     assert int(out) != step.pid
     assert step.returncode == 0

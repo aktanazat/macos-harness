@@ -265,9 +265,17 @@ def _shape(args: list[str]) -> str | None:
     stdin, ``run`` for a saved one or ``-c`` for one in the arguments with
     nothing on stdin, else None. A terminal keeps its own process, whose
     output it sees line by line."""
-    command = next((i for i, arg in enumerate(args) if not arg.startswith("-")), len(args))
-    if any(arg not in ("--json-errors", "-c") for arg in args[:command]):
-        return None
+    command = 0
+    while command < len(args) and args[command].startswith("-"):
+        option = args[command]
+        if option == "--agent-id":
+            if command + 1 == len(args):
+                return None
+            command += 2
+        elif option in ("--json-errors", "-c") or option.startswith("--agent-id="):
+            command += 1
+        else:
+            return None
     try:
         if os.isatty(1) or os.isatty(2):
             return None

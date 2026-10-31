@@ -7,6 +7,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `MacOS(agent_id=)`, CLI `--agent-id`, and `MACOS_HARNESS_AGENT_ID` give
+  each agent a named pointer with a stable color, without moving the
+  physical cursor. Named pointers mark Accessibility actions and appear
+  in `see(show_pointer=True)`; pointer metadata includes `agent_id`.
+
 - `mac.notifications()` lists the banners and alerts on screen, each with
   the `app` that sent it, its `title`, `subtitle`, `body`, `actions`, and
   `element`. `mac.ax.perform(note["element"], "Close")` dismisses one and

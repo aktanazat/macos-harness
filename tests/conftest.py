@@ -13,6 +13,11 @@ import macos_harness.overlay as overlay_module
 
 
 @pytest.fixture(autouse=True)
+def own_agent_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MACOS_HARNESS_AGENT_ID", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def own_capture_lock(monkeypatch, tmp_path):
     """Each test's process owns capture and input locks of its own, never
     the ones a live harness on this Mac holds."""

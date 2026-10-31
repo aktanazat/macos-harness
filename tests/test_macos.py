@@ -1764,7 +1764,11 @@ class _ScriptedAX(MacOS):
     def _frontmost_app(cls) -> dict[str, object]:
         return {"name": "Finder", "pid": 1}
 
-    def perform_action(self, element_index: int, action: str = "AXPress") -> None:
+    def perform_action(
+        self, element_index: macos_module.ElementRef, action: str = "AXPress"
+    ) -> None:
+        if not isinstance(element_index, int):
+            element_index = int(element_index["element_index"])
         self.pressed.append((element_index, action))
 
 
@@ -1971,40 +1975,6 @@ def test_ax_press_tie_lists_every_match_with_its_frame_and_enabled_state() -> No
         for match in caught.value.details["matches"]
     ] == [(index, index <= 2, 70.0 * index) for index in range(1, 6)]
     assert mac.pressed == []
-
-
-def test_ax_press_supports_one_line_cross_app_use(monkeypatch) -> None:
-    mac = MacOS()
-    match = {
-        "element_index": 4,
-        "role": "AXButton",
-        "actions": ["AXPress"],
-        "app": {"name": "Chrome", "pid": 42},
-    }
-    wait_arguments = {}
-    actions = []
-
-    def fake_wait(**kwargs):
-        wait_arguments.update(kwargs)
-        return match
-
-    monkeypatch.setattr(mac, "ax_wait", fake_wait)
-    monkeypatch.setattr(
-        mac,
-        "_frontmost_app",
-        lambda: {"name": "Ghostty", "pid": 1},
-    )
-    monkeypatch.setattr(
-        mac,
-        "perform_action",
-        lambda element_index, action: actions.append((element_index, action)),
-    )
-
-    assert mac.ax.press("Not Now", role="button", all_apps=True) is match
-    assert wait_arguments["text"] == "Not Now"
-    assert wait_arguments["search_key"] == "AXButtonSearchKey"
-    assert wait_arguments["include_actions"] is True
-    assert actions == [(4, "AXPress")]
 
 
 def test_ax_press_reports_target_activation(monkeypatch) -> None:

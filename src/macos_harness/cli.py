@@ -24,10 +24,12 @@ from .telemetry import run_cli as run_telemetry_cli
 
 
 @contextmanager
-def _namespace(program_args: Mapping[str, str] | None = None) -> Iterator[dict[str, object]]:
+def _namespace(
+    program_args: Mapping[str, str] | None = None, *, agent_id: str | None = None
+) -> Iterator[dict[str, object]]:
     from .macos import MacOS
 
-    with MacOS() as mac:
+    with MacOS(agent_id=agent_id) as mac:
         yield {
             "__name__": "__macos_harness__",
             "args": dict(program_args or {}),
@@ -152,11 +154,12 @@ def _execute(
     *,
     filename: str = "<macos-harness>",
     program_args: Mapping[str, str] | None = None,
+    agent_id: str | None = None,
 ) -> int:
     if not code.strip():
         print("No Python code received on stdin", file=sys.stderr)
         return 2
-    with _namespace(program_args) as namespace:
+    with _namespace(program_args, agent_id=agent_id) as namespace:
         try:
             exec(compile(code, filename, "exec"), namespace, namespace)  # noqa: S102
         except TypeError as exc:
@@ -234,12 +237,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="write execution errors as JSON to stderr",
     )
     parser.add_argument("-c", dest="code", metavar="CODE", help="run CODE instead of stdin")
+    parser.add_argument("--agent-id", help="name this agent's colored virtual pointer")
     errors = argparse.ArgumentParser(add_help=False)
     errors.add_argument(
         "--json-errors",
         action="store_true",
         default=argparse.SUPPRESS,
         help="write errors as JSON to stderr",
+    )
+    errors.add_argument(
+        "--agent-id", default=argparse.SUPPRESS,
+        help="name this agent's colored virtual pointer",
     )
     subparsers = parser.add_subparsers(dest="command")
     doctor = subparsers.add_parser(
@@ -347,12 +355,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if saved is not None:
             program, program_args = saved
-            result = _execute(program, filename=str(args.file), program_args=program_args)
+            result = _execute(
+                program, filename=str(args.file), program_args=program_args, agent_id=args.agent_id
+            )
             return result
         if args.command == "doctor":
             from .macos import MacOS
 
-            with MacOS() as mac:
+            with MacOS(agent_id=args.agent_id) as mac:
                 if args.request:
                     mac.request_permissions()
                 print(json.dumps(mac.doctor(), indent=2))
@@ -361,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "apps":
             from .macos import MacOS
 
-            with MacOS() as mac:
+            with MacOS(agent_id=args.agent_id) as mac:
                 apps = mac.list_apps()
             if args.name is not None:
                 needle = args.name.casefold()
@@ -385,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "repl":
             import code
 
-            with _namespace() as namespace:
+            with _namespace(agent_id=args.agent_id) as namespace:
                 code.interact(
                     banner=(
                         "macos-harness: mac.see/key/type/click/ax/script, browser, "
@@ -399,7 +409,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "see":
             from .macos import MacOS
 
-            with MacOS() as mac:
+            with MacOS(agent_id=args.agent_id) as mac:
                 result = mac.see(
                     args.app,
                     window_index=args.window_index,
@@ -417,7 +427,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "state":
             from .macos import MacOS
 
-            with MacOS() as mac:
+            with MacOS(agent_id=args.agent_id) as mac:
                 state = mac.get_app_state(
                     args.app,
                     screenshot=args.screenshot,
@@ -436,13 +446,13 @@ def main(argv: list[str] | None = None) -> int:
             return result
         if args.command is None:
             if args.code is not None:
-                result = _execute(args.code, filename="<-c>")
+                result = _execute(args.code, filename="<-c>", agent_id=args.agent_id)
                 return result
             if sys.stdin.isatty():
                 parser.print_help()
                 result = 2
                 return result
-            result = _execute(sys.stdin.read())
+            result = _execute(sys.stdin.read(), agent_id=args.agent_id)
             return result
         parser.error(f"unknown command: {args.command}")
     except (MacOSError, RuntimeError) as exc:

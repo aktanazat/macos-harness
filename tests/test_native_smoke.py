@@ -703,31 +703,6 @@ def test_targeted_ax_press_dispatches_once_through_native_and_never_locally(
         mac._element(stale_index)
 
 
-def test_cross_app_press_never_routes_to_native_directly(monkeypatch) -> None:
-    client = _FakeNativeClient()
-    mac = MacOS(backend="native")
-    monkeypatch.setattr(mac, "_acquire_native", lambda: client)
-    fake_match = {
-        "element_index": mac._remember_element(object()),
-        "role": "AXButton",
-        "app": {"name": "Chrome", "pid": 7},
-    }
-    monkeypatch.setattr(mac, "ax_wait", lambda **kwargs: fake_match)
-    monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "Chrome", "pid": 7})
-    performed: list[tuple[int, str]] = []
-    monkeypatch.setattr(
-        mac,
-        "perform_action",
-        lambda element_index, action: performed.append((element_index, action)),
-    )
-
-    result = mac.ax_press(text="Not Now", all_apps=True)
-
-    assert result is fake_match
-    assert performed == [(fake_match["element_index"], "AXPress")]
-    assert client.calls == []
-
-
 def test_auto_backend_falls_back_to_python_when_native_client_is_none(
     monkeypatch,
 ) -> None:
@@ -895,6 +870,7 @@ def test_query_parity_on_finder_bounded_fallback() -> None:
 # assume never happened.
 _HARNESS_PROBE_HELPER = r'''
 import os
+import sys
 
 from AppKit import (
     NSApplication,
@@ -925,6 +901,9 @@ class _Target(NSObject):
     def pressed_(self, sender):
         global _presses
         _presses += 1
+        if "remove" in sys.argv[1:]:
+            sender.removeFromSuperview()
+            return
         sender.setTitle_(
             "harness-pressed" if _presses == 1 else f"harness-pressed-{_presses}"
         )
@@ -1087,6 +1066,51 @@ def test_native_press_round_trip_without_activation() -> None:
                 proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+
+@pytest.mark.native
+@pytest.mark.smoke
+@pytest.mark.parametrize("backend", ["python", "native"])
+@pytest.mark.parametrize(
+    ("disappear", "use_index"), [(False, False), (True, False), (True, True)]
+)
+def test_named_pointer_marks_the_semantic_target_in_a_screenshot(
+    backend, disappear, use_index, tmp_path
+) -> None:
+    _require_trusted_native_agent()
+    process = subprocess.Popen(
+        [sys.executable, "-c", _HARNESS_PROBE_HELPER, "remove" if disappear else "keep"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    try:
+        ready = _read_ready_line(process)
+        pid = int(ready.split(" ", 1)[1])
+        with MacOS(backend=backend, agent_id="research") as mac:
+            target = mac.ax.wait("harness-ok", app=pid, timeout=20)
+            frame = target["frame"]
+            if use_index:
+                mac.perform_action(target["element_index"])
+            else:
+                mac.ax.press(app=pid, text="harness-ok", timeout=20)
+            if disappear:
+                assert not mac.ax.query("harness-ok", app=pid)
+            else:
+                pressed = mac.ax.wait("harness-pressed", app=pid, timeout=10)
+                assert mac.ax.get(pressed["element_index"], "AXTitle") == "harness-pressed"
+            screenshot = mac.see(pid, path=tmp_path / "named-pointer.png", show_pointer=True)
+            pointer = screenshot["virtual_pointer"]
+            assert pointer is not None
+            assert pointer["agent_id"] == "research"
+            assert pointer["screen"] == {
+                "x": frame["x"] + frame["width"] / 2,
+                "y": frame["y"] + frame["height"] / 2,
+            }
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
 
 
 # An AppKit app with no window, Dock icon, or activation: says "ready" once

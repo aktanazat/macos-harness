@@ -5,11 +5,11 @@ description: "Read when a task has to drive a native or Electron macOS app: a wi
 
 # macOS Harness
 
-One CLI call per decision point; a step takes about a second, so run it
-synchronously. `mac`, `Path`, `subprocess`, `present` and `gone` are
-preloaded; `-c CODE` runs one line; `--json-errors` prints failures as
-JSON; `run flow.py --arg pid=42` reruns a saved program with `args`. After
-compaction, run `macos-harness skill signatures`.
+One synchronous call per decision. `mac`, `Path`, `subprocess`, `present`
+and `gone` are preloaded. `-c CODE` runs one line; `--json-errors` prints
+JSON failures; `run flow.py --arg pid=42` passes strings in `args`.
+Use `--agent-id NAME` for a named, colored pointer. After compaction,
+run `macos-harness skill signatures`.
 
 ```bash
 macos-harness <<'PY'

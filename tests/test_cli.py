@@ -401,6 +401,9 @@ class _FakeMac:
 
     asked: ClassVar[dict[str, object]] = {}
 
+    def __init__(self, *, agent_id: str | None = None) -> None:
+        self.agent_id = agent_id
+
     def __enter__(self) -> Self:
         return self
 

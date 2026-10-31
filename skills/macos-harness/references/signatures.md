@@ -30,6 +30,19 @@ unreadable or empty file exits 2 before anything runs.
 bundle ID contains NAME in any case. `macos-harness state APP` reads 400
 nodes unless `--max-nodes` says more, and says on stderr where it stopped.
 
+## Agent pointers
+
+`MacOS(*, backend=None, agent_id=None)` names a caller's pointer through
+`agent_id`. The CLI accepts `--agent-id NAME` before or after a command;
+`MACOS_HARNESS_AGENT_ID=NAME` applies when no explicit name is given.
+Names contain 1–64 printable characters. Give each parallel agent a
+different name; its color stays the same across processes.
+
+Named pointers mark `ax.set`, `ax.perform`, and `ax.press` when the target
+has a screen frame. `see(show_pointer=True)` draws the same arrow and label;
+the pointer result includes `agent_id`. `hide_pointer()` stays hidden
+until `show_pointer()`; `close()` reaps only the caller's helper.
+
 ## Primitives
 
 ```text

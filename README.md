@@ -596,6 +596,22 @@ acknowledgement, not proof the human succeeded, and it carries no once-token,
 receipt, or resume method to skip that rediscovery. After `cancelled`, stop;
 do not rediscover or retry.
 
+## Agent pointers
+
+`MacOS(agent_id="research")` gives a caller a colored arrow and a name.
+The same name keeps its color across processes. The CLI accepts
+`macos-harness --agent-id research -c 'print(mac.move(400, 300, coordinate_space="screen"))'`;
+`MACOS_HARNESS_AGENT_ID=research` also names the preloaded instance.
+An explicit argument wins over the environment. Use a distinct name for
+each agent, with 1–64 printable characters.
+
+Named pointers also mark Accessibility actions when the target reports a
+screen frame. `see(show_pointer=True)` includes the same arrow and name;
+`virtual_pointer["agent_id"]` identifies the caller. Without an agent name,
+the system-arrow behavior is unchanged. Each caller still owns its helper:
+closing one leaves the other agents' pointers alone. Nothing moves the
+physical cursor or brings an app forward.
+
 ## Native backend
 
 `mac.*` runs entirely in Python by default. A separate, optional Swift agent

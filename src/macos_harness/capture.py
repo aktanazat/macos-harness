@@ -22,7 +22,7 @@ from typing import Any
 
 from ._paths import user_temp_dir
 from .errors import AccessibilityPermissionError, ErrorCode, MacOSError
-from .pointer import POINTER_HOTSPOT, pointer_points
+from .pointer import POINTER_HOTSPOT, PointerIdentity, pointer_points
 
 try:
     import Quartz
@@ -670,7 +670,10 @@ def changed_area(before: GrayPrint, after: GrayPrint) -> float:
     return moved / 255 * before.point_area
 
 
-def draw_pointer(image: Any, x: float, y: float, scale: float) -> Any:
+def draw_pointer(
+    image: Quartz.CGImageRef, x: float, y: float, scale: float,
+    *, identity: PointerIdentity | None = None,
+) -> Quartz.CGImageRef:
     """Return a copy of ``image`` with the virtual pointer drawn at (x, y) px.
 
     ``scale`` is image pixels per screen point. The arrow never shrinks
@@ -696,6 +699,18 @@ def draw_pointer(image: Any, x: float, y: float, scale: float) -> Any:
 
     draw_scale = max(1.0, scale)
     hot_x, hot_y = POINTER_HOTSPOT
+    if identity is not None:
+        artwork = identity.image()
+        graphic, _ = artwork.CGImageForProposedRect_context_hints_(None, None, None)
+        size = artwork.size()
+        Quartz.CGContextTranslateCTM(
+            context, x - hot_x * draw_scale, y + (size.height - hot_y) * draw_scale
+        )
+        Quartz.CGContextScaleCTM(context, draw_scale, -draw_scale)
+        Quartz.CGContextDrawImage(
+            context, Quartz.CGRectMake(0, 0, size.width, size.height), graphic
+        )
+        return Quartz.CGBitmapContextCreateImage(context)
     points = [
         (x + (px - hot_x) * draw_scale, y + (py - hot_y) * draw_scale)
         for px, py in pointer_points()

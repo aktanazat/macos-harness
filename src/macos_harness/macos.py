@@ -21,6 +21,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -1266,7 +1267,7 @@ class MacOS:
     _observation_refs: Mapping[Any, int] = MappingProxyType({})
     _observation_ref_seq: int = 0
 
-    def __init__(self, *, backend: str | None = None) -> None:
+    def __init__(self, *, backend: str | None = None, agent_id: str | None = None) -> None:
         _require_macos()
         self._elements: dict[int, Any] = {}
         self._element_seq = 0
@@ -1303,7 +1304,7 @@ class MacOS:
         from .ops import Operations
 
         self._pointer_position: tuple[float, float] | None = None
-        self._overlay = LivePointerOverlay()
+        self._overlay = LivePointerOverlay(agent_id=agent_id)
         self.ax = Accessibility(self)
         self.do = Operations(self)
         self._backend = _resolve_backend(backend)
@@ -4279,7 +4280,7 @@ class MacOS:
                 # this directly; a client-side ax_wait traversal first
                 # would just be a second, redundant round trip for the
                 # same uniqueness check the agent already performs.
-                return self._native_press(
+                match = self._native_press(
                     client,
                     pid=target_pid,
                     search_key=search_key,
@@ -4295,6 +4296,8 @@ class MacOS:
                     single_attempt=single_attempt,
                     interval=interval,
                 )
+                self._pulse_element_pointer(self._show_element_pointer(match))
+                return match
 
         if not single_attempt:
             deadline.check_dispatch()
@@ -4332,7 +4335,7 @@ class MacOS:
         before = self._frontmost_app()
         if not single_attempt:
             deadline.check_dispatch()
-        self.perform_action(int(match["element_index"]), "AXPress")
+        self.perform_action(match, "AXPress")
         self._guard_focus(before, target_pid, "AX press")
         return match
 
@@ -4351,6 +4354,7 @@ class MacOS:
                 )
         element = self._element(element_index)
         self._hold_before_input(self._element_pid(element_index))
+        self._show_element_pointer(element_index)
         if not self._is_ax_element(element):
             element.client.set(element, attribute, value)
             return
@@ -4371,8 +4375,11 @@ class MacOS:
         element = self._element(element_index)
         self._hold_before_input(self._element_pid(element_index))
         normalized = _ACTION_ALIASES.get(action.casefold(), action)
+        pointer_ref = element_index
         if not self._is_ax_element(element):
+            marked = self._show_element_pointer(pointer_ref)
             element.client.perform(element, normalized)
+            self._pulse_element_pointer(marked and normalized == "AXPress")
             return
         available = self._actions(element)
         if normalized not in available:
@@ -4392,8 +4399,12 @@ class MacOS:
                     },
                 )
             element, normalized = button, "AXPress"
+            if self._overlay.identity is not None:
+                pointer_ref = self._remember_element(element)
+        marked = self._show_element_pointer(pointer_ref)
         error = AS.AXUIElementPerformAction(element, normalized)
         if error == _AX_SUCCESS or self._gone_after_action(element, error):
+            self._pulse_element_pointer(marked and normalized == "AXPress")
             return
         raise _ax_error(
             f"Perform {normalized} on element {element_index}",
@@ -5391,9 +5402,13 @@ class MacOS:
                 "inside": inside,
                 "visible": visible,
             }
+            if self._overlay.identity is not None:
+                screenshot["virtual_pointer"]["agent_id"] = self._overlay.identity.agent_id
             if show_pointer and visible and inside:
                 scale = (screenshot["scale_x"] + screenshot["scale_y"]) / 2
-                image = draw_pointer(image, image_x, image_y, scale)
+                image = draw_pointer(
+                    image, image_x, image_y, scale, identity=self._overlay.identity
+                )
         write_png(image, output)
         record = {key: screenshot[key] for key in _CAPTURE_RECORD_KEYS}
         if window_bounds is not None:
@@ -6375,6 +6390,8 @@ class MacOS:
             return None
         screen_x, screen_y = self._pointer_position
         result: dict[str, object] = {"screen": {"x": screen_x, "y": screen_y}}
+        if self._overlay.identity is not None:
+            result["agent_id"] = self._overlay.identity.agent_id
         shot = self._last_screenshot
         if shot is not None and (
             pid is None or shot["pid"] is None or int(shot["pid"]) == int(pid)
@@ -6383,6 +6400,37 @@ class MacOS:
             result["image"] = {"x": image_x, "y": image_y}
             result["inside"] = inside
         return result
+
+    def _show_element_pointer(self, element: ElementRef) -> bool:
+        if self._overlay.identity is None:
+            return False
+        frame = element.get("frame") if isinstance(element, Mapping) else None
+        if frame is None:
+            try:
+                frame = self.get(element, "AXFrame", missing_ok=True)
+            except MacOSError:
+                return False
+        if not isinstance(frame, Mapping):
+            return False
+        coordinates = tuple(frame.get(key) for key in ("x", "y", "width", "height"))
+        if not all(
+            isinstance(value, (int, float)) and math.isfinite(value)
+            for value in coordinates
+        ):
+            return False
+        x, y, width, height = coordinates
+        if width <= 0 or height <= 0:
+            return False
+        self._pointer_position = (x + width / 2, y + height / 2)
+        with suppress(OSError):
+            self._overlay.move(*self._pointer_position)
+            return True
+        return False
+
+    def _pulse_element_pointer(self, marked: bool) -> None:
+        if marked:
+            with suppress(OSError):
+                self._overlay.click()
 
     def move(
         self,

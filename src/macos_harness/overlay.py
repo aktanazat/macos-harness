@@ -17,7 +17,8 @@ import time
 import weakref
 from typing import Any, TextIO
 
-from .pointer import POINTER_HOTSPOT, POINTER_PRESS_SCALE
+from .errors import MacOSError
+from .pointer import POINTER_HOTSPOT, POINTER_PRESS_SCALE, PointerIdentity
 
 # Seconds without a move, show, or click before the helper hides the arrow.
 IDLE_HIDE_SECONDS = 3.0
@@ -66,7 +67,20 @@ class LivePointerOverlay:
     a later explicit move or show can recreate it without keeping UI alive.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, agent_id: str | None = None) -> None:
+        configured = (
+            agent_id if agent_id is not None else os.environ.get("MACOS_HARNESS_AGENT_ID") or None
+        )
+        try:
+            self.identity = PointerIdentity(configured) if configured is not None else None
+        except MacOSError as exc:
+            if agent_id is not None:
+                raise
+            raise MacOSError(
+                f"MACOS_HARNESS_AGENT_ID: {exc}",
+                code=exc.code,
+                details={"parameter": "MACOS_HARNESS_AGENT_ID"},
+            ) from exc
         self._process_box: list[subprocess.Popen[str] | None] = [None]
         self._creator_pid = os.getpid()
         self._lock = threading.RLock()
@@ -151,6 +165,10 @@ class LivePointerOverlay:
     def _start(self) -> subprocess.Popen[str]:
         process = subprocess.Popen(
             [sys.executable, "-m", "macos_harness.overlay", "--helper"],
+            env=(
+                {**os.environ, "MACOS_HARNESS_AGENT_ID": self.identity.agent_id}
+                if self.identity is not None else None
+            ),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -222,8 +240,9 @@ def _run_helper() -> None:  # pragma: no cover - exercised by the live smoke tes
     app = AppKit.NSApplication.sharedApplication()
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
 
-    cursor = AppKit.NSCursor.arrowCursor()
-    cursor_image = cursor.image()
+    agent_id = os.environ.get("MACOS_HARNESS_AGENT_ID")
+    identity = PointerIdentity(agent_id) if agent_id is not None else None
+    cursor_image = identity.image() if identity is not None else AppKit.NSCursor.arrowCursor().image()
     magnification = _cursor_magnification()
     size = cursor_image.size()
     width = float(size.width) * magnification
@@ -285,7 +304,8 @@ def _run_helper() -> None:  # pragma: no cover - exercised by the live smoke tes
                 AppKit.NSMakeRect(0, 0, width, height)
             )
             controller.panel.setContentView_(controller.view)
-            controller.panel.setTitle_("macOS Harness Pointer")
+            title = "macOS Harness Pointer"
+            controller.panel.setTitle_(f"{title}: {identity.agent_id}" if identity else title)
             controller.panel.setOpaque_(False)
             controller.panel.setBackgroundColor_(AppKit.NSColor.clearColor())
             controller.panel.setHasShadow_(False)

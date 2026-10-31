@@ -287,3 +287,23 @@ finally:
     assert json.loads(result.stdout) == {
         "commands": ["show", "move"], "helpers_created": 1,
     }
+
+
+@pytest.mark.parametrize(
+    ("environment", "explicit", "expected"),
+    [
+        ("research", None, "research"),
+        ("research", "writer", "writer"),
+        ("", None, None),
+        (" ", "writer", "writer"),
+    ],
+)
+def test_pointer_identity_uses_environment_unless_the_caller_names_it(
+    monkeypatch, pointer_children, environment, explicit, expected
+) -> None:
+    monkeypatch.setenv("MACOS_HARNESS_AGENT_ID", environment)
+    with MacOS(agent_id=explicit) as mac:
+        pointer = mac.move(10, 20, coordinate_space="screen")
+
+    assert pointer.get("agent_id") == expected
+    assert pointer_children[0].returncode == 0
