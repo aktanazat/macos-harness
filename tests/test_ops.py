@@ -1779,6 +1779,70 @@ def test_a_call_holding_an_apps_input_takes_it_again_to_send_more() -> None:
         pass
 
 
+_INPUT_FORK_SCRIPT = r'''
+import os
+import sys
+import threading
+
+import macos_harness._input_lock as input_lock
+from macos_harness.errors import MacOSError
+
+input_lock.user_temp_dir = lambda: sys.argv[1]
+taken, release = threading.Event(), threading.Event()
+
+
+def hold():
+    with input_lock.app_input(41, 1):
+        taken.set()
+        release.wait(5)
+
+
+holder = threading.Thread(target=hold)
+holder.start()
+taken.wait(5)
+go_read, go_write = os.pipe()
+child = os.fork()
+if child == 0:
+    os.close(go_write)
+    os.read(go_read, 1)
+    try:
+        with input_lock.app_input(41, 1):
+            pass
+    except MacOSError:
+        os._exit(1)
+    os._exit(0)
+os.close(go_read)
+release.set()
+holder.join(5)
+try:
+    with input_lock.app_input(41, 0.2):
+        print("parent took the input", flush=True)
+except MacOSError as error:
+    print("parent", error.details["reason"], flush=True)
+os.write(go_write, b"g")
+_, status = os.waitpid(child, 0)
+print("child exit", os.waitstatus_to_exitcode(status), flush=True)
+'''
+
+
+def test_a_child_forked_while_a_thread_holds_an_apps_input_keeps_none_of_it(tmp_path) -> None:
+    """The child's copy of the lock file kept the app's input locked after
+    the parent let go, and its copy of the thread lock belonged to a
+    thread it does not have. The fork runs in an interpreter of its own,
+    whose only other thread is the holder, as the fork tests in
+    test_macos.py do."""
+    result = subprocess.run(
+        [sys.executable, "-c", _INPUT_FORK_SCRIPT, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["parent took the input", "child exit 0"]
+
+
 def test_key_changed_is_none_without_a_verified_postcondition_or_on_ambiguous_failure() -> None:
     host, operations = _ops()
     no_postcondition = operations.key("return", app="Demo")

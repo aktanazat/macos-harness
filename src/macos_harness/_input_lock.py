@@ -13,7 +13,7 @@ import os
 import threading
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 
 from ._paths import user_temp_dir
 from .errors import ErrorCode, MacOSError
@@ -32,6 +32,26 @@ class _Hold:
 
 _holds_guard = threading.Lock()
 _holds: dict[int, _Hold] = {}
+
+
+def _forget_holds_after_fork() -> None:
+    """Start a forked child with no holds. Its copy of a held lock file
+    would keep the app's input locked after the parent let go, and a
+    hold's thread lock may belong to a thread the child does not have.
+    Closing the copy, never unlocking it, leaves the parent's hold as it
+    was, and a hold the forking thread is inside then ends without
+    closing it again; a file whose holder was closing it as the child
+    forked may be closed already."""
+    global _holds, _holds_guard
+    inherited, _holds, _holds_guard = _holds, {}, threading.Lock()
+    for hold in inherited.values():
+        fd, hold.fd = hold.fd, None
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+
+
+os.register_at_fork(after_in_child=_forget_holds_after_fork)
 
 
 @contextmanager
