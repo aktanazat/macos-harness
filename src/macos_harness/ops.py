@@ -601,6 +601,18 @@ def _validate_type_text(text: str) -> None:
     _validate_utf8_text(text, parameter="text")
 
 
+def _named_keyboard_window(
+    host: _Host, pid: int, window_id: int | None
+) -> dict[str, JSONValue] | None:
+    """The ``target`` field a `key` or `type` naming ``window_id`` adds,
+    once that window is ``pid``'s and on screen, so a window that cannot
+    take the keys fails before anything is reserved or sent."""
+    if window_id is None:
+        return None
+    host._keyboard_target(pid, window_id)
+    return {"window_id": window_id}
+
+
 def _validate_fill_value(value: str) -> None:
     """Reject a ``fill`` ``value`` no keyboard input could carry: one
     `_validate_type_text` already refuses, or one holding a control
@@ -1271,6 +1283,7 @@ class _Host(Protocol):
     ) -> dict[str, JSONValue]: ...
     def _validate_button(self, button: str) -> str: ...
     def _validate_clicks(self, clicks: int) -> int: ...
+    def _keyboard_target(self, pid: int, window_id: int) -> None: ...
     def _focus_sample(self, pid: int) -> dict[str, JSONValue]: ...
     def _exited(self, pid: int) -> bool: ...
     def _window_button(
@@ -2628,6 +2641,7 @@ class Operations:
         key: str,
         *,
         app: str | int,
+        window_id: int | None = None,
         timeout: float = 5.0,
         postcondition: Postcondition | None = None,
         once: str | None = None,
@@ -2638,27 +2652,32 @@ class Operations:
 
         Unlike the AX verbs, ``key`` has no ``all_apps``/``apps`` scope: a
         key combo always targets one exact process, so ``app`` is required.
+        ``window_id`` names the window it goes to, as `type` takes it.
         """
 
         quits = _is_quit_key(key)
 
-        def prepare(host: _Host, pid: int, deadline: _Deadline) -> None:
-            del pid, deadline
+        def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            del deadline
             host._validate_key(key)
+            return _named_keyboard_window(host, pid, window_id)
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
             del deadline
-            host.key(key, app=pid)
+            host.key(key, app=pid, window_id=window_id)
 
         def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
             if quits and postcondition is None:
                 return self._await_effect(deadline, lambda: host._exited(pid), {"exited": True})
             return None
 
+        request: dict[str, JSONValue] = {"key": key}
+        if window_id is not None:
+            request["window_id"] = window_id
         return self._input_verb(
             op="key",
             app=app,
-            request={"key": key},
+            request=request,
             timeout=timeout,
             postcondition=postcondition,
             once=once,
@@ -2767,6 +2786,7 @@ class Operations:
         text: str,
         *,
         app: str | int,
+        window_id: int | None = None,
         timeout: float = 5.0,
         postcondition: Postcondition | None = None,
         once: str | None = None,
@@ -2779,20 +2799,30 @@ class Operations:
         `_value_summary`, the same rule `set` applies to a value. The
         text is bounded and checked (`_validate_type_text`) before the
         ``once`` token is reserved.
+
+        ``window_id`` names the window the text goes to. It must be
+        ``app``'s and on screen, checked before anything is reserved, and
+        it becomes the app's focused window under the same turn on the
+        app's input that sends the text, so another run's window focused
+        since cannot take it.
         """
 
-        def prepare(host: _Host, pid: int, deadline: _Deadline) -> None:
-            del host, pid, deadline
+        def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            del deadline
             _validate_type_text(text)
+            return _named_keyboard_window(host, pid, window_id)
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
             del deadline
-            host.type(text, app=pid)
+            host.type(text, app=pid, window_id=window_id)
 
+        request: dict[str, JSONValue] = {"text": _value_summary(text)}
+        if window_id is not None:
+            request["window_id"] = window_id
         return self._input_verb(
             op="type",
             app=app,
-            request={"text": _value_summary(text)},
+            request=request,
             timeout=timeout,
             postcondition=postcondition,
             once=once,

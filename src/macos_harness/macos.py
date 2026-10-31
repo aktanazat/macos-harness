@@ -5989,12 +5989,34 @@ class MacOS:
         focused window, None where accessibility cannot name it."""
         if window_id is None:
             return self._focused_window_id(pid)
-        window = self._described_window(window_id)
-        self._require_owner(window, pid)
-        self._require_on_screen(window)
+        self._keyboard_target(pid, window_id)
         if self._focused_window_id(pid) != window_id:
             self._focus_window(pid, window_id)
         return window_id
+
+    def _keyboard_target(self, pid: int, window_id: int) -> None:
+        """Refuse keys meant for ``window_id`` unless ``pid`` owns it and it is on screen."""
+        window = self._described_window(window_id)
+        self._require_owner(window, pid)
+        self._require_on_screen(window)
+
+    def _guard_keyboard_window(self, pid: int, window_id: int, sent: int, total: int) -> None:
+        """Stop typing once ``pid``'s keys go to a window accessibility
+        names other than ``window_id``: something that does not wait its
+        turn, a person's click or the app itself, moved them there."""
+        focused = self._focused_window_id(pid)
+        if focused is not None and focused != window_id:
+            raise FocusChangedError(
+                f"Keys to pid {pid} moved from window {window_id} to window {focused} "
+                f"after {sent} of {total} characters; stopped",
+                details={
+                    "operation": "typing",
+                    "target_pid": pid,
+                    "window_id": window_id,
+                    "focused_window_id": focused,
+                    "characters_sent": sent,
+                },
+            )
 
     def _focused_window_id(self, pid: int) -> int | None:
         """The window ``pid``'s keys go to, None when accessibility cannot say."""
@@ -7051,7 +7073,9 @@ class MacOS:
         app: it becomes the app's focused window first, as a click on it
         would make it, without bringing the app forward. The result names
         the window that took the keys, None where accessibility cannot
-        say, and whether the app was in front.
+        say, and whether the app was in front. In the background, typing
+        stops with `FocusChangedError` before the next character once the
+        app's keys go to another window.
         """
         self._ensure_accessibility()
         self._ensure_post_events()
@@ -7061,7 +7085,10 @@ class MacOS:
             self._hold_before_input(pid, window_id)
             focus_before = self._frontmost_app()
             packed = focus_before is not None and int(focus_before["pid"]) == pid
+            sent = 0
             for chunk in _typing_chunks(text, packed=packed):
+                if not packed and target is not None:
+                    self._guard_keyboard_window(pid, target, sent, len(text))
                 if packed and chunk not in _KEY_ONLY_CHARACTERS:
                     keycode, flags = 0, 0
                 else:
@@ -7075,6 +7102,7 @@ class MacOS:
                 AS.CGEventSetFlags(up, flags)
                 self._post(down, pid)
                 self._post(up, pid)
+                sent += len(chunk)
                 if not packed:
                     # A frontmost app took focus already, so the guard that
                     # stops when the target steals it has nothing to catch.

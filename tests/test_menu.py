@@ -216,7 +216,7 @@ class _Quitting(_Sona):
         super().perform_action(element_index, action)
         self.gone = self.pressed[-1] == ("AXMenuBar", self.exits_on)
 
-    def key(self, key: str, *, app: str | int | None = None) -> None:
+    def key(self, key: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
         self.gone = key == "cmd+q"
 
     def _identity_from_info(self, info: object) -> object:

@@ -97,6 +97,12 @@ with repeated keys, clicks, deletion loops, or bulk input.
   postcondition, a quit, a window closing, or `fill` reading its text back,
   leaves the app's input free. Runs aimed at different apps never wait for
   each other.
+- Turns keep runs apart only when each names its window: one that names
+  none types into whichever window the app focused last, maybe another
+  run's. `window_id` on `key` or `type`, raw or `mac.do`, makes that window
+  the focused one inside the same turn. Typing into an app in the
+  background stops with `focus.changed` once the app's keys go to another
+  window; the character already on its way can still land there.
 - An inactive app takes scrolls, plain keys, and typed text, but AppKit drops a
   menu shortcut (`cmd+a`) sent to it and passes a first click only to a view
   that accepts first mouse; text views do not. The click result says

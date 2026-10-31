@@ -133,6 +133,9 @@ class FakeHost:
         self.target_window_error: MacOSError | None = None
         self.target_window_calls: list[tuple[int, tuple[float, float], int | None]] = []
         self.screenshots_used: list[object] = []
+        self.keyboard_target_error: MacOSError | None = None
+        self.keyboard_targets: list[tuple[int, int]] = []
+        self.keyboard_windows: list[int | None] = []
 
     def _resolve_app(self, query: str | int | None) -> tuple[object, dict[str, object]]:
         if query is None:
@@ -310,8 +313,9 @@ class FakeHost:
         if self.toggle_on_press:
             self.value = not bool(self.value)
 
-    def key(self, key: str, *, app: str | int | None = None) -> None:
+    def key(self, key: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
         self.key_calls.append((key, app))
+        self.keyboard_windows.append(window_id)
         if self.key_hook is not None:
             self.key_hook()
         if self.key_error is not None:
@@ -332,10 +336,16 @@ class FakeHost:
         if self.click_error is not None:
             raise self.click_error
 
-    def type(self, text: str, *, app: str | int | None = None) -> None:
+    def type(self, text: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
         self.type_calls.append((text, app))
+        self.keyboard_windows.append(window_id)
         if self.type_error is not None:
             raise self.type_error
+
+    def _keyboard_target(self, pid: int, window_id: int) -> None:
+        self.keyboard_targets.append((pid, window_id))
+        if self.keyboard_target_error is not None:
+            raise self.keyboard_target_error
 
 
 def _exit_script(returncode: int = 0, *, stdout: bytes = b"", stderr: bytes = b"") -> str:
@@ -1799,6 +1809,34 @@ def test_other_runs_send_the_app_input_while_a_key_waits_on_its_postcondition(ap
     assert free == [True]
 
 
+def test_key_and_type_go_to_the_window_they_name() -> None:
+    """Keys go to whichever window the app has focused, and another run
+    may have focused its own window since, so a run names the window it
+    means; the raw verb makes it the focused one before sending."""
+    host, operations = _ops()
+
+    pressed = operations.key("return", app="Demo", window_id=9)
+    typed = operations.type("hi", app="Demo", window_id=9)
+
+    assert host.keyboard_targets == [(41, 9), (41, 9)]
+    assert host.keyboard_windows == [9, 9]
+    assert [receipt.target["window_id"] for receipt in (pressed, typed)] == [9, 9]
+    assert [receipt.request["window_id"] for receipt in (pressed, typed)] == [9, 9]
+
+
+def test_type_naming_a_window_the_app_cannot_type_in_sends_nothing() -> None:
+    host, operations = _ops()
+    host.keyboard_target_error = MacOSError(
+        "Window 9 belongs to Other (pid 7), not pid 41", code=ErrorCode.BAD_REQUEST
+    )
+
+    error = _failed(lambda: operations.type("hi", app="Demo", window_id=9))
+
+    assert error.code == ErrorCode.BAD_REQUEST
+    assert error.receipt.acted is Acted.NO
+    assert host.type_calls == []
+
+
 def test_a_call_holding_an_apps_input_takes_it_again_to_send_more() -> None:
     """``mac.do`` holds the app's input while dispatch sends it through
     the raw verbs, which take that input themselves."""
@@ -2320,13 +2358,13 @@ class FormHost(FakeHost):
         else:
             super().set(element_index, value, attribute)
 
-    def key(self, key: str, *, app: str | int | None = None) -> None:
+    def key(self, key: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
         if key == "backspace":
             self.type("", app=app)
         else:
-            super().key(key, app=app)
+            super().key(key, app=app, window_id=window_id)
 
-    def type(self, text: str, *, app: str | int | None = None) -> None:
+    def type(self, text: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
         if self.reject_text:
             return
         if not self.focused:
@@ -2361,8 +2399,8 @@ class _ReadBackHost(FormHost):
             self.input_free.append(self.app_input_free(41))
         return super().get(element_index, attribute, missing_ok=missing_ok)
 
-    def type(self, text: str, *, app: str | int | None = None) -> None:
-        super().type(text, app=app)
+    def type(self, text: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
+        super().type(text, app=app, window_id=window_id)
         self.typed = True
 
 

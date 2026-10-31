@@ -2590,6 +2590,36 @@ def test_typing_stops_if_target_becomes_frontmost(monkeypatch) -> None:
     assert len(posted) == 2
 
 
+class _KeysMoveAway(MacOS):
+    """An app whose keys go to window 5 until, at the third look,
+    something else has moved them to window 6."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.focused = iter([5, 5, 6])
+
+    def _keyboard_window(self, pid: int, window_id: int | None) -> int | None:
+        return 5
+
+    def _focused_window_id(self, pid: int) -> int | None:
+        return next(self.focused)
+
+
+def test_typing_stops_once_the_app_moves_its_keys_to_another_window(monkeypatch) -> None:
+    """Something that does not wait its turn, a person's click or the app
+    itself, moving the app's keys to another window mid-text sent the rest
+    of the text into that window."""
+    mac = _KeysMoveAway()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=7)
+
+    with pytest.raises(FocusChangedError) as stopped:
+        mac.type("abc", app=42)
+
+    assert [event["text"] for event, _ in posted if event["down"]] == ["a", "b"]
+    assert stopped.value.details["focused_window_id"] == 6
+    assert stopped.value.details["characters_sent"] == 2
+
+
 def test_background_click_uses_private_event_source(monkeypatch) -> None:
     mac = MacOS()
     sources = []
