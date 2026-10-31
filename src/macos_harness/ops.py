@@ -613,6 +613,19 @@ def _named_keyboard_window(
     return {"window_id": window_id}
 
 
+# A plain text control: a field or area holding plain text, never a
+# secure one.
+_PLAIN_TEXT_ROLES = frozenset({"AXTextField", "AXTextArea"})
+_PLAIN_TEXT_SUBROLES = frozenset({None, "AXUnknown", "AXSearchField"})
+
+
+def _has_control_character(text: str) -> bool:
+    """Whether ``text`` holds a control character, which a key event
+    delivers as a key -- a newline submitting a form, a tab leaving a
+    field -- rather than as typed text."""
+    return any(ord(char) < 32 or ord(char) == 127 for char in text)
+
+
 def _validate_fill_value(value: str) -> None:
     """Reject a ``fill`` ``value`` no keyboard input could carry: one
     `_validate_type_text` already refuses, or one holding a control
@@ -627,7 +640,7 @@ def _validate_fill_value(value: str) -> None:
     rather than carrying a second copy that drifts.
     """
     _validate_type_text(value)
-    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+    if _has_control_character(value):
         raise MacOSError("fill does not accept control characters", code=ErrorCode.BAD_REQUEST)
 
 
@@ -2870,9 +2883,8 @@ class Operations:
             )
             element_index = int(match["element_index"])
             if (
-                host.get(element_index, "AXRole") not in {"AXTextField", "AXTextArea"}
-                or host.get(element_index, "AXSubrole", missing_ok=True)
-                not in {None, "AXUnknown", "AXSearchField"}
+                host.get(element_index, "AXRole") not in _PLAIN_TEXT_ROLES
+                or host.get(element_index, "AXSubrole", missing_ok=True) not in _PLAIN_TEXT_SUBROLES
                 or host.get(element_index, "AXEnabled") is not True
             ):
                 raise MacOSError(
