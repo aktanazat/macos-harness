@@ -181,8 +181,9 @@ follows [Semantic Versioning](https://semver.org/).
   into the other. A click, drag, scroll, key, or typed text now waits
   while another run sends that app input, up to 60s for the raw verbs or
   the `mac.do` call's `timeout`, then raises `timeout` with `reason:
-  "app_input_busy"` having sent nothing. Input to different apps still
-  runs at once.
+  "app_input_busy"` having sent nothing; a lock file that will not open
+  raises `ax.error` with `reason: "app_input_lock_unavailable"`, also
+  having sent nothing. Input to different apps still runs at once.
 - `wait_change(by="ax")` skips a read of the app's accessibility tree
   that was cut short instead of comparing it: unreadable reads had
   reported `changed` and `settled` with nothing changed. The result, or

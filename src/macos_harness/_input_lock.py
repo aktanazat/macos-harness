@@ -80,11 +80,19 @@ def app_input(pid: int, wait: float) -> Iterator[None]:
 
 
 def _lock_file(pid: int, wait: float, end: float) -> int:
-    fd = os.open(
-        os.path.join(user_temp_dir(), f"macos-harness-input-{pid}.lock"),
-        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
-        0o600,
-    )
+    try:
+        fd = os.open(
+            os.path.join(user_temp_dir(), f"macos-harness-input-{pid}.lock"),
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+    except OSError as error:
+        raise MacOSError(
+            f"Could not open the lock that keeps input to pid {pid} from "
+            f"mixing with another call's ({error}), so nothing was sent",
+            code=ErrorCode.AX_ERROR,
+            details={"pid": pid, "reason": "app_input_lock_unavailable", "error": str(error)},
+        ) from error
     try:
         while True:
             try:

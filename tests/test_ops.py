@@ -1772,6 +1772,20 @@ def test_key_sends_nothing_while_another_run_sends_the_app_input(hold_app_input)
     assert host.key_calls == [("return", 41)]
 
 
+def test_key_sends_nothing_when_the_apps_input_lock_will_not_open(tmp_path) -> None:
+    """A link where the lock file goes, which the lock never follows,
+    leaves the app's input unguarded."""
+    (tmp_path / "macos-harness-input-41.lock").symlink_to(tmp_path / "elsewhere")
+    host, operations = _ops()
+
+    error = _failed(lambda: operations.key("return", app="Demo", timeout=0.2))
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.error["code"] == ErrorCode.AX_ERROR.value
+    assert error.receipt.error["details"]["reason"] == "app_input_lock_unavailable"
+    assert host.key_calls == []
+
+
 def test_a_call_holding_an_apps_input_takes_it_again_to_send_more() -> None:
     """``mac.do`` holds the app's input from dispatch on and sends it
     through the raw verbs, which take that input themselves."""
