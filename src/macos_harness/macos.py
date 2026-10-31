@@ -684,6 +684,9 @@ _INPUT_WAIT = 60.0
 # still sliding into place.
 _FRAME_SECONDS = 1 / 60
 _STILL_SECONDS = 0.5
+# How long a click waits before asking accessibility again what lies at an
+# element's center when the first answer named something else.
+_HIT_AGAIN_SECONDS = 0.1
 
 
 def _character_key(character: str) -> tuple[int, int]:
@@ -6807,6 +6810,8 @@ class MacOS:
             pid = self._input_pid(owner, window_id, "Pointer input")
             point = self._element_point(element, pid)
         window = self._target_window(pid, point, window_id)
+        if element is not None:
+            self._require_uncovered(element, pid, point, window.window_id)
         in_front = self._post_click(pid, point, window, button=button, clicks=clicks)
         pointer = self._pointer_info(pid=pid)
         assert pointer is not None
@@ -6848,10 +6853,7 @@ class MacOS:
         The frame is read again a display frame later, and again until
         two readings agree, for at most `_STILL_SECONDS` and never past
         ``within`` seconds. An element still moving then is refused, and
-        so is a center where accessibility finds an element that neither
-        holds nor lies inside this one: nothing is clicked either way. A
-        center where the app names nothing, as a game that draws its own
-        buttons, keeps the click."""
+        nothing is clicked."""
         owner = self._element_pid(element)
         if owner not in (None, pid):
             raise MacOSError(
@@ -6882,19 +6884,42 @@ class MacOS:
                 code=ErrorCode.UNSUPPORTED_OP,
                 details={"frame": frame},
             )
-        point = frame["x"] + frame["width"] / 2, frame["y"] + frame["height"] / 2
+        return frame["x"] + frame["width"] / 2, frame["y"] + frame["height"] / 2
+
+    def _require_uncovered(
+        self, element: ElementRef, pid: int, point: tuple[float, float], window_id: int
+    ) -> None:
+        """Refuse a click on ``element`` at ``point`` where accessibility
+        finds, in window ``window_id`` the click is routed to, an element
+        that neither holds nor lies inside it. One found in another of
+        the app's windows, as a floating panel over a document or the
+        front window over a named one behind it, takes no click routed
+        here, and a center where the app names nothing keeps the click.
+        Chromium answers a first hit test from bounding boxes, which miss
+        z-order and sticky layout, and the true one on the next ask
+        (browser_accessibility_manager.cc ``CachingAsyncHitTest``), so a
+        disagreement is asked again once before the click is refused."""
         aimed = self._element(element)
-        if self._is_ax_element(aimed):
+        if not self._is_ax_element(aimed):
+            return
+        for ask in range(2):
             found, hit = self._hit(pid, point)
-            if hit is not None and not (self._within(found, aimed) or self._within(aimed, found)):
-                named = hit["title"] or hit["description"]
-                raise MacOSError(
-                    f"Accessibility finds {hit['role']}{f' {named!r}' if named else ''} at the "
-                    "element's center, not the element; nothing was clicked",
-                    code=ErrorCode.UNSUPPORTED_OP,
-                    details={"point": {"x": point[0], "y": point[1]}, "found": hit},
-                )
-        return point
+            if (
+                hit is None
+                or self._within(found, aimed)
+                or self._within(aimed, found)
+                or self._ax_window_id(self._copy_attribute(found, "AXWindow")) != window_id
+            ):
+                return
+            if ask == 0:
+                self._pause(_HIT_AGAIN_SECONDS)
+        named = hit["title"] or hit["description"]
+        raise MacOSError(
+            f"Accessibility finds {hit['role']}{f' {named!r}' if named else ''} at the "
+            "element's center, not the element; nothing was clicked",
+            code=ErrorCode.UNSUPPORTED_OP,
+            details={"point": {"x": point[0], "y": point[1]}, "found": hit},
+        )
 
     def _post_click(
         self,

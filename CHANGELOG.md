@@ -150,8 +150,10 @@ follows [Semantic Versioning](https://semver.org/).
   rows can. The element may be a match from any run or an index from this
   one. An element of another app, one with no area on screen, one still
   moving half a second on, or one whose center accessibility finds another
-  element over, named in the error, is refused before anything is posted,
-  and the receipt names the element by its role and labels, never its
+  element over, in the window the click is routed to, on two asks a tenth
+  of a second apart, is refused before anything is posted, naming what is
+  there; one of the app's other windows over it, as a floating panel, is
+  not. The receipt names the element by its role and labels, never its
   value.
 - `mac.do.menu("View > Reload Page", app=...)` chooses a menu command by its
   path, each step found only under the one before, so an item two menus

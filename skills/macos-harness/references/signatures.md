@@ -179,8 +179,11 @@ A control that ignores `AXPress`, as a SwiftUI row can, takes a click:
 center of the element's frame once it holds still, in the element's own
 process, in place of `x` and `y`. An element of another app, one with no
 area on screen, one still moving half a second on, or one whose center
-accessibility finds another element over is refused before anything is
-posted; the error names what is there.
+accessibility finds another element over, in the window the click is
+routed to, on two asks a tenth of a second apart, is refused before
+anything is posted; the error names what is there. One of the app's other
+windows over the element, as a floating panel, takes no click and is not
+a reason to refuse.
 
 ## Accessibility
 

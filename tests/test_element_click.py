@@ -1,8 +1,9 @@
 """A click aimed at an element instead of a point, for a control that
 ignores AXPress. It lands on the center of the element's frame once the
 frame holds still, in the element's own process, and only where
-accessibility finds that element. One app's row and window are fakes;
-each test asserts where a click was posted, or that none was."""
+accessibility finds that element in the window the click goes to. One
+app's row and window are fakes; each test asserts where a click was
+posted, or that none was."""
 
 from __future__ import annotations
 
@@ -120,24 +121,27 @@ class _Sona(MacOS):
 
 
 class _Node:
-    """An element accessibility answers for: its frame and its parent."""
+    """An element accessibility answers for: its frame, its parent, and
+    the number of the window it lies in."""
 
-    def __init__(self, parent: _Node | None = None) -> None:
+    def __init__(self, parent: _Node | None = None, window: int = _WINDOW) -> None:
         self.parent = parent
+        self.window = window
         self.frame = _ROW
 
 
 class _Covered(_Sona):
     """Sona read through accessibility instead of the agent: its row sits
-    in its window, and at the row's center accessibility finds the
-    element ``found`` picks, or nothing."""
+    in its window, and at the row's center accessibility finds, at each
+    ask, the element the next of ``answers`` picks, the last for every
+    ask after, or nothing."""
 
-    def __init__(self, found: Callable[[_Node, _Node], _Node | None]) -> None:
+    def __init__(self, *answers: Callable[[_Node, _Node], _Node | None]) -> None:
         super().__init__()
         window = _Node()
         self.row = _Node(window)
         self.row_index = self._remember_element(self.row)
-        self.found = found(self.row, window)
+        self.answers = deque(answer(self.row, window) for answer in answers)
 
     def _is_ax_element(self, value: object) -> bool:
         return isinstance(value, _Node)
@@ -148,12 +152,22 @@ class _Covered(_Sona):
 
     @staticmethod
     def _copy_attribute(element: object, attribute: str, *, checked: bool = False) -> object:
-        return element.parent if isinstance(element, _Node) and attribute == "AXParent" else None
+        if not isinstance(element, _Node):
+            return None
+        return {"AXParent": element.parent, "AXWindow": element.window}.get(attribute)
+
+    @staticmethod
+    def _ax_window_id(window: object) -> int | None:
+        return window if isinstance(window, int) else None
+
+    def _pause(self, seconds: float) -> None:
+        return None
 
     def _hit(self, pid: int, point: tuple[float, float]) -> tuple[object | None, dict[str, object] | None]:
-        if self.found is None:
+        found = self.answers.popleft() if len(self.answers) > 1 else self.answers[0]
+        if found is None:
             return None, None
-        return self.found, {"role": "AXButton", "title": "Cover", "description": None}
+        return found, {"role": "AXButton", "title": "Cover", "description": None}
 
 
 class _SlidingRow(_Row):
@@ -322,20 +336,37 @@ def test_a_click_that_would_land_on_something_else_posts_nothing(
 
 
 @pytest.mark.parametrize(
+    "click",
+    [
+        lambda mac: mac.click(element=_EARLIER, app="Sona"),
+        lambda mac: mac.do.click(element=_EARLIER, app="Sona"),
+    ],
+    ids=["click", "do-click"],
+)
+@pytest.mark.parametrize(
     ("make", "center"),
     [
         (lambda: _Covered(lambda row, window: _Node(row)), (250.0, 220.0)),
         (lambda: _Covered(lambda row, window: window), (250.0, 220.0)),
         (lambda: _Covered(lambda row, window: None), (250.0, 220.0)),
+        (lambda: _Covered(lambda row, window: _Node(window=_WINDOW + 1)), (250.0, 220.0)),
+        (lambda: _Covered(lambda row, window: _Node(_Node()), lambda row, window: row), (250.0, 220.0)),
         (lambda: _Sliding(_SETTLING), (250.0, 223.0)),
     ],
-    ids=["a-part-of-it", "what-holds-it", "nothing-named", "held-still-after-sliding"],
+    ids=[
+        "a-part-of-it", "what-holds-it", "nothing-named", "another-window-over-it",
+        "found-on-asking-again", "held-still-after-sliding",
+    ],
 )
 def test_a_click_lands_where_accessibility_finds_the_element_once_still(
-    make: Callable[[], _Sona], center: tuple[float, float],
+    click: Callable[[_Sona], object], make: Callable[[], _Sona], center: tuple[float, float],
 ) -> None:
+    """Another of the app's windows over the element, as a floating panel,
+    takes no click routed to the element's window; and an app may name
+    the element only on a second ask, as Chromium answers a first hit
+    test from bounding boxes."""
     mac = make()
 
-    mac.click(element=_EARLIER, app="Sona")
+    click(mac)
 
     assert mac.posted == [(_SONA, center, _WINDOW)]

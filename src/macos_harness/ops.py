@@ -1393,6 +1393,10 @@ class _Host(Protocol):
     def _element_point(
         self, element: int | Mapping[str, JSONValue], pid: int, *, within: float
     ) -> tuple[float, float]: ...
+    def _require_uncovered(
+        self, element: int | Mapping[str, JSONValue], pid: int,
+        point: tuple[float, float], window_id: int,
+    ) -> None: ...
     def _menu_item(
         self, pid: int, steps: Sequence[str | None], *, bar: str
     ) -> dict[str, JSONValue]: ...
@@ -2819,6 +2823,8 @@ class Operations:
             else:
                 screen = host._element_point(element, pid, within=deadline.remaining())
             window = host._target_window(pid, screen, aimed_window)
+            if element is not None:
+                host._require_uncovered(element, pid, screen, window.window_id)
             resolved = (normalized_button, normalized_clicks, screen, window)
             extras: dict[str, JSONValue] = {
                 "point": {"x": screen[0], "y": screen[1]},
