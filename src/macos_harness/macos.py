@@ -361,6 +361,9 @@ _ACTION_ALIASES = {
     "decrement": "AXDecrement",
     "raise": "AXRaise",
 }
+_NOTIFICATION_CENTER = "com.apple.notificationcenterui"
+_NOTIFICATION_SUBROLES = frozenset({"AXNotificationCenterBanner", "AXNotificationCenterAlert"})
+_NOTIFICATION_TEXTS = ("title", "subtitle", "body")
 _BUTTONS = {
     "left": (AS.kCGMouseButtonLeft if AS else 0),
     "right": (AS.kCGMouseButtonRight if AS else 1),
@@ -453,6 +456,12 @@ def _role_filter(search_key: str) -> str | None:
     "AXWindow", "AXPopUpButton", "AXRow" -- asks the app for every kind of
     element and keeps those of that role."""
     return None if search_key.endswith("SearchKey") else search_key
+
+
+def _action_name(action: str) -> str:
+    """The name ``action`` goes by: an app's own action reads
+    "Name:Close\\nTarget:0x0\\nSelector:(null)" and goes by "Close"."""
+    return action.removeprefix("Name:").partition("\n")[0] if action.startswith("Name:") else action
 
 
 def _of_role(matches: SearchMatches, role: str, limit: int) -> SearchMatches:
@@ -4324,6 +4333,10 @@ class MacOS:
             return
         available = self._actions(element)
         if normalized not in available:
+            named = [item for item in available if _action_name(item).casefold() == normalized.casefold()]
+            if len(named) == 1:
+                normalized = named[0]
+        if normalized not in available:
             raise MacOSError(
                 f"Element {element_index} does not expose {normalized!r}; available actions: {available}",
                 code=ErrorCode.UNSUPPORTED_OP,
@@ -4450,6 +4463,54 @@ class MacOS:
                 item["submenu"] = True
             items.append(item)
         return items
+
+    def notifications(self) -> list[dict[str, JSONValue]]:
+        """The banners and alerts Notification Center shows on screen now.
+
+        Each has the ``app`` that sent it, its ``title``, ``subtitle``,
+        and ``body`` (None where it has none), the ``actions`` it takes,
+        and its ``element``, the match `ax.perform` takes in this run or
+        a later one: ``ax.perform(note["element"], "Close")`` dismisses
+        it and brings nothing forward, while "Show" and "AXPress" open
+        the app that sent it. Reading opens nothing.
+        """
+        self._ensure_accessibility()
+        _, info = self._resolve_app(_NOTIFICATION_CENTER)
+        pid = int(info["pid"])
+        nodes = self._snapshot_tree(
+            self._application_element(pid, enhance=False),
+            max_depth=_INSPECT_MAX_DEPTH,
+            max_nodes=_INSPECT_MAX_NODES,
+            include_menu_bar=False,
+            include_settable=False,
+        ).nodes
+        found: list[dict[str, JSONValue]] = []
+        for position, node in enumerate(nodes):
+            if node.get("subrole") not in _NOTIFICATION_SUBROLES:
+                continue
+            texts: dict[str, str] = {}
+            for child in nodes[position + 1:]:
+                if child["depth"] <= node["depth"]:
+                    break
+                part, value = child.get("identifier"), child.get("value")
+                if child["depth"] == node["depth"] + 1 and part in _NOTIFICATION_TEXTS and isinstance(value, str):
+                    texts[part] = value
+            # The description reads "<app>, <title>, <subtitle>, <body>".
+            app = str(node.get("description", "")).partition(", ")[0]
+            element: dict[str, JSONValue] = {
+                "element_index": node["element_index"],
+                "pid": pid,
+                **{key: node[key] for key in ("role", "subrole", "identifier", "description", "frame") if key in node},
+            }
+            found.append(
+                {
+                    "app": app or None,
+                    **{part: texts.get(part) for part in _NOTIFICATION_TEXTS},
+                    "actions": [_action_name(action) for action in node.get("actions", [])],
+                    "element": _OwnedMatch(element, self),
+                }
+            )
+        return found
 
     def _menu_labels(self, item: object) -> set[str]:
         """``item``'s title and description as `_menu_label` compares them."""

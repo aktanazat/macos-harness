@@ -2104,6 +2104,25 @@ def test_perform_still_fails_when_the_element_outlives_a_failed_action(monkeypat
     assert caught.value.details["ax_error"] == -25205
 
 
+def test_perform_takes_an_apps_own_action_by_the_name_it_shows(monkeypatch) -> None:
+    """A notification banner lists its Close action as
+    "Name:Close\\nTarget:0x0\\nSelector:(null)"; "Close" names it."""
+    AS = macos_module.AS
+    mac = MacOS()
+    index = mac._remember_element(AS.AXUIElementCreateApplication(os.getpid()))
+    close = "Name:Close\nTarget:0x0\nSelector:(null)"
+    actions = ["AXPress", "Name:Show\nTarget:0x0\nSelector:(null)", close]
+    performed: list[str] = []
+    monkeypatch.setattr(AS, "AXUIElementCopyActionNames", lambda element, _out: (0, actions))
+    monkeypatch.setattr(
+        AS, "AXUIElementPerformAction", lambda element, action: performed.append(action) or 0
+    )
+
+    mac.ax.perform(index, "Close")
+
+    assert performed == [close]
+
+
 def test_ax_wait_gone_requires_two_empty_polls(monkeypatch) -> None:
     mac = MacOS()
     responses = iter(

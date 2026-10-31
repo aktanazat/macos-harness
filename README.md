@@ -499,6 +499,11 @@ honored it. If the target makes itself frontmost, `press` detects that change
 and raises `FocusChangedError`. It cannot undo a focus change initiated by the
 target.
 
+`mac.notifications()` lists the banners and alerts on screen, each with the
+`app` that sent it, its `title`, `subtitle`, `body`, `actions`, and `element`.
+`mac.ax.perform(note["element"], "Close")` dismisses one without bringing
+anything forward; `"Show"` opens the app that sent it.
+
 These calls act only on accessible UI that macOS already rendered. They cannot
 make secure UI appear in an inactive app. They cannot bypass Touch ID, passkeys,
 CAPTCHA, account recovery, or another check that requires the user. Declare a

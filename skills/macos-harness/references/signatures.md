@@ -51,6 +51,7 @@ mac.windows(app=None, *, all_layers=False)
 mac.wait_for_window(app=None, *, title=None, timeout=2.0, all_layers=False)
 mac.place(app=None, *, window_index=0, window_id=None, x=None, y=None, width=None, height=None, display=None)
 mac.menus(app, path=None)
+mac.notifications()
 mac.list_apps()
 mac.show_pointer()
 mac.hide_pointer()
@@ -119,6 +120,15 @@ Export"` for a submenu, or with no path the menus in the menu bar: each has
 `title`, `enabled`, `checked`, its full `path` for `do.menu`, and a
 `shortcut` such as `"shift+cmd+s"` when it has one, for `do.key`.
 
+`mac.notifications()` lists the banners and alerts Notification Center
+shows: each has the `app` that sent it, its `title`, `subtitle`, and
+`body` (None where it has none), the `actions` it takes, and its
+`element`, a match: `mac.ax.perform(note["element"], "Close")` dismisses
+it, in this run or a later one, and brings nothing forward; `"Show"` and
+`"AXPress"` open the app that sent it. Only the newest banner shows at a
+time, for about five seconds; a closed one leaves the list within a
+second.
+
 `see(display=0)` (0 is the main display) or `see(region=(x, y, w, h))` in
 screen points captures the screen as it shows, every window composited.
 The result has no `app` or `pid`, and its pixels map a later
@@ -186,6 +196,9 @@ mac.ax.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title
 The AX calls also take rarer keywords: `attributes`, `include_actions`,
 `search_key`, `visible_only`, `direction`, `immediate_descendants_only`, and
 `element_index` on `query`. `help(mac.ax.query)` lists them.
+
+`perform` takes an action an app names itself, which accessibility lists
+as `"Name:Close\nTarget:0x0\nSelector:(null)"`, by that name: `"Close"`.
 
 ## Receipted operations
 
