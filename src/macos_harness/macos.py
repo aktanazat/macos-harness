@@ -6895,24 +6895,23 @@ class MacOS:
         the app's windows, as a floating panel over a document or the
         front window over a named one behind it, takes no click routed
         here, and a center where the app names nothing keeps the click.
-        Chromium answers a first hit test from bounding boxes, which miss
-        z-order and sticky layout, and the true one on the next ask
-        (browser_accessibility_manager.cc ``CachingAsyncHitTest``), so a
-        disagreement is asked again once before the click is refused."""
+        Chromium's first answer can be cached or approximate; asking
+        starts an asynchronous refresh (``CachingAsyncHitTest`` in
+        browser_accessibility_manager.cc). Check the refreshed answer
+        even when the first one matched."""
         aimed = self._element(element)
         if not self._is_ax_element(aimed):
             return
-        for ask in range(2):
-            found, hit = self._hit(pid, point)
-            if (
-                hit is None
-                or self._within(found, aimed)
-                or self._within(aimed, found)
-                or self._ax_window_id(self._copy_attribute(found, "AXWindow")) != window_id
-            ):
-                return
-            if ask == 0:
-                self._pause(_HIT_AGAIN_SECONDS)
+        self._hit(pid, point)
+        self._pause(_HIT_AGAIN_SECONDS)
+        found, hit = self._hit(pid, point)
+        if (
+            hit is None
+            or self._within(found, aimed)
+            or self._within(aimed, found)
+            or self._ax_window_id(self._copy_attribute(found, "AXWindow")) != window_id
+        ):
+            return
         named = hit["title"] or hit["description"]
         raise MacOSError(
             f"Accessibility finds {hit['role']}{f' {named!r}' if named else ''} at the "

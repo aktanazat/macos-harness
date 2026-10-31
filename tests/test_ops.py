@@ -2509,6 +2509,51 @@ def test_type_of_the_text_its_selection_holds_is_never_verified_by_the_field() -
     assert "input" not in receipt.to_json()["observed"]
 
 
+@pytest.mark.parametrize(("verb", "slow"), [("key", "focus"), ("type", "focus"), ("type", "value")])
+def test_keyboard_prechecks_that_exhaust_the_budget_send_nothing_and_keep_once(verb: str, slow: str) -> None:
+    clock = _SleepClock()
+
+    class SlowHost(FormHost):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delay_reads = True
+            self.focus_reads = 0
+
+        def _focused_element(self, pid: int, window_id: int | None = None) -> int | None:
+            self.focus_reads += 1
+            if self.delay_reads and slow == "focus" and self.focus_reads == 2:
+                clock.sleep(0.06)
+            return super()._focused_element(pid, window_id)
+
+        def get(self, index: int, attribute: str = "AXValue", *, missing_ok: bool = False) -> object:
+            if self.delay_reads and slow == "value" and attribute == "AXValue":
+                clock.sleep(0.06)
+            return super().get(index, attribute, missing_ok=missing_ok)
+
+    host = SlowHost()
+    operations = Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+    host.focused = True
+    host.selection = {"location": len(host.value), "length": 0}
+    host.keyboard_focus.extend([7, 7])
+    operation = operations.key if verb == "key" else operations.type
+    with pytest.raises(OperationError) as caught:
+        operation("x", app="Demo", timeout=0.05, once="slow-precheck")
+    assert caught.value.receipt.acted is Acted.NO
+    assert caught.value.receipt.error["details"]["reason"] == "deadline_exhausted_before_dispatch"
+    assert host.value == "doubleclick.net"
+    assert host.key_calls == []
+
+    host.delay_reads = False
+    host.keyboard_focus.extend([7, 7])
+    receipt = operation("x", app="Demo", timeout=0.05, once="slow-precheck")
+    assert receipt.acted is Acted.YES
+    assert receipt.replayed is False
+    if verb == "type":
+        assert host.value == "doubleclick.netx"
+    else:
+        assert host.key_calls == [("x", 41)]
+
+
 
 def test_other_runs_send_the_app_input_while_type_reads_its_text_back(app_input_free) -> None:
     host = _ReadBackHost(app_input_free)

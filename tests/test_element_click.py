@@ -319,9 +319,10 @@ def test_a_click_on_an_element_it_cannot_land_on_posts_nothing(
     ("make", "code"),
     [
         (lambda: _Covered(lambda row, window: _Node(_Node())), ErrorCode.UNSUPPORTED_OP),
+        (lambda: _Covered(lambda row, window: row, lambda row, window: _Node(_Node())), ErrorCode.UNSUPPORTED_OP),
         (lambda: _Sliding(_SLIDING), ErrorCode.TIMEOUT),
     ],
-    ids=["another-element-over-it", "still-moving"],
+    ids=["another-element-over-it", "cached-match-now-covered", "still-moving"],
 )
 def test_a_click_that_would_land_on_something_else_posts_nothing(
     click: Callable[[_Sona], object], make: Callable[[], _Sona], code: ErrorCode,

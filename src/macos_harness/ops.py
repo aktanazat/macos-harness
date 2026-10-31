@@ -2743,8 +2743,8 @@ class Operations:
             return named
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
-            del deadline
             _require_focus(host, pid, field, window_id, "key")
+            deadline.check_dispatch()
             host.key(key, app=pid, window_id=window_id)
 
         def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
@@ -2915,10 +2915,10 @@ class Operations:
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
             nonlocal change
-            del deadline
             if field is not None and postcondition is None:
                 change = _typed_change(host, field, text)
             _require_focus(host, pid, field, window_id, "type")
+            deadline.check_dispatch()
             host.type(text, app=pid, window_id=window_id)
 
         def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
@@ -3436,8 +3436,13 @@ class Operations:
                     turn.close()
                 if settle is not None:
                     input_observed = settle(host, pid, deadline)
-            except (FocusChangedError, _BlockedEffect) as exc:
-                if exc.details.get("reason") == "focus_moved_before_dispatch":
+            except MacOSError as exc:
+                if (
+                    isinstance(exc, FocusChangedError)
+                    and exc.details.get("reason") == "focus_moved_before_dispatch"
+                    or exc.code == ErrorCode.TIMEOUT.value
+                    and exc.details.get("reason") == "deadline_exhausted_before_dispatch"
+                ):
                     if once is not None:
                         self._ledger.release(once)
                     return self._finish(
@@ -3447,12 +3452,9 @@ class Operations:
                         )
                     )
                 receipt = builder.build(
-                    outcome=Outcome.FAILED, acted=Acted.YES, changed=None, verified=False,
-                    target=target, error=exc.to_json(),
-                )
-            except MacOSError as exc:
-                receipt = builder.build(
-                    outcome=Outcome.FAILED, acted=Acted.UNKNOWN, changed=None, verified=False,
+                    outcome=Outcome.FAILED,
+                    acted=Acted.YES if isinstance(exc, (FocusChangedError, _BlockedEffect)) else Acted.UNKNOWN,
+                    changed=None, verified=False,
                     target=target, error=exc.to_json(),
                 )
             else:

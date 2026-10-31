@@ -150,11 +150,14 @@ follows [Semantic Versioning](https://semver.org/).
   rows can. The element may be a match from any run or an index from this
   one. An element of another app, one with no area on screen, one still
   moving half a second on, or one whose center accessibility finds another
-  element over, in the window the click is routed to, on two asks a tenth
-  of a second apart, is refused before anything is posted, naming what is
-  there; one of the app's other windows over it, as a floating panel, is
-  not. The receipt names the element by its role and labels, never its
-  value.
+  element over in the window the click is routed to, is refused before
+  anything is posted. The refreshed second answer decides, even when the
+  first matched the target. A hit in another of the app's windows, such as
+  a floating panel, does not block input routed here. The receipt names
+  the element by its role and labels, never its value.
+- `mac.do.key` and `mac.do.type` check the shared deadline again after
+  their final field and focus reads. If those reads use up the budget,
+  nothing is sent and the `once` token remains available for another try.
 - `mac.do.menu("View > Reload Page", app=...)` chooses a menu command by its
   path, each step found only under the one before, so an item two menus
   share, such as Close under File and under Window, is never ambiguous.
