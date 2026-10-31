@@ -63,6 +63,7 @@ PyObjC or constructing a real `MacOS`.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import math
@@ -81,6 +82,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Literal, Protocol, TypeVar
 
 from . import receipt_log
+from ._input_lock import app_input
 from .errors import ApplicationNotFoundError, ErrorCode, FocusChangedError, MacOSError
 from .receipts import (
     Acted,
@@ -3167,8 +3169,9 @@ class Operations:
                 return self._finish(self._in_flight_receipt(builder, target=None))
 
         # Resolve -> precheck -> reserve -> dispatch -> verify, serialized
-        # against every other mutating call on this one `Operations`.
-        with self._dispatch_lock:
+        # against every other mutating call on this one `Operations`, and
+        # from dispatch on against input to the app from any other call.
+        with self._dispatch_lock, contextlib.ExitStack() as turn:
             try:
                 host._ensure_accessibility()
                 host._ensure_post_events()
@@ -3217,6 +3220,16 @@ class Operations:
                     builder.build(
                         outcome=Outcome.PLANNED, acted=Acted.NO, changed=False,
                         verified=False, target=target,
+                    )
+                )
+
+            try:
+                turn.enter_context(app_input(pid, deadline.remaining()))
+            except MacOSError as exc:
+                return self._finish(
+                    builder.build(
+                        outcome=Outcome.FAILED, acted=Acted.NO, changed=False,
+                        verified=False, target=target, error=exc.to_json(),
                     )
                 )
 

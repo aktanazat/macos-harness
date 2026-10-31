@@ -98,10 +98,12 @@ later steps should still run, then look before acting again.
   call. Presses share it across agent startup, searches, retry delays, and the
   frontmost-app reading. A press stopped with
   `deadline_exhausted_before_dispatch` reports `acted="no"` and keeps its `once`
-  token available. Other timeouts can mean the action happened: keep the token
-  and inspect the receipt. A synchronous AX or input call already in progress
-  cannot be preempted. Raw `mac.ax.press(timeout=0)` makes one attempt;
-  `mac.do.press(timeout=0)` does not dispatch.
+  token available, as does an input or menu verb stopped with `app_input_busy`
+  while another harness run kept sending the app input. Other timeouts can mean
+  the action happened: keep the token and inspect the receipt. A synchronous AX
+  or input call already in progress cannot be preempted. Raw
+  `mac.ax.press(timeout=0)` makes one attempt; `mac.do.press(timeout=0)` does
+  not dispatch.
 - `run` receipts keep source, arguments, and output as length/SHA-256 metadata.
   Pass `capture_output=True` only when you need bounded stdout/stderr text and
   accept that it can contain sensitive data.

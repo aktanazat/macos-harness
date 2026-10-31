@@ -27,6 +27,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
 
+from ._input_lock import app_input
 from .capture import (
     GrayPrint,
     WindowCapture,
@@ -631,6 +632,9 @@ _KEY_ONLY_CHARACTERS = frozenset("\n\r\t")
 _TYPE_CHUNK_UNITS = 20
 # macOS has no gesture past a triple click.
 _MAX_CLICKS = 3
+# The longest raw input waits while another call sends input to the same
+# app: `do.type`'s 4096 characters into an inactive app take about 41s.
+_INPUT_WAIT = 60.0
 
 
 def _character_key(character: str) -> tuple[int, int]:
@@ -5844,22 +5848,18 @@ class MacOS:
             )
         return pid
 
-    def _keyboard_target(
-        self, app: str | int | None, window_id: int | None
-    ) -> tuple[int, int | None]:
-        """The pid keyboard input goes to, and the window that takes it:
-        ``window_id``'s, made the app's focused window first when it is
-        not, else the app's focused window, None where accessibility
-        cannot name it."""
-        pid = self._input_pid(app, window_id, "Keyboard input")
+    def _keyboard_window(self, pid: int, window_id: int | None) -> int | None:
+        """The window ``pid``'s keyboard input goes to: ``window_id``'s,
+        made the app's focused window first when it is not, else the app's
+        focused window, None where accessibility cannot name it."""
         if window_id is None:
-            return pid, self._focused_window_id(pid)
+            return self._focused_window_id(pid)
         window = self._described_window(window_id)
         self._require_owner(window, pid)
         self._require_on_screen(window)
         if self._focused_window_id(pid) != window_id:
             self._focus_window(pid, window_id)
-        return pid, window_id
+        return window_id
 
     def _focused_window_id(self, pid: int) -> int | None:
         """The window ``pid``'s keys go to, None when accessibility cannot say."""
@@ -6706,18 +6706,19 @@ class MacOS:
         ``click`` resolves those three for a raw call; ``mac.do.click``
         resolves them itself, before it reserves anything, and hands them
         over so the window it reports is the one the events carry."""
-        self._hold_before_input(pid, window.window_id)
-        focus_before = self._frontmost_app()
-        self._pointer_position = point
-        self._overlay.move(*point)
-        down_type, up_type, _ = _MOUSE_EVENTS[button]
-        for click_count in range(1, clicks + 1):
-            for event_type in (down_type, up_type):
-                self._post_mouse(
-                    pid, window, button, event_type, point, click_state=click_count
-                )
-                time.sleep(0.03)
-            self._guard_focus(focus_before, pid, "click")
+        with app_input(pid, _INPUT_WAIT):
+            self._hold_before_input(pid, window.window_id)
+            focus_before = self._frontmost_app()
+            self._pointer_position = point
+            self._overlay.move(*point)
+            down_type, up_type, _ = _MOUSE_EVENTS[button]
+            for click_count in range(1, clicks + 1):
+                for event_type in (down_type, up_type):
+                    self._post_mouse(
+                        pid, window, button, event_type, point, click_state=click_count
+                    )
+                    time.sleep(0.03)
+                self._guard_focus(focus_before, pid, "click")
         self._overlay.click()
         return focus_before is not None and int(focus_before["pid"]) == pid
 
@@ -6768,30 +6769,31 @@ class MacOS:
         window = self._target_window(
             pid, start, self._pictured_window(window_id, coordinate_space)
         )
-        self._hold_before_input(pid, window.window_id)
-        focus_before = self._frontmost_app()
-        self._pointer_position = start
-        self._overlay.move(*start, duration=0)
-        self._overlay.move(*end, duration=duration)
-        down_type, up_type, drag_type = _MOUSE_EVENTS[button]
+        with app_input(pid, _INPUT_WAIT):
+            self._hold_before_input(pid, window.window_id)
+            focus_before = self._frontmost_app()
+            self._pointer_position = start
+            self._overlay.move(*start, duration=0)
+            self._overlay.move(*end, duration=duration)
+            down_type, up_type, drag_type = _MOUSE_EVENTS[button]
 
-        def post(event_type: int, point: tuple[float, float]) -> None:
-            self._post_mouse(pid, window, button, event_type, point)
+            def post(event_type: int, point: tuple[float, float]) -> None:
+                self._post_mouse(pid, window, button, event_type, point)
 
-        post(down_type, start)
-        self._pointer_position = end
-        for index in range(1, max(1, steps) + 1):
-            ratio = index / max(1, steps)
-            post(
-                drag_type,
-                (
-                    start[0] + (end[0] - start[0]) * ratio,
-                    start[1] + (end[1] - start[1]) * ratio,
-                ),
-            )
-            time.sleep(max(0.0, duration) / max(1, steps))
-        post(up_type, end)
-        self._guard_focus(focus_before, pid, "drag")
+            post(down_type, start)
+            self._pointer_position = end
+            for index in range(1, max(1, steps) + 1):
+                ratio = index / max(1, steps)
+                post(
+                    drag_type,
+                    (
+                        start[0] + (end[0] - start[0]) * ratio,
+                        start[1] + (end[1] - start[1]) * ratio,
+                    ),
+                )
+                time.sleep(max(0.0, duration) / max(1, steps))
+            post(up_type, end)
+            self._guard_focus(focus_before, pid, "drag")
 
     def scroll(
         self,
@@ -6870,28 +6872,29 @@ class MacOS:
         window = self._target_window(
             pid, point, self._pictured_window(window_id, coordinate_space)
         )
-        self._hold_before_input(pid, window.window_id)
-        self._pointer_position = point
-        self._overlay.move(*point)
+        with app_input(pid, _INPUT_WAIT):
+            self._hold_before_input(pid, window.window_id)
+            self._pointer_position = point
+            self._overlay.move(*point)
 
-        focus_before = self._frontmost_app()
+            focus_before = self._frontmost_app()
 
-        maximum = 100 if unit == "pixel" else 10
-        y_steps = _split_scroll_delta(delta_y, maximum)
-        x_steps = _split_scroll_delta(delta_x, maximum)
-        count = max(len(y_steps), len(x_steps))
-        y_steps.extend([0] * (count - len(y_steps)))
-        x_steps.extend([0] * (count - len(x_steps)))
+            maximum = 100 if unit == "pixel" else 10
+            y_steps = _split_scroll_delta(delta_y, maximum)
+            x_steps = _split_scroll_delta(delta_x, maximum)
+            count = max(len(y_steps), len(x_steps))
+            y_steps.extend([0] * (count - len(y_steps)))
+            x_steps.extend([0] * (count - len(x_steps)))
 
-        for step_y, step_x in zip(y_steps, x_steps, strict=True):
-            event = AS.CGEventCreateScrollWheelEvent(
-                self._event_source, scroll_unit, 2, int(step_y), int(step_x)
-            )
-            AS.CGEventSetLocation(event, point)
-            self._route_to_window(event, window, point)
-            self._post(event, pid)
-            time.sleep(0.01)
-            self._guard_focus(focus_before, pid, "scroll")
+            for step_y, step_x in zip(y_steps, x_steps, strict=True):
+                event = AS.CGEventCreateScrollWheelEvent(
+                    self._event_source, scroll_unit, 2, int(step_y), int(step_x)
+                )
+                AS.CGEventSetLocation(event, point)
+                self._route_to_window(event, window, point)
+                self._post(event, pid)
+                time.sleep(0.01)
+                self._guard_focus(focus_before, pid, "scroll")
 
     def type(
         self, text: str, *, app: str | int | None = None, window_id: int | None = None
@@ -6917,29 +6920,31 @@ class MacOS:
         """
         self._ensure_accessibility()
         self._ensure_post_events()
-        pid, target = self._keyboard_target(app, window_id)
-        self._hold_before_input(pid, window_id)
-        focus_before = self._frontmost_app()
-        packed = focus_before is not None and int(focus_before["pid"]) == pid
-        for chunk in _typing_chunks(text, packed=packed):
-            if packed and chunk not in _KEY_ONLY_CHARACTERS:
-                keycode, flags = 0, 0
-            else:
-                keycode, flags = _character_key(chunk)
-            down = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, True)
-            up = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, False)
-            length = len(chunk.encode("utf-16-le")) // 2
-            AS.CGEventKeyboardSetUnicodeString(down, length, chunk)
-            AS.CGEventKeyboardSetUnicodeString(up, length, chunk)
-            AS.CGEventSetFlags(down, flags)
-            AS.CGEventSetFlags(up, flags)
-            self._post(down, pid)
-            self._post(up, pid)
-            if not packed:
-                # A frontmost app took focus already, so the guard that
-                # stops when the target steals it has nothing to catch.
-                time.sleep(0.01)
-                self._guard_focus(focus_before, pid, "typing")
+        pid = self._input_pid(app, window_id, "Keyboard input")
+        with app_input(pid, _INPUT_WAIT):
+            target = self._keyboard_window(pid, window_id)
+            self._hold_before_input(pid, window_id)
+            focus_before = self._frontmost_app()
+            packed = focus_before is not None and int(focus_before["pid"]) == pid
+            for chunk in _typing_chunks(text, packed=packed):
+                if packed and chunk not in _KEY_ONLY_CHARACTERS:
+                    keycode, flags = 0, 0
+                else:
+                    keycode, flags = _character_key(chunk)
+                down = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, True)
+                up = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, False)
+                length = len(chunk.encode("utf-16-le")) // 2
+                AS.CGEventKeyboardSetUnicodeString(down, length, chunk)
+                AS.CGEventKeyboardSetUnicodeString(up, length, chunk)
+                AS.CGEventSetFlags(down, flags)
+                AS.CGEventSetFlags(up, flags)
+                self._post(down, pid)
+                self._post(up, pid)
+                if not packed:
+                    # A frontmost app took focus already, so the guard that
+                    # stops when the target steals it has nothing to catch.
+                    time.sleep(0.01)
+                    self._guard_focus(focus_before, pid, "typing")
         return self._keyboard_result(
             app, pid, target, named_window=window_id is not None, in_front=packed
         )
@@ -6958,38 +6963,40 @@ class MacOS:
         self._ensure_accessibility()
         self._ensure_post_events()
         keycode, parsed_modifiers = _parse_key(key)
-        pid, target = self._keyboard_target(app, window_id)
-        self._hold_before_input(pid, window_id)
-        focus_before = self._frontmost_app()
-        active_flags = 0
-        pressed: list[tuple[int, int]] = []
-        try:
-            for modifier_keycode, modifier_flag in parsed_modifiers:
-                active_flags |= modifier_flag
-                event = AS.CGEventCreateKeyboardEvent(
-                    self._event_source, modifier_keycode, True
-                )
-                AS.CGEventSetFlags(event, active_flags)
-                self._post(event, pid)
-                pressed.append((modifier_keycode, modifier_flag))
-                time.sleep(0.005)
+        pid = self._input_pid(app, window_id, "Keyboard input")
+        with app_input(pid, _INPUT_WAIT):
+            target = self._keyboard_window(pid, window_id)
+            self._hold_before_input(pid, window_id)
+            focus_before = self._frontmost_app()
+            active_flags = 0
+            pressed: list[tuple[int, int]] = []
+            try:
+                for modifier_keycode, modifier_flag in parsed_modifiers:
+                    active_flags |= modifier_flag
+                    event = AS.CGEventCreateKeyboardEvent(
+                        self._event_source, modifier_keycode, True
+                    )
+                    AS.CGEventSetFlags(event, active_flags)
+                    self._post(event, pid)
+                    pressed.append((modifier_keycode, modifier_flag))
+                    time.sleep(0.005)
 
-            down = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, True)
-            up = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, False)
-            AS.CGEventSetFlags(down, active_flags)
-            AS.CGEventSetFlags(up, active_flags)
-            self._post(down, pid)
-            self._post(up, pid)
-        finally:
-            for modifier_keycode, modifier_flag in reversed(pressed):
-                active_flags &= ~modifier_flag
-                event = AS.CGEventCreateKeyboardEvent(
-                    self._event_source, modifier_keycode, False
-                )
-                AS.CGEventSetFlags(event, active_flags)
-                self._post(event, pid)
-        time.sleep(0.01)
-        self._guard_focus(focus_before, pid, f"key {key!r}")
+                down = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, True)
+                up = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, False)
+                AS.CGEventSetFlags(down, active_flags)
+                AS.CGEventSetFlags(up, active_flags)
+                self._post(down, pid)
+                self._post(up, pid)
+            finally:
+                for modifier_keycode, modifier_flag in reversed(pressed):
+                    active_flags &= ~modifier_flag
+                    event = AS.CGEventCreateKeyboardEvent(
+                        self._event_source, modifier_keycode, False
+                    )
+                    AS.CGEventSetFlags(event, active_flags)
+                    self._post(event, pid)
+            time.sleep(0.01)
+            self._guard_focus(focus_before, pid, f"key {key!r}")
         return self._keyboard_result(
             app,
             pid,

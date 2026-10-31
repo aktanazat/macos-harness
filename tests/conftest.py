@@ -7,20 +7,58 @@ import sys
 
 import pytest
 
+import macos_harness._input_lock as input_lock_module
 import macos_harness.capture as capture_module
 import macos_harness.overlay as overlay_module
 
 
 @pytest.fixture(autouse=True)
 def own_capture_lock(monkeypatch, tmp_path):
-    """Each test's process owns capture through a lock of its own, never
-    the one a live harness on this Mac holds."""
+    """Each test's process owns capture and input locks of its own, never
+    the ones a live harness on this Mac holds."""
     monkeypatch.setattr(capture_module, "user_temp_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(input_lock_module, "user_temp_dir", lambda: str(tmp_path))
     monkeypatch.setattr(capture_module, "_capture_owner", None)
     yield
     if capture_module._capture_owner is not None:
         os.close(capture_module._capture_owner)
 
+
+_HOLD_INPUT = (
+    "import fcntl, os, sys\n"
+    "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+    "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+    "print('held', flush=True)\n"
+    "sys.stdin.read()\n"
+)
+
+
+@pytest.fixture
+def hold_app_input(tmp_path):
+    """Hold an app's input from another process, as a second harness run
+    sending that app input does; closing the holder's stdin lets go."""
+    holders: list[subprocess.Popen[str]] = []
+
+    def hold(pid: int) -> subprocess.Popen[str]:
+        holder = subprocess.Popen(
+            [sys.executable, "-c", _HOLD_INPUT, str(tmp_path / f"macos-harness-input-{pid}.lock")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        holders.append(holder)
+        assert holder.stdout is not None
+        assert holder.stdout.readline() == "held\n"
+        return holder
+
+    yield hold
+    for holder in holders:
+        assert holder.stdin is not None
+        with contextlib.suppress(BrokenPipeError, OSError):
+            holder.stdin.close()
+        holder.wait(timeout=5)
+        assert holder.stdout is not None
+        holder.stdout.close()
 
 @pytest.fixture
 def pointer_children(monkeypatch):

@@ -85,6 +85,13 @@ with repeated keys, clicks, deletion loops, or bulk input.
 - `mac.type()` into the frontmost app lands 128 characters in about 30 ms; into
   an inactive app it sends one character every 10 ms, so long text there costs
   seconds. `mac.do.type` takes at most 4096 characters.
+- Input to one app goes out one call at a time across every harness process
+  of this user: keys go to whichever window the app has focused, so two runs
+  typing into two windows of one app had put both texts, mixed, into one of
+  them. A click, drag, scroll, key, or typed text waits while another run
+  sends that app input, up to 60s for the raw verbs or the `mac.do` call's
+  `timeout`, then raises `timeout` with `reason: "app_input_busy"` having sent
+  nothing. Runs aimed at different apps never wait for each other.
 - An inactive app takes scrolls, plain keys, and typed text, but AppKit drops a
   menu shortcut (`cmd+a`) sent to it and passes a first click only to a view
   that accepts first mouse; text views do not. The click result says

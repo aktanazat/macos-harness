@@ -709,7 +709,8 @@ searching and again after reading the frontmost app.
 
 - Captures one app window through ScreenCaptureKit, behind other windows or
   on another Space, without bringing it forward
-- Sends keyboard and coordinate input directly to an app PID
+- Sends keyboard and coordinate input directly to an app PID, one harness
+  run at a time per app, so agents working in parallel never mix their keys
 - Draws an animated, click-through pointer at the system cursor size without
   moving your real cursor
 - Exposes raw Apple Accessibility and Apple Events when vision is not enough

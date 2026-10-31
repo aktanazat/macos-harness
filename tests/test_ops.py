@@ -19,6 +19,7 @@ from typing import ClassVar, NamedTuple
 import pytest
 
 from macos_harness import receipt_log
+from macos_harness._input_lock import app_input
 from macos_harness.errors import (
     ApplicationNotFoundError,
     ErrorCode,
@@ -1750,6 +1751,32 @@ def test_key_deadline_exhausted_before_dispatch_fails_without_acting_or_burning_
     assert receipt.outcome is Outcome.DONE
     assert receipt.replayed is False
     assert host.key_calls == [("return", 41)]
+
+
+def test_key_sends_nothing_while_another_run_sends_the_app_input(hold_app_input) -> None:
+    host, operations = _ops()
+    holder = hold_app_input(41)
+
+    error = _failed(lambda: operations.key("return", app="Demo", once="busy", timeout=0.2))
+    assert holder.stdin is not None
+    holder.stdin.close()
+    holder.wait(timeout=5)
+    retry = operations.key("return", app="Demo", once="busy")
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.changed is False
+    assert error.receipt.error["code"] == ErrorCode.TIMEOUT.value
+    assert error.receipt.error["details"]["reason"] == "app_input_busy"
+    assert retry.outcome is Outcome.DONE
+    assert retry.replayed is False
+    assert host.key_calls == [("return", 41)]
+
+
+def test_a_call_holding_an_apps_input_takes_it_again_to_send_more() -> None:
+    """``mac.do`` holds the app's input from dispatch on and sends it
+    through the raw verbs, which take that input themselves."""
+    with app_input(41, 0.05), app_input(41, 0.05):
+        pass
 
 
 def test_key_changed_is_none_without_a_verified_postcondition_or_on_ambiguous_failure() -> None:

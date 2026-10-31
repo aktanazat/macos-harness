@@ -5,6 +5,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple, Never
@@ -2477,6 +2478,25 @@ def test_type_into_the_frontmost_app_packs_runs_of_text_per_event(monkeypatch) -
     assert [event["flags"] for event in downs] == [0, 0, 0, 0]
     assert [pid for _, pid in posted] == [42] * 8
     assert sleeps == []
+
+
+def test_type_waits_while_another_run_sends_the_app_input(monkeypatch, hold_app_input) -> None:
+    """Keys go to whichever window the app has focused, so another run
+    typing into a second window of the app would carry these keys there."""
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=7)
+    holder = hold_app_input(42)
+    typing = threading.Thread(target=mac.type, args=("hi",), kwargs={"app": "Spotify"})
+
+    typing.start()
+    typing.join(0.2)
+    sent_while_held = list(posted)
+    assert holder.stdin is not None
+    holder.stdin.close()
+    typing.join(5)
+
+    assert sent_while_held == []
+    assert [event["text"] for event, _ in posted if event["down"]] == ["h", "i"]
 
 
 def test_key_posts_real_modifier_transitions(monkeypatch) -> None:
