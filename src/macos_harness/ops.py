@@ -63,6 +63,7 @@ PyObjC or constructing a real `MacOS`.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import math
@@ -81,6 +82,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Literal, Protocol, TypeVar
 
 from . import receipt_log
+from ._input_lock import app_input
 from .errors import ApplicationNotFoundError, ErrorCode, FocusChangedError, MacOSError
 from .receipts import (
     Acted,
@@ -597,6 +599,18 @@ def _validate_type_text(text: str) -> None:
             details={"parameter": "text", "length": len(text), "limit": _MAX_TYPE_CHARS},
         )
     _validate_utf8_text(text, parameter="text")
+
+
+def _named_keyboard_window(
+    host: _Host, pid: int, window_id: int | None
+) -> dict[str, JSONValue] | None:
+    """The ``target`` field a `key` or `type` naming ``window_id`` adds,
+    once that window is ``pid``'s and on screen, so a window that cannot
+    take the keys fails before anything is reserved or sent."""
+    if window_id is None:
+        return None
+    host._keyboard_target(pid, window_id)
+    return {"window_id": window_id}
 
 
 def _validate_fill_value(value: str) -> None:
@@ -1269,6 +1283,7 @@ class _Host(Protocol):
     ) -> dict[str, JSONValue]: ...
     def _validate_button(self, button: str) -> str: ...
     def _validate_clicks(self, clicks: int) -> int: ...
+    def _keyboard_target(self, pid: int, window_id: int) -> None: ...
     def _focus_sample(self, pid: int) -> dict[str, JSONValue]: ...
     def _exited(self, pid: int) -> bool: ...
     def _window_button(
@@ -2626,6 +2641,7 @@ class Operations:
         key: str,
         *,
         app: str | int,
+        window_id: int | None = None,
         timeout: float = 5.0,
         postcondition: Postcondition | None = None,
         once: str | None = None,
@@ -2636,30 +2652,39 @@ class Operations:
 
         Unlike the AX verbs, ``key`` has no ``all_apps``/``apps`` scope: a
         key combo always targets one exact process, so ``app`` is required.
+        ``window_id`` names the window it goes to, as `type` takes it.
         """
 
         quits = _is_quit_key(key)
 
-        def prepare(host: _Host, pid: int, deadline: _Deadline) -> None:
-            del pid, deadline
+        def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            del deadline
             host._validate_key(key)
+            return _named_keyboard_window(host, pid, window_id)
 
-        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
-            host.key(key, app=pid)
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            del deadline
+            host.key(key, app=pid, window_id=window_id)
+
+        def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
             if quits and postcondition is None:
                 return self._await_effect(deadline, lambda: host._exited(pid), {"exited": True})
             return None
 
+        request: dict[str, JSONValue] = {"key": key}
+        if window_id is not None:
+            request["window_id"] = window_id
         return self._input_verb(
             op="key",
             app=app,
-            request={"key": key},
+            request=request,
             timeout=timeout,
             postcondition=postcondition,
             once=once,
             dry_run=dry_run,
             prepare=prepare,
             dispatch=dispatch,
+            settle=settle,
             quits=lambda: quits,
         )
 
@@ -2761,6 +2786,7 @@ class Operations:
         text: str,
         *,
         app: str | int,
+        window_id: int | None = None,
         timeout: float = 5.0,
         postcondition: Postcondition | None = None,
         once: str | None = None,
@@ -2773,20 +2799,30 @@ class Operations:
         `_value_summary`, the same rule `set` applies to a value. The
         text is bounded and checked (`_validate_type_text`) before the
         ``once`` token is reserved.
+
+        ``window_id`` names the window the text goes to. It must be
+        ``app``'s and on screen, checked before anything is reserved, and
+        it becomes the app's focused window under the same turn on the
+        app's input that sends the text, so another run's window focused
+        since cannot take it.
         """
 
-        def prepare(host: _Host, pid: int, deadline: _Deadline) -> None:
-            del host, pid, deadline
+        def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            del deadline
             _validate_type_text(text)
+            return _named_keyboard_window(host, pid, window_id)
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
             del deadline
-            host.type(text, app=pid)
+            host.type(text, app=pid, window_id=window_id)
 
+        request: dict[str, JSONValue] = {"text": _value_summary(text)}
+        if window_id is not None:
+            request["window_id"] = window_id
         return self._input_verb(
             op="type",
             app=app,
-            request={"text": _value_summary(text)},
+            request=request,
             timeout=timeout,
             postcondition=postcondition,
             once=once,
@@ -2859,7 +2895,10 @@ class Operations:
                     },
                 )
 
-        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
+        before: str | None = None
+
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            nonlocal before
             assert element_index is not None
             frontmost = host._frontmost_app()
             if deadline.exhausted():
@@ -2887,6 +2926,10 @@ class Operations:
                 host.type(value, app=pid)
             else:
                 host.key("backspace", app=pid)
+
+        def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
+            del pid
+            assert element_index is not None and before is not None
             require(deadline, lambda: host.get(element_index), value, "text readback")
             return {"before": _value_summary(before), "after": _value_summary(value)}
 
@@ -2898,7 +2941,7 @@ class Operations:
                 "interval": interval,
             },
             timeout=timeout, postcondition=postcondition, once=once, dry_run=dry_run,
-            prepare=prepare, dispatch=dispatch,
+            prepare=prepare, dispatch=dispatch, settle=settle,
         )
 
     def menu(
@@ -2986,10 +3029,15 @@ class Operations:
             )
             return {"window_id": pressed[1]["window_id"]}
 
-        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            del deadline
+            assert pressed is not None
+            _perform_guarded(host, pressed[0], "AXPress", pid, "mac.do.window", host._frontmost_app())
+
+        def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            del pid
             assert pressed is not None
             index, window = pressed
-            _perform_guarded(host, index, "AXPress", pid, "mac.do.window", host._frontmost_app())
             if postcondition is not None:
                 return None
             effect = self._await_effect(
@@ -3012,7 +3060,7 @@ class Operations:
         return self._input_verb(
             op="window", app=app, request=request, timeout=timeout,
             postcondition=postcondition, once=once, dry_run=dry_run,
-            prepare=prepare, dispatch=dispatch, executor=Executor.PYTHON,
+            prepare=prepare, dispatch=dispatch, settle=settle, executor=Executor.PYTHON,
         )
 
     def reveal(
@@ -3081,11 +3129,14 @@ class Operations:
             quits = _is_quit_item(match)
             return self._match_summary_payload(match)
 
-        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            del deadline
             assert element_index is not None
             _perform_guarded(
                 host, element_index, "AXPress", pid, f"mac.do.{op}", host._frontmost_app()
             )
+
+        def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
             if quits and postcondition is None:
                 return self._await_effect(deadline, lambda: host._exited(pid), {"exited": True})
             return None
@@ -3100,6 +3151,7 @@ class Operations:
             dry_run=dry_run,
             prepare=prepare,
             dispatch=dispatch,
+            settle=settle,
             executor=Executor.PYTHON,
             quits=lambda: quits,
         )
@@ -3116,6 +3168,7 @@ class Operations:
         dry_run: bool,
         prepare: Callable[[_Host, int, _Deadline], JSONValue],
         dispatch: Callable[[_Host, int, _Deadline], dict[str, JSONValue] | None],
+        settle: Callable[[_Host, int, _Deadline], dict[str, JSONValue] | None] | None = None,
         executor: Executor = Executor.INPUT,
         quits: Callable[[], bool] | None = None,
     ) -> Receipt:
@@ -3130,7 +3183,10 @@ class Operations:
         reserved or dispatched: it validates what is about to be sent and
         may return extra ``target`` fields (a click's resolved screen
         point), so a dry run reports them too. ``dispatch`` acts on
-        ``pid``.
+        ``pid`` holding the app's input; ``settle`` then waits, with that
+        input free for other calls, for what the input did -- a quit's
+        exit, a window's close -- and what it saw replaces what
+        ``dispatch`` returned.
         """
         self._check_owner()
         host = self._host
@@ -3166,9 +3222,11 @@ class Operations:
             if action == "in_flight":
                 return self._finish(self._in_flight_receipt(builder, target=None))
 
-        # Resolve -> precheck -> reserve -> dispatch -> verify, serialized
-        # against every other mutating call on this one `Operations`.
-        with self._dispatch_lock:
+        # Resolve -> precheck -> reserve -> dispatch -> settle -> verify,
+        # serialized against every other mutating call on this one
+        # `Operations`, and from the focus reading before dispatch until
+        # dispatch returns against input to the app from any other call.
+        with self._dispatch_lock, contextlib.ExitStack() as turn:
             try:
                 host._ensure_accessibility()
                 host._ensure_post_events()
@@ -3220,6 +3278,16 @@ class Operations:
                     )
                 )
 
+            try:
+                turn.enter_context(app_input(pid, deadline.remaining()))
+            except MacOSError as exc:
+                return self._finish(
+                    builder.build(
+                        outcome=Outcome.FAILED, acted=Acted.NO, changed=False,
+                        verified=False, target=target, error=exc.to_json(),
+                    )
+                )
+
             # The focus reading before dispatch is a witness, but it is
             # AX work against the app, so it counts against the budget:
             # it runs only while time remains and the deadline is checked
@@ -3247,7 +3315,12 @@ class Operations:
                     return self._finish(self._in_flight_receipt(builder, target=target))
 
             try:
-                input_observed = dispatch(host, pid, deadline)
+                try:
+                    input_observed = dispatch(host, pid, deadline)
+                finally:
+                    turn.close()
+                if settle is not None:
+                    input_observed = settle(host, pid, deadline)
             except (FocusChangedError, _BlockedEffect) as exc:
                 receipt = builder.build(
                     outcome=Outcome.FAILED, acted=Acted.YES, changed=None, verified=False,

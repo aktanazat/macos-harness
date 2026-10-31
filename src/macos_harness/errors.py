@@ -140,7 +140,8 @@ class ApplicationNotFoundError(MacOSError):
 
 
 class FocusChangedError(MacOSError):
-    """A background-targeted action made its target frontmost.
+    """A background-targeted action lost its target: the target came to
+    the front, or its keys moved to another of its windows.
 
     Defaults to ``ErrorCode.FOCUS_CHANGED``.
     """

@@ -5,6 +5,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple, Never
@@ -2103,6 +2104,25 @@ def test_perform_still_fails_when_the_element_outlives_a_failed_action(monkeypat
     assert caught.value.details["ax_error"] == -25205
 
 
+def test_perform_takes_an_apps_own_action_by_the_name_it_shows(monkeypatch) -> None:
+    """A notification banner lists its Close action as
+    "Name:Close\\nTarget:0x0\\nSelector:(null)"; "Close" names it."""
+    AS = macos_module.AS
+    mac = MacOS()
+    index = mac._remember_element(AS.AXUIElementCreateApplication(os.getpid()))
+    close = "Name:Close\nTarget:0x0\nSelector:(null)"
+    actions = ["AXPress", "Name:Show\nTarget:0x0\nSelector:(null)", close]
+    performed: list[str] = []
+    monkeypatch.setattr(AS, "AXUIElementCopyActionNames", lambda element, _out: (0, actions))
+    monkeypatch.setattr(
+        AS, "AXUIElementPerformAction", lambda element, action: performed.append(action) or 0
+    )
+
+    mac.ax.perform(index, "Close")
+
+    assert performed == [close]
+
+
 def test_ax_wait_gone_requires_two_empty_polls(monkeypatch) -> None:
     mac = MacOS()
     responses = iter(
@@ -2479,6 +2499,25 @@ def test_type_into_the_frontmost_app_packs_runs_of_text_per_event(monkeypatch) -
     assert sleeps == []
 
 
+def test_type_waits_while_another_run_sends_the_app_input(monkeypatch, hold_app_input) -> None:
+    """Keys go to whichever window the app has focused, so another run
+    typing into a second window of the app would carry these keys there."""
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=7)
+    holder = hold_app_input(42)
+    typing = threading.Thread(target=mac.type, args=("hi",), kwargs={"app": "Spotify"})
+
+    typing.start()
+    typing.join(0.2)
+    sent_while_held = list(posted)
+    assert holder.stdin is not None
+    holder.stdin.close()
+    typing.join(5)
+
+    assert sent_while_held == []
+    assert [event["text"] for event, _ in posted if event["down"]] == ["h", "i"]
+
+
 def test_key_posts_real_modifier_transitions(monkeypatch) -> None:
     mac = MacOS()
     posted = []
@@ -2549,6 +2588,36 @@ def test_typing_stops_if_target_becomes_frontmost(monkeypatch) -> None:
         mac.type("ab", app="Spotify")
 
     assert len(posted) == 2
+
+
+class _KeysMoveAway(MacOS):
+    """An app whose keys go to window 5 until, at the third look,
+    something else has moved them to window 6."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.focused = iter([5, 5, 6])
+
+    def _keyboard_window(self, pid: int, window_id: int | None) -> int | None:
+        return 5
+
+    def _focused_window_id(self, pid: int) -> int | None:
+        return next(self.focused)
+
+
+def test_typing_stops_once_the_app_moves_its_keys_to_another_window(monkeypatch) -> None:
+    """Something that does not wait its turn, a person's click or the app
+    itself, moving the app's keys to another window mid-text sent the rest
+    of the text into that window."""
+    mac = _KeysMoveAway()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=7)
+
+    with pytest.raises(FocusChangedError) as stopped:
+        mac.type("abc", app=42)
+
+    assert [event["text"] for event, _ in posted if event["down"]] == ["a", "b"]
+    assert stopped.value.details["focused_window_id"] == 6
+    assert stopped.value.details["characters_sent"] == 2
 
 
 def test_background_click_uses_private_event_source(monkeypatch) -> None:

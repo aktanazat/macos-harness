@@ -4,6 +4,8 @@ whose rows sit below the visible part of its scroll area."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 from macos_harness.errors import ErrorCode, MacOSError
@@ -134,6 +136,33 @@ def test_window_close_stopped_by_a_save_prompt_names_its_buttons() -> None:
     assert (caught.value.code, caught.value.details["buttons"], caught.value.receipt.acted) == (
         ErrorCode.TIMEOUT, ["Delete", "Cancel", "Save"], Acted.YES,
     )
+
+
+class _Watched(_Sona):
+    """Sona whose window, once a title bar button is pressed, notes on
+    each look whether another harness run could send Sona input then."""
+
+    def __init__(self, app_input_free: Callable[[int], bool], **options: object) -> None:
+        super().__init__(**options)
+        self.app_input_free = app_input_free
+        self.input_free: list[bool] = []
+
+    def _window_description(self, window_id: int) -> object:
+        if self.pressed:
+            self.input_free.append(self.app_input_free(_PID))
+        return super()._window_description(window_id)
+
+
+def test_other_runs_send_sona_input_while_a_close_waits_for_its_window(app_input_free) -> None:
+    """A window asking to save stays for the whole wait, which kept every
+    other run's input from Sona, an answer to that prompt among it."""
+    mac = _Watched(app_input_free, stays=True)
+
+    receipt = mac.do.window("close", app="Sona", timeout=0.3)
+
+    assert (receipt.outcome, receipt.verified) == (Outcome.DONE, False)
+    assert mac.input_free
+    assert all(mac.input_free)
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,13 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `mac.notifications()` lists the banners and alerts on screen, each with
+  the `app` that sent it, its `title`, `subtitle`, `body`, `actions`, and
+  `element`. `mac.ax.perform(note["element"], "Close")` dismisses one and
+  brings nothing forward; an alert's own buttons, such as `"Snooze"`, are
+  among its `actions` and press by name the same way. `ax.perform` takes
+  any action an app names itself, listed as
+  `"Name:Close\nTarget:0x0\nSelector:(null)"`, by that name.
 - `see(crop=(x, y, w, h), zoom=)` captures part of a window, in window
   points, and draws it at `zoom` times the screen's pixels per point, so
   small text in a large window reads; clicks map through the cut picture.
@@ -14,6 +21,10 @@ follows [Semantic Versioning](https://semver.org/).
   focused one without bringing the app forward, and return the `pid`,
   the `window_id` that took the keys, `target_is_frontmost`, and a `note`
   when the app was in the background. They returned `None` before.
+- `mac.do.key` and `mac.do.type` take `window_id=` too. The window must
+  be the app's and on screen, checked before anything is reserved, and
+  it becomes the app's focused window in the same turn that sends the
+  keys, so a window another run focused since cannot take them.
 - `mac.click(element=...)` returns `miss` when accessibility finds
   something else over the element's center, which then took the click.
 - A name that fits several processes, such as `wine`, adds a `warning`
@@ -168,6 +179,21 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Two harness runs sending input to one app take turns, which keeps the
+  keys of runs that each name their window apart. Keys go to whichever
+  window the app has focused, so two runs typing into two of its windows
+  at once put both texts, mixed, into one window and nothing into the
+  other. A click, drag, scroll, key, or typed text now waits
+  while another run sends that app input, up to 60s for the raw verbs or
+  the `mac.do` call's `timeout`, then raises `timeout` with `reason:
+  "app_input_busy"` having sent nothing; a lock file that will not open
+  raises `ax.error` with `reason: "app_input_lock_unavailable"`, also
+  having sent nothing. A `mac.do` call keeps its turn only while it
+  sends, not while it waits for a postcondition, a quit, a window to
+  close, or `fill`'s read back. Input to different apps still runs at
+  once. Typing into an app in the background stops with `focus.changed`
+  once the app's keys go to another window, instead of sending the rest
+  of the text there.
 - `wait_change(by="ax")` skips a read of the app's accessibility tree
   that was cut short instead of comparing it: unreadable reads had
   reported `changed` and `settled` with nothing changed. The result, or

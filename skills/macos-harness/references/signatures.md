@@ -51,6 +51,7 @@ mac.windows(app=None, *, all_layers=False)
 mac.wait_for_window(app=None, *, title=None, timeout=2.0, all_layers=False)
 mac.place(app=None, *, window_index=0, window_id=None, x=None, y=None, width=None, height=None, display=None)
 mac.menus(app, path=None)
+mac.notifications()
 mac.list_apps()
 mac.show_pointer()
 mac.hide_pointer()
@@ -118,6 +119,18 @@ in the window behind it.
 Export"` for a submenu, or with no path the menus in the menu bar: each has
 `title`, `enabled`, `checked`, its full `path` for `do.menu`, and a
 `shortcut` such as `"shift+cmd+s"` when it has one, for `do.key`.
+
+`mac.notifications()` lists the banners and alerts Notification Center
+shows: each has the `app` that sent it, its `title`, `subtitle`, and
+`body` (None where it shows none as a text of its own; the `description`
+of its `element` joins them all), the `actions` it takes, an alert's
+buttons such as `"Snooze"` among them, and its `element`, a match:
+`mac.ax.perform(note["element"], "Close")` dismisses it, in this run or a
+later one, and brings nothing forward; `"Show"` and `"AXPress"` open the
+app that sent it, and a button's name presses that button. Only the
+newest banner shows at a time, for about five seconds; a closed one
+leaves the list within a second. A read Notification Center cuts short
+raises `ax.error` rather than list less: read again.
 
 `see(display=0)` (0 is the main display) or `see(region=(x, y, w, h))` in
 screen points captures the screen as it shows, every window composited.
@@ -187,6 +200,9 @@ The AX calls also take rarer keywords: `attributes`, `include_actions`,
 `search_key`, `visible_only`, `direction`, `immediate_descendants_only`, and
 `element_index` on `query`. `help(mac.ax.query)` lists them.
 
+`perform` takes an action an app names itself, which accessibility lists
+as `"Name:Close\nTarget:0x0\nSelector:(null)"`, by that name: `"Close"`.
+
 ## Receipted operations
 
 ```text
@@ -194,8 +210,8 @@ mac.do.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title
 mac.do.set(value, *, app=None, all_apps=False, apps=None, role=None, text=None, title=None, identifier=None, description=None, attribute="AXValue", timeout=5.0, postcondition=None, dry_run=False)
 mac.do.toggle(desired, *, app=None, all_apps=False, apps=None, role=None, text=None, title=None, identifier=None, description=None, attribute="AXValue", timeout=5.0, postcondition=None, dry_run=False)
 mac.do.fill(value, *, app, role="text field", text=None, title=None, identifier=None, description=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
-mac.do.key(key, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
-mac.do.type(text, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.key(key, *, app, window_id=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.type(text, *, app, window_id=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.click(x=None, y=None, *, element=None, app, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.menu(path, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.status_item(path=None, *, app, name=None, timeout=5.0, postcondition=None, once=None, dry_run=False)

@@ -19,6 +19,7 @@ from typing import ClassVar, NamedTuple
 import pytest
 
 from macos_harness import receipt_log
+from macos_harness._input_lock import app_input
 from macos_harness.errors import (
     ApplicationNotFoundError,
     ErrorCode,
@@ -132,6 +133,9 @@ class FakeHost:
         self.target_window_error: MacOSError | None = None
         self.target_window_calls: list[tuple[int, tuple[float, float], int | None]] = []
         self.screenshots_used: list[object] = []
+        self.keyboard_target_error: MacOSError | None = None
+        self.keyboard_targets: list[tuple[int, int]] = []
+        self.keyboard_windows: list[int | None] = []
 
     def _resolve_app(self, query: str | int | None) -> tuple[object, dict[str, object]]:
         if query is None:
@@ -309,8 +313,9 @@ class FakeHost:
         if self.toggle_on_press:
             self.value = not bool(self.value)
 
-    def key(self, key: str, *, app: str | int | None = None) -> None:
+    def key(self, key: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
         self.key_calls.append((key, app))
+        self.keyboard_windows.append(window_id)
         if self.key_hook is not None:
             self.key_hook()
         if self.key_error is not None:
@@ -331,10 +336,16 @@ class FakeHost:
         if self.click_error is not None:
             raise self.click_error
 
-    def type(self, text: str, *, app: str | int | None = None) -> None:
+    def type(self, text: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
         self.type_calls.append((text, app))
+        self.keyboard_windows.append(window_id)
         if self.type_error is not None:
             raise self.type_error
+
+    def _keyboard_target(self, pid: int, window_id: int) -> None:
+        self.keyboard_targets.append((pid, window_id))
+        if self.keyboard_target_error is not None:
+            raise self.keyboard_target_error
 
 
 def _exit_script(returncode: int = 0, *, stdout: bytes = b"", stderr: bytes = b"") -> str:
@@ -1752,6 +1763,151 @@ def test_key_deadline_exhausted_before_dispatch_fails_without_acting_or_burning_
     assert host.key_calls == [("return", 41)]
 
 
+def test_key_sends_nothing_while_another_run_sends_the_app_input(hold_app_input) -> None:
+    host, operations = _ops()
+    holder = hold_app_input(41)
+
+    error = _failed(lambda: operations.key("return", app="Demo", once="busy", timeout=0.2))
+    assert holder.stdin is not None
+    holder.stdin.close()
+    holder.wait(timeout=5)
+    retry = operations.key("return", app="Demo", once="busy")
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.changed is False
+    assert error.receipt.error["code"] == ErrorCode.TIMEOUT.value
+    assert error.receipt.error["details"]["reason"] == "app_input_busy"
+    assert retry.outcome is Outcome.DONE
+    assert retry.replayed is False
+    assert host.key_calls == [("return", 41)]
+
+
+def test_key_sends_nothing_when_the_apps_input_lock_will_not_open(tmp_path) -> None:
+    """A link where the lock file goes, which the lock never follows,
+    leaves the app's input unguarded."""
+    (tmp_path / "macos-harness-input-41.lock").symlink_to(tmp_path / "elsewhere")
+    host, operations = _ops()
+
+    error = _failed(lambda: operations.key("return", app="Demo", timeout=0.2))
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.error["code"] == ErrorCode.AX_ERROR.value
+    assert error.receipt.error["details"]["reason"] == "app_input_lock_unavailable"
+    assert host.key_calls == []
+
+
+def test_other_runs_send_the_app_input_while_a_key_waits_on_its_postcondition(app_input_free) -> None:
+    """A postcondition can wait out the whole deadline, and while it did,
+    every other run's input to the app waited too."""
+    host, operations = _ops()
+    free: list[bool] = []
+    host.wait_hook = lambda: free.append(app_input_free(41))
+
+    receipt = operations.key("return", app="Demo", postcondition=present(identifier="save"))
+
+    assert receipt.outcome is Outcome.DONE
+    assert free == [True]
+
+
+def test_key_and_type_go_to_the_window_they_name() -> None:
+    """Keys go to whichever window the app has focused, and another run
+    may have focused its own window since, so a run names the window it
+    means; the raw verb makes it the focused one before sending."""
+    host, operations = _ops()
+
+    pressed = operations.key("return", app="Demo", window_id=9)
+    typed = operations.type("hi", app="Demo", window_id=9)
+
+    assert host.keyboard_targets == [(41, 9), (41, 9)]
+    assert host.keyboard_windows == [9, 9]
+    assert [receipt.target["window_id"] for receipt in (pressed, typed)] == [9, 9]
+    assert [receipt.request["window_id"] for receipt in (pressed, typed)] == [9, 9]
+
+
+def test_type_naming_a_window_the_app_cannot_type_in_sends_nothing() -> None:
+    host, operations = _ops()
+    host.keyboard_target_error = MacOSError(
+        "Window 9 belongs to Other (pid 7), not pid 41", code=ErrorCode.BAD_REQUEST
+    )
+
+    error = _failed(lambda: operations.type("hi", app="Demo", window_id=9))
+
+    assert error.code == ErrorCode.BAD_REQUEST
+    assert error.receipt.acted is Acted.NO
+    assert host.type_calls == []
+
+
+def test_a_call_holding_an_apps_input_takes_it_again_to_send_more() -> None:
+    """``mac.do`` holds the app's input while dispatch sends it through
+    the raw verbs, which take that input themselves."""
+    with app_input(41, 0.05), app_input(41, 0.05):
+        pass
+
+
+_INPUT_FORK_SCRIPT = r'''
+import os
+import sys
+import threading
+
+import macos_harness._input_lock as input_lock
+from macos_harness.errors import MacOSError
+
+input_lock.user_temp_dir = lambda: sys.argv[1]
+taken, release = threading.Event(), threading.Event()
+
+
+def hold():
+    with input_lock.app_input(41, 1):
+        taken.set()
+        release.wait(5)
+
+
+holder = threading.Thread(target=hold)
+holder.start()
+taken.wait(5)
+go_read, go_write = os.pipe()
+child = os.fork()
+if child == 0:
+    os.close(go_write)
+    os.read(go_read, 1)
+    try:
+        with input_lock.app_input(41, 1):
+            pass
+    except MacOSError:
+        os._exit(1)
+    os._exit(0)
+os.close(go_read)
+release.set()
+holder.join(5)
+try:
+    with input_lock.app_input(41, 0.2):
+        print("parent took the input", flush=True)
+except MacOSError as error:
+    print("parent", error.details["reason"], flush=True)
+os.write(go_write, b"g")
+_, status = os.waitpid(child, 0)
+print("child exit", os.waitstatus_to_exitcode(status), flush=True)
+'''
+
+
+def test_a_child_forked_while_a_thread_holds_an_apps_input_keeps_none_of_it(tmp_path) -> None:
+    """The child's copy of the lock file kept the app's input locked after
+    the parent let go, and its copy of the thread lock belonged to a
+    thread it does not have. The fork runs in an interpreter of its own,
+    whose only other thread is the holder, as the fork tests in
+    test_macos.py do."""
+    result = subprocess.run(
+        [sys.executable, "-c", _INPUT_FORK_SCRIPT, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["parent took the input", "child exit 0"]
+
+
 def test_key_changed_is_none_without_a_verified_postcondition_or_on_ambiguous_failure() -> None:
     host, operations = _ops()
     no_postcondition = operations.key("return", app="Demo")
@@ -2202,13 +2358,13 @@ class FormHost(FakeHost):
         else:
             super().set(element_index, value, attribute)
 
-    def key(self, key: str, *, app: str | int | None = None) -> None:
+    def key(self, key: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
         if key == "backspace":
             self.type("", app=app)
         else:
-            super().key(key, app=app)
+            super().key(key, app=app, window_id=window_id)
 
-    def type(self, text: str, *, app: str | int | None = None) -> None:
+    def type(self, text: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
         if self.reject_text:
             return
         if not self.focused:
@@ -2224,6 +2380,40 @@ def _form_ops() -> tuple[FormHost, Operations]:
     host = FormHost()
     clock = _SleepClock()
     return host, Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+
+
+class _ReadBackHost(FormHost):
+    """A form that, once typed into, notes on each read of its value
+    whether another harness run could send the app input then."""
+
+    def __init__(self, app_input_free: Callable[[int], bool]) -> None:
+        super().__init__()
+        self.app_input_free = app_input_free
+        self.typed = False
+        self.input_free: list[bool] = []
+
+    def get(
+        self, element_index: int, attribute: str = "AXValue", *, missing_ok: bool = False
+    ) -> object:
+        if self.typed and attribute == "AXValue":
+            self.input_free.append(self.app_input_free(41))
+        return super().get(element_index, attribute, missing_ok=missing_ok)
+
+    def type(self, text: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
+        super().type(text, app=app, window_id=window_id)
+        self.typed = True
+
+
+def test_other_runs_send_the_app_input_while_fill_reads_its_value_back(app_input_free) -> None:
+    host = _ReadBackHost(app_input_free)
+    clock = _SleepClock()
+    operations = Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+
+    receipt = operations.fill("example.org", app="Demo", identifier="domain")
+
+    assert receipt.outcome is Outcome.DONE
+    assert host.input_free
+    assert all(host.input_free)
 
 
 def test_fill_updates_the_app_model_even_when_visible_text_matches() -> None:
