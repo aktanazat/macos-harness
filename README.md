@@ -125,6 +125,10 @@ PY
   silently dropped shows up. `press`/`run` have no readback of their own,
   so `changed` is `None` unless you pass a `postcondition` that confirms
   the effect actually took hold.
+- `key` and `type` note the element with keyboard focus when they are
+  prepared and send nothing, failing with `focus.changed` (reason
+  `focus_moved_before_dispatch`) and `acted="no"`, when focus is on another
+  element by dispatch.
 - A bad argument — an unknown role, a malformed postcondition, reusing a
   `once` token for a genuinely different request — raises `MacOSError`
   directly, before anything is dispatched: there is no receipt, because

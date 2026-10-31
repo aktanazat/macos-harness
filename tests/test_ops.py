@@ -136,6 +136,9 @@ class FakeHost:
         self.keyboard_target_error: MacOSError | None = None
         self.keyboard_targets: list[tuple[int, int]] = []
         self.keyboard_windows: list[int | None] = []
+        self.elements: dict[int, object] = {7: object(), 9: object()}
+        # Each `_focused_element` call takes the next index; none left is None.
+        self.keyboard_focus: deque[int | None] = deque()
 
     def _resolve_app(self, query: str | int | None) -> tuple[object, dict[str, object]]:
         if query is None:
@@ -243,8 +246,12 @@ class FakeHost:
             raise self.guard_error
 
     def _element(self, element_index: int) -> object:
-        assert element_index == 7
-        return object()
+        return self.elements[element_index]
+
+    def _focused_element(self, pid: int, window_id: int | None) -> int | None:
+        assert pid == 41
+        del window_id
+        return self.keyboard_focus.popleft() if self.keyboard_focus else None
 
     def _is_ax_element(self, value: object) -> bool:
         del value
@@ -2309,6 +2316,27 @@ def test_type_failure_after_dispatch_is_acted_unknown() -> None:
     assert error.receipt.acted is Acted.UNKNOWN
     assert error.receipt.changed is None
     assert host.focus_sample_calls == 1
+
+
+@pytest.mark.parametrize("verb", ["key", "type"])
+def test_keys_go_nowhere_once_focus_moved_to_another_element(verb: str) -> None:
+    host, operations = _ops()
+
+    def send() -> Receipt:
+        if verb == "key":
+            return operations.key("cmd+s", app="Demo", once="save")
+        return operations.type("hello", app="Demo", once="save")
+
+    host.keyboard_focus.extend([7, 9])
+    error = _failed(send)
+    host.keyboard_focus.extend([7, 7])
+    retry = send()
+
+    assert error.code == ErrorCode.FOCUS_CHANGED
+    assert error.receipt.error["details"]["reason"] == "focus_moved_before_dispatch"
+    assert error.receipt.acted is Acted.NO
+    assert retry.replayed is False
+    assert len(host.key_calls) + len(host.type_calls) == 1
 
 
 class FormHost(FakeHost):

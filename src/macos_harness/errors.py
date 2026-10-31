@@ -141,7 +141,9 @@ class ApplicationNotFoundError(MacOSError):
 
 class FocusChangedError(MacOSError):
     """A background-targeted action lost its target: the target came to
-    the front, or its keys moved to another of its windows.
+    the front, or its keys moved to another of its windows or elements.
+    One stopped before any key went out carries reason
+    ``focus_moved_before_dispatch``: nothing was sent.
 
     Defaults to ``ErrorCode.FOCUS_CHANGED``.
     """

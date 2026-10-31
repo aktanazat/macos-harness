@@ -6011,16 +6011,19 @@ class MacOS:
         turn, a person's click or the app itself, moved them there."""
         focused = self._focused_window_id(pid)
         if focused is not None and focused != window_id:
+            details: dict[str, JSONValue] = {
+                "operation": "typing",
+                "target_pid": pid,
+                "window_id": window_id,
+                "focused_window_id": focused,
+                "characters_sent": sent,
+            }
+            if not sent:
+                details["reason"] = "focus_moved_before_dispatch"
             raise FocusChangedError(
                 f"Keys to pid {pid} moved from window {window_id} to window {focused} "
                 f"after {sent} of {total} characters; stopped",
-                details={
-                    "operation": "typing",
-                    "target_pid": pid,
-                    "window_id": window_id,
-                    "focused_window_id": focused,
-                    "characters_sent": sent,
-                },
+                details=details,
             )
 
     def _focused_window_id(self, pid: int) -> int | None:
@@ -6029,6 +6032,17 @@ class MacOS:
             self._application_element(pid, enhance=False), "AXFocusedWindow"
         )
         return None if focused is None else self._ax_window_id(focused)
+
+    def _focused_element(self, pid: int, window_id: int | None) -> int | None:
+        """The index of the element ``pid``'s keys go to, None when
+        accessibility cannot name one or they go to a window other than
+        ``window_id``."""
+        if window_id is not None and self._focused_window_id(pid) != window_id:
+            return None
+        focused = self._copy_attribute(
+            self._application_element(pid, enhance=False), "AXFocusedUIElement"
+        )
+        return None if focused is None else self._remember_element(focused)
 
     def _focus_window(self, pid: int, window_id: int) -> None:
         """Make ``window_id`` the window ``pid``'s keys go to, raised among

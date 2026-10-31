@@ -231,6 +231,10 @@ program. They take the same selectors as `mac.ax.wait` plus their
 own `timeout` and `interval`. A receipt that acted with nothing confirming
 its effect prints which postcondition would.
 
+`do.key` and `do.type` send nothing when keyboard focus has moved to
+another element since they were prepared (`focus.changed`, reason
+`focus_moved_before_dispatch`, `acted="no"`).
+
 `do.window("close" | "minimize" | "zoom", app=)` presses that title bar
 button of window `window_index` or `window_id`, then waits until the window
 is gone, off screen, or resized. A close a sheet stops fails with `timeout`:

@@ -223,6 +223,13 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `mac.do.key` and `mac.do.type` note the element that has keyboard focus
+  when they are prepared, in the window they name if one is focused, and
+  send nothing when focus is on another element by the time they would:
+  the receipt fails with `focus.changed`, `reason:
+  "focus_moved_before_dispatch"`, and `acted="no"`, and its `once` token
+  stays free. Background typing stopped by a window change before its
+  first character carries that reason too, and its receipt says the same.
 - A stdin step no longer loads the REPL, the nearest-call hint, the
   cross-app sweep's thread pool, the bundle-version reader, or
   `mac.route` before it needs them; `mac.route` is built on first use.

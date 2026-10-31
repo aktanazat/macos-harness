@@ -343,7 +343,6 @@ class _BlockedEffect(MacOSError):
     window asked to close is by the prompt its app shows."""
 
 
-
 def _sample_focus(host: _Host, pid: int) -> dict[str, JSONValue] | None:
     """`MacOS._focus_sample`, or `None` when the app's AX tree would not
     answer (a non-finite geometry raises ``ax_error``, for one). The
@@ -354,6 +353,26 @@ def _sample_focus(host: _Host, pid: int) -> dict[str, JSONValue] | None:
         return host._focus_sample(pid)
     except MacOSError:
         return None
+
+
+def _require_focus(
+    host: _Host, pid: int, field: int | None, window_id: int | None, op: str
+) -> None:
+    """Stop a ``key`` or ``type`` before any of it goes out once
+    ``pid``'s keyboard focus is on another element than ``field``, the
+    one it was on when the verb was prepared. A reading that names no
+    element proves no move, and neither does focus in a window other
+    than the ``window_id`` named, which the raw verb focuses again
+    before it sends."""
+    if field is None:
+        return
+    now = host._focused_element(pid, window_id)
+    if now is not None and host._element(now) != host._element(field):
+        raise FocusChangedError(
+            f"Keyboard focus moved to another element after this {op} was prepared; "
+            "nothing was sent",
+            details={"reason": "focus_moved_before_dispatch", "operation": op, "target_pid": pid},
+        )
 
 
 def _changed_focus_fields(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> list[str]:
@@ -395,9 +414,11 @@ def _atomic_press_acted(exc: MacOSError) -> Acted:
     resolution and dispatch are one inseparable call and so cannot be
     told apart by which step actually failed.
 
-    ``focus.changed`` only ever comes from the guard that runs *after*
-    `AXPress` has landed, so it is the one code guaranteed to mean the
-    press happened; ``element.unknown``/``bad_request``/
+    From `ax_press`, ``focus.changed`` only ever comes from the guard
+    that runs *after* `AXPress` has landed, so here it is the one code
+    guaranteed to mean the press happened; a ``key`` or ``type`` that
+    sent nothing marks its own with reason ``focus_moved_before_dispatch``
+    instead. ``element.unknown``/``bad_request``/
     ``unsupported_op`` are exactly as certain in the other direction --
     no match, an ambiguous one, or one without the action at all.
     A timeout explicitly marked as before dispatch also means no action.
@@ -1298,6 +1319,7 @@ class _Host(Protocol):
     def _validate_clicks(self, clicks: int) -> int: ...
     def _keyboard_target(self, pid: int, window_id: int) -> None: ...
     def _focus_sample(self, pid: int) -> dict[str, JSONValue]: ...
+    def _focused_element(self, pid: int, window_id: int | None) -> int | None: ...
     def _exited(self, pid: int) -> bool: ...
     def _window_button(
         self, pid: int, action: str, *, window_id: int | None, window_index: int
@@ -2666,17 +2688,24 @@ class Operations:
         Unlike the AX verbs, ``key`` has no ``all_apps``/``apps`` scope: a
         key combo always targets one exact process, so ``app`` is required.
         ``window_id`` names the window it goes to, as `type` takes it.
+        The key goes only to the element that had keyboard focus when the
+        call was prepared, as `type`'s text does.
         """
 
         quits = _is_quit_key(key)
+        field: int | None = None
 
         def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            nonlocal field
             del deadline
             host._validate_key(key)
-            return _named_keyboard_window(host, pid, window_id)
+            named = _named_keyboard_window(host, pid, window_id)
+            field = host._focused_element(pid, window_id)
+            return named
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
             del deadline
+            _require_focus(host, pid, field, window_id, "key")
             host.key(key, app=pid, window_id=window_id)
 
         def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
@@ -2819,15 +2848,26 @@ class Operations:
         it becomes the app's focused window under the same turn on the
         app's input that sends the text, so another run's window focused
         since cannot take it.
+
+        The keys go only to the element that had keyboard focus when the
+        call was prepared, in that window when one is named. Focus on
+        another element of it by then fails with ``focus.changed``,
+        reason ``focus_moved_before_dispatch``: ``acted=NO``, nothing
+        typed, and the ``once`` token stays free.
         """
+        field: int | None = None
 
         def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            nonlocal field
             del deadline
             _validate_type_text(text)
-            return _named_keyboard_window(host, pid, window_id)
+            named = _named_keyboard_window(host, pid, window_id)
+            field = host._focused_element(pid, window_id)
+            return named
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
             del deadline
+            _require_focus(host, pid, field, window_id, "type")
             host.type(text, app=pid, window_id=window_id)
 
         request: dict[str, JSONValue] = {"text": _value_summary(text)}
@@ -3189,8 +3229,11 @@ class Operations:
         input verbs (``key``, ``click``, ``type``, ``fill``) and the menu
         verbs, which press the item a path leads to. The receipt names
         ``executor``, and ``acted`` is judged from whether ``dispatch``
-        raised. ``quits`` says, once ``prepare`` has run, whether the
-        dispatch is the app's own Quit, whose exit is then its effect.
+        raised: a ``focus.changed`` with reason
+        ``focus_moved_before_dispatch`` says it sent nothing, so it fails
+        with ``acted=NO`` and frees the ``once`` token. ``quits`` says,
+        once ``prepare`` has run, whether the dispatch is the app's own
+        Quit, whose exit is then its effect.
 
         ``prepare`` runs once the app is resolved and before anything is
         reserved or dispatched: it validates what is about to be sent and
@@ -3335,6 +3378,15 @@ class Operations:
                 if settle is not None:
                     input_observed = settle(host, pid, deadline)
             except (FocusChangedError, _BlockedEffect) as exc:
+                if exc.details.get("reason") == "focus_moved_before_dispatch":
+                    if once is not None:
+                        self._ledger.release(once)
+                    return self._finish(
+                        builder.build(
+                            outcome=Outcome.FAILED, acted=Acted.NO, changed=False,
+                            verified=False, target=target, error=exc.to_json(),
+                        )
+                    )
                 receipt = builder.build(
                     outcome=Outcome.FAILED, acted=Acted.YES, changed=None, verified=False,
                     target=target, error=exc.to_json(),

@@ -2591,12 +2591,12 @@ def test_typing_stops_if_target_becomes_frontmost(monkeypatch) -> None:
 
 
 class _KeysMoveAway(MacOS):
-    """An app whose keys go to window 5 until, at the third look,
+    """An app whose keys go to window 5 until, at look ``moved_at``,
     something else has moved them to window 6."""
 
-    def __init__(self) -> None:
+    def __init__(self, moved_at: int) -> None:
         super().__init__()
-        self.focused = iter([5, 5, 6])
+        self.focused = iter([5] * (moved_at - 1) + [6])
 
     def _keyboard_window(self, pid: int, window_id: int | None) -> int | None:
         return 5
@@ -2605,19 +2605,46 @@ class _KeysMoveAway(MacOS):
         return next(self.focused)
 
 
-def test_typing_stops_once_the_app_moves_its_keys_to_another_window(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("moved_at", "sent", "reason"),
+    [(3, ["a", "b"], None), (1, [], "focus_moved_before_dispatch")],
+    ids=["mid-text", "before-the-first-character"],
+)
+def test_typing_stops_once_the_app_moves_its_keys_to_another_window(
+    monkeypatch, moved_at, sent, reason
+) -> None:
     """Something that does not wait its turn, a person's click or the app
     itself, moving the app's keys to another window mid-text sent the rest
-    of the text into that window."""
-    mac = _KeysMoveAway()
+    of the text into that window. Only a stop before the first character
+    says nothing was sent, which frees a `mac.do` call's ``once`` token."""
+    mac = _KeysMoveAway(moved_at)
     posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=7)
 
     with pytest.raises(FocusChangedError) as stopped:
         mac.type("abc", app=42)
 
-    assert [event["text"] for event, _ in posted if event["down"]] == ["a", "b"]
+    assert [event["text"] for event, _ in posted if event["down"]] == sent
     assert stopped.value.details["focused_window_id"] == 6
-    assert stopped.value.details["characters_sent"] == 2
+    assert stopped.value.details["characters_sent"] == len(sent)
+    assert stopped.value.details.get("reason") == reason
+
+
+def test_keys_for_a_named_window_follow_no_element_while_another_window_has_them(
+    monkeypatch,
+) -> None:
+    """Another run may focus its own window between a `do.type` naming
+    window 5 and its keys, and the raw verb focuses window 5 again before
+    sending, so focus over there must not read as the keys' element
+    moving."""
+    mac = MacOS()
+    field = object()
+    monkeypatch.setattr(mac, "_focused_window_id", lambda pid: 6)
+    monkeypatch.setattr(mac, "_application_element", lambda pid, **kwargs: object())
+    monkeypatch.setattr(mac, "_copy_attribute", lambda element, attribute, **kwargs: field)
+
+    assert mac._focused_element(42, 5) is None
+    assert mac._element(mac._focused_element(42, 6)) is field
+    assert mac._element(mac._focused_element(42, None)) is field
 
 
 def test_background_click_uses_private_event_source(monkeypatch) -> None:
