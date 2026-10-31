@@ -233,7 +233,9 @@ its effect prints which postcondition would.
 
 `do.key` and `do.type` send nothing when keyboard focus has moved to
 another element since they were prepared (`focus.changed`, reason
-`focus_moved_before_dispatch`, `acted="no"`).
+`focus_moved_before_dispatch`, `acted="no"`). Without a postcondition,
+`do.type` into a plain text field is verified once the field shows the
+typed text, with `observed["input"]["landed"]`.
 
 `do.window("close" | "minimize" | "zoom", app=)` presses that title bar
 button of window `window_index` or `window_id`, then waits until the window

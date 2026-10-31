@@ -2444,6 +2444,47 @@ def test_other_runs_send_the_app_input_while_fill_reads_its_value_back(app_input
     assert all(host.input_free)
 
 
+def test_type_is_verified_once_the_focused_field_shows_the_text() -> None:
+    host, operations = _form_ops()
+    host.focused = True
+    host.selection = {"location": len(host.value), "length": 0}
+    host.keyboard_focus.extend([7, 7])
+
+    receipt = operations.type(".au", app="Demo")
+
+    assert host.value == "doubleclick.net.au"
+    assert receipt.verified is True
+    assert receipt.to_json()["observed"]["input"] == {"landed": True}
+
+
+def test_type_stays_unverified_and_is_never_repeated_when_the_field_misses_the_text() -> None:
+    host, operations = _form_ops()
+    host.selection = {"location": len(host.value), "length": 0}
+    host.keyboard_focus.extend([7, 7])
+
+    receipt = operations.type(".au", app="Demo", timeout=0.5)
+
+    assert (host.value, host.other_value) == ("doubleclick.net", "untouched.au")
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.verified is False
+    assert "input" not in receipt.to_json()["observed"]
+
+
+def test_other_runs_send_the_app_input_while_type_reads_its_text_back(app_input_free) -> None:
+    host = _ReadBackHost(app_input_free)
+    host.focused = True
+    host.selection = {"location": len(host.value), "length": 0}
+    host.keyboard_focus.extend([7, 7])
+    clock = _SleepClock()
+    operations = Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+
+    receipt = operations.type(".au", app="Demo")
+
+    assert receipt.to_json()["observed"]["input"] == {"landed": True}
+    assert host.input_free
+    assert all(host.input_free)
+
+
 def test_fill_updates_the_app_model_even_when_visible_text_matches() -> None:
     host, operations = _form_ops()
     receipt = operations.fill(

@@ -230,6 +230,11 @@ follows [Semantic Versioning](https://semver.org/).
   "focus_moved_before_dispatch"`, and `acted="no"`, and its `once` token
   stays free. Background typing stopped by a window change before its
   first character carries that reason too, and its receipt says the same.
+- `mac.do.type` without a postcondition reads a plain text field back, as
+  `do.fill` does, until it shows the typed text where the selection was;
+  only then is the receipt verified, with `observed["input"]["landed"]`.
+  Text the field never shows leaves the receipt unverified once the
+  timeout runs out, and nothing is typed twice.
 - A stdin step no longer loads the REPL, the nearest-call hint, the
   cross-app sweep's thread pool, the bundle-version reader, or
   `mac.route` before it needs them; `mac.route` is built on first use.

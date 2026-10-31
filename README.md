@@ -128,7 +128,10 @@ PY
 - `key` and `type` note the element with keyboard focus when they are
   prepared and send nothing, failing with `focus.changed` (reason
   `focus_moved_before_dispatch`) and `acted="no"`, when focus is on another
-  element by dispatch.
+  element by dispatch. Without a `postcondition`, `type` into a plain text
+  field then reads the field back, as `fill` does, until it shows the
+  typed text where the selection was: only then is the receipt verified,
+  with `observed.input.landed`. It never types twice.
 - A bad argument — an unknown role, a malformed postcondition, reusing a
   `once` token for a genuinely different request — raises `MacOSError`
   directly, before anything is dispatched: there is no receipt, because

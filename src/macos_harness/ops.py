@@ -334,7 +334,8 @@ _FOCUS_POLLS = 10
 _FOCUS_WATCH_SECONDS = 0.1
 # How often a receipt looks for the effect its verb waits on itself: an
 # app's exit after its Quit (one app `mac.quit` asked exited 235ms after
-# the request), a window closed, minimized, or zoomed.
+# the request), a window closed, minimized, or zoomed, typed text showing
+# in its field.
 _EFFECT_POLL_SECONDS = 0.05
 
 
@@ -373,6 +374,42 @@ def _require_focus(
             "nothing was sent",
             details={"reason": "focus_moved_before_dispatch", "operation": op, "target_pid": pid},
         )
+
+
+def _typed_value(host: _Host, field: int, text: str) -> str | None:
+    """What plain text control ``field`` holds once ``text`` is typed in
+    place of its selection, counted in UTF-16 units as accessibility
+    counts them; None where that cannot be told: another kind of
+    element, a secure field, a control character in ``text``, or a value
+    or selection that does not read as text."""
+    if _has_control_character(text):
+        return None
+    try:
+        if (
+            host.get(field, "AXRole") not in _PLAIN_TEXT_ROLES
+            or host.get(field, "AXSubrole", missing_ok=True) not in _PLAIN_TEXT_SUBROLES
+        ):
+            return None
+        value = host.get(field)
+        selection = host.get(field, "AXSelectedTextRange")
+    except MacOSError:
+        return None
+    if not isinstance(value, str) or not isinstance(selection, Mapping):
+        return None
+    start, length = selection.get("location"), selection.get("length")
+    if not isinstance(start, int) or not isinstance(length, int):
+        return None
+    units = value.encode("utf-16-le", "surrogatepass")
+    typed = units[: 2 * start] + text.encode("utf-16-le", "surrogatepass") + units[2 * (start + length) :]
+    return typed.decode("utf-16-le", "surrogatepass")
+
+
+def _holds(host: _Host, field: int, expected: str) -> bool:
+    """Whether ``field`` holds ``expected`` now; a refused read says no."""
+    try:
+        return host.get(field) == expected
+    except MacOSError:
+        return False
 
 
 def _changed_focus_fields(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> list[str]:
@@ -2853,7 +2890,12 @@ class Operations:
         call was prepared, in that window when one is named. Focus on
         another element of it by then fails with ``focus.changed``,
         reason ``focus_moved_before_dispatch``: ``acted=NO``, nothing
-        typed, and the ``once`` token stays free.
+        typed, and the ``once`` token stays free. Without a
+        postcondition, a plain text control is then read back, as `fill`
+        reads its value, until it shows ``text`` in place of its
+        selection: the receipt is verified, with
+        ``observed["input"]["landed"]``, only once it does. Nothing is
+        typed twice.
         """
         field: int | None = None
 
@@ -2865,10 +2907,24 @@ class Operations:
             field = host._focused_element(pid, window_id)
             return named
 
+        expected: str | None = None
+
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            nonlocal expected
             del deadline
+            if field is not None and postcondition is None:
+                expected = _typed_value(host, field, text)
             _require_focus(host, pid, field, window_id, "type")
             host.type(text, app=pid, window_id=window_id)
+
+        def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            del pid
+            aimed, typed = field, expected
+            if aimed is None or typed is None:
+                return None
+            return self._await_effect(
+                deadline, lambda: _holds(host, aimed, typed), {"landed": True}
+            )
 
         request: dict[str, JSONValue] = {"text": _value_summary(text)}
         if window_id is not None:
@@ -2883,6 +2939,7 @@ class Operations:
             dry_run=dry_run,
             prepare=prepare,
             dispatch=dispatch,
+            settle=settle,
         )
 
     def fill(
@@ -3241,8 +3298,8 @@ class Operations:
         point), so a dry run reports them too. ``dispatch`` acts on
         ``pid`` holding the app's input; ``settle`` then waits, with that
         input free for other calls, for what the input did -- a quit's
-        exit, a window's close -- and what it saw replaces what
-        ``dispatch`` returned.
+        exit, a window's close, typed text showing in its field -- and
+        what it saw replaces what ``dispatch`` returned.
         """
         self._check_owner()
         host = self._host

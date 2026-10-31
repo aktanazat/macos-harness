@@ -60,6 +60,10 @@ later steps should still run, then look before acting again.
   `None` and never counts as focus moving. Without a postcondition the
   after-reading repeats every 10 ms for up to 100 ms until it differs; with
   one, the postcondition is checked right after a single after-reading.
+- `type` without a postcondition reads a plain text field back until it
+  shows the typed text where the selection was; the receipt is then
+  verified, with `observed.input.landed`. Text it never shows leaves the
+  receipt unverified after the timeout. It never types twice.
 - `changed` is `True` when a postcondition verified the effect or focus moved,
   and `None` when nothing observable moved, which is how a key AppKit silently
   dropped shows up. `press`/`run` have no readback, so `changed` is `None`
