@@ -241,6 +241,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The native skill prefers OMP's readable native tools when available,
+  selecting them from the task without requiring the owner to name one.
+  Python remains for operations those tools do not cover; credential
+  input stays under the credential guide.
+
 - `mac.do.key` and `mac.do.type` note the element that has keyboard focus
   when they are prepared, in the window they name if one is focused, and
   send nothing when focus is on another element by the time they would:

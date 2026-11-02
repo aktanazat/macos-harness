@@ -5,6 +5,13 @@ description: "Read when a task has to drive a native or Electron macOS app: a wi
 
 # macOS Harness
 
+In OMP, prefer `mac_see`, `mac_query`, `mac_press`, `mac_click`,
+`mac_type`, `mac_key`, and `mac_handoff` when those tools are available.
+Choose the matching tool from the task without waiting for the owner to
+name it. Their results use readable tool cards. Use the Python surface
+below for native operations those tools do not cover. Credential input
+stays under `credentials`; never put secrets in tool arguments.
+
 One synchronous call per decision. `mac`, `Path`, `subprocess`, `present`
 and `gone` are preloaded. `-c CODE` runs one line; `--json-errors` prints
 JSON failures; `run flow.py --arg pid=42` passes strings in `args`.
