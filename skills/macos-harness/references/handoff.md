@@ -7,6 +7,12 @@ temporary PIN, or account recovery. Do it immediately: do not burn a
 happened for an unrelated reason. An absence you cannot identify stays a plain
 timeout.
 
+An ordinary password-only login or lock screen in an explicitly approved
+local test VM is not a human-presence gate. Follow the target and focus
+checks in `credentials` and continue without asking the owner to unlock it.
+This exception does not apply to the host Mac, Passwords, Keychain, production
+accounts, or any of the gates above.
+
 ```python
 from macos_harness import HandoffReason
 

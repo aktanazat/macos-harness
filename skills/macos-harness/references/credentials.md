@@ -15,14 +15,21 @@ advanced.
 
 ## Native login fields
 
-A native app's login field belongs to system AutoFill or a physical handoff.
-Typing a secret into whichever native control has focus can send it to the
-wrong process, so macOS Harness does not fill native credential fields.
+Native credentials normally use system AutoFill or a physical handoff.
+Typing into an unconfirmed control can send a password to the wrong process.
 
-Call `mac.handoff(...)` only at a gate owned by macOS or the provider: Touch ID,
-a passkey, the Mac login password, a CAPTCHA, or a sign-in approval. Never
-unlock Passwords, get around Touch ID, or act while a physical-presence prompt
-is on screen. Tell the user before any call that can raise a system prompt.
+When the owner explicitly authorizes an ordinary password login to a named
+local test VM, complete it without another handoff. This includes the VM's
+password-only lock screen. Confirm the current VM, guest account, window,
+password field, and focus before entering the authorized test password.
+Target only that VM's process and window; stop before input if either target
+or focus has changed. Never echo or save the password.
+
+This exception does not cover the host Mac's lock screen, Passwords or
+Keychain unlocking, production accounts, Touch ID, passkeys, verification
+codes, CAPTCHA, account recovery, or approvals requiring the user's presence.
+Use `mac.handoff(...)` at those gates; do not bypass them. Tell the user before
+any call that can raise a system prompt.
 
 ## Permissions
 

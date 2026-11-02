@@ -192,6 +192,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The credential and handoff guides allow an ordinary password-only login
+  to an explicitly approved local test VM after checking its account,
+  window, password field, and focus. Host credentials, production accounts,
+  and checks requiring the user's presence still require a handoff.
+
 - Two harness runs sending input to one app take turns, which keeps the
   keys of runs that each name their window apart. Keys go to whichever
   window the app has focused, so two runs typing into two of its windows

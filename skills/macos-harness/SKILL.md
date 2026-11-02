@@ -65,10 +65,12 @@ mac.ax.wait("Distribute App", role="button", app="Xcode", timeout=600)
 
 ## Handoff and credentials
 
-At Touch ID, a passkey, a CAPTCHA, a code, or a sign-in approval, print
-`mac.handoff(reason="authentication_required", app=...)` and end
-the turn. Never type secrets into native fields or drive web pages through
-Accessibility: `credentials`.
+At Touch ID, a passkey, a CAPTCHA, a verification code, or a sign-in approval,
+print `mac.handoff(reason="authentication_required", app=...)` and end the turn.
+An ordinary password login to an explicitly approved local test VM may proceed
+under the target checks in `credentials`; do not request another handoff.
+Other native credentials use system AutoFill or a physical handoff.
+Never drive web pages through Accessibility: `credentials`.
 
 Run `macos-harness doctor` only after a permission or connection error.
 
