@@ -27,6 +27,7 @@ from macos_harness.ops import Operations
 
 class InspectionHost(FakeHost, MacOS):
     _focus_sample = MacOS._focus_sample
+    _remember_element = MacOS._remember_element
 
     def __init__(self) -> None:
         super().__init__()

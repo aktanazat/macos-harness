@@ -16,6 +16,13 @@ follows [Semantic Versioning](https://semver.org/).
   matching lines with their ancestors. Unlabeled layout groups fold away
   and controls outside the window are counted, not listed.
 
+- `mac.do.press(element=match, app=)` presses a match from `mac.state` or a
+  search as it is, with no pointer travel: about 50 ms a press on
+  Calculator, against 360 ms for `do.click(element=)`. A match from the
+  latest look takes no search; an older one is found again first. A match
+  of another app, of an app it cannot tell, or with no press fails with
+  `acted="no"`.
+
 - `MacOS(agent_id=)`, CLI `--agent-id`, and `MACOS_HARNESS_AGENT_ID` give
   each agent a named pointer with a stable color, without moving the
   physical cursor. Named pointers mark Accessibility actions and appear

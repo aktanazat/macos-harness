@@ -257,7 +257,7 @@ as `"Name:Close\nTarget:0x0\nSelector:(null)"`, by that name: `"Close"`.
 ## Receipted operations
 
 ```text
-mac.do.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=5000, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.press(text=None, *, app=None, element=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=5000, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.set(value, *, app=None, all_apps=False, apps=None, role=None, text=None, title=None, identifier=None, description=None, attribute="AXValue", timeout=5.0, postcondition=None, dry_run=False)
 mac.do.toggle(desired, *, app=None, all_apps=False, apps=None, role=None, text=None, title=None, identifier=None, description=None, attribute="AXValue", timeout=5.0, postcondition=None, dry_run=False)
 mac.do.fill(value, *, app, role="text field", text=None, title=None, identifier=None, description=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
@@ -287,6 +287,12 @@ another element since they were prepared (`focus.changed`, reason
 `focus_moved_before_dispatch`, `acted="no"`). Without a postcondition,
 `do.type` into a plain text field is verified once the field shows the
 typed text, with `observed["input"]["landed"]`.
+
+`do.press(element=state[12], app=)` presses a match it is handed: about
+50 ms against 360 ms for `do.click(element=)`, with no pointer travel, so a
+button in a background window takes it. A match from the latest look takes
+no search; an older one is found again first. A match of another app, of
+an app it cannot tell, or without a press, fails with `acted="no"`.
 
 `do.window("close" | "minimize" | "zoom", app=)` presses that title bar
 button of window `window_index` or `window_id`, then waits until the window

@@ -528,8 +528,8 @@ def _observation_of(postcondition: Postcondition, exc: MacOSError) -> tuple[Obse
 
 
 def _perform_guarded(
-    host: _Host, element_index: int, action: str, target_pid: int, operation: str,
-    before: dict[str, JSONValue] | None,
+    host: _Host, element_index: int | Mapping[str, JSONValue], action: str, target_pid: int,
+    operation: str, before: dict[str, JSONValue] | None,
 ) -> None:
     """Perform ``action`` on ``element_index``, then check focus.
 
@@ -1279,7 +1279,9 @@ class _Host(Protocol):
         target_pid: int,
         operation: str,
     ) -> None: ...
-    def _element(self, element_index: int) -> object: ...
+    def _element(self, element_index: int | Mapping[str, JSONValue]) -> object: ...
+    def _element_pid(self, element: int | Mapping[str, JSONValue]) -> int | None: ...
+    def _remember_element(self, element: object) -> int: ...
     def _is_ax_element(self, value: object) -> bool: ...
     def ax_wait(
         self,
@@ -1343,7 +1345,9 @@ class _Host(Protocol):
         self, element_index: int, attribute: str = "AXValue", *, missing_ok: bool = False
     ) -> object: ...
     def set(self, element_index: int, value: object, attribute: str = "AXValue") -> None: ...
-    def perform_action(self, element_index: int, action: str = "AXPress") -> None: ...
+    def perform_action(
+        self, element_index: int | Mapping[str, JSONValue], action: str = "AXPress"
+    ) -> None: ...
     def key(
         self, key: str, *, app: str | int | None = None, window_id: int | None = None
     ) -> dict[str, JSONValue]: ...
@@ -1806,6 +1810,7 @@ class Operations:
         text: str | None = None,
         *,
         app: str | int | None = None,
+        element: int | Mapping[str, JSONValue] | None = None,
         all_apps: bool = False,
         apps: str | int | Iterable[str | int] | None = None,
         role: str | None = None,
@@ -1836,9 +1841,25 @@ class Operations:
         dry run can report what it *would* press without ever dispatching
         anything, and ``all_apps``/``apps`` can search more than the one
         app `MacOS.ax_press` presses.
+
+        ``element``, a match a search or `mac.state` returned, is pressed
+        as it is: in ``app`` only, and with no text or selector beside it.
+        A match from the latest search or state takes no search; an older
+        one is found again first. An element of another app, of an app it
+        cannot tell, or one that no longer exists, fails with
+        ``acted=NO``.
         """
         self._check_owner()
         host = self._host
+        if element is not None and (
+            app is None
+            or any(v is not None for v in (text, role, search_key, title, identifier, description))
+        ):
+            raise MacOSError(
+                "element= presses one control of one app: pass app= and no text or selector",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "element"},
+            )
         apps = validate_scope(app=app, all_apps=all_apps, apps=apps, required=True)
         validate_exact_selectors(title=title, identifier=identifier, description=description)
         self._validate_postcondition(host, postcondition)
@@ -1864,6 +1885,10 @@ class Operations:
             "interval": interval,
             "postcondition": self._postcondition_payload(postcondition),
         }
+        if element is not None:
+            request = {
+                key: request[key] for key in ("op", "scope", "timeout", "postcondition")
+            } | {"element": _element_request(element)}
         fingerprint = request_fingerprint(request) if once is not None else None
         builder = _ReceiptBuilder(
             op="press",
@@ -1889,6 +1914,12 @@ class Operations:
         # Serialized against every other mutating call on this one
         # `Operations` instance.
         with self._dispatch_lock:
+            if element is not None:
+                assert app is not None
+                return self._finish(self._press_element(
+                    host, builder, element, app=app, postcondition=postcondition,
+                    deadline=deadline, once=once, fingerprint=fingerprint, dry_run=dry_run,
+                ))
             if app is not None and not dry_run:
                 if deadline.exhausted():
                     return self._finish(
@@ -2097,6 +2128,97 @@ class Operations:
             if once is not None:
                 self._ledger.finalize(once, receipt)
             return self._finish(receipt)
+
+    def _press_element(
+        self,
+        host: _Host,
+        builder: _ReceiptBuilder,
+        element: int | Mapping[str, JSONValue],
+        *,
+        app: str | int,
+        postcondition: Postcondition | None,
+        deadline: _Deadline,
+        once: str | None,
+        fingerprint: str | None,
+        dry_run: bool,
+    ) -> Receipt:
+        """`press` of an element the caller already holds: the app's own,
+        found once and pressed through `_perform_guarded`."""
+        try:
+            _, app_info = host._resolve_app(app)
+            builder.bind_app(app_info)
+            pid = int(app_info["pid"])
+            index = element if isinstance(element, int) else host._remember_element(
+                host._element(element)
+            )
+            named = element.get("pid") if isinstance(element, Mapping) else None
+            owner = named if isinstance(named, int) else host._element_pid(index)
+            if owner != pid:
+                raise MacOSError(
+                    f"The element is in process {owner}, not {app!r}; nothing was pressed"
+                    if owner is not None
+                    else "Which app the element is in is unknown; nothing was pressed",
+                    code=ErrorCode.BAD_REQUEST,
+                    details={"parameter": "element", "pid": owner, "target_pid": pid},
+                )
+            builder.executor = self._executor_of(host, index)
+        except MacOSError as exc:
+            return builder.build(
+                outcome=Outcome.FAILED, acted=Acted.NO, changed=False,
+                verified=False, error=exc.to_json(),
+            )
+        target = self._match_target(element if isinstance(element, Mapping) else {}, app_info)
+        if dry_run:
+            return builder.build(
+                outcome=Outcome.PLANNED, acted=Acted.NO, changed=False,
+                verified=False, target=target,
+            )
+        if deadline.exhausted():
+            return builder.build(
+                outcome=Outcome.FAILED, acted=Acted.NO, changed=False, verified=False,
+                target=target,
+                error=_deadline_exhausted_error(
+                    "deadline_exhausted_before_dispatch",
+                    "No time remained on the shared deadline to dispatch this press",
+                ),
+            )
+        if once is not None:
+            assert fingerprint is not None
+            action = self._ledger.reserve(once, "press", fingerprint)
+            if action == "replay":
+                return self._ledger.stored(once).replayed_as()
+            if action == "in_flight":
+                return self._in_flight_receipt(builder, target=target)
+        try:
+            _perform_guarded(
+                host, index, "AXPress", pid, "mac.do.press", host._frontmost_app()
+            )
+        except FocusChangedError as exc:
+            receipt = builder.build(
+                outcome=Outcome.FAILED, acted=Acted.YES, changed=None, verified=False,
+                target=target, error=exc.to_json(),
+            )
+        except MacOSError as exc:
+            refused = exc.code in (ErrorCode.UNSUPPORTED_OP.value, ErrorCode.ELEMENT_UNKNOWN.value)
+            receipt = builder.build(
+                outcome=Outcome.FAILED, acted=Acted.NO if refused else Acted.UNKNOWN,
+                changed=False if refused else None, verified=False,
+                target=target, error=exc.to_json(),
+            )
+        else:
+            verified = self._verify_postcondition(
+                host, postcondition, deadline, app=app, all_apps=False, apps=None
+            )
+            receipt = builder.build(
+                outcome=Outcome.DONE if verified.ok else Outcome.FAILED, acted=Acted.YES,
+                changed=_changed_after_dispatch(postcondition, verified),
+                verified=postcondition is not None and verified.ok,
+                target=target, observed=verified.observed,
+                error=None if verified.ok else verified.error,
+            )
+        if once is not None:
+            self._ledger.finalize(once, receipt)
+        return receipt
 
     def set(
         self,
@@ -3832,7 +3954,7 @@ class Operations:
         }
 
     @staticmethod
-    def _executor_of(host: _Host, element_index: int) -> Executor:
+    def _executor_of(host: _Host, element_index: int | Mapping[str, JSONValue]) -> Executor:
         element = host._element(element_index)
         return Executor.PYTHON if host._is_ax_element(element) else Executor.NATIVE
 
