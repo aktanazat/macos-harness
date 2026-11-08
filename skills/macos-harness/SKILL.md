@@ -5,17 +5,12 @@ description: "Read when a task has to drive a native or Electron macOS app: a wi
 
 # macOS Harness
 
-In OMP, prefer `mac_see`, `mac_query`, `mac_press`, `mac_click`,
-`mac_type`, `mac_key`, and `mac_handoff` when those tools are available.
-Choose the matching tool from the task without waiting for the owner to
-name it. Their results use readable tool cards. Use the Python surface
-below for native operations those tools do not cover. Credential input
-stays under `credentials`; never put secrets in tool arguments.
+In OMP, pick the matching `mac_*` tool from the task unasked; Python
+below covers the rest. Never put secrets in tool arguments: `credentials`.
 
 One synchronous call per decision. `mac`, `Path`, `subprocess`, `present`
-and `gone` are preloaded. `-c CODE` runs one line; `--json-errors` prints
-JSON failures; `run flow.py --arg pid=42` passes strings in `args`.
-Use `--agent-id NAME` for a named, colored pointer. After compaction,
+and `gone` are preloaded. `-c CODE` runs one line; `run flow.py` a file.
+`--agent-id NAME` names the pointer and turns on state diffs. After compaction,
 run `macos-harness skill signatures`.
 
 ```bash
@@ -26,32 +21,31 @@ print(mac.see("Spotify"))
 PY
 ```
 
-In omp, `tool.read` the PNG in the same cell.
+In omp, `tool.read` the PNG.
 
 Bundle reversible steps; verify once at the end. Stop only for unclear
 identity, an irreversible action, or unexpected state.
 
-## Six verbs
+## Seven verbs
 
+- `mac.state(app)`: the window as text, then only changes; `state[id]` is a match.
 - `mac.see(app)`: capture a window; clicks map through the latest or `screenshot=<png>`.
 - `mac.key("cmd+k", app=...)`: a key or combo.
 - `mac.type(text, app=...)`: typed text.
-- `mac.click(x, y, app=...)`: a raw click at screenshot points, or `element=match`.
-- `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, or press a control; a match outlives its run, an index does not.
+- `mac.click(x, y, app=...)`: a click at screenshot points, or `element=match`.
+- `mac.ax.query/wait/press(text, role=..., app=...)`: find, await or press a control; keep matches, not indexes.
 - `mac.script(source)`: AppleScript with the harness's Accessibility.
 
 `mac.windows(all_layers=True)` lists menus and panels for `window_id=`;
-`see(display=0)` or `see(region=(x, y, w, h))` replaces `screencapture`.
-`mac.place(app, x=, y=, width=)` moves a window.
+`see(display=0)` or a `region=` replaces `screencapture`.
 
-`mac.launch(app)` opens an app unfocused and waits for its window.
+`mac.launch(app)` opens an app unfocused, then awaits its window.
 Never `sleep`: `mac.wait_change(app)` returns once the window changed and
 settled; `see(app, after_change=True)` waits first.
 
 ## Receipts
 
-For a change, use
-`mac.do.press/set/fill/toggle/key/click/type/run/menu/status_item/window/reveal`;
+For a change, use `mac.do.press/set/fill/type/menu/...`;
 `mac.menus(app, "Edit")` lists a menu. Each returns a `Receipt` or raises
 `OperationError` with `exc.receipt`. `postcondition=` proves the effect;
 `once=` guards an action you cannot repeat. Await the next control in one
@@ -74,12 +68,9 @@ mac.ax.wait("Distribute App", role="button", app="Xcode", timeout=600)
 
 At Touch ID, a passkey, a CAPTCHA, a verification code, or a sign-in approval,
 print `mac.handoff(reason="authentication_required", app=...)` and end the turn.
-An ordinary password login to an explicitly approved local test VM may proceed
-under the target checks in `credentials`; do not request another handoff.
-Other native credentials use system AutoFill or a physical handoff.
-Never drive web pages through Accessibility: `credentials`.
+Passwords, including an approved local test VM's, and web pages: `credentials`.
 
-Run `macos-harness doctor` only after a permission or connection error.
+`macos-harness doctor` only after a permission or connection error.
 
 ## References
 
@@ -93,4 +84,4 @@ Run `macos-harness doctor` only after a permission or connection error.
 - `diagnostics`: inspect a failure first
 - `handoff`: the call and what follows
 - `credentials`: logins, permissions
-- `native-backend`: the optional backend
+- `native-backend`: an optional backend
