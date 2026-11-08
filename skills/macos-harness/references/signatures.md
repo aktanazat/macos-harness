@@ -46,6 +46,7 @@ until `show_pointer()`; `close()` reaps only the caller's helper.
 ## Primitives
 
 ```text
+mac.state(app, *, query=None, window_id=None, diff=True, max_nodes=2000)
 mac.see(app=None, *, window_index=0, window_id=None, display=None, region=None, path=None, max_width=1280, max_height=1280, crop=None, zoom=1.0, show_pointer=False, after_change=False, timeout=10.0, settle=0.15)
 mac.wait_change(app=None, *, window_index=0, window_id=None, region=None, by="pixels", timeout=30.0, settle=0.15)
 mac.key(key, *, app=None, window_id=None)
@@ -167,6 +168,40 @@ and `y` count from the top-left of `display` (0 is the main one). With
 such as one at negative coordinates on another, is centered there. A
 minimized window, or one its app will not move or resize, raises
 `unsupported_op` and nothing changes.
+
+## Window state as text
+
+`print(mac.state(app))` lists the focused window, or `window_id`'s, one
+control a line: `[12] button "All Clear"`, a value after `=`, and
+`(disabled)` or `(selected)`. Unlabeled layout groups fold into their
+children, and controls outside the window are counted, not listed. It
+costs fewer tokens than a screenshot, and a later look far fewer, so look
+with it and keep `see` for what the text does not say.
+
+An id names the same control in later runs, for the same `agent_id` and
+the same launch of the app. `state[12]` is its match. Printing a state
+makes it your last look; `state[12]` refuses an id whose line changed
+since that look, as when a row inserted above shifts unlabeled rows,
+until you print the new state:
+
+```python
+print(mac.state("Calculator"))  # [9] button "7", [12] button "Multiply", ...
+s = mac.state("Calculator")      # a later run
+for key in (9, 12, 13, 24):      # 7 × 4 =
+    mac.ax.perform(s[key], "AXPress")
+print(mac.state("Calculator"))
+```
+
+With an `agent_id` (`MacOS(agent_id=)`, `--agent-id`, or
+`MACOS_HARNESS_AGENT_ID`), the next printed look holds only what changed
+since your last: removed ids, then `~` changed and `+` added lines, or
+`No changes since your last look`. It prints the whole window when that
+is shorter or the last look was incomplete, and `diff=False` always
+does; use it when you no longer remember the window, as after a
+compaction. Without an `agent_id` every look prints the whole window.
+`query="macOS version"` lists the lines holding the phrase, or else any
+word of three letters or more, with their ancestors and small subtrees,
+including controls scrolled away; it leaves the last look alone.
 
 ## Across runs
 

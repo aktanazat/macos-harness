@@ -29,6 +29,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
 
 from ._input_lock import app_input
+from ._paths import user_temp_dir
 from .capture import (
     GrayPrint,
     WindowCapture,
@@ -60,6 +61,8 @@ from .receipts import (
     validate_exact_selectors,
     validate_scope,
 )
+from .state import AppState, Memory, build_lines, project
+from .state import diff as state_diff
 
 if TYPE_CHECKING:
     # Only for annotations -- `native.py` imports from this module at
@@ -257,6 +260,12 @@ _AX_SAFE_ATTRIBUTES = (
     "AXSelected",
     "AXHidden",
     "AXFrame",
+)
+# What `MacOS.state` reads per control; no actions or settable probes,
+# each of which would cost another round trip to the app.
+_STATE_ATTRIBUTES = (
+    "AXRole", "AXSubrole", "AXTitle", "AXDescription", "AXIdentifier", "AXValue",
+    "AXPlaceholderValue", "AXEnabled", "AXFocused", "AXSelected", "AXFrame",
 )
 _AX_CROSS_APP_MESSAGING_TIMEOUT = 0.5
 # How many matches a wait with search text reads: enough for the tiebreak
@@ -1149,6 +1158,8 @@ class _TreeSnapshot(NamedTuple):
     read_cut: bool
     # The first read that cut the walk: its depth, attribute, and AXError.
     read_failure: dict[str, JSONValue] | None = None
+    # Some node's children did not read, so a subtree may be missing.
+    children_cut: bool = False
 
 
 _BACKENDS = ("python", "native", "auto")
@@ -2399,7 +2410,7 @@ class MacOS:
         nodes: list[dict[str, Any]] = []
         seen: set[Any] = set()
         read_failure: dict[str, JSONValue] | None = None
-        node_cut = depth_cut = read_cut = False
+        node_cut = depth_cut = read_cut = children_cut = False
         requested_attributes = tuple(
             dict.fromkeys(
                 (
@@ -2422,7 +2433,7 @@ class MacOS:
         reads_values = len(safe_attributes) != len(requested_attributes)
 
         def visit(element: Any, depth: int) -> None:
-            nonlocal node_cut, depth_cut, read_cut, read_failure
+            nonlocal node_cut, depth_cut, read_cut, read_failure, children_cut
             if element in seen:
                 return
             if depth > max_depth:
@@ -2452,6 +2463,7 @@ class MacOS:
                 if int(error) in _AX_ERROR_MEANINGS:
                     read_failure["meaning"] = _AX_ERROR_MEANINGS[int(error)]
             read_cut = read_cut or bool(failures)
+            children_cut = children_cut or "AXChildren" in failures
             role = raw.get("AXRole")
             if role == "AXMenuBar" and not include_menu_bar:
                 return
@@ -2506,7 +2518,7 @@ class MacOS:
                         visit(child, depth + 1)
 
         visit(root, 0)
-        return _TreeSnapshot(nodes, node_cut, depth_cut, read_cut, read_failure)
+        return _TreeSnapshot(nodes, node_cut, depth_cut, read_cut, read_failure, children_cut)
 
     def _closed_menu(self, menu: object) -> bool:
         """Whether ``menu`` is closed: AppKit keeps a closed menu at zero
@@ -2603,6 +2615,147 @@ class MacOS:
         return state
 
     snapshot = get_app_state
+
+    def state(
+        self,
+        app: str | int,
+        *,
+        query: str | None = None,
+        window_id: int | None = None,
+        diff: bool = True,
+        max_nodes: int = 2000,
+    ) -> AppState:
+        """One window of ``app`` as compact text, a line per control:
+        ``[12] button "All Clear"``. The focused window unless
+        ``window_id`` names another.
+
+        An id names the same control in later calls and later runs, for
+        this agent (``agent_id``) and this launch of the app; ``state[12]``
+        is its match for ``click(element=)``, ``ax.perform`` or ``ax.set``.
+        Unlabeled layout groups fold into their children, and controls
+        scrolled out of the window are counted, not listed.
+
+        Reading the text (``print``, ``str``, ``.text``) makes it this
+        agent's last look at the window. ``state[12]`` refuses an id whose
+        line changed since that look until this state is read. With a named
+        agent, ``diff=True`` then returns only what changed since the last
+        look (``~`` changed, ``+`` added, removed ids), or the whole window
+        when that is shorter. ``query`` shows only the lines that mention
+        it, their ancestors, and small subtrees, from the whole window,
+        scrolled out or not; it leaves the last look as it was."""
+        self._ensure_accessibility()
+        if query is not None and not isinstance(query, str):
+            raise MacOSError("query must be a string", code=ErrorCode.BAD_REQUEST)
+        if isinstance(max_nodes, bool) or not isinstance(max_nodes, int) or max_nodes < 1:
+            raise MacOSError("max_nodes must be a positive integer", code=ErrorCode.BAD_REQUEST)
+        _, info = self._resolve_app(app)
+        pid = int(info["pid"])
+        window = self._state_window(pid, window_id)
+        frame, _ = self._window_geometry(window)
+        snapshot = self._snapshot_tree(
+            # Chromium trees run deeper than native ones: Slack's reaches 28.
+            window, max_depth=50, max_nodes=max_nodes, include_menu_bar=False,
+            attributes=_STATE_ATTRIBUTES, include_actions=False, include_settable=False,
+            skip_closed_menus=True,
+        )
+        self._last_app = info
+        identity = self._overlay.identity
+        agent_id = identity.agent_id if identity is not None else None
+        place = (Path(user_temp_dir()) / "macos-harness-state", agent_id, pid, _process_start_time(pid))
+        number = self._ax_window_id(window)
+        with Memory.locked(*place) as memory:
+            lines, offscreen, memory.next_id = build_lines(snapshot.nodes, memory.ids, memory.next_id, frame)
+            window_key = str(number) if number is not None else f"line:{lines[0].id if lines else 0}"
+            previous = memory.looks.get(window_key)
+        title = snapshot.nodes[0].get("title", "") if snapshot.nodes else ""
+        header = f"{info['name']} window {json.dumps(title, ensure_ascii=False)}" + (
+            f" (window_id {number})" if number is not None else ""
+        )
+        focused = self._copy_attribute(self._application_element(pid), "AXFocusedUIElement")
+        focus = next(
+            (line.id for line in lines if focused is not None and self._elements[line.node["element_index"]] == focused),
+            None,
+        )
+        if focus is not None:
+            header += f"\nFocused: [{focus}]"
+        # A label that did not read shortens one line; children that did
+        # not read may hide a subtree, which a diff would call removed.
+        complete = not (snapshot.node_cut or snapshot.depth_cut or snapshot.children_cut)
+        notes: list[str] = []
+        if not complete:
+            notes.append(
+                f"[Tree incomplete: stopped at max_nodes={max_nodes}; pass a larger max_nodes, "
+                "or use mac.see for what is missing.]" if snapshot.node_cut else
+                "[Tree incomplete: part of the window did not answer or nests too deep; "
+                "use mac.see for what is missing.]"
+            )
+        look = [(line.id, line.render(), out) for line, out in zip(lines, offscreen, strict=True)]
+        if query is not None:
+            shown = project(lines, query)
+            label = json.dumps(query, ensure_ascii=False)
+            body = (
+                [f"Query {label} matched nothing among {len(lines)} controls; omit query to see the window."]
+                if shown is None else
+                [f"Query {label}: {len(shown)} of {len(lines)} lines (matches, their ancestors, small subtrees).",
+                 *(line.render() for line in shown)]
+            )
+        else:
+            visible = [(element_id, text) for element_id, text, out in look if not out]
+            body = [text for _, text in visible]
+            hidden = sum(offscreen)
+            if hidden:
+                notes.append(f"{hidden} more controls lie outside the window; scroll, or pass query= to find them.")
+            # Without a name, another agent's look could be the baseline.
+            if diff and agent_id and complete and previous is not None:
+                changes = state_diff(
+                    [(element_id, text) for element_id, text, out in previous if not out],
+                    visible, {element_id for element_id, _, _ in look},
+                )
+                if changes is not None and len(changes) < len("\n".join(body)):
+                    body = [changes]
+
+        def remember() -> None:
+            with Memory.locked(*place) as memory:
+                memory.remember(window_key, look)
+
+        matches: dict[int, Mapping[str, JSONValue]] = {}
+        for line in lines:
+            node = line.node
+            match = {"element_index": node["element_index"], "role": node["role"], "pid": pid}
+            match.update({key: node[key] for key in ("title", "identifier", "description", "frame") if key in node})
+            if number is not None:
+                match["window_id"] = number
+            matches[line.id] = _OwnedMatch(match, self)
+        return AppState(
+            "\n".join([header, *body, *notes]), matches, complete=complete,
+            lines={line.id: line.text for line in lines},
+            seen={element_id: text for element_id, text, _ in previous or ()},
+            on_show=remember if query is None and complete else None,
+        )
+
+    def _state_window(self, pid: int, window_id: int | None) -> object:
+        """The AX window `state` reads: ``window_id``'s, or else the
+        focused, main, or first window of ``pid``."""
+        if window_id is not None:
+            for window in self._ax_windows(pid):
+                if self._ax_window_id(window) == window_id:
+                    return window
+            raise MacOSError(
+                f"Process {pid} shows no Accessibility window {window_id} on this Space",
+                code=ErrorCode.BAD_REQUEST, details={"pid": pid, "window_id": window_id},
+            )
+        root = self._application_element(pid)
+        for name in ("AXFocusedWindow", "AXMainWindow"):
+            window = self._copy_attribute(root, name)
+            if window is not None and self._is_ax_element(window):
+                return window
+        windows = self._ax_windows(pid)
+        if not windows:
+            raise MacOSError(
+                f"Process {pid} shows no window on this Space", code=ErrorCode.UNSUPPORTED_OP,
+                details={"pid": pid},
+            )
+        return windows[0]
 
     # --- AX actions ------------------------------------------------------
 

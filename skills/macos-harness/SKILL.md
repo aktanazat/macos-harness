@@ -31,8 +31,9 @@ In omp, `tool.read` the PNG in the same cell.
 Bundle reversible steps; verify once at the end. Stop only for unclear
 identity, an irreversible action, or unexpected state.
 
-## Six verbs
+## Seven verbs
 
+- `mac.state(app)`: the window as text; later looks print only changes; `state[id]` is a match.
 - `mac.see(app)`: capture a window; clicks map through the latest or `screenshot=<png>`.
 - `mac.key("cmd+k", app=...)`: a key or combo.
 - `mac.type(text, app=...)`: typed text.

@@ -7,6 +7,15 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `mac.state(app)` prints a window as text, one control a line, as
+  `[12] button "All Clear"`. Ids hold across runs for the same agent and
+  app launch, and `state[12]` is a match for `click(element=)`,
+  `ax.perform`, and `ax.set`; it refuses an id whose line changed since
+  the agent last printed the window. With an `agent_id`, a printed look
+  holds only what changed since the last one; `query=` prints the
+  matching lines with their ancestors. Unlabeled layout groups fold away
+  and controls outside the window are counted, not listed.
+
 - `MacOS(agent_id=)`, CLI `--agent-id`, and `MACOS_HARNESS_AGENT_ID` give
   each agent a named pointer with a stable color, without moving the
   physical cursor. Named pointers mark Accessibility actions and appear
