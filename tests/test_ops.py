@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import ClassVar, NamedTuple
 
@@ -245,8 +245,22 @@ class FakeHost:
         if self.guard_error is not None:
             raise self.guard_error
 
-    def _element(self, element_index: int) -> object:
+    def _element(self, element_index: int | Mapping[str, object]) -> object:
+        if isinstance(element_index, Mapping):
+            element_index = int(element_index["element_index"])
         return self.elements[element_index]
+
+    def _element_pid(self, element: int | Mapping[str, object]) -> int | None:
+        named = element.get("pid") if isinstance(element, Mapping) else None
+        return named if isinstance(named, int) else None
+
+    def _remember_element(self, element: object) -> int:
+        for index, held in self.elements.items():
+            if held is element:
+                return index
+        index = max(self.elements, default=0) + 1
+        self.elements[index] = element
+        return index
 
     def _focused_element(self, pid: int, window_id: int | None) -> int | None:
         assert pid == 41
@@ -309,7 +323,9 @@ class FakeHost:
             raise self.set_error
         self.value = value
 
-    def perform_action(self, element_index: int, action: str = "AXPress") -> None:
+    def perform_action(self, element_index: int | Mapping[str, object], action: str = "AXPress") -> None:
+        if isinstance(element_index, Mapping):
+            element_index = int(element_index["element_index"])
         assert element_index == 7
         assert action == "AXPress"
         self.action_calls += 1
@@ -1079,6 +1095,23 @@ def test_press_atomic_reserves_once_token_before_dispatching() -> None:
     operations.press(app="Demo", text="Save", once="order")
 
     assert seen == ["in_flight"]
+
+
+def test_press_element_presses_the_held_match_and_refuses_another_apps() -> None:
+    host, operations = _ops()
+    own = {**host.match, "pid": 41}
+
+    foreign = _failed(lambda: operations.press(app="Demo", element={**own, "pid": 99}))
+    unowned = _failed(lambda: operations.press(app="Demo", element=dict(host.match)))
+    receipt = operations.press(app="Demo", element=own)
+
+    assert foreign.receipt.acted is Acted.NO
+    assert unowned.receipt.acted is Acted.NO
+    assert receipt.outcome is Outcome.DONE
+    assert receipt.acted is Acted.YES
+    assert host.action_calls == 1
+    assert host.press_calls == []
+    assert host.wait_calls == []
 
 
 def test_press_atomic_focus_changed_is_acted_yes() -> None:
