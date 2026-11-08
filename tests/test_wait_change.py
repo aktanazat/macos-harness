@@ -6,6 +6,7 @@ comparison under test is the one a live window gets."""
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -45,7 +46,8 @@ _DOT = _frame((200, 140, 6, 6))
 
 
 class _Screen(MacOS):
-    """`MacOS` over one window whose captures follow ``frames``."""
+    """`MacOS` over one window whose captures follow ``frames``, with
+    nobody at its keyboard."""
 
     def __init__(self, *frames: object, texts: tuple[str | None, ...] = ()) -> None:
         super().__init__()
@@ -68,6 +70,10 @@ class _Screen(MacOS):
 
     def _ensure_accessibility(self) -> None:
         return None
+
+    @staticmethod
+    def _since_person() -> float:
+        return math.inf
 
     def _resolve_app(self, query: str | int | None) -> tuple[None, dict[str, object]]:
         return None, {"name": "Test", "pid": 42, "bundle_id": "test", "path": None}

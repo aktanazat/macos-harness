@@ -55,7 +55,29 @@ def _on_screen_windows(monkeypatch, *windows: tuple[int | float, ...]) -> list[d
     return described
 
 
-class _Described(MacOS):
+class _Unattended(MacOS):
+    """`MacOS` on a Mac nobody is using, so input to the app in front
+    never waits on whoever is at the Mac running these tests."""
+
+    @staticmethod
+    def _since_person() -> float:
+        return math.inf
+
+
+class _ResumesAfterOneLook(MacOS):
+    """`MacOS` on a Mac whose person pauses for the harness's first look
+    and is using it again at every later one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.looks = 0
+
+    def _since_person(self) -> float:
+        self.looks += 1
+        return math.inf if self.looks == 1 else 0.0
+
+
+class _Described(_Unattended):
     """`MacOS` whose window server describes a window by its number from
     ``described``, the list `_on_screen_windows` returns."""
 
@@ -2343,17 +2365,19 @@ def test_scroll_without_a_point_at_an_app_with_no_window_is_refused(monkeypatch)
 
 
 @pytest.mark.parametrize(
-    ("appkit_takes", "accessibility_takes", "activated", "via", "ax_requests"),
+    ("person", "appkit_takes", "accessibility_takes", "activated", "via", "ax_requests"),
     [
-        (True, False, True, "appkit", []),
-        (False, True, True, "accessibility", [(42, "AXFrontmost", True)]),
-        (False, False, False, None, [(42, "AXFrontmost", True)]),
+        (_Unattended, True, False, True, "appkit", []),
+        (_Unattended, False, True, True, "accessibility", [(42, "AXFrontmost", True)]),
+        (_Unattended, False, False, False, None, [(42, "AXFrontmost", True)]),
+        (_ResumesAfterOneLook, False, True, False, None, []),
     ],
+    ids=["appkit", "accessibility", "neither", "person-resumed-before-accessibility"],
 )
 def test_activate_falls_back_to_accessibility_once_and_reports_what_macos_did(
-    monkeypatch, appkit_takes, accessibility_takes, activated, via, ax_requests
+    monkeypatch, person, appkit_takes, accessibility_takes, activated, via, ax_requests
 ) -> None:
-    mac = MacOS()
+    mac = person()
     other = {"name": "Other", "bundle_id": None, "pid": 7, "path": None}
     info = {"name": "Test", "bundle_id": None, "pid": 42, "path": None}
     front = [other]
@@ -2388,6 +2412,116 @@ def test_activate_falls_back_to_accessibility_once_and_reports_what_macos_did(
     assert result["via"] == via
     assert result["previous"] == other
     assert result["frontmost"] == (info if activated else other)
+
+
+class _Typist(MacOS):
+    """`MacOS` on a Mac where someone types until ``stops_ms`` on a clock
+    that moves only while the harness pauses, or never stops for None.
+    Whole milliseconds keep the pause it waits for exact."""
+
+    def __init__(self, stops_ms: int | None) -> None:
+        super().__init__()
+        self.stops_ms = stops_ms
+        self.ms = 0
+
+    def _now(self) -> float:
+        return self.ms / 1000
+
+    def _pause(self, seconds: float) -> None:
+        self.ms += round(seconds * 1000)
+
+    def _since_person(self) -> float:
+        if self.stops_ms is None:
+            return 0.0
+        return max(0, self.ms - self.stops_ms) / 1000
+
+
+def test_activate_asks_nothing_while_the_person_at_the_mac_never_pauses() -> None:
+    """An app brought forward mid-keystroke took the person's next keys."""
+    requests: list[int] = []
+
+    class _Running:
+        def activateWithOptions_(self, options: int) -> bool:
+            requests.append(options)
+            return True
+
+    class _Behind(_Typist):
+        def _resolve_app(self, query: str | int | None) -> tuple[_Running, dict[str, object]]:
+            return _Running(), {"name": "Test", "bundle_id": None, "pid": 42, "path": None}
+
+        @classmethod
+        def _frontmost_app(cls) -> dict[str, object]:
+            return {"name": "Other", "bundle_id": None, "pid": 7, "path": None}
+
+    mac = _Behind(None)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.activate("Test")
+
+    assert refused.value.code == ErrorCode.TIMEOUT.value
+    assert refused.value.details["reason"] == "person_active"
+    assert requests == []
+    assert mac.ms == 2500
+
+
+class _Control:
+    """An element of process ``pid`` that is its own handle's client and
+    records each action performed on it; with ``role``, an Accessibility
+    element of that role."""
+
+    def __init__(self, pid: int, role: str | None = None) -> None:
+        self.pid = pid
+        self.role = role
+        self.client = self
+        self.performed: list[str] = []
+
+    def perform(self, element: _Control, action: str) -> None:
+        element.performed.append(action)
+
+
+class _Presses(_Typist):
+    """`_Typist` whose person never pauses, with process 42 in front and
+    `_Control` elements."""
+
+    def __init__(self) -> None:
+        super().__init__(None)
+
+    @classmethod
+    def _frontmost_app(cls) -> dict[str, object]:
+        return {"name": "Front", "bundle_id": None, "pid": 42, "path": None}
+
+    def _element_pid(self, element: int) -> int:
+        return self._element(element).pid
+
+    @staticmethod
+    def _is_ax_element(value: object) -> bool:
+        return isinstance(value, _Control) and value.role is not None
+
+    @staticmethod
+    def _copy_attribute(element: _Control, attribute: str, *, checked: bool = False) -> str | None:
+        return element.role if attribute == "AXRole" else None
+
+
+@pytest.mark.parametrize(
+    ("pid", "role", "action"),
+    [(42, None, "AXPress"), (7, "AXPopUpButton", "AXPress"), (7, None, "AXShowMenu")],
+    ids=["press-in-the-app-in-front", "pop-up-button-behind", "menu-behind"],
+)
+def test_a_press_that_would_take_the_persons_keys_waits_for_them_to_pause(
+    pid: int, role: str | None, action: str
+) -> None:
+    """A press in the app in front moved the focus its person typed into,
+    and a menu opened in any app took their next keys; a plain press in
+    an app behind takes neither, so it goes at once."""
+    mac = _Presses()
+    behind, control = _Control(7), _Control(pid, role)
+
+    mac.perform_action(mac._remember_element(behind), "AXPress")
+    with pytest.raises(MacOSError) as refused:
+        mac.perform_action(mac._remember_element(control), action)
+
+    assert refused.value.details["reason"] == "person_active"
+    assert (behind.performed, control.performed, mac.ms) == (["AXPress"], [], 2500)
 
 
 def test_input_without_target_is_refused(monkeypatch) -> None:
@@ -2455,7 +2589,7 @@ def test_type_into_the_frontmost_app_packs_runs_of_text_per_event(monkeypatch) -
     """A frontmost app takes text in runs of up to 20 UTF-16 units per
     key event with no pause, split only between code points; a newline
     still travels alone as the Return key."""
-    mac = MacOS()
+    mac = _Unattended()
     posted, sleeps = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
 
     mac.type("a" * 19 + "😀" + "b\n" + "c", app="Spotify")
@@ -2467,6 +2601,40 @@ def test_type_into_the_frontmost_app_packs_runs_of_text_per_event(monkeypatch) -
     assert [event["flags"] for event in downs] == [0, 0, 0, 0]
     assert [pid for _, pid in posted] == [42] * 8
     assert sleeps == []
+
+
+@pytest.mark.parametrize(
+    ("frontmost_pid", "stops_ms", "sent", "waited_ms"),
+    [(42, 1000, ["hi"], 1450), (7, None, ["h", "i"], 0)],
+    ids=["in-front-after-the-person-pauses", "behind-at-once"],
+)
+def test_typing_waits_for_the_person_at_the_mac_only_in_the_app_in_front(
+    monkeypatch, frontmost_pid, stops_ms, sent, waited_ms
+) -> None:
+    """Text sent to the app in front while its person typed landed in
+    the middle of theirs; an app behind keeps its keys apart from theirs."""
+    mac = _Typist(stops_ms)
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=frontmost_pid)
+
+    mac.type("hi", app="Spotify")
+
+    assert [event["text"] for event, _ in posted if event["down"]] == sent
+    assert mac.ms == waited_ms
+
+
+def test_typing_into_the_app_in_front_sends_nothing_while_the_person_never_pauses(
+    monkeypatch,
+) -> None:
+    mac = _Typist(None)
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.type("hi", app="Spotify")
+
+    assert refused.value.code == ErrorCode.TIMEOUT.value
+    assert refused.value.details["reason"] == "person_active"
+    assert posted == []
+    assert mac.ms == 2500
 
 
 def test_type_waits_while_another_run_sends_the_app_input(monkeypatch, hold_app_input) -> None:
@@ -2528,6 +2696,7 @@ def test_typing_stops_if_target_becomes_frontmost(monkeypatch) -> None:
     posted = []
     focus = iter(
         [
+            {"name": "Terminal", "pid": 7},
             {"name": "Terminal", "pid": 7},
             {"name": "Spotify", "pid": 42},
         ]
@@ -2696,7 +2865,7 @@ def test_click_screen_space_omits_image_coordinates_from_a_different_app(
 
 @pytest.mark.parametrize(("frontmost_pid", "in_front"), [(222, True), (7, False)])
 def test_click_reports_whether_its_app_was_in_front(monkeypatch, frontmost_pid, in_front) -> None:
-    mac = MacOS()
+    mac = _Unattended()
     monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
     monkeypatch.setattr(mac, "_ensure_post_events", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 222)
@@ -2709,6 +2878,45 @@ def test_click_reports_whether_its_app_was_in_front(monkeypatch, frontmost_pid, 
 
     assert pointer["target_is_frontmost"] is in_front
     assert ("mac.activate(222)" in pointer.get("note", "")) is not in_front
+
+
+class _ClickInFront(_ResumesAfterOneLook):
+    """A click aimed at process 222, the app in front, that keeps the pid
+    of each event it would post."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.posted: list[int | None] = []
+
+    def _ensure_accessibility(self) -> None:
+        pass
+
+    def _ensure_post_events(self) -> None:
+        pass
+
+    def _pid(self, app: str | int | None) -> int:
+        return 222
+
+    @classmethod
+    def _frontmost_app(cls) -> dict[str, object]:
+        return {"name": "Front", "pid": 222}
+
+    def _post(self, event: object, pid: int | None) -> None:
+        self.posted.append(pid)
+
+
+def test_a_click_in_front_posts_nothing_once_the_person_resumes(monkeypatch) -> None:
+    """The person at the Mac started again while the click found its
+    window; posting it then moved their caret mid-keystroke."""
+    mac = _ClickInFront()
+    mac.hide_pointer()
+    _on_screen_windows(monkeypatch, (222, 9, 0, 0, 800, 600))
+
+    with pytest.raises(MacOSError) as refused:
+        mac.click(10, 20, app="B", coordinate_space="screen")
+
+    assert refused.value.details["reason"] == "person_active"
+    assert (mac.looks, mac.posted) == (2, [])
 
 
 def test_screen_point_requires_screenshot() -> None:

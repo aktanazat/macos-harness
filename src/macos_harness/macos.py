@@ -362,6 +362,8 @@ _FOCUS_DETAIL_ATTRIBUTES = {
 _SECURE_SUBROLE = "AXSecureTextField"
 _SENSITIVE_ATTRIBUTES = frozenset({"AXValue", "AXSelectedText", "AXSelectedTextRange", "AXNumberOfCharacters"})
 _SETTABLE_CANDIDATES = ("AXValue", "AXFocused", "AXSelected")
+_FOCUS_ATTRIBUTES = frozenset({"AXFocused", "AXMain", "AXFrontmost"})
+_MENU_ROLES = frozenset({"AXMenuBarItem", "AXMenuButton", "AXPopUpButton"})
 _ACTION_ALIASES = {
     "press": "AXPress",
     "show menu": "AXShowMenu",
@@ -697,6 +699,10 @@ _STILL_SECONDS = 0.5
 # How long a click waits before asking accessibility again what lies at an
 # element's center when the first answer named something else.
 _HIT_AGAIN_SECONDS = 0.1
+# An input that would take the focus or the keys of the person at this
+# Mac waits for a pause this long in their input, and at most this long.
+_PERSON_PAUSE_SECONDS = 0.45
+_PERSON_WAIT_SECONDS = 2.5
 
 
 def _character_key(character: str) -> tuple[int, int]:
@@ -1875,6 +1881,58 @@ class MacOS:
                     "frontmost": after,
                 },
             )
+
+    @staticmethod
+    def _since_person() -> float:
+        """Seconds since the person at this Mac last pressed a key or
+        used a mouse, trackpad, or tablet. macOS counts an event posted
+        to one process, the only way any harness run sends input, under
+        `kCGAnyInputEventType` but never under its own type (measured on
+        macOS 27), so these clocks of each type leave every harness run's
+        input out."""
+        return min(
+            AS.CGEventSourceSecondsSinceLastEventType(AS.kCGEventSourceStateHIDSystemState, kind)
+            for kind in (
+                AS.kCGEventKeyDown, AS.kCGEventKeyUp, AS.kCGEventFlagsChanged,
+                AS.kCGEventMouseMoved, AS.kCGEventScrollWheel,
+                AS.kCGEventLeftMouseDown, AS.kCGEventLeftMouseUp, AS.kCGEventLeftMouseDragged,
+                AS.kCGEventRightMouseDown, AS.kCGEventRightMouseUp, AS.kCGEventRightMouseDragged,
+                AS.kCGEventOtherMouseDown, AS.kCGEventOtherMouseUp, AS.kCGEventOtherMouseDragged,
+                AS.kCGEventTabletPointer, AS.kCGEventTabletProximity,
+            )
+        )
+
+    def _yield_to_person(self, pid: int | None, operation: str, *, forward: bool = False) -> None:
+        """Hold ``operation`` for a pause in the input of the person at
+        this Mac when it would take their focus or their keys: input to
+        ``pid`` while it is the app in front, or, with ``forward``,
+        bringing ``pid`` there from behind. Anything else goes at once."""
+        front = self._frontmost_app()
+        if (front is not None and int(front["pid"]) == pid) != forward:
+            self._await_person_pause(operation)
+
+    def _await_person_pause(self, operation: str, wait: float = _PERSON_WAIT_SECONDS) -> None:
+        """Return once the person at this Mac has gone
+        `_PERSON_PAUSE_SECONDS` without input, so ``operation`` never
+        lands mid-stroke. Without that pause in ``wait`` seconds it
+        raises `timeout`, reason ``person_active``, having sent
+        nothing."""
+        started = self._now()
+        while (idle := self._since_person()) < _PERSON_PAUSE_SECONDS:
+            waited = self._now() - started
+            if waited >= wait:
+                raise MacOSError(
+                    f"Someone is using this Mac's keyboard or mouse, and {operation} would "
+                    "take their focus or their keys, so nothing was sent: try again in a "
+                    "moment, or ask them to do this step",
+                    code=ErrorCode.TIMEOUT,
+                    details={
+                        "reason": "person_active",
+                        "operation": operation,
+                        "waited_ms": round(waited * 1000),
+                    },
+                )
+            self._pause(min(_PERSON_PAUSE_SECONDS - idle, wait - waited))
 
     def _resolve_app(self, query: str | int | None) -> tuple[Any, dict[str, Any]]:
         if not query and self._last_app:
@@ -4512,7 +4570,10 @@ class MacOS:
                     code=ErrorCode.BAD_REQUEST,
                 )
         element = self._element(element_index)
-        self._hold_before_input(self._element_pid(element_index))
+        pid = self._element_pid(element_index)
+        if attribute in _FOCUS_ATTRIBUTES:
+            self._yield_to_person(pid, f"setting {attribute}", forward=attribute == "AXFrontmost")
+        self._hold_before_input(pid)
         self._show_element_pointer(element_index)
         if not self._is_ax_element(element):
             element.client.set(element, attribute, value)
@@ -4532,8 +4593,17 @@ class MacOS:
 
     def perform_action(self, element_index: ElementRef, action: str = "AXPress") -> None:
         element = self._element(element_index)
-        self._hold_before_input(self._element_pid(element_index))
         normalized = _ACTION_ALIASES.get(action.casefold(), action)
+        pid = self._element_pid(element_index)
+        if normalized == "AXShowMenu" or (
+            normalized == "AXPress"
+            and self._is_ax_element(element)
+            and self._copy_attribute(element, "AXRole") in _MENU_ROLES
+        ):
+            self._await_person_pause("opening a menu")
+        elif normalized != "AXScrollToVisible":
+            self._yield_to_person(pid, f"performing {normalized} in the app in front")
+        self._hold_before_input(pid)
         pointer_ref = element_index
         if not self._is_ax_element(element):
             marked = self._show_element_pointer(pointer_ref)
@@ -4911,7 +4981,7 @@ class MacOS:
 
     @staticmethod
     def _now() -> float:
-        """The monotonic clock the launch, quit, window, and change waits read."""
+        """The monotonic clock the launch, quit, window, change, and person waits read."""
         return time.monotonic()
 
     @staticmethod
@@ -6652,24 +6722,32 @@ class MacOS:
 
         Since macOS 14 activation is a request the system may decline.
         AppKit's request comes first; when ``app`` is not frontmost after
-        ``timeout`` seconds, one Accessibility request sets the app's
-        ``AXFrontmost``, the route System Events takes, and the frontmost
-        app is observed for up to ``timeout`` again. Wine declined every
-        AppKit request and took the Accessibility one in 19ms.
+        ``timeout`` seconds and the person at this Mac has not used the
+        keyboard or mouse since its wait, one Accessibility request sets
+        the app's ``AXFrontmost``, the route System Events takes, and the
+        frontmost app is observed for up to ``timeout`` again. Wine
+        declined every AppKit request and took the Accessibility one in 19ms.
         ``activated`` says whether either took and ``via`` which:
         ``appkit`` or ``accessibility``, None when neither did. Nothing
         here retries further -- a request both routes decline means the
         person at the keyboard has priority, so hand off instead of
-        asking again.
+        asking again. While someone uses the keyboard or mouse, it waits
+        for them to pause first, and with no pause in 2.5s it raises
+        `timeout`, having asked nothing.
         """
         running, info = self._resolve_app(app)
         pid = int(info["pid"])
+        self._yield_to_person(pid, f"bringing {info['name']} forward", forward=True)
         previous = self._frontmost_app()
         started = time.monotonic()
         running.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
         frontmost, activated = self._await_frontmost(pid, timeout)
         via = "appkit" if activated else None
-        if not activated and self.is_accessibility_trusted():
+        if (
+            not activated
+            and self._since_person() >= _PERSON_PAUSE_SECONDS
+            and self.is_accessibility_trusted()
+        ):
             AS.AXUIElementSetAttributeValue(
                 AS.AXUIElementCreateApplication(pid), "AXFrontmost", True
             )
@@ -7000,6 +7078,10 @@ class MacOS:
         control that ignores ``AXPress``, as a SwiftUI row can. An element
         still moving after half a second, or one where accessibility finds
         another element over its center, is refused and nothing is clicked.
+
+        With ``app`` in front, the click first waits for the person at
+        this Mac to pause their own keyboard and mouse input; with no
+        pause in 2.5s it raises `timeout`, having sent nothing.
         """
         validate_click_aim(x, y, element)
         self._ensure_accessibility()
@@ -7016,6 +7098,7 @@ class MacOS:
             owner = self._element_pid(element) if app is None else app
             pid = self._input_pid(owner, window_id, "Pointer input")
         with app_input(pid, _INPUT_WAIT):
+            self._yield_to_person(pid, "a click in the app in front")
             if element is not None:
                 point = self._element_point(element, pid)
             window = self._target_window(pid, point, window_id)
@@ -7140,10 +7223,14 @@ class MacOS:
         routed to ``window``, and say whether ``pid`` was frontmost then.
         ``click`` resolves those three for a raw call; ``mac.do.click``
         resolves them itself, before it reserves anything, and hands them
-        over so the window it reports is the one the events carry."""
+        over so the window it reports is the one the events carry. With
+        ``pid`` in front, it posts nothing unless the person at this Mac
+        is still pausing, as the click waited for before it aimed."""
         with app_input(pid, _INPUT_WAIT):
             self._hold_before_input(pid, window.window_id)
             focus_before = self._frontmost_app()
+            if focus_before is not None and int(focus_before["pid"]) == pid:
+                self._await_person_pause("a click in the app in front", wait=0.0)
             self._pointer_position = point
             self._overlay.move(*point)
             down_type, up_type, _ = _MOUSE_EVENTS[button]
@@ -7205,6 +7292,7 @@ class MacOS:
             pid, start, self._pictured_window(window_id, coordinate_space)
         )
         with app_input(pid, _INPUT_WAIT):
+            self._yield_to_person(pid, "a drag in the app in front")
             self._hold_before_input(pid, window.window_id)
             focus_before = self._frontmost_app()
             self._pointer_position = start
@@ -7354,11 +7442,16 @@ class MacOS:
         say, and whether the app was in front. In the background, typing
         stops with `FocusChangedError` before the next character once the
         app's keys go to another window.
+
+        With ``app`` in front, the text first waits for the person at this
+        Mac to pause their own keyboard and mouse input; with no pause in
+        2.5s it raises `timeout`, having sent nothing.
         """
         self._ensure_accessibility()
         self._ensure_post_events()
         pid = self._input_pid(app, window_id, "Keyboard input")
         with app_input(pid, _INPUT_WAIT):
+            self._yield_to_person(pid, "typing into the app in front")
             target = self._keyboard_window(pid, window_id)
             self._hold_before_input(pid, window_id)
             focus_before = self._frontmost_app()
@@ -7400,12 +7493,14 @@ class MacOS:
         """Press ``key``, with any modifiers it names, in ``app``.
 
         ``window_id`` names the window to press it in, as `type` takes it;
-        the result says the same as `type`'s."""
+        the result, and the wait for the person while ``app`` is in front,
+        are the same as `type`'s."""
         self._ensure_accessibility()
         self._ensure_post_events()
         keycode, parsed_modifiers = _parse_key(key)
         pid = self._input_pid(app, window_id, "Keyboard input")
         with app_input(pid, _INPUT_WAIT):
+            self._yield_to_person(pid, f"pressing {key} in the app in front")
             target = self._keyboard_window(pid, window_id)
             self._hold_before_input(pid, window_id)
             focus_before = self._frontmost_app()

@@ -271,6 +271,25 @@ follows [Semantic Versioning](https://semver.org/).
   Python remains for operations those tools do not cover; credential
   input stays under the credential guide.
 
+- Input that would take the focus or the keys of the person at this Mac
+  waits for them to pause: `activate` and `ax.set` of `AXFrontmost` for
+  an app behind; `click`, `drag`, `key`, `type`, `ax.set` of `AXFocused`
+  or `AXMain`, presses and other `ax.perform` actions, and the `mac.do`
+  verbs built on them for the app in front; and, in any app, a press that
+  opens a menu. It goes once 450 ms pass with no key, mouse, trackpad, or
+  tablet input, and after 2.5s without such a pause raises `timeout` with
+  `reason: "person_active"`, having sent nothing; a `mac.do` receipt then
+  fails with `acted="no"` and its `once` token stays free. A `do.fill`
+  that had already focused its field and selected the text reports
+  `acted="yes"` instead and keeps its token. A click in the app in front
+  checks again just before its events go, `activate` skips its
+  Accessibility request when the person resumed during AppKit's attempt,
+  a route replay tries again a step the person held back while its time
+  lasts, and a recording stays open after one. Input from any harness run
+  never counts as the person's. Other input to an app behind, scrolls,
+  and reads never wait. Before, an `activate` while they typed sent their
+  next keys to the app it brought forward.
+
 - `mac.do.key` and `mac.do.type` note the element that has keyboard focus
   when they are prepared, in the window they name if one is focused, and
   send nothing when focus is on another element by the time they would:

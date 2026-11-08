@@ -105,14 +105,17 @@ later steps should still run, then look before acting again.
   frontmost-app reading. A press stopped with
   `deadline_exhausted_before_dispatch` reports `acted="no"` and keeps its `once`
   token available, as does an input or menu verb stopped with `app_input_busy`
-  while another harness run kept sending the app input, and a `key` or `type`
+  while another harness run kept sending the app input, a `key` or `type`
   stopped by `focus.changed` with reason `focus_moved_before_dispatch` because
-  keyboard focus moved before it sent anything. An element `click` stopped
-  with `timeout`, reason `still_moving`, sent nothing either and reports
-  `acted="no"`. Other timeouts can mean the action happened: keep the token
-  and inspect the receipt. A synchronous AX or input call already in progress
-  cannot be preempted. Raw `mac.ax.press(timeout=0)` makes one attempt;
-  `mac.do.press(timeout=0)` does not dispatch.
+  keyboard focus moved before it sent anything, and a verb stopped with
+  `timeout`, reason `person_active`, because the person at this Mac never
+  paused their keyboard or mouse. A `fill` stopped that way after it selected
+  the field's text reports `acted="yes"` and keeps its token. An element
+  `click` stopped with `timeout`, reason `still_moving`, sent nothing either
+  and reports `acted="no"`. Other timeouts can mean the action happened: keep
+  the token and inspect the receipt. A synchronous AX or input call already in
+  progress cannot be preempted. Raw `mac.ax.press(timeout=0)` makes one
+  attempt; `mac.do.press(timeout=0)` does not dispatch.
 - `run` receipts keep source, arguments, and output as length/SHA-256 metadata.
   Pass `capture_output=True` only when you need bounded stdout/stderr text and
   accept that it can contain sensitive data.

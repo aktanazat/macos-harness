@@ -345,7 +345,9 @@ _TEXT_STILL_SECONDS = 0.3
 
 class _BlockedEffect(MacOSError):
     """What a verb waits for after its input landed was stopped, as a
-    window asked to close is by the prompt its app shows."""
+    window asked to close is by the prompt its app shows, or the rest of
+    its input was, as a fill's typing is by the person at this Mac once
+    the fill has focused its field and selected its text."""
 
 
 def _sample_focus(host: _Host, pid: int) -> dict[str, JSONValue] | None:
@@ -456,16 +458,32 @@ def _atomic_press_acted(exc: MacOSError) -> Acted:
     instead. ``element.unknown``/``bad_request``/
     ``unsupported_op`` are exactly as certain in the other direction --
     no match, an ambiguous one, or one without the action at all.
-    A timeout explicitly marked as before dispatch also means no action.
+    A timeout that sent nothing -- the deadline ran out first, or the
+    person at this Mac never paused -- also means no action.
     Other timeouts remain unknown because dispatch may already have happened.
     """
     if exc.code == ErrorCode.FOCUS_CHANGED.value:
         return Acted.YES
-    if exc.code == ErrorCode.TIMEOUT.value and exc.details.get("reason") == "deadline_exhausted_before_dispatch":
+    if _sent_nothing(exc):
         return Acted.NO
     if exc.code in {ErrorCode.ELEMENT_UNKNOWN.value, ErrorCode.BAD_REQUEST.value, ErrorCode.UNSUPPORTED_OP.value}:
         return Acted.NO
     return Acted.UNKNOWN
+
+
+def _sent_nothing(exc: MacOSError) -> bool:
+    """Whether a dispatch that raised ``exc`` stopped before any input
+    left: keyboard focus moved off its element first, the deadline ran
+    out first, or the person at this Mac never paused their own input.
+    A `_BlockedEffect` always comes after some input left."""
+    if isinstance(exc, _BlockedEffect):
+        return False
+    reason = exc.details.get("reason")
+    if isinstance(exc, FocusChangedError):
+        return reason == "focus_moved_before_dispatch"
+    return exc.code == ErrorCode.TIMEOUT.value and reason in {
+        "deadline_exhausted_before_dispatch", "person_active",
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1279,6 +1297,7 @@ class _Host(Protocol):
         target_pid: int,
         operation: str,
     ) -> None: ...
+    def _yield_to_person(self, pid: int | None, operation: str, *, forward: bool = False) -> None: ...
     def _element(self, element_index: int | Mapping[str, JSONValue]) -> object: ...
     def _element_pid(self, element: int | Mapping[str, JSONValue]) -> int | None: ...
     def _remember_element(self, element: object) -> int: ...
@@ -2108,10 +2127,15 @@ class Operations:
                     target=target, error=exc.to_json(),
                 )
             except MacOSError as exc:
+                unsent = _sent_nothing(exc)
                 receipt = builder.build(
-                    outcome=Outcome.FAILED, acted=Acted.UNKNOWN, changed=None, verified=False,
+                    outcome=Outcome.FAILED, acted=Acted.NO if unsent else Acted.UNKNOWN,
+                    changed=False if unsent else None, verified=False,
                     target=target, error=exc.to_json(),
                 )
+                if unsent and once is not None:
+                    self._ledger.release(once)
+                    return self._finish(receipt)
             else:
                 verified = self._verify_postcondition(
                     host, postcondition, deadline, app=app, all_apps=all_apps, apps=apps
@@ -2199,12 +2223,16 @@ class Operations:
                 target=target, error=exc.to_json(),
             )
         except MacOSError as exc:
-            refused = exc.code in (ErrorCode.UNSUPPORTED_OP.value, ErrorCode.ELEMENT_UNKNOWN.value)
+            unsent = _sent_nothing(exc)
+            refused = unsent or exc.code in (ErrorCode.UNSUPPORTED_OP.value, ErrorCode.ELEMENT_UNKNOWN.value)
             receipt = builder.build(
                 outcome=Outcome.FAILED, acted=Acted.NO if refused else Acted.UNKNOWN,
                 changed=False if refused else None, verified=False,
                 target=target, error=exc.to_json(),
             )
+            if unsent and once is not None:
+                self._ledger.release(once)
+                return receipt
         else:
             verified = self._verify_postcondition(
                 host, postcondition, deadline, app=app, all_apps=False, apps=None
@@ -2376,9 +2404,11 @@ class Operations:
             try:
                 host.set(element_index, value, attribute)
             except MacOSError as exc:
+                unsent = _sent_nothing(exc)
                 return self._finish(
                     builder.build(
-                        outcome=Outcome.FAILED, acted=Acted.UNKNOWN, changed=None, verified=False,
+                        outcome=Outcome.FAILED, acted=Acted.NO if unsent else Acted.UNKNOWN,
+                        changed=False if unsent else None, verified=False,
                         target=target, observed=_value_summary(before), error=exc.to_json(),
                     )
                 )
@@ -2622,9 +2652,11 @@ class Operations:
                     )
                 )
             except MacOSError as exc:
+                unsent = _sent_nothing(exc)
                 return self._finish(
                     builder.build(
-                        outcome=Outcome.FAILED, acted=Acted.UNKNOWN, changed=None, verified=False,
+                        outcome=Outcome.FAILED, acted=Acted.NO if unsent else Acted.UNKNOWN,
+                        changed=False if unsent else None, verified=False,
                         target=target, observed=_value_summary(before), error=exc.to_json(),
                     )
                 )
@@ -2865,6 +2897,7 @@ class Operations:
             return named
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            host._yield_to_person(pid, f"pressing {key} in the app in front")
             _require_focus(host, pid, field, window_id, "key")
             deadline.check_dispatch()
             host.key(key, app=pid, window_id=window_id)
@@ -2934,6 +2967,8 @@ class Operations:
 
         def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
             nonlocal resolved
+            if not dry_run:
+                host._yield_to_person(pid, "a click in the app in front")
             normalized_button = host._validate_button(button)
             normalized_clicks = host._validate_clicks(clicks)
             aimed_window = window_id
@@ -3038,6 +3073,7 @@ class Operations:
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
             nonlocal change
+            host._yield_to_person(pid, "typing into the app in front")
             if field is not None and postcondition is None:
                 change = _typed_change(host, field, text)
             _require_focus(host, pid, field, window_id, "type")
@@ -3134,6 +3170,7 @@ class Operations:
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
             nonlocal before
+            host._yield_to_person(pid, "filling a field in the app in front")
             assert element_index is not None
             frontmost = host._frontmost_app()
             if deadline.exhausted():
@@ -3157,10 +3194,21 @@ class Operations:
                 raise FocusChangedError("fill target changed before typing")
             if deadline.exhausted():
                 raise MacOSError("fill deadline expired before typing", code=ErrorCode.TIMEOUT)
-            if value:
-                host.type(value, app=pid)
-            else:
-                host.key("backspace", app=pid)
+            try:
+                if value:
+                    host.type(value, app=pid)
+                else:
+                    host.key("backspace", app=pid)
+            except MacOSError as exc:
+                if exc.details.get("reason") != "person_active":
+                    raise
+                raise _BlockedEffect(
+                    "fill focused the field and selected its text, then someone kept using "
+                    "this Mac's keyboard or mouse, so it typed nothing: the field's text "
+                    "stays selected",
+                    code=ErrorCode.TIMEOUT,
+                    details={**exc.details, "stage": "typing"},
+                ) from exc
 
         def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
             del pid
@@ -3413,10 +3461,11 @@ class Operations:
         verbs, which press the item a path leads to. The receipt names
         ``executor``, and ``acted`` is judged from whether ``dispatch``
         raised: a ``focus.changed`` with reason
-        ``focus_moved_before_dispatch`` says it sent nothing, so it fails
-        with ``acted=NO`` and frees the ``once`` token. ``quits`` says,
-        once ``prepare`` has run, whether the dispatch is the app's own
-        Quit, whose exit is then its effect.
+        ``focus_moved_before_dispatch``, or a ``timeout`` with reason
+        ``person_active`` or ``deadline_exhausted_before_dispatch``, says
+        it sent nothing, so it fails with ``acted=NO`` and frees the
+        ``once`` token. ``quits`` says, once ``prepare`` has run, whether
+        the dispatch is the app's own Quit, whose exit is then its effect.
 
         ``prepare`` runs once the app is resolved and before anything is
         reserved or dispatched: it validates what is about to be sent and
@@ -3567,12 +3616,7 @@ class Operations:
                 if settle is not None:
                     input_observed = settle(host, pid, deadline)
             except MacOSError as exc:
-                if (
-                    isinstance(exc, FocusChangedError)
-                    and exc.details.get("reason") == "focus_moved_before_dispatch"
-                    or exc.code == ErrorCode.TIMEOUT.value
-                    and exc.details.get("reason") == "deadline_exhausted_before_dispatch"
-                ):
+                if _sent_nothing(exc):
                     if once is not None:
                         self._ledger.release(once)
                     return self._finish(
