@@ -179,9 +179,12 @@ costs fewer tokens than a screenshot, and a later look far fewer, so look
 with it and keep `see` for what the text does not say.
 
 An id names the same control in later runs, for the same `agent_id` and
-the same launch of the app. `state[12]` is its match. Printing a state
-makes it your last look; `state[12]` refuses an id whose line changed
-since that look, as when a row inserted above shifts unlabeled rows,
+the same launch of the app, also after its label changes in place inside
+the window: when Calculator's "All Clear" turns "Clear", it keeps the id
+your last look showed there. A control relabelled outside the window
+takes a new id. `state[12]` is its match. Printing a state makes it your
+last look; `state[12]` refuses an id whose line changed since that look,
+as when a row inserted above shifts unlabeled rows or a label changed,
 until you print the new state:
 
 ```python
