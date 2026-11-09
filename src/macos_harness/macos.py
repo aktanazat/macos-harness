@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
 
 from ._input_lock import app_input
 from ._paths import user_temp_dir
+from ._pool import pooled_methods
 from .capture import (
     GrayPrint,
     WindowCapture,
@@ -1298,6 +1299,7 @@ if hasattr(os, "register_at_fork"):  # pragma: no branch - always true on macOS
     os.register_at_fork(after_in_child=_disarm_inherited_native_state_after_fork)
 
 
+@pooled_methods
 class MacOS:
     """Low-level macOS observation and control for one persistent process."""
 
