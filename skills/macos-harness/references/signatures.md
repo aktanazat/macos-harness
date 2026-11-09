@@ -47,6 +47,7 @@ until `show_pointer()`; `close()` reaps only the caller's helper.
 
 ```text
 mac.state(app, *, query=None, window_id=None, diff=True, max_nodes=2000)
+mac.text(app, *, query=None, window_id=None)
 mac.see(app=None, *, window_index=0, window_id=None, display=None, region=None, path=None, max_width=1280, max_height=1280, crop=None, zoom=1.0, show_pointer=False, after_change=False, timeout=10.0, settle=0.15)
 mac.wait_change(app=None, *, window_index=0, window_id=None, region=None, by="pixels", timeout=30.0, settle=0.15)
 mac.key(key, *, app=None, window_id=None)
@@ -221,6 +222,25 @@ compaction. Without an `agent_id` every look prints the whole window.
 `query="macOS version"` lists the lines holding the phrase, or else any
 word of three letters or more, with their ancestors and small subtrees,
 including controls scrolled away; it leaves the last look alone.
+
+`print(mac.text(app))` reads the window's pixels with Apple Vision where
+accessibility names nothing, as in iPhone Mirroring: one line of text a
+row, `[t3] "Continue"`, top to bottom, with `query=` as above. It needs
+Screen Recording and takes about 0.3 s. `text[3]` or `text["t3"]` is a
+match for `click(element=)` and `do.click(element=)` only: the click
+goes to the center of the line's box once that box, captured and read
+again, still shows the line, in the same window, unmoved; otherwise
+nothing is clicked. Ids count lines from the top, so a line appearing
+above gives t3 to another line. Printing a read makes the lines it shows
+your last look, as with `state`; in a later run, `text[3]` refuses an id
+that no longer reads the same at the same place in the window until you
+print the new read:
+
+```python
+print(mac.text("iPhone Mirroring"))  # [t3] "Continue", ...
+t = mac.text("iPhone Mirroring")      # a later run
+mac.do.click(element=t[3], app="iPhone Mirroring")
+```
 
 ## Across runs
 

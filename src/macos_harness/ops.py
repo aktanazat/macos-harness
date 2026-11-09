@@ -105,6 +105,7 @@ from .receipts import (
     validate_exact_selectors,
     validate_scope,
 )
+from .text import is_text_match
 
 if TYPE_CHECKING:
     from .macos import _AppIdentity
@@ -145,16 +146,21 @@ def _args_summary(argv: Sequence[str]) -> list[JSONValue]:
 #: What finds a match again (`MacOS._find_again`), and all a receipt keeps
 #: of an element a click aimed at.
 _ELEMENT_IDENTITY = ("pid", "role", "title", "identifier", "description", "frame")
+#: All a receipt keeps of a line `MacOS.text` read that a click aimed at.
+_TEXT_LINE_IDENTITY = ("pid", "window_id", "text", "frame")
 
 
 def _element_request(element: int | Mapping[str, JSONValue] | list[dict[str, JSONValue]]) -> JSONValue:
     """The element a click aimed at, as its receipt records it: an index
     as given, a match -- or a search result's one match -- by what finds
     it again, never its value, which for a text field is what the user
-    wrote."""
+    wrote. A line `MacOS.text` read keeps the words it showed, which the
+    click aimed by, with its window and box."""
     if isinstance(element, list):
         identities = [_element_request(match) for match in element]
         return identities[0] if len(identities) == 1 else identities
+    if is_text_match(element):
+        return {key: element.get(key) for key in _TEXT_LINE_IDENTITY}
     if isinstance(element, Mapping):
         return {key: element.get(key) for key in _ELEMENT_IDENTITY}
     return element
@@ -2960,7 +2966,9 @@ class Operations:
         instead of ``x`` and ``y``: at the center of its frame once it
         holds still, and only when it is ``app``'s own element and
         accessibility finds no other element there. An element still
-        moving, or one another element covers, fails with ``acted=NO``.
+        moving, or one another element covers, fails with ``acted=NO``,
+        as does a line `mac.text` read whose box, captured again, no
+        longer reads it, or whose window moved since.
         """
         validate_click_aim(x, y, element)
         resolved: tuple[str, int, tuple[float, float], _RoutedWindow] | None = None

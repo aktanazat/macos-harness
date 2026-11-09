@@ -63,6 +63,15 @@ from .receipts import (
 )
 from .state import AppState, Memory, build_lines, project
 from .state import diff as state_diff
+from .text import (
+    Match,
+    WindowText,
+    is_text_match,
+    names_text_line,
+    recognize,
+    still_reads,
+    window_text,
+)
 
 if TYPE_CHECKING:
     # Only for annotations -- `native.py` imports from this module at
@@ -2719,9 +2728,8 @@ class MacOS:
             skip_closed_menus=True,
         )
         self._last_app = info
-        identity = self._overlay.identity
-        agent_id = identity.agent_id if identity is not None else None
-        place = (Path(user_temp_dir()) / "macos-harness-state", agent_id, pid, _process_start_time(pid))
+        place = self._memory_place(pid)
+        agent_id = place[1]
         number = self._ax_window_id(window)
         root = snapshot.nodes[0] if snapshot.nodes else {}
         window_key = str(number) if number is not None else f"{root.get('role')}:{root.get('subrole', '')}"
@@ -2821,11 +2829,70 @@ class MacOS:
             )
         return windows[0]
 
+    def _memory_place(self, pid: int) -> tuple[Path, str | None, int, float]:
+        """Where `Memory.locked` keeps this agent's (``agent_id``) ids and
+        last looks at the windows of ``pid``: a file a launch of the app."""
+        identity = self._overlay.identity
+        agent_id = identity.agent_id if identity is not None else None
+        return Path(user_temp_dir()) / "macos-harness-state", agent_id, pid, _process_start_time(pid)
+
+    def text(
+        self, app: str | int, *, query: str | None = None, window_id: int | None = None
+    ) -> WindowText:
+        """The text in one window of ``app``, read from its pixels by Apple
+        Vision, a line each: ``[t3] "Continue"``, top to bottom and left to
+        right. For a window accessibility cannot see into, such as iPhone
+        Mirroring, a canvas, or an image. The window is the one `see`
+        captures unless ``window_id`` names another; one off screen reads
+        as it last drew.
+
+        ``text["t3"]`` is the line's match for ``click(element=)``, which
+        reads that box again just before it clicks and refuses, clicking
+        nothing, once its text changed or the window moved. Printing a
+        read (``print``, ``str``, ``.text``) makes the lines it shows this
+        agent's last look at the window, as with `state`; before this read
+        is printed, as in a later run, ``text[3]`` refuses when t3 is not
+        the line that look showed, at the same place in the window. ``query``
+        shows only the lines that hold it, or else any of its words of
+        three letters or more."""
+        self._ensure_screen_recording()
+        if query is not None and not isinstance(query, str):
+            raise MacOSError("query must be a string", code=ErrorCode.BAD_REQUEST)
+        _, info = self._resolve_app(app)
+        window = self._app_window(info, window_id, 0)
+        number = int(window["window_id"])
+        # Vision misses small text drawn a pixel per point, as on iPhone
+        # Mirroring's scaled-down screen.
+        captured = self._window_image(number, max_width=None, max_height=None)
+        self._last_app = info
+        pid = int(info["pid"])
+        place = self._memory_place(pid)
+        with Memory.locked(*place) as memory:
+            seen = memory.texts.get(str(number), {})
+
+        def remember(shown: Mapping[str, Match]) -> None:
+            with Memory.locked(*place) as memory:
+                memory.remember_text(str(number), shown)
+
+        return window_text(
+            recognize(captured.image, captured.bounds),
+            header=f"{info['name']} window {json.dumps(window['title'], ensure_ascii=False)} "
+            f"(window_id {number})",
+            query=query, pid=pid, window_id=number, window=captured.bounds, seen=seen, remember=remember,
+        )
+
     # --- AX actions ------------------------------------------------------
 
     def _element(self, element_index: ElementRef) -> Any:
         """The element an index from this run names, or that a match
         describes (`_find_again`); a search result stands for its one match."""
+        if names_text_line(element_index):
+            raise MacOSError(
+                "A line mac.text read is not an accessibility element: only click(element=) "
+                "and do.click(element=) take one, as the match text[3] returns",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "element"},
+            )
         if isinstance(element_index, SearchMatches):
             if len(element_index) != 1:
                 listed = "; ".join(self._match_summary(match) for match in element_index[:5])
@@ -7078,6 +7145,9 @@ class MacOS:
         control that ignores ``AXPress``, as a SwiftUI row can. An element
         still moving after half a second, or one where accessibility finds
         another element over its center, is refused and nothing is clicked.
+        A line `text` read aims at the center of its box once that box,
+        captured again, still reads the line in the same window, unmoved;
+        otherwise nothing is clicked.
 
         With ``app`` in front, the click first waits for the person at
         this Mac to pause their own keyboard and mouse input; with no
@@ -7145,7 +7215,8 @@ class MacOS:
         The frame is read again a display frame later, and again until
         two readings agree, for at most `_STILL_SECONDS` and never past
         ``within`` seconds. An element still moving then is refused, and
-        nothing is clicked."""
+        nothing is clicked. A line `text` read aims at the center of its
+        box, which `_require_uncovered` reads again."""
         owner = self._element_pid(element)
         if owner not in (None, pid):
             raise MacOSError(
@@ -7153,6 +7224,9 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "element", "pid": owner, "target_pid": pid},
             )
+        if is_text_match(element):
+            frame = element["frame"]
+            return frame["x"] + frame["width"] / 2, frame["y"] + frame["height"] / 2
         if not isinstance(element, int):
             element = self._remember_element(self._element(element))
         bound = min(_STILL_SECONDS, within)
@@ -7190,7 +7264,11 @@ class MacOS:
         Chromium's first answer can be cached or approximate; asking
         starts an asynchronous refresh (``CachingAsyncHitTest`` in
         browser_accessibility_manager.cc). Check the refreshed answer
-        even when the first one matched."""
+        even when the first one matched. A line `text` read is checked
+        by its pixels instead (`_require_text_unchanged`)."""
+        if is_text_match(element):
+            self._require_text_unchanged(element, window_id)
+            return
         aimed = self._element(element)
         if not self._is_ax_element(aimed):
             return
@@ -7209,6 +7287,47 @@ class MacOS:
             code=ErrorCode.UNSUPPORTED_OP,
             details={"point": {"x": point[0], "y": point[1]}, "found": hit},
         )
+
+    def _require_text_unchanged(self, match: Match, window_id: int) -> None:
+        """Refuse a click on a line `text` read unless the click goes to
+        the window it was read in, that window has neither moved nor
+        resized, and the line's box, captured and read again now, still
+        shows its text."""
+        if window_id != match.get("window_id"):
+            raise MacOSError(
+                f"The click would go to window {window_id}, not window "
+                f"{match.get('window_id')} the text was read in; nothing was clicked",
+                code=ErrorCode.WINDOW_CHANGED,
+                details={"reason": "other_window", "window_id": window_id},
+            )
+        self._ensure_screen_recording()
+        captured = self._window_image(window_id, max_width=None, max_height=None)
+        if captured.bounds != match.get("window"):
+            raise MacOSError(
+                "The window moved or resized since its text was read; read it again; "
+                "nothing was clicked",
+                code=ErrorCode.WINDOW_CHANGED,
+                details={"reason": "moved", "was": match.get("window"), "now": captured.bounds},
+            )
+        frame = match["frame"]
+        margin = frame["height"] / 2
+        box = reframed(
+            captured,
+            {
+                "x": frame["x"] - margin, "y": frame["y"] - margin,
+                "width": frame["width"] + 2 * margin, "height": frame["height"] + 2 * margin,
+            },
+            zoom=1, max_width=None, max_height=None,
+        )
+        lines = recognize(box.image, box.bounds)
+        if not still_reads(match, lines):
+            now = " ".join(line["text"] for line in lines)
+            raise MacOSError(
+                f"The line read {match['text']!r}, and its box now reads {now!r}; read "
+                "the window again; nothing was clicked",
+                code=ErrorCode.ELEMENT_UNKNOWN,
+                details={"reason": "text_changed", "was": match["text"], "now": now},
+            )
 
     def _post_click(
         self,
