@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import ApplicationServices as AS
 
+from ._pool import pooled_methods
 from .errors import ErrorCode, MacOSError
 from .macos import (
     _AX_ROLES,
@@ -35,6 +36,7 @@ _ROLE_SEARCH_KEYS = {"any": "AXAnyTypeSearchKey"} | {
 }
 
 
+@pooled_methods
 class Accessibility:
     """Thin, opt-in access to Apple's AXUIElement operations."""
 

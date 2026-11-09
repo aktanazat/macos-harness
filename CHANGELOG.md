@@ -230,6 +230,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Public `MacOS`, `mac.ax`, and `mac.do` calls drain temporary Cocoa
+  objects before returning, even without an AppKit event loop. Repeated
+  window and control reads no longer retain each call's native objects;
+  native objects returned to the caller remain usable.
+
 - The credential and handoff guides allow an ordinary password-only login
   to an explicitly approved local test VM after checking its account,
   window, password field, and focus. Host credentials, production accounts,

@@ -83,6 +83,7 @@ from typing import IO, TYPE_CHECKING, Literal, Protocol, TypeVar
 
 from . import receipt_log
 from ._input_lock import app_input
+from ._pool import pooled_methods
 from .errors import ApplicationNotFoundError, ErrorCode, FocusChangedError, MacOSError
 from .receipts import (
     Acted,
@@ -1521,6 +1522,7 @@ class _ReceiptBuilder:
 # --- Operations ------------------------------------------------------------
 
 
+@pooled_methods
 class Operations:
     """``mac.do``: receipted mutations, read-only assertions, and token recall.
 
