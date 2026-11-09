@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import errno
+import fcntl
 import os
+import resource
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -193,6 +196,82 @@ def test_await_reports_a_capture_that_never_answers() -> None:
     assert exc_info.value.code == ErrorCode.TIMEOUT
     assert exc_info.value.details["operation"] == "Window capture"
     assert exc_info.value.details["timeout"] == 0.01
+
+
+def test_capture_owner_keeps_only_its_executable_exclusive(tmp_path) -> None:
+    assert capture_module._owns_capture()
+    shared = os.open(tmp_path / "macos-harness-capture.lock", os.O_RDWR)
+    try:
+        fcntl.flock(shared, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        own = os.open(tmp_path / capture_module._executable_lock(), os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(own, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(own)
+    finally:
+        os.close(shared)
+
+
+def test_legacy_capture_owner_excludes_new_owners(tmp_path) -> None:
+    fd = os.open(tmp_path / "macos-harness-capture.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert not capture_module._owns_capture()
+    finally:
+        os.close(fd)
+
+
+def test_new_capture_owner_excludes_legacy_owners(tmp_path) -> None:
+    assert capture_module._owns_capture()
+    fd = os.open(tmp_path / "macos-harness-capture.lock", os.O_RDWR)
+    try:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+
+
+def test_failed_executable_lock_does_not_block_a_legacy_owner(tmp_path, request) -> None:
+    child_marker = "_MACOS_HARNESS_FD_EXHAUSTION_TEST"
+    if os.environ.get(child_marker) != "1":
+        child = subprocess.run(
+            [sys.executable, "-m", "pytest", f"{__file__}::{request.node.name}", "-q"],
+            env={**os.environ, child_marker: "1"},
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        assert child.returncode == 0, child.stdout + child.stderr
+        return
+
+    capture_module._executable_lock()
+    limits = resource.getrlimit(resource.RLIMIT_NOFILE)
+    descriptors = []
+    error_number = None
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(128, limits[0]), limits[1]))
+        while True:
+            try:
+                descriptors.append(os.open("/dev/null", os.O_RDONLY))
+            except OSError as error:
+                assert error.errno == errno.EMFILE
+                break
+        os.close(descriptors.pop())
+        try:
+            capture_module._owns_capture()
+        except OSError as error:
+            error_number = error.errno
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, limits)
+        for fd in descriptors:
+            os.close(fd)
+
+    assert error_number == errno.EMFILE
+    fd = os.open(tmp_path / "macos-harness-capture.lock", os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert capture_module._capture_owner is None
+    finally:
+        os.close(fd)
 
 
 _CAPTURE_AND_STAY = """
