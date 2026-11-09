@@ -235,6 +235,10 @@ follows [Semantic Versioning](https://semver.org/).
   window and control reads no longer retain each call's native objects;
   native objects returned to the caller remain usable.
 
+- A script whose pipe-reader thread cannot start closes its pipes and
+  keeps a terminal receipt instead of failing again while joining the
+  unstarted thread.
+
 - The credential and handoff guides allow an ordinary password-only login
   to an explicitly approved local test VM after checking its account,
   window, password field, and focus. Host credentials, production accounts,
