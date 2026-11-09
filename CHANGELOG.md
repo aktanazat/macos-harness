@@ -76,9 +76,10 @@ follows [Semantic Versioning](https://semver.org/).
 - `see(region=...)` and `see(display=...)` name the windows they show
   under `shows`, the most visible first, each with its visible `share`,
   so a picture covered by another app's window says so.
-- Two live harness processes capture side by side: the first to capture
-  keeps ScreenCaptureKit and others render through `screencapture`.
-  Before, once both had captured, every capture in either timed out.
+- Harness processes using different Python executables each keep fast,
+  in-process ScreenCaptureKit capture. Processes using the same executable
+  still share one owner and use `screencapture` for the others. An older
+  harness holding the original lock keeps the same fallback on newer ones.
 - `mac.ax` takes any AX role, by its AX name or in words (`pop up button`,
   `AXRow`); a role Apple's search has no key for is filtered from an
   any-role search, and `role="window"` finds the app's windows. A

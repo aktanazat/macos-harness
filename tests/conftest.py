@@ -25,8 +25,8 @@ def own_capture_lock(monkeypatch, tmp_path):
     monkeypatch.setattr(input_lock_module, "user_temp_dir", lambda: str(tmp_path))
     monkeypatch.setattr(capture_module, "_capture_owner", None)
     yield
-    if capture_module._capture_owner is not None:
-        os.close(capture_module._capture_owner)
+    for fd in capture_module._capture_owner or ():
+        os.close(fd)
 
 
 _HOLD_INPUT = (

@@ -9,6 +9,7 @@ encoded exactly once, by ImageIO, straight into the output file.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import math
 import os
 import subprocess
@@ -27,10 +28,11 @@ from .pointer import POINTER_HOTSPOT, PointerIdentity, pointer_points
 try:
     import Quartz
     import ScreenCaptureKit as SCK
-    from Foundation import NSDataWritingAtomic, NSMutableData
+    from Foundation import NSBundle, NSDataWritingAtomic, NSMutableData
 except ImportError as exc:  # pragma: no cover - exercised on non-macOS hosts
     Quartz = None  # type: ignore[assignment]
     SCK = None  # type: ignore[assignment]
+    NSBundle = None  # type: ignore[assignment]
     NSMutableData = None  # type: ignore[assignment]
     NSDataWritingAtomic = 0
     _IMPORT_ERROR: ImportError | None = exc
@@ -43,7 +45,7 @@ else:
 CAPTURE_TIMEOUT = 5.0
 _CAPTURE_LOCK = "macos-harness-capture.lock"
 _SCREENCAPTURE = "/usr/sbin/screencapture"
-_capture_owner: int | None = None
+_capture_owner: tuple[int, int] | None = None
 _SC_STREAM_ERROR_DOMAIN = "com.apple.ScreenCaptureKit.SCStreamErrorDomain"
 _SC_ERROR_USER_DECLINED = -3801
 _PIXEL_FORMAT_BGRA = 1111970369  # kCVPixelFormatType_32BGRA ('BGRA')
@@ -97,29 +99,61 @@ def _await(
     return box[0], box[1]
 
 
-def _owns_capture() -> bool:
-    """Whether this process is the one that renders through
-    ScreenCaptureKit, held from its first capture until it exits.
+def _executable_lock() -> str:
+    """The lock the processes of this executable contend for. A venv's
+    python is a link to the interpreter it was made from, so the real
+    path names the executable macOS sees."""
+    image = os.path.realpath(NSBundle.mainBundle().executablePath())
+    return f"macos-harness-capture-{hashlib.sha256(image.encode()).hexdigest()[:16]}.lock"
 
-    macOS's capture service tells its clients apart by executable path, so
-    two live processes of one Python are one client to it: once both had
-    captured, every capture either asked for went unanswered, 30 seconds
-    as surely as 5, until one exited. Another process captures through
-    ``screencapture``, which ran beside a capturing harness 6 times in 6."""
-    global _capture_owner
-    if _capture_owner is not None:
-        return True
+
+def _locked(name: str, mode: int) -> int | None:
+    """An open ``name`` in the user's temp dir holding ``mode``, or None
+    when another process's lock on it stands in the way."""
     fd = os.open(
-        os.path.join(user_temp_dir(), _CAPTURE_LOCK),
+        os.path.join(user_temp_dir(), name),
         os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
         0o600,
     )
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, mode | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(fd)
+        return None
+    return fd
+
+
+def _owns_capture() -> bool:
+    """Whether this process is the one of its executable that renders
+    through ScreenCaptureKit, held from its first capture until it exits.
+
+    macOS's capture service tells its clients apart by executable path, so
+    two live processes of one Python are one client to it: once both had
+    captured, every capture either asked for went unanswered, 30 seconds
+    as surely as 5, until one exited (1 of 50 answered). Processes of two
+    Pythons are two clients and both render (50 of 50). Another process of
+    this executable captures through ``screencapture``, which ran beside a
+    capturing harness 6 times in 6.
+
+    An owner also holds `_CAPTURE_LOCK` shared. A harness from before the
+    lock was per executable takes that one exclusively, whatever its
+    Python: while it owns capture no newer process does, and while a newer
+    process owns capture it does not, so the two never render at once."""
+    global _capture_owner
+    if _capture_owner is not None:
+        return True
+    shared = _locked(_CAPTURE_LOCK, fcntl.LOCK_SH)
+    if shared is None:
         return False
-    _capture_owner = fd
+    try:
+        own = _locked(_executable_lock(), fcntl.LOCK_EX)
+    except BaseException:
+        os.close(shared)
+        raise
+    if own is None:
+        os.close(shared)
+        return False
+    _capture_owner = (shared, own)
     return True
 
 
