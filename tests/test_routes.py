@@ -265,8 +265,8 @@ class FormRouteHost(FormHost):
     def __init__(self) -> None:
         super().__init__()
         self.identity = _AppIdentity(41, _APP, 1000.0, "Demo", None)
-        clock = _SleepClock()
-        self.do = Operations(self, _monotonic=clock.monotonic, _sleep=clock.sleep)
+        self.clock = _SleepClock()
+        self.do = Operations(self, _monotonic=self.clock.monotonic, _sleep=self.clock.sleep)
         self.route = Routes(self)
 
     def _process_identity(self, query: str | int) -> _AppIdentity:
@@ -310,6 +310,68 @@ def test_recorded_forms_do_not_persist_the_entered_text(form_host: FormRouteHost
     assert form_host.model == "recorded-domain-canary.invalid"
     assert "recorded-domain-canary.invalid" not in path.read_text()
     assert form_host.route.list(app=_APP)[0]["inputs"] == ["domain"]
+
+
+class _BusyFormRouteHost(FormRouteHost):
+    """A form whose person at the Mac keeps using it through the next
+    ``busy`` waits for them, each the full 2.5 s on the route's clock."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.busy = 0
+        self.refusals = 0
+
+    def _yield_to_person(self, pid: int | None, operation: str, *, forward: bool = False) -> None:
+        if self.refusals < self.busy:
+            self.refusals += 1
+            self.clock.sleep(2.5)
+            raise MacOSError(
+                "Someone is using this Mac's keyboard or mouse",
+                code=ErrorCode.TIMEOUT,
+                details={"reason": "person_active"},
+            )
+
+
+@pytest.fixture
+def busy_form_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _BusyFormRouteHost:
+    monkeypatch.setenv("MACOS_HARNESS_HOME", str(tmp_path))
+    return _BusyFormRouteHost()
+
+
+@pytest.mark.parametrize(
+    ("busy", "status", "refusals", "model"),
+    [
+        (2, "done", 2, "new-domain.invalid"),
+        (100, "diverged", 3, "recorded-domain-canary.invalid"),
+    ],
+    ids=["person-pauses", "route-time-runs-out"],
+)
+def test_replay_tries_a_step_again_while_the_person_at_the_mac_keeps_it_back(
+    busy_form_host: _BusyFormRouteHost, busy: int, status: str, refusals: int, model: str,
+) -> None:
+    record_form(busy_form_host)
+    busy_form_host.busy = busy
+
+    result = busy_form_host.route.run("domain", app=_APP, timeout=6.0,
+                                      inputs={"domain": "new-domain.invalid"})
+
+    assert (result.status, busy_form_host.refusals, busy_form_host.model) == (status, refusals, model)
+
+
+def test_a_recording_goes_on_after_a_step_the_person_at_the_mac_kept_back(
+    busy_form_host: _BusyFormRouteHost,
+) -> None:
+    busy_form_host.busy = 1
+    with busy_form_host.route.record("domain", app=_APP, inputs={"domain": "recorded.invalid"},
+                                     entry=present(role="text field", identifier="domain"),
+                                     goal=equals(role="button", title="Check", attribute="AXEnabled",
+                                                 value=True)) as rec:
+        with pytest.raises(OperationError):
+            rec.fill("domain", identifier="domain")
+        rec.fill("domain", identifier="domain")
+
+    assert [receipt.acted for receipt in rec.receipts] == [Acted.NO, Acted.YES]
+    assert rec.path is not None and rec.path.exists()
 
 
 @pytest.mark.parametrize("failure", ["missing", "unknown", "control-character"])

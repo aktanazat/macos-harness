@@ -100,6 +100,7 @@ class FakeHost:
         self.key_error: BaseException | None = None
         self.validation_error: MacOSError | None = None
         self.guard_error: FocusChangedError | None = None
+        self.person_error: MacOSError | None = None
         self.action_hook: Callable[[], None] | None = None
         self.key_hook: Callable[[], None] | None = None
         self.wait_hook: Callable[[], None] | None = None
@@ -244,6 +245,11 @@ class FakeHost:
         self.guard_focus_calls += 1
         if self.guard_error is not None:
             raise self.guard_error
+
+    def _yield_to_person(self, pid: int | None, operation: str, *, forward: bool = False) -> None:
+        del pid, operation, forward
+        if self.person_error is not None:
+            raise self.person_error
 
     def _element(self, element_index: int | Mapping[str, object]) -> object:
         if isinstance(element_index, Mapping):
@@ -1155,6 +1161,38 @@ def test_known_predispatch_press_timeout_keeps_the_once_token_available() -> Non
     receipt = operations.press(app="Demo", title="Save", once="late")
     assert receipt.outcome is Outcome.DONE
     assert receipt.replayed is False
+
+
+@pytest.mark.parametrize(
+    "press",
+    [
+        lambda do, match: do.press(app="Demo", title="Save", once="save"),
+        lambda do, match: do.press(app="Demo", element={**match, "pid": 41}, once="save"),
+        lambda do, match: do.press(apps=["Demo"], title="Save", once="save"),
+        lambda do, match: do.toggle(True, app="Demo", text="Enabled"),
+    ],
+    ids=["found-and-pressed", "held-match", "across-apps", "toggle"],
+)
+def test_a_press_the_person_at_the_mac_kept_back_sent_nothing(
+    press: Callable[[Operations, dict[str, object]], Receipt],
+) -> None:
+    host, operations = _ops()
+    host.toggle_on_press = True
+    refusal = MacOSError(
+        "Someone is using this Mac's keyboard or mouse",
+        code=ErrorCode.TIMEOUT,
+        details={"reason": "person_active"},
+    )
+    host.press_results.append(refusal)
+    host.action_error = refusal
+
+    error = _failed(lambda: press(operations, host.match))
+    host.press_results.clear()
+    host.action_error = None
+    retry = press(operations, host.match)
+
+    assert (error.receipt.acted, error.receipt.changed) == (Acted.NO, False)
+    assert (retry.outcome, retry.replayed) == (Outcome.DONE, False)
 
 
 @pytest.mark.parametrize("code", [ErrorCode.AX_ERROR, ErrorCode.TIMEOUT])
@@ -2372,6 +2410,30 @@ def test_keys_go_nowhere_once_focus_moved_to_another_element(verb: str) -> None:
     assert len(host.key_calls) + len(host.type_calls) == 1
 
 
+@pytest.mark.parametrize("verb", ["key", "type"])
+def test_keys_go_nowhere_while_the_person_at_the_mac_never_pauses(verb: str) -> None:
+    host, operations = _ops()
+
+    def send() -> Receipt:
+        if verb == "key":
+            return operations.key("cmd+s", app="Demo", once="save")
+        return operations.type("hello", app="Demo", once="save")
+
+    host.person_error = MacOSError(
+        "Someone is using this Mac's keyboard or mouse",
+        code=ErrorCode.TIMEOUT,
+        details={"reason": "person_active"},
+    )
+    error = _failed(send)
+    host.person_error = None
+    retry = send()
+
+    assert error.receipt.error["details"]["reason"] == "person_active"
+    assert error.receipt.acted is Acted.NO
+    assert retry.replayed is False
+    assert len(host.key_calls) + len(host.type_calls) == 1
+
+
 class FormHost(FakeHost):
     def __init__(self) -> None:
         super().__init__()
@@ -2671,6 +2733,41 @@ def test_fill_fails_when_the_app_drops_the_text() -> None:
     assert error.code == ErrorCode.TIMEOUT
     assert error.receipt.verified is False
     assert host.value == "doubleclick.net"
+
+
+class _PersonResumesTyping(FormHost):
+    """A form whose person at the Mac starts again once fill has focused
+    the field and selected its text, so fill's own keys are refused."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.typing_attempts = 0
+
+    def type(self, text: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
+        self.typing_attempts += 1
+        raise MacOSError(
+            "Someone is using this Mac's keyboard or mouse",
+            code=ErrorCode.TIMEOUT,
+            details={"reason": "person_active"},
+        )
+
+
+@pytest.mark.parametrize("value", ["replacement", ""], ids=["typing", "clearing"])
+def test_fill_refused_after_it_selected_the_text_keeps_its_token(value: str) -> None:
+    """The field was focused and its text selected before the person
+    resumed, so the fill acted: its token replays that failure rather
+    than taking the field again."""
+    host = _PersonResumesTyping()
+    clock = _SleepClock()
+    operations = Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+
+    error = _failed(lambda: operations.fill(value, app="Demo", once="form"))
+    retry = _failed(lambda: operations.fill(value, app="Demo", once="form"))
+
+    assert error.receipt.acted is Acted.YES
+    assert error.receipt.error["details"]["reason"] == "person_active"
+    assert (host.focused, host.value) == (True, "doubleclick.net")
+    assert (retry.receipt.replayed, host.typing_attempts) == (True, 1)
 
 
 def test_once_collision_rejects_different_request_without_dispatch() -> None:

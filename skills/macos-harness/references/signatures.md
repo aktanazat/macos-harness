@@ -106,6 +106,22 @@ when the app was in the background, where some apps ignore posted keys.
 With `window_id`, that window becomes the app's focused window first,
 without bringing the app forward.
 
+Input that would take the focus or the keys of the person at this Mac
+waits for a 450 ms pause in their keyboard, mouse, trackpad, and tablet
+input: `activate` and `ax.set` of `AXFrontmost` for an app behind;
+`click`, `drag`, `key`, `type`, `ax.set` of `AXFocused` or `AXMain`, and
+`ax.press` or `ax.perform` for the app in front; and, in any app, a press
+that opens a menu: `AXShowMenu`, or `AXPress` on a pop-up button, menu
+button, or menu bar item. A press through an agent's handle, which names
+no process, waits only for `AXShowMenu`. With no pause in 2.5s it raises
+`timeout`, reason `person_active`, having sent nothing: try again, or ask
+the person to do that step. A click in the app in front checks again just
+before its events go and sends nothing if the person has started again;
+`activate` skips its Accessibility request when they used the keyboard or
+mouse during AppKit's attempt. Input from any harness run never counts as
+theirs. Other input to an app behind, `AXScrollToVisible`, scrolls, and
+reads never wait.
+
 `see(app, crop=(x, y, w, h))` captures that part of the window, in window
 points; `zoom=2` draws it at twice the screen's pixels per point, still
 inside `max_width` and `max_height`. Click its pixels with
@@ -291,6 +307,16 @@ another element since they were prepared (`focus.changed`, reason
 `do.type` into a plain text field is verified once the field shows the
 typed text, with `observed["input"]["landed"]`.
 
+`do.key`, `do.type`, `do.fill`, `do.click`, `do.press`, and `do.toggle`
+wait for the person in the same way when the app is in front, and
+`do.click` waits before it aims; `do.set` of a focus attribute waits as
+`ax.set` does, and a press that opens a menu waits in any app. With no
+pause they fail with `timeout`, reason `person_active`, and `acted="no"`,
+and the `once` token stays free. A `do.fill` whose person started again
+after it focused the field and selected its text fails with `acted="yes"`
+instead: the text stays selected, and its `once` token replays that
+failure.
+
 `do.press(element=state[12], app=)` presses a match it is handed: about
 50 ms against 360 ms for `do.click(element=)`, with no pointer travel, so a
 button in a background window takes it. A match from the latest look takes
@@ -321,6 +347,10 @@ mac.crashes(receipt_or_time_pair, *, app=None, limit=3, max_files=128)
 mac.sample(app_or_receipt, *, duration=1, timeout=5.0, max_bytes=1048576)
 mac.explain(receipt, *evidence)
 ```
+
+A replay step the person at this Mac kept from sending anything
+(`person_active`, `acted="no"`) is tried again while the route's
+`timeout` lasts, and a recording stays open after such a step.
 
 `inspect` walks at most 5000 nodes and 25 levels; a larger ask walks the
 cap, and the result's `capped` says what was asked and used.

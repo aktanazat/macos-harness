@@ -21,6 +21,7 @@ from ._paths import config_dir
 from .errors import ErrorCode, MacOSError
 from .ops import Operations, _Deadline, _validate_fill_value
 from .receipts import (
+    Acted,
     Equals,
     ErrorPayload,
     Gone,
@@ -454,6 +455,18 @@ class Routes:
             return ops.toggle(step.value, attribute=step.attribute, **step.target.query(), **args)
         return ops.set(step.value, attribute=step.attribute, **step.target.query(), **args)
 
+    def _dispatch_past_person(self, step: _Step, identity: _AppIdentity, deadline: _Deadline,
+                              token: str, inputs: Mapping[str, str]) -> Receipt:
+        """`_dispatch`, again each time the person at this Mac kept the step
+        from sending anything, while the route's time lasts."""
+        while True:
+            try:
+                return self._dispatch(step, identity, deadline, token, inputs)
+            except OperationError as exc:
+                if (exc.receipt.acted is not Acted.NO or exc.details.get("reason") != "person_active"
+                        or deadline.exhausted()):
+                    raise
+
     @contextmanager
     def record(self, name: str, *, app: str, entry: Postcondition,
                goal: Postcondition, timeout: float = 30.0,
@@ -538,7 +551,7 @@ class Routes:
                 for index, step in enumerate(route.steps):
                     at = f"steps[{index}]"
                     try:
-                        receipt = self._dispatch(step, identity, deadline,
+                        receipt = self._dispatch_past_person(step, identity, deadline,
                             f"route:{app}:{name}:{run_id}:{index}", values)
                     except OperationError as exc:
                         receipts.append(exc.receipt)
@@ -596,6 +609,7 @@ class _Recorder:
                 f"record:{self._app}:{self._run_id}:{len(self._steps)}", self._inputs)
         except OperationError as exc:
             self._receipts.append(exc.receipt)
+            self._failed = exc.receipt.acted is not Acted.NO
             raise
         self._receipts.append(receipt)
         if receipt.outcome not in (Outcome.DONE, Outcome.ALREADY) or (

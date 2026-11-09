@@ -8,6 +8,7 @@ sleep."""
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -91,7 +92,8 @@ class _Running:
 
 class _Desk(MacOS):
     """`MacOS` over the fake window server ``entries`` and two displays,
-    recording every capture, click, and event it would post."""
+    with nobody at its keyboard, recording every capture, click, and
+    event it would post."""
 
     def __init__(self, *entries: dict[str, object]) -> None:
         super().__init__()
@@ -118,6 +120,10 @@ class _Desk(MacOS):
 
     def _ensure_post_events(self) -> None:
         return None
+
+    @staticmethod
+    def _since_person() -> float:
+        return math.inf
 
     def _frontmost_app(self) -> dict[str, object]:
         return _APPS[_NOTES]

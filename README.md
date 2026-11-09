@@ -161,8 +161,11 @@ PY
   next mutating call. A synchronous macOS Accessibility or input call
   already in progress cannot be preempted safely and can return later.
   Timed-out script process groups are terminated.
-  A press stopped with `deadline_exhausted_before_dispatch` reports
-  `acted="no"` and leaves its `once` token available for another attempt.
+  A press stopped with `deadline_exhausted_before_dispatch`, or a `mac.do`
+  verb stopped with `person_active` because the person at this Mac never
+  paused their keyboard or mouse, reports `acted="no"` and leaves its
+  `once` token available for another attempt; a `fill` that had already
+  selected its field's text reports `acted="yes"` and keeps its token.
   Other timeouts can mean the action happened and retain their token.
   Raw `mac.ax.press(timeout=0)` makes one attempt without retry;
   `mac.do.press(timeout=0)` does not dispatch.
