@@ -670,6 +670,72 @@ def changed_area(before: GrayPrint, after: GrayPrint) -> float:
     return moved / 255 * before.point_area
 
 
+def changing_cells(
+    earlier: GrayPrint, later: GrayPrint, *, cell: int, least: float, most: float,
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Boxes (left, top, right, bottom, in print pixels) around what
+    differs between two prints of a window no input reached in between:
+    what changes by itself, such as a clock. A group of touching
+    ``cell``-pixel squares that differ counts only when it moved at least
+    ``least`` square points, as `changed_area` measures them, so a
+    blinking caret stays watched where the text typed next to it lands.
+    Each counted square grows by a cell up and down and two along its
+    row, so a clock's next digit is inside too. Empty when the boxes
+    would cover more than ``most`` of the print: then the window was not
+    still."""
+    width, height = earlier.width, earlier.height
+    if (width, height) != (later.width, later.height):
+        return ()
+    moved: dict[tuple[int, int], int] = {}
+    for top in range(0, width * height, width):
+        before, after = earlier.pixels[top:top + width], later.pixels[top:top + width]
+        if before == after:
+            continue
+        row = top // width // cell
+        for x, (old, new) in enumerate(zip(before, after, strict=True)):
+            if old != new:
+                moved[x // cell, row] = moved.get((x // cell, row), 0) + abs(old - new)
+    counted: set[tuple[int, int]] = set()
+    unvisited = set(moved)
+    while unvisited:
+        group, frontier = set(), [unvisited.pop()]
+        while frontier:
+            column, row = frontier.pop()
+            group.add((column, row))
+            touching = {
+                (column + dx, row + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+            } & unvisited
+            unvisited -= touching
+            frontier.extend(touching)
+        if sum(moved[square] for square in group) / 255 * earlier.point_area >= least:
+            counted |= group
+    columns, rows = -(-width // cell), -(-height // cell)
+    grown = {
+        (column + dx, row + dy)
+        for column, row in counted for dx in range(-2, 3) for dy in range(-1, 2)
+        if 0 <= column + dx < columns and 0 <= row + dy < rows
+    }
+    boxes = tuple(
+        (column * cell, row * cell, min(width, (column + 1) * cell), min(height, (row + 1) * cell))
+        for column, row in sorted(grown, key=lambda box: (box[1], box[0]))
+    )
+    covered = sum((right - left) * (bottom - top) for left, top, right, bottom in boxes)
+    return () if covered > most * width * height else boxes
+
+
+def blanked(gray: GrayPrint, boxes: tuple[tuple[int, int, int, int], ...]) -> GrayPrint:
+    """``gray`` with ``boxes`` (from `changing_cells`) painted black, so a
+    comparison of two prints so blanked leaves them out."""
+    if not boxes:
+        return gray
+    pixels = bytearray(gray.pixels)
+    for left, top, right, bottom in boxes:
+        for row in range(top, bottom):
+            start = row * gray.width
+            pixels[start + left:start + right] = bytes(right - left)
+    return GrayPrint(gray.width, gray.height, bytes(pixels), gray.point_area)
+
+
 def draw_pointer(
     image: Quartz.CGImageRef, x: float, y: float, scale: float,
     *, identity: PointerIdentity | None = None,

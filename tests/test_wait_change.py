@@ -369,18 +369,24 @@ def _key_and_wait(mac: MacOS, path: Path) -> None:
 
 
 @pytest.mark.parametrize("look", [_see, _key_and_wait], ids=["after-see", "after-wait"])
-def test_a_key_right_after_a_look_lists_no_windows_and_takes_no_picture(
-    tmp_path: Path, look: Callable[[MacOS, Path], None]
+@pytest.mark.parametrize(
+    ("pause", "pictures"), [(0.0, 0), (1.5, 1)], ids=["right-after", "a-while-after"]
+)
+def test_a_key_after_a_look_lists_no_windows_and_pictures_only_after_a_pause(
+    tmp_path: Path, look: Callable[[MacOS, Path], None], pause: float, pictures: int
 ) -> None:
     """The look pictured the app's first window after every earlier
-    input, so the key adds neither a window listing nor a capture."""
+    input, so the key lists no windows. Right after the look it takes no
+    picture either; a while after, it takes the one that shows what
+    changed by itself in between."""
     mac = _Keypad()
     look(mac, tmp_path / "before.png")
-    spent = (mac.listings, len(mac.captured_after))
+    listings, captures = mac.listings, len(mac.captured_after)
+    mac.clock += pause
 
     mac.key("5", app="Test")
 
-    assert (mac.listings, len(mac.captured_after)) == spent
+    assert (mac.listings, len(mac.captured_after)) == (listings, captures + pictures)
 
 
 def test_a_key_whose_picture_fails_still_goes_out_and_the_wait_measures_from_now() -> None:
@@ -403,6 +409,116 @@ def test_a_blinking_caret_is_no_change() -> None:
 
     assert raised.value.code == ErrorCode.TIMEOUT
     assert (raised.value.details["changed"], raised.value.details["elapsed_ms"]) == (False, 1000)
+
+
+class _Clock(_Keypad):
+    """`_Keypad` whose window also shows a seconds clock at its top right
+    whose last digit changes shape every second; with ``answers``, the
+    key brings up the result as Calculator's does, else nothing."""
+
+    def __init__(self, *, answers: bool) -> None:
+        super().__init__()
+        self.answers = answers
+
+    def _window_image(
+        self,
+        window_id: int,
+        *,
+        max_width: int | None,
+        max_height: int | None,
+        size: tuple[int, int] | None = None,
+    ) -> WindowCapture:
+        digit = (330, 10, 20, 24) if int(self.clock) % 2 == 0 else (330, 10, 20, 12)
+        blocks = [digit, (150, 100, 100, 40)] if self.answers and self.posted else [digit]
+        return WindowCapture(
+            image=_frame(*blocks), width=800, height=600, bounds=_BOUNDS,
+            on_screen=True, captured_at=0.0,
+        )
+
+
+@pytest.mark.parametrize("answers", [False, True], ids=["key-does-nothing", "key-answers"])
+def test_a_clock_that_ticked_while_the_agent_thought_is_no_change(
+    tmp_path: Path, answers: bool
+) -> None:
+    """The clock ticked between the `see` and the key, so its next tick
+    during the wait is no change: a key that does nothing times out
+    instead of returning on the tick, and one whose answer shows still
+    returns on the answer."""
+    mac = _Clock(answers=answers)
+    mac.see("Test", path=tmp_path / "before.png")
+    mac.clock = 1.5
+
+    mac.key("5", app="Test")
+    result = _outcome(lambda: mac.wait_change("Test", timeout=2.0))
+
+    assert result["changed"] is answers
+    assert result["ignored"] > 0
+
+
+def _two_keys(mac: MacOS) -> Mapping[str, object]:
+    mac.key("5", app="Test")
+    mac.key("5", app="Test")
+    return _outcome(lambda: mac.wait_change("Test", timeout=2.0))
+
+
+def _key_wait_key(mac: MacOS) -> Mapping[str, object]:
+    mac.key("5", app="Test")
+    _outcome(lambda: mac.wait_change("Test", timeout=2.0))
+    mac.key("5", app="Test")
+    return _outcome(lambda: mac.wait_change("Test", timeout=2.0))
+
+
+@pytest.mark.parametrize(
+    "inputs", [_two_keys, _key_wait_key], ids=["two-keys", "key-wait-key"]
+)
+def test_the_clock_stays_left_out_for_later_inputs_until_the_next_see(
+    tmp_path: Path, inputs: Callable[[MacOS], Mapping[str, object]]
+) -> None:
+    """Only the first input after the `see` came a while after a look;
+    the clock it learned stays left out for the inputs a script sends
+    right after, so their wait times out instead of returning on a tick."""
+    mac = _Clock(answers=False)
+    mac.see("Test", path=tmp_path / "before.png")
+    mac.clock = 1.5
+
+    result = inputs(mac)
+
+    assert (result["changed"], result["ignored"] > 0) == (False, True)
+
+
+class _Editor(_Keypad):
+    """`_Keypad` over a text view whose caret blinks every half second
+    and whose typed word shows just right of it once a key reaches it."""
+
+    def _window_image(
+        self,
+        window_id: int,
+        *,
+        max_width: int | None,
+        max_height: int | None,
+        size: tuple[int, int] | None = None,
+    ) -> WindowCapture:
+        blocks = [(200, 140, 1, 18)] if int(self.clock * 2) % 2 == 0 else []
+        if self.posted:
+            blocks.append((203, 142, 30, 12))
+        return WindowCapture(
+            image=_frame(*blocks), width=800, height=600, bounds=_BOUNDS,
+            on_screen=True, captured_at=0.0,
+        )
+
+
+def test_a_word_typed_where_the_caret_blinked_still_counts(tmp_path: Path) -> None:
+    """The caret was on at the `see` and off at the key: too small to
+    count as a change, it is not left out, so the word typed beside it
+    counts instead of vanishing with the caret's surroundings."""
+    mac = _Editor()
+    mac.see("Test", path=tmp_path / "before.png")
+    mac.clock = 1.5
+
+    mac.key("5", app="Test")
+    result = _outcome(lambda: mac.wait_change("Test", timeout=2.0))
+
+    assert (result["changed"], "ignored" in result) == (True, False)
 
 
 @pytest.mark.parametrize(

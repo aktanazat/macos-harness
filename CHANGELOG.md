@@ -144,10 +144,14 @@ follows [Semantic Versioning](https://semver.org/).
   the program's latest input to it, or since its last `see` or wait when no
   input came after that, and held still for 0.15 seconds, in place of a
   guessed sleep, with how many looks it took. A blinking caret is no
-  change; `region=` watches a smaller one and `by="ax"` compares the app's
-  text. Nothing changing raises a timeout whose details say `changed` is
-  false. `mac.see(app, after_change=True)` waits the same way, `settle=`
-  included, and then captures, reporting `changed` instead of raising.
+  change, and what changed by itself between a `see` or wait and an input
+  a second or more later, like a ticking clock, is left out until the next
+  `see` and reported as `ignored` square points; that input takes one more
+  capture, about 40 ms, to see it. `region=` watches a smaller change and
+  `by="ax"` compares the app's text. Nothing changing raises a timeout
+  whose details say `changed` is false. `mac.see(app, after_change=True)`
+  waits the same way, `settle=` included, and then captures, reporting
+  `changed` instead of raising.
 - `mac.see(window_id=N)` captures any window, panel, menu, prompt, or the
   menu bar, whoever owns it, and reports its `layer` and owner `pid`;
   `macos-harness see --window-id N` does the same. `mac.see(display=0)` and

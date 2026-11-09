@@ -53,7 +53,10 @@ with repeated keys, clicks, deletion loops, or bulk input.
   when no input came after that, so a change the action already made counts
   and an earlier action's does not (with none of these, against the window
   when called), and returns once the new look has held still `settle` seconds.
-  About one changed word of text counts; a blinking caret does not.
+  About one changed word of text counts; a blinking caret does not, and what
+  changed by itself between a look and an input a second or more later,
+  like a ticking clock, is left out until the next `see` and reported as
+  `ignored` square points.
   `region=(x, y, w, h)` in that `see`'s pixels watches a smaller change, and
   `by="ax"` the app's text. Nothing changing by `timeout` raises `timeout` with
   `details["changed"]` False; `mac.see(app, after_change=True)` waits 10
