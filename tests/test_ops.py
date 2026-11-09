@@ -1667,6 +1667,61 @@ def test_run_unexpected_exception_during_dispatch_is_cleaned_up_and_replayable()
     assert len(spawner.calls) == 1
 
 
+def test_run_thread_start_failure_closes_pipes_and_keeps_a_terminal_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes: list[subprocess.Popen[bytes]] = []
+
+    class RecordingFactory(PopenFactory):
+        def __call__(self, command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+            process = super().__call__(command, **kwargs)
+            processes.append(process)
+            return process
+
+    factory = RecordingFactory()
+    _host, operations = _ops(spawn=factory)
+    start = threading.Thread.start
+    attempts = 0
+
+    def fail_second(thread: threading.Thread) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            raise RuntimeError("dummy thread allocation failure")
+        start(thread)
+
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(threading.Thread, "start", fail_second)
+            first = _failed(lambda: operations.run("return 1", once="partial-workers"))
+
+        assert first.receipt.outcome is Outcome.FAILED
+        assert first.receipt.acted is Acted.UNKNOWN
+        assert first.code == ErrorCode.AX_ERROR
+        assert operations.history() == (first.receipt,)
+        process = processes[0]
+        assert process.poll() is not None
+        assert all(pipe is not None and pipe.closed for pipe in (process.stdin, process.stdout, process.stderr))
+
+        recalled = _failed(lambda: operations.recall("partial-workers"))
+        replayed = _failed(lambda: operations.run("return 1", once="partial-workers"))
+        assert recalled.receipt == first.receipt.replayed_as()
+        assert replayed.receipt == first.receipt.replayed_as()
+        assert len(factory.calls) == 1
+    finally:
+        for process in processes:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+
+
 @pytest.mark.parametrize(
     "source,args,detail",
     [

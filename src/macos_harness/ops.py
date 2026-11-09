@@ -971,7 +971,8 @@ def _abandon(
     _kill_process_group(proc, monotonic)
     grace = monotonic() + _KILL_REAP_TIMEOUT_S
     for thread in threads:
-        thread.join(timeout=max(grace - monotonic(), 0.0))
+        if thread.ident is not None:
+            thread.join(timeout=max(grace - monotonic(), 0.0))
     try:
         proc.wait(timeout=max(grace - monotonic(), 0.0))
     except (subprocess.TimeoutExpired, ProcessLookupError):
