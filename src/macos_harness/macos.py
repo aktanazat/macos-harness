@@ -35,9 +35,11 @@ from .capture import (
     WindowCapture,
     WindowCatalog,
     _owns_capture,
+    blanked,
     capture_screen,
     capture_window,
     changed_area,
+    changing_cells,
     displays,
     draw_pointer,
     gray_print,
@@ -130,14 +132,19 @@ class _AppIdentity(NamedTuple):
 @dataclass(slots=True)
 class _Picture:
     """A window as this process last pictured it, where the next
-    `wait_change` of it measures from. ``first_of`` is the pid whose
-    first window it was then, the one input naming only that app
-    reaches; ``acted`` says an input has reached the window since."""
+    `wait_change` of it measures from, ``taken`` at that `_now`.
+    ``first_of`` is the pid whose first window it was then, the one input
+    naming only that app reaches; ``acted`` says an input has reached the
+    window since. ``still`` is two pictures with no input between them,
+    the second taken just before an input since the last `see`: what
+    differs between them changed by itself, like a clock."""
 
     window_id: int
     capture: WindowCapture
+    taken: float
     first_of: int | None = None
     acted: bool = False
+    still: tuple[WindowCapture, WindowCapture] | None = None
 
 
 # A mouse or scroll event posted with ``CGEventPostToPid`` skips the window
@@ -308,6 +315,17 @@ _CHANGE_AREA = 64.0
 _CHANGE_REGION_SHARE = 0.02
 _CHANGE_BASELINE_SIZE = 640
 _PRINT_POINTS_PER_PIXEL = 2.0
+# What changed by itself between two pictures of a window with no input
+# between them is left out of a wait in squares of 16 points, unless it
+# covers more than a quarter of the window, or moved less than half of
+# what counts as a change: a blinking caret moves about 20 square
+# points, one tick of a 20-point seconds clock 20 to 79. Pictures under
+# a second apart rarely span a tick, so an input that soon after a look
+# keeps what was learned before instead of picturing the window again.
+_STILL_CELL_POINTS = 16.0
+_STILL_LEAST_SHARE = 0.5
+_STILL_MOST = 0.25
+_STILL_GAP_SECONDS = 1.0
 _PRINT_MAX_WIDTH = 400
 _AREA_SAMPLES = 32
 # What `wait_change(by="ax")` compares: what an element says and its
@@ -5717,7 +5735,7 @@ class MacOS:
             if not reframe:
                 seen = int(window["window_id"])
                 first_of = int(info["pid"]) if window_id is None and window_index == 0 else None
-                self._last_capture = _Picture(seen, captured, first_of)
+                self._last_capture = _Picture(seen, captured, self._now(), first_of)
                 if self._before_input is not None and self._before_input.window_id == seen:
                     self._before_input = None
         self._last_screenshot = screenshot
@@ -5982,11 +6000,14 @@ class MacOS:
 
         The baseline is the newest picture of the window this process
         holds: its last `see`, where its last wait ended, or one taken
-        just before an input when neither came after the input before.
-        With none, it is the window as it looks now. So a change the
-        latest input made before this call still counts, and one an
-        earlier input made does not. ``region`` (x, y, width, height in
-        that `see`'s pixels) watches part of the window;
+        just before an input that followed another input or came a second
+        or more after that look. With none, it is the window as it looks
+        now. So a change the latest input made before this call still
+        counts, and one an earlier input made does not. What changed by
+        itself between a look and an input a second or more later, like a
+        ticking clock, is left out until the next `see`; the result's
+        ``ignored`` gives its square points. ``region`` (x, y, width,
+        height in that `see`'s pixels) watches part of the window;
         ``by="ax"`` compares the app's accessibility text instead of
         pixels; a read the app cuts short is no look at all, and the
         result counts those in ``failed_reads`` with the last
@@ -6071,7 +6092,9 @@ class MacOS:
                 window_id = int(self._indexed_window(windows, window_index)["window_id"])
             picture = self._held_picture(window_id)
             framed = picture is not None and picture is self._last_capture
-            look, baseline, threshold = self._pixel_looks(window_id, picture, region, framed=framed)
+            look, baseline, threshold, ignored = self._pixel_looks(
+                window_id, picture, region, framed=framed,
+            )
             changed, settled, polls = self._until_settled(
                 look, baseline, lambda before, after: changed_area(before, after) >= threshold,
                 look_now=picture is not None, deadline=deadline, settle=settle,
@@ -6080,6 +6103,8 @@ class MacOS:
                 baseline="see" if framed else "input" if picture is not None else "now",
                 window_id=window_id,
             )
+            if ignored:
+                watched["ignored"] = ignored
         watched.update(
             changed=changed, settled=settled, polls=polls,
             elapsed_ms=round((self._now() - started) * 1000),
@@ -6093,12 +6118,14 @@ class MacOS:
         region: tuple[float, float, float, float] | None,
         *,
         framed: bool,
-    ) -> tuple[Callable[[], GrayPrint], GrayPrint, float]:
+    ) -> tuple[Callable[[], GrayPrint], GrayPrint, float, float]:
         """How `wait_change` looks at a window: a fresh print, the baseline
-        print, and the square points two prints must differ by to count.
-        The baseline is ``picture``, the one held of the window, else the
-        window now; ``framed`` when it is in the last `see`'s pixels, the
-        ones ``region`` names."""
+        print, the square points two prints must differ by to count, and
+        the square points left out because they changed by themselves
+        before the last input (`changing_cells`). The baseline is
+        ``picture``, the one held of the window, else the window now;
+        ``framed`` when it is in the last `see`'s pixels, the ones
+        ``region`` names."""
         if region is not None and not framed:
             raise MacOSError(
                 "region is in the pixels of the last mac.see of this window; see it first",
@@ -6125,15 +6152,26 @@ class MacOS:
         def shrink(image: object) -> GrayPrint:
             return gray_print(image, width=width, height=height, points=points, crop=crop)
 
+        still = None if picture is None else picture.still
+        boxes: tuple[tuple[int, int, int, int], ...] = ()
+        if still is not None and all((shot.width, shot.height) == size for shot in still):
+            cell = max(1, round(_STILL_CELL_POINTS * width / points[0]))
+            boxes = changing_cells(
+                shrink(still[0].image), shrink(still[1].image), cell=cell,
+                least=_STILL_LEAST_SHARE * threshold, most=_STILL_MOST,
+            )
+        ignored = sum((right - left) * (bottom - top) for left, top, right, bottom in boxes)
+
         def look() -> GrayPrint:
             captured = self._window_image(window_id, max_width=None, max_height=None, size=size)
             if picture is not None:
-                # The next wait measures from here, not from a change this
-                # one saw, and the next input needs no picture of its own.
-                picture.capture, picture.acted = captured, False
-            return shrink(captured.image)
+                # The next wait measures from here, not from a change this one saw.
+                picture.capture, picture.taken, picture.acted = captured, self._now(), False
+            return blanked(shrink(captured.image), boxes)
 
-        return look, shrink(first.image), threshold
+        return look, blanked(shrink(first.image), boxes), threshold, round(
+            ignored * points[0] * points[1] / (width * height)
+        )
 
     @staticmethod
     def _print_crop(region: object, width: int, height: int) -> tuple[float, float, float, float]:
@@ -6232,50 +6270,57 @@ class MacOS:
     def _hold_before_input(self, pid: int | None, window_id: int | None = None) -> None:
         """Picture the window an input to ``pid`` is about to reach --
         ``window_id``'s, else the app's first, the one a wait on the app
-        watches -- unless the picture held of it came from a `see` or a
-        wait after the last input to it. A wait for this input's effect
-        then measures from just before it, not from after it already
-        showed or from before an earlier input. A held picture is retaken
-        at its own size, keeping a `see`'s in the pixels ``region``
-        names; a capture costs about 40ms. An input right after a `see`
-        or a wait costs nothing, and one naming only the app skips even
-        the window listing when that look was of the app's first window.
-        Without Screen Recording, a window, or a capture it keeps what it
-        held, and the input goes out regardless."""
+        watches. A wait for this input's effect then measures from just
+        before it, not from after it already showed or from before an
+        earlier input. A held picture is retaken at its own size, keeping
+        a `see`'s in the pixels ``region`` names; a capture costs about
+        40ms. When no input came since the held picture, from a `see` or
+        a wait, the two pictures show what changes by itself, which the
+        wait leaves out (`_Picture.still`) until the next `see`; when that
+        picture is under `_STILL_GAP_SECONDS` old, the input takes none.
+        An input naming only the app skips the window listing when that
+        look was of the app's first window. Without Screen Recording, a
+        window, or a capture it keeps what it held, and the input goes out
+        regardless."""
         if pid is None:
             return
         try:
             first_of = None
+            picture = None
             if window_id is None:
-                covered = next(
+                picture = next(
                     (
                         picture for picture in (self._last_capture, self._before_input)
                         if picture is not None and picture.first_of == pid and not picture.acted
                     ),
                     None,
                 )
-                if covered is not None:
-                    covered.acted = True
-                    return
-                windows = self.windows(pid)
-                if not windows:
-                    return
-                window_id, first_of = int(windows[0]["window_id"]), pid
-            picture = self._held_picture(window_id)
-            if picture is not None and not picture.acted:
-                picture.acted = True
-                return
-            self._ensure_screen_recording()
+                if picture is None:
+                    windows = self.windows(pid)
+                    if not windows:
+                        return
+                    window_id, first_of = int(windows[0]["window_id"]), pid
             if picture is None:
+                picture = self._held_picture(window_id)
+            if picture is None:
+                self._ensure_screen_recording()
                 self._before_input = _Picture(window_id, self._window_image(
                     window_id, max_width=_CHANGE_BASELINE_SIZE, max_height=_CHANGE_BASELINE_SIZE
-                ), first_of, acted=True)
-            else:
-                picture.capture = self._window_image(
-                    window_id, max_width=None, max_height=None,
-                    size=(picture.capture.width, picture.capture.height),
-                )
+                ), self._now(), first_of, acted=True)
+                return
+            if not picture.acted and self._now() - picture.taken < _STILL_GAP_SECONDS:
                 picture.acted = True
+                return
+            earlier = None if picture.acted else picture.capture
+            picture.acted = True
+            self._ensure_screen_recording()
+            picture.capture = self._window_image(
+                picture.window_id, max_width=None, max_height=None,
+                size=(picture.capture.width, picture.capture.height),
+            )
+            picture.taken = self._now()
+            if earlier is not None:
+                picture.still = (earlier, picture.capture)
         except MacOSError:
             return
 
@@ -6287,6 +6332,14 @@ class MacOS:
         _, info = self._resolve_app(app)
         self._last_app = info
         return int(info["pid"])
+
+    def _pictures_acted(self) -> None:
+        """Count an activation or a script as an input to every held
+        picture: each can change how any window looks, so two pictures
+        around it no longer show only what changes by itself."""
+        for picture in (self._last_capture, self._before_input):
+            if picture is not None:
+                picture.acted = True
 
     def _input_pid(self, app: str | int | None, window_id: int | None, what: str) -> int:
         """The pid pointer input goes to: ``app``'s, else the owner's of
@@ -6821,6 +6874,7 @@ class MacOS:
             frontmost, activated = self._await_frontmost(pid, timeout)
             via = "accessibility" if activated else None
         self._last_app = info
+        self._pictures_acted()
         result = {
             "app": info,
             "activated": activated,
@@ -7571,8 +7625,8 @@ class MacOS:
         pid = self._input_pid(app, window_id, "Keyboard input")
         with app_input(pid, _INPUT_WAIT):
             self._yield_to_person(pid, "typing into the app in front")
-            target = self._keyboard_window(pid, window_id)
             self._hold_before_input(pid, window_id)
+            target = self._keyboard_window(pid, window_id)
             focus_before = self._frontmost_app()
             packed = focus_before is not None and int(focus_before["pid"]) == pid
             sent = 0
@@ -7620,8 +7674,8 @@ class MacOS:
         pid = self._input_pid(app, window_id, "Keyboard input")
         with app_input(pid, _INPUT_WAIT):
             self._yield_to_person(pid, f"pressing {key} in the app in front")
-            target = self._keyboard_window(pid, window_id)
             self._hold_before_input(pid, window_id)
+            target = self._keyboard_window(pid, window_id)
             focus_before = self._frontmost_app()
             active_flags = 0
             pressed: list[tuple[int, int]] = []
@@ -7668,6 +7722,7 @@ class MacOS:
         """Run ``source`` with osascript and return what it printed; stop it
         after ``timeout`` seconds, since a script that waits on an app's
         dialog or a permission prompt never returns on its own."""
+        self._pictures_acted()
         try:
             result = subprocess.run(
                 ["/usr/bin/osascript", "-l", language, "-"],
