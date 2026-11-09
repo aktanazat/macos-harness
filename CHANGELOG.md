@@ -23,6 +23,23 @@ follows [Semantic Versioning](https://semver.org/).
   of another app, of an app it cannot tell, or with no press fails with
   `acted="no"`.
 
+- `mac.text(app)` reads a window's text from its pixels with Apple Vision,
+  for windows accessibility leaves blank, as iPhone Mirroring's: one line
+  a row, as `[t3] "Continue"`, with `query=` as in `mac.state`. `text[3]`
+  is a match for `click(element=)` and `do.click(element=)`, which click
+  the center of its box with no new search; given to `ax.perform` or
+  `do.press`, or passed as `"t3"`, it is a bad request. Right before the
+  click the box is captured and read again, in 45 to 70 ms; a line that
+  no longer reads the same, a window that moved, or a click routed to
+  another window is refused with `acted="no"`. Printing a read makes its
+  lines the agent's last look, as with `mac.state`: in a later run,
+  `text[3]` refuses an id that no longer reads the same at the same place
+  in the window, as when a line appeared above it, until the next print.
+  A click's receipt names the line's text, window, and box. A Preview
+  window of 33 lines read 32 exactly in 220 to 320 ms, as about 310
+  tokens against 1,100 to 1,700 for its screenshot. It needs Screen
+  Recording.
+
 - `MacOS(agent_id=)`, CLI `--agent-id`, and `MACOS_HARNESS_AGENT_ID` give
   each agent a named pointer with a stable color, without moving the
   physical cursor. Named pointers mark Accessibility actions and appear

@@ -340,15 +340,22 @@ def _ranges(ids: Sequence[int]) -> str:
     return ", ".join(f"[{a}]" if a == b else f"[{a}]-[{b}]" for a, b in spans)
 
 
-def project(lines: Sequence[Line], query: str) -> list[Line] | None:
-    """The lines that match ``query``, their ancestors, and each match's
-    subtree when small; None when nothing matches. The whole phrase is
-    tried first, then any of its words of three or more letters."""
+def matching(haystacks: Sequence[str], query: str) -> list[int]:
+    """The indexes of the lowercase ``haystacks`` that match ``query``:
+    those holding the whole phrase, else any of its words of three or
+    more letters."""
     phrase = query.strip().lower()
-    matched = [i for i, line in enumerate(lines) if phrase and phrase in line.haystack]
+    matched = [i for i, haystack in enumerate(haystacks) if phrase and phrase in haystack]
     if not matched:
         words = [word for word in re.split(r"\W+", phrase) if len(word) >= 3]
-        matched = [i for i, line in enumerate(lines) if any(word in line.haystack for word in words)]
+        matched = [i for i, haystack in enumerate(haystacks) if any(word in haystack for word in words)]
+    return matched
+
+
+def project(lines: Sequence[Line], query: str) -> list[Line] | None:
+    """The lines that match ``query`` (`matching`), their ancestors, and
+    each match's subtree when small; None when nothing matches."""
+    matched = matching([line.haystack for line in lines], query)
     if not matched:
         return None
     keep: set[int] = set()
@@ -371,7 +378,8 @@ def project(lines: Sequence[Line], query: str) -> list[Line] | None:
 
 class Memory:
     """One agent's ids and last looks for one process, kept as a file in
-    the user's temporary directory. `Memory.locked` opens it."""
+    the user's temporary directory, with the lines `MacOS.text` last
+    showed it of each window (``texts``). `Memory.locked` opens it."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -388,6 +396,9 @@ class Memory:
         self.slots: dict[str, Slots] = {
             window: {slot: (int(i), str(part)) for slot, (i, part) in held.items()}
             for window, held in saved.get("slots", {}).items()
+        }
+        self.texts: dict[str, dict[str, JSONValue]] = {
+            window: dict(lines) for window, lines in saved.get("texts", {}).items()
         }
 
     @classmethod
@@ -416,11 +427,21 @@ class Memory:
             del self.looks[oldest]
             self.slots.pop(oldest, None)
 
+    def remember_text(self, window: str, lines: Mapping[str, JSONValue]) -> None:
+        """Make ``lines`` (id to match) what this agent last saw of each of
+        those ids in ``window``; ids not among them keep what it saw before."""
+        self.texts[window] = {**self.texts.pop(window, {}), **lines}
+        while len(self.texts) > _REMEMBERED_WINDOWS:
+            del self.texts[next(iter(self.texts))]
+
     def save(self) -> None:
         if len(self.ids) > _REMEMBERED_IDS:
             newest = sorted(self.ids.items(), key=lambda item: item[1])[-_REMEMBERED_IDS:]
             self.ids = dict(newest)
         with tempfile.NamedTemporaryFile("w", dir=self.path.parent, delete=False, suffix=".tmp") as handle:
             # json.dump writes token by token: twice as slow on a big window.
-            handle.write(json.dumps({"ids": self.ids, "next_id": self.next_id, "looks": self.looks, "slots": self.slots}))
+            handle.write(json.dumps({
+                "ids": self.ids, "next_id": self.next_id, "looks": self.looks, "slots": self.slots,
+                "texts": self.texts,
+            }))
         os.replace(handle.name, self.path)
