@@ -239,6 +239,9 @@ follows [Semantic Versioning](https://semver.org/).
   keeps a terminal receipt instead of failing again while joining the
   unstarted thread.
 
+- A short receipt-log append is rolled back so the preceding records stay
+  valid. The completed action and its in-memory receipt are preserved.
+
 - The credential and handoff guides allow an ordinary password-only login
   to an explicitly approved local test VM after checking its account,
   window, password field, and focus. Host credentials, production accounts,

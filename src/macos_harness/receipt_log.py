@@ -119,7 +119,9 @@ def _write(path: Path, data: bytes) -> None:
             if opened.st_size and opened.st_size + len(data) > MAX_BYTES:
                 os.replace(path, path.with_name(path.name + ".1"))
                 continue
-            os.write(fd, data)
+            if os.write(fd, data) != len(data):
+                os.ftruncate(fd, opened.st_size)
+                raise OSError("receipt log append was incomplete")
             return
         finally:
             os.close(fd)
