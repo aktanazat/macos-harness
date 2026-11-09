@@ -6,10 +6,12 @@ across runs, and after the first look only what changed.
 their children, and controls scrolled out of the window are left out.
 Each control's id comes from its path in the tree, remembered per agent
 and process in the user's temporary directory, so the id a program saw
-in one run names the same control in the next. The text an agent reads
-becomes its last look: a named agent's next look returns the lines that
-changed since, or the whole window when that is shorter, and an id whose
-line changed since that look is refused until the agent reads again.
+in one run names the same control in the next; a control whose label
+changes in place in the window, as Calculator's "All Clear" turning
+"Clear", keeps its id. The text an agent reads becomes its last look: a
+named agent's next look returns the lines that changed since, or the
+whole window when that is shorter, and an id whose line changed since
+that look is refused until the agent reads again.
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ from .receipts import JSONValue
 Node = Mapping[str, JSONValue]
 # One line of a look: id, rendered text, outside the window.
 Look = list[tuple[int, str, bool]]
+# Each line's slot in a look, with its id and key part (`build_lines`).
+Slots = dict[str, tuple[int, str]]
 
 # Layout containers that carry nothing an agent reads or acts on unless
 # they are labeled or selected.
@@ -138,6 +142,15 @@ class _Parent(NamedTuple):
 _ROOT = _Parent("", 0, False, False, "", False)
 
 
+class _Control(NamedTuple):
+    node: Node
+    key: str
+    part: str
+    slot: str
+    depth: int
+    outside: bool
+
+
 def _role(node: Node) -> str:
     role = str(node.get("role") or "AXUnknown").removeprefix("AX")
     return role[:1].lower() + role[1:]
@@ -216,13 +229,24 @@ def build_lines(
     ids: dict[str, int],
     next_id: int,
     window_frame: Mapping[str, float] | None,
-) -> tuple[list[Line], list[bool], int]:
-    """Lines for ``nodes`` (a depth-first walk), ids from ``ids`` or new,
-    and for each line whether it lies outside ``window_frame``."""
-    lines: list[Line] = []
-    offscreen: list[bool] = []
+    last: Mapping[str, tuple[int, str]],
+) -> tuple[list[Line], list[bool], int, Slots]:
+    """Lines for ``nodes`` (a depth-first walk), whether each lies outside
+    ``window_frame``, the next free id, and each line's slot (a digest of
+    its parent, its role, and how many of that role come before it there)
+    with its id and key part.
+
+    A control takes the id ``ids`` holds for its key, else the id that
+    held its slot in ``last``, the slots of the window's last printed look:
+    under the same label, or under another so long as the control lies in
+    the window, no control here still bears the old label, as one that
+    moved does, and none claims the id by its key. Otherwise it takes a new
+    id, saved in ``ids``. Outside the window, where a diff shows no change,
+    a control never takes an id the last look showed under another label."""
+    controls: list[_Control] = []
     stack: list[_Parent] = []
     siblings: dict[tuple[str, str], int] = {}
+    kinds: dict[tuple[str, str], int] = {}
     for node in nodes:
         depth = int(node["depth"])
         del stack[depth:]
@@ -230,6 +254,9 @@ def build_lines(
         part = _key_part(node)
         ordinal = siblings.get((parent.key, part), 0)
         siblings[(parent.key, part)] = ordinal + 1
+        kind = f"{node.get('role')}:{node.get('subrole', '')}"
+        position = kinds.get((parent.key, kind), 0)
+        kinds[(parent.key, kind)] = position + 1
         key = f"{parent.key}/{part}#{ordinal}"
         # An open menu is on screen even where it runs past its window.
         in_menu = parent.in_menu or node.get("role") == "AXMenu"
@@ -247,16 +274,38 @@ def build_lines(
         if folded:
             stack.append(parent._replace(key=key, outside=outside, in_menu=in_menu))
             continue
-        element_id = ids.get(key)
+        slot = hashlib.blake2b(f"{parent.key}/{kind}@{position}".encode(), digest_size=8).hexdigest()
+        controls.append(_Control(node, key, part, slot, parent.depth, outside))
+        stack.append(_Parent(key, parent.depth + 1, outside, node.get("role") in _LEAF_ROLES, label, in_menu))
+    was = {element_id: part for element_id, part in last.values()}
+    claimed: list[int | None] = []
+    for control in controls:
+        element_id = ids.get(control.key)
+        if element_id is not None and control.outside and was.get(element_id, control.part) != control.part:
+            element_id = None
+        claimed.append(element_id)
+    taken = {element_id for element_id in claimed if element_id is not None}
+    parts = {control.part for control in controls}
+    lines: list[Line] = []
+    offscreen: list[bool] = []
+    slots: Slots = {}
+    for control, element_id in zip(controls, claimed, strict=True):
         if element_id is None:
-            element_id, next_id = next_id, next_id + 1
-            ids[key] = element_id
+            held = last.get(control.slot)
+            if held is not None and held[0] not in taken and (
+                held[1] == control.part or not (control.outside or held[1] in parts)
+            ):
+                element_id = held[0]
+            else:
+                element_id, next_id = next_id, next_id + 1
+                ids[control.key] = element_id
+        slots[control.slot] = (element_id, control.part)
+        node = control.node
         text = _line_text(node, element_id)
         full_value = node.get("value") if isinstance(node.get("value"), str) else ""
-        lines.append(Line(element_id, parent.depth, text, f"{text} {full_value}".lower(), node))
-        offscreen.append(outside)
-        stack.append(_Parent(key, parent.depth + 1, outside, node.get("role") in _LEAF_ROLES, label, in_menu))
-    return lines, offscreen, next_id
+        lines.append(Line(element_id, control.depth, text, f"{text} {full_value}".lower(), node))
+        offscreen.append(control.outside)
+    return lines, offscreen, next_id, slots
 
 
 def diff(old: Sequence[tuple[int, str]], new: Sequence[tuple[int, str]], present: Container[int]) -> str | None:
@@ -336,6 +385,10 @@ class Memory:
             window: [(int(i), str(line), bool(out)) for i, line, out in look]
             for window, look in saved.get("looks", {}).items()
         }
+        self.slots: dict[str, Slots] = {
+            window: {slot: (int(i), str(part)) for slot, (i, part) in held.items()}
+            for window, held in saved.get("slots", {}).items()
+        }
 
     @classmethod
     @contextmanager
@@ -354,16 +407,20 @@ class Memory:
         finally:
             os.close(fd)
 
-    def remember(self, window: str, look: Look) -> None:
+    def remember(self, window: str, look: Look, slots: Slots) -> None:
         self.looks.pop(window, None)
         self.looks[window] = look
+        self.slots[window] = slots
         while len(self.looks) > _REMEMBERED_WINDOWS:
-            self.looks.pop(next(iter(self.looks)))
+            oldest = next(iter(self.looks))
+            del self.looks[oldest]
+            self.slots.pop(oldest, None)
 
     def save(self) -> None:
         if len(self.ids) > _REMEMBERED_IDS:
             newest = sorted(self.ids.items(), key=lambda item: item[1])[-_REMEMBERED_IDS:]
             self.ids = dict(newest)
         with tempfile.NamedTemporaryFile("w", dir=self.path.parent, delete=False, suffix=".tmp") as handle:
-            json.dump({"ids": self.ids, "next_id": self.next_id, "looks": self.looks}, handle)
+            # json.dump writes token by token: twice as slow on a big window.
+            handle.write(json.dumps({"ids": self.ids, "next_id": self.next_id, "looks": self.looks, "slots": self.slots}))
         os.replace(handle.name, self.path)

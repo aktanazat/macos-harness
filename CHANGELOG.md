@@ -254,6 +254,15 @@ follows [Semantic Versioning](https://semver.org/).
   `get_app_state`; only that field is dropped and named under `non_finite`.
 - An untitled off-screen helper window no longer ends `launch` and
   `wait_for_window` before the app's real window is up.
+- A control whose label changes in place keeps its `mac.state` id. When
+  Calculator's "All Clear" turned "Clear", the next look removed `[5]`
+  and added the button under a new id, so `state[5]` failed as unknown;
+  now the look marks `[5] button "Clear"` changed. `state[5]` still
+  refuses the id until the window is printed again, since a relabelled
+  control may do something else. A control keeps its id this way only
+  inside the window and against that window's last printed look; one
+  relabelled outside the window, which a look does not list, takes a new
+  id.
 
 ### Changed
 

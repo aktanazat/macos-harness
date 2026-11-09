@@ -2630,10 +2630,12 @@ class MacOS:
         ``window_id`` names another.
 
         An id names the same control in later calls and later runs, for
-        this agent (``agent_id``) and this launch of the app; ``state[12]``
-        is its match for ``click(element=)``, ``ax.perform`` or ``ax.set``.
-        Unlabeled layout groups fold into their children, and controls
-        scrolled out of the window are counted, not listed.
+        this agent (``agent_id``) and this launch of the app, also after its
+        label changes in place inside the window, as All Clear turning
+        Clear; ``state[12]`` is its match for ``click(element=)``,
+        ``ax.perform`` or ``ax.set``. Unlabeled layout groups fold into
+        their children, and controls scrolled out of the window are
+        counted, not listed.
 
         Reading the text (``print``, ``str``, ``.text``) makes it this
         agent's last look at the window. ``state[12]`` refuses an id whose
@@ -2663,11 +2665,18 @@ class MacOS:
         agent_id = identity.agent_id if identity is not None else None
         place = (Path(user_temp_dir()) / "macos-harness-state", agent_id, pid, _process_start_time(pid))
         number = self._ax_window_id(window)
+        root = snapshot.nodes[0] if snapshot.nodes else {}
+        window_key = str(number) if number is not None else f"{root.get('role')}:{root.get('subrole', '')}"
+        # A label that did not read shortens one line; children that did
+        # not read may hide a subtree, which a diff would call removed, and
+        # a control that moved, which `build_lines` would take as relabelled.
+        complete = not (snapshot.node_cut or snapshot.depth_cut or snapshot.children_cut)
         with Memory.locked(*place) as memory:
-            lines, offscreen, memory.next_id = build_lines(snapshot.nodes, memory.ids, memory.next_id, frame)
-            window_key = str(number) if number is not None else f"line:{lines[0].id if lines else 0}"
+            lines, offscreen, memory.next_id, slots = build_lines(
+                snapshot.nodes, memory.ids, memory.next_id, frame, memory.slots.get(window_key, {}) if complete else {},
+            )
             previous = memory.looks.get(window_key)
-        title = snapshot.nodes[0].get("title", "") if snapshot.nodes else ""
+        title = root.get("title", "")
         header = f"{info['name']} window {json.dumps(title, ensure_ascii=False)}" + (
             f" (window_id {number})" if number is not None else ""
         )
@@ -2678,9 +2687,6 @@ class MacOS:
         )
         if focus is not None:
             header += f"\nFocused: [{focus}]"
-        # A label that did not read shortens one line; children that did
-        # not read may hide a subtree, which a diff would call removed.
-        complete = not (snapshot.node_cut or snapshot.depth_cut or snapshot.children_cut)
         notes: list[str] = []
         if not complete:
             notes.append(
@@ -2716,7 +2722,7 @@ class MacOS:
 
         def remember() -> None:
             with Memory.locked(*place) as memory:
-                memory.remember(window_key, look)
+                memory.remember(window_key, look, slots)
 
         matches: dict[int, Mapping[str, JSONValue]] = {}
         for line in lines:
