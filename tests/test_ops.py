@@ -3307,3 +3307,40 @@ def test_receipt_log_rotates_before_passing_its_size_bound(
 
     assert log.with_name("receipts.jsonl.1").stat().st_size == receipt_log.MAX_BYTES
     assert [json.loads(line)["op"] for line in log.read_text(encoding="utf-8").splitlines()] == ["key"]
+
+
+def test_receipt_log_rolls_back_a_short_write_without_losing_prior_records(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import warnings
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(receipt_log.ENV, "1")
+    _host, operations = _ops()
+    first = operations.key("return", app="Demo")
+    log = _receipt_log(tmp_path)
+    before = log.read_bytes()
+    prior_rows = [json.loads(line) for line in before.splitlines()]
+    write = os.write
+
+    def short_write(fd: int, data: bytes) -> int:
+        return write(fd, data[:21])
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        with monkeypatch.context() as fault:
+            fault.setattr(receipt_log.os, "write", short_write)
+            second = operations.key("escape", app="Demo")
+
+    assert second.outcome is Outcome.DONE
+    assert operations.history() == (first, second)
+    assert log.read_bytes() == before
+    assert [json.loads(line) for line in log.read_bytes().splitlines()] == prior_rows
+    assert any(
+        issubclass(warning.category, RuntimeWarning)
+        and "receipt log not written" in str(warning.message)
+        for warning in caught
+    )
+
+    operations.press("Save", app="Demo")
+    assert [json.loads(line)["op"] for line in log.read_bytes().splitlines()] == ["key", "press"]
