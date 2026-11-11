@@ -4271,7 +4271,8 @@ class MacOS:
         the app shows instead (`_wait_clues`). Between searches in one app
         the wait rests up to ``interval``, and searches again as soon as
         the app reports a change, though never sooner than the last
-        search took (`AppChanges`).
+        search took, nor than half an ``interval`` while the app keeps
+        changing (`AppChanges`).
         """
         exact = _ExactSelector.parse(
             title=title, identifier=identifier, description=description
@@ -4305,7 +4306,7 @@ class MacOS:
         limit = _AX_LABEL_SEARCH_LIMIT if text else 2
         deadline = time.monotonic() + timeout
         polls = 0
-        with AppChanges() as changes:
+        with AppChanges(interval) as changes:
             while True:
                 polls += 1
                 started = time.monotonic()
@@ -4574,7 +4575,7 @@ class MacOS:
 
         deadline = time.monotonic() + timeout
         empty_polls = 0
-        with AppChanges() as changes:
+        with AppChanges(interval) as changes:
             while True:
                 started = time.monotonic()
                 try:
@@ -4636,7 +4637,8 @@ class MacOS:
                         message += note
                         details.update(gaps)
                     raise MacOSError(message, code=ErrorCode.TIMEOUT, details=details)
-                changes.follow(matches.pid)
+                if not empty_polls:
+                    changes.follow(matches.pid)
                 changes.rest(
                     min(interval, remaining),
                     at_least=interval if empty_polls else min(time.monotonic() - started, interval),

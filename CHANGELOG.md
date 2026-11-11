@@ -445,10 +445,12 @@ follows [Semantic Versioning](https://semver.org/).
   accessibility notification, though never less than its last search
   took, instead of always sleeping `interval`. In a VM, after a
   Calculator button press, the wait reported the new display value in
-  18–21 ms (median of 10 presses, three batches) instead of 44–51 ms, and
-  in 34 ms at worst instead of 116 ms. `interval` is now the longest
+  18–28 ms (median of 10 presses, six batches) instead of 49–69 ms, and
+  in 37 ms at worst instead of 112 ms. `interval` is now the longest
   rest, which catches changes no notification reports, such as a view an
-  AppKit window adds or hides. A wait across apps still searches every
+  AppKit window adds or hides. While the app keeps posting notifications,
+  a rest lasts at least half of `interval`, so a busy app is searched at
+  most twice per `interval`. A wait across apps still searches every
   `interval`, and `wait_gone` still confirms an empty search a full
   `interval` later.
 

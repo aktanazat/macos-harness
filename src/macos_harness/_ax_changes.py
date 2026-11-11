@@ -36,6 +36,10 @@ _NOTIFICATIONS = (
 # A run loop mode only the observer's source runs in, so a rest services
 # nothing else the calling thread has scheduled.
 _MODE = "com.macos-harness.app-changes"
+# How long a hung app can hold up adding or removing the observer. A live
+# app answers all of them in under a millisecond; a stopped one holds each
+# call for the system's messaging timeout, 1.5 s in a macOS 27 VM.
+_MESSAGING_TIMEOUT = 0.25
 
 
 @cache
@@ -63,13 +67,16 @@ class AppChanges:
 
     `follow` names the app by pid. Without one, or for a process that
     takes no observer (one gone, one with no accessibility, or a caller
-    without Accessibility trust), `rest` just sleeps. Use from one
-    thread: the observer runs on that thread's run loop.
+    without Accessibility trust), `rest` just sleeps. ``interval`` is the
+    wait's. Use from one thread: the observer runs on that thread's run
+    loop.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, interval: float) -> None:
+        self._interval = interval
         self._pid: int | None = None
         self._watch: _Watch | None = None
+        self._busy = False
 
     def __enter__(self) -> Self:
         return self
@@ -87,6 +94,8 @@ class AppChanges:
         if error != AS.kAXErrorSuccess:
             return
         app = AS.AXUIElementCreateApplication(pid)
+        if AS.AXUIElementSetMessagingTimeout(app, _MESSAGING_TIMEOUT) != AS.kAXErrorSuccess:
+            return
         names: list[str] = []
         for name in _NOTIFICATIONS:
             added = AS.AXObserverAddNotification(observer, app, name, None)
@@ -104,20 +113,31 @@ class AppChanges:
 
     def rest(self, seconds: float, *, at_least: float) -> None:
         """Sleep ``seconds``, or end sooner, though not before ``at_least``,
-        once the app has reported a change since the last rest ended."""
+        once the app has reported a change since the last rest ended. After
+        a rest the app changed in, a rest also lasts half the interval: an
+        app that never stops changing is searched at most twice per
+        interval."""
         if self._watch is None:
             time.sleep(seconds)
             return
-        end = time.monotonic() + seconds
-        time.sleep(min(at_least, seconds))
-        woke = AS.CFRunLoopRunInMode(_MODE, max(0.0, end - time.monotonic()), True)
+        began = time.monotonic()
+        end = began + seconds
+        floor = began + min(max(at_least, self._interval / 2) if self._busy else at_least, seconds)
+        changed = False
+        while (now := time.monotonic()) < floor:
+            if AS.CFRunLoopRunInMode(_MODE, floor - now, True) == AS.kCFRunLoopRunHandledSource:
+                changed = True
+        if not changed and (now := time.monotonic()) < end:
+            changed = AS.CFRunLoopRunInMode(_MODE, end - now, True) == AS.kCFRunLoopRunHandledSource
         # One burst of notifications wakes one search.
-        while woke == AS.kCFRunLoopRunHandledSource and time.monotonic() < end:
-            woke = AS.CFRunLoopRunInMode(_MODE, 0, True)
+        woke = changed
+        while woke:
+            woke = AS.CFRunLoopRunInMode(_MODE, 0, True) == AS.kCFRunLoopRunHandledSource
+        self._busy = changed
 
     def close(self) -> None:
         """Stop watching; a later `follow` may watch again."""
-        watch, self._watch, self._pid = self._watch, None, None
+        watch, self._watch, self._pid, self._busy = self._watch, None, None, False
         if watch is None:
             return
         AS.CFRunLoopRemoveSource(watch.loop, watch.source, _MODE)

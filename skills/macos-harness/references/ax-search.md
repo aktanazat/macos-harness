@@ -79,9 +79,10 @@ did not answer.
 `wait` returns the one match; zero matches keep polling; several fail closed and
 report owner, role, title, frame, and enabled state. In one app a wait searches
 again as soon as the app posts an Accessibility notification (a value or title
-change, say), never sooner than its last search took, and at least every
-`interval`, which catches changes with no notification, such as a view an AppKit
-window adds or hides; across apps it searches every `interval`. An app that does not
+change, say), never sooner than its last search took, at most twice per
+`interval` while the app keeps changing, and at least every `interval`, which
+catches changes with no notification, such as a view an AppKit window adds or
+hides; across apps it searches every `interval`. An app that does not
 answer in time (AXError -25204), as one still launching does for a second or
 more after `open -a`, also keeps the wait polling until its timeout. A timeout
 names the query and how many searches ran; in one app it also names a match
