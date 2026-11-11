@@ -268,6 +268,15 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Turning on accessibility for an Electron app, one whose bundle ships
+  `Electron Framework.framework`, also sets `AXManualAccessibility`, the
+  switch Electron documents for assistive apps; other apps never get it.
+  Electron releases from before November 2020 built their web tree for
+  `AXEnhancedUserInterface` only while VoiceOver ran. Current Electron
+  treats the two alike: VS Code 1.146 read 315 to 318 nodes and 136 to
+  137 controls with either, once Electron's 2 s delay after the first
+  look had passed.
+
 - Public `MacOS`, `mac.ax`, and `mac.do` calls drain temporary Cocoa
   objects before returning, even without an AppKit event loop. Repeated
   window and control reads no longer retain each call's native objects;

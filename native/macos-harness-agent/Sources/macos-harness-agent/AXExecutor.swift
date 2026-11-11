@@ -604,9 +604,10 @@ final class AXExecutor {
 
   /// Sets up the application-root AX element exactly like `_application_element` in
   /// `macos.py`: an optional per-element messaging timeout, then — unless `enhance` is false —
-  /// reads `AXEnhancedUserInterface` and, only if it is not already enabled, enables it and
-  /// waits 50ms for the target app to settle. Never activates or raises the target application;
-  /// `AXUIElementCreateApplication` performs no messaging of its own and cannot fail.
+  /// reads `AXEnhancedUserInterface` and, only if it is not already enabled, enables it (plus
+  /// `AXManualAccessibility` on an Electron app) and waits 50ms for the target app to settle.
+  /// Never activates or raises the target application; `AXUIElementCreateApplication` performs
+  /// no messaging of its own and cannot fail.
   private static func applicationElement(
     pid: pid_t, messagingTimeout: Double?, enhance: Bool
   ) throws -> AXUIElement {
@@ -628,9 +629,27 @@ final class AXExecutor {
       // enhanced-UI attribute is intentionally not checked.
       _ = AXUIElementSetAttributeValue(
         root, "AXEnhancedUserInterface" as CFString, true as CFTypeRef)
+      if runsElectron(pid) {
+        _ = AXUIElementSetAttributeValue(
+          root, "AXManualAccessibility" as CFString, true as CFTypeRef)
+      }
       Thread.sleep(forTimeInterval: 0.05)
     }
     return root
+  }
+
+  /// Whether `pid` runs from an app bundle that ships Electron, matching `_runs_electron` in
+  /// `macos.py`: the kernel's executable path, not AppKit's pid lookup, which misses apps
+  /// launched a moment ago.
+  private static func runsElectron(_ pid: pid_t) -> Bool {
+    var path = [CChar](repeating: 0, count: 4096)  // PROC_PIDPATHINFO_MAXSIZE
+    guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return false }
+    let framework = URL(fileURLWithPath: String(cString: path))
+      .deletingLastPathComponent().deletingLastPathComponent()
+      .appendingPathComponent("Frameworks/Electron Framework.framework").path
+    var isDirectory: ObjCBool = false
+    return FileManager.default.fileExists(atPath: framework, isDirectory: &isDirectory)
+      && isDirectory.boolValue
   }
 
   /// Builds one wire match, matching `_describe_element` in `macos.py`: re-reads `AXRole` plus

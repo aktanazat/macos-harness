@@ -204,6 +204,19 @@ def _load_process_info() -> Callable[[int, int, int, object, int], int] | None:
 _process_info = _load_process_info() if AS else None
 
 
+def _load_process_path() -> Callable[[int, object, int], int] | None:
+    try:
+        function = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidpath
+    except (OSError, AttributeError):
+        return None
+    function.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+    function.restype = ctypes.c_int
+    return function
+
+
+_process_path = _load_process_path() if AS else None
+
+
 def _load_window_number_reader() -> Callable[[int, object], int] | None:
     """Resolve the private ``_AXUIElementGetWindow``; ``None`` on a macOS
     that dropped it."""
@@ -235,6 +248,23 @@ def _process_start_time(pid: int) -> float:
         raise MacOSError("Could not read the process start identity", code=ErrorCode.UNSUPPORTED_OP,
                          details={"pid": pid, "errno": error, "bytes_read": returned})
     return info.pbi_start_tvsec + info.pbi_start_tvusec / 1_000_000
+
+
+def _ships_electron(executable: Path) -> bool:
+    """Whether ``executable`` sits in an app bundle that ships Electron."""
+    return (executable.parent.parent / "Frameworks" / "Electron Framework.framework").is_dir()
+
+
+def _runs_electron(pid: int) -> bool:
+    """Whether ``pid`` runs from an app bundle that ships Electron, by the
+    kernel's executable path: AppKit's pid lookup misses apps launched a
+    moment ago."""
+    if _process_path is None:
+        return False
+    buffer = ctypes.create_string_buffer(4096)  # PROC_PIDPATHINFO_MAXSIZE
+    if _process_path(pid, buffer, len(buffer)) <= 0:
+        return False
+    return _ships_electron(Path(os.fsdecode(buffer.value)))
 
 
 _AX_SUCCESS = 0
@@ -2222,8 +2252,10 @@ class MacOS:
 
         ``enhance`` sets ``AXEnhancedUserInterface``, the "a screen reader
         is running" signal Chromium and Electron use to build their full
-        tree. It also changes how AppKit apps animate and lay out, so a
-        caller that only needs the root can pass ``enhance=False``.
+        tree, and on an Electron app ``AXManualAccessibility``, the switch
+        Electron documents for other assistive apps. It also changes how
+        AppKit apps animate and lay out, so a caller that only needs the
+        root can pass ``enhance=False``.
         """
         root = AS.AXUIElementCreateApplication(pid)
         if messaging_timeout is not None:
@@ -2237,6 +2269,8 @@ class MacOS:
         )
         if error == _AX_SUCCESS and not enhanced:
             AS.AXUIElementSetAttributeValue(root, "AXEnhancedUserInterface", True)
+            if _runs_electron(pid):
+                AS.AXUIElementSetAttributeValue(root, "AXManualAccessibility", True)
             time.sleep(0.05)
         return root
 
