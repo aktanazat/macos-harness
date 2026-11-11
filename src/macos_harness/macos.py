@@ -896,6 +896,25 @@ def _hides_match(error: int) -> bool:
     return error != AS.kAXErrorFailure
 
 
+def _secure(identity: Mapping[str, object]) -> bool:
+    """Whether the element whose role and subrole read as ``identity`` is
+    a secure text field, whose value, length and selection are never read."""
+    return _SECURE_SUBROLE in (identity.get("AXRole"), identity.get("AXSubrole"))
+
+
+def _guarded_reads(names: Iterable[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``names`` split into the two reads `MacOS._read_guarded` makes:
+    every name that is not sensitive, with the role and subrole when one
+    is, then the sensitive ones."""
+    names = tuple(dict.fromkeys(names))
+    sensitive = tuple(name for name in names if name in _SENSITIVE_ATTRIBUTES)
+    first = (
+        *(name for name in names if name not in _SENSITIVE_ATTRIBUTES),
+        *(_FOCUS_IDENTITY_ATTRIBUTES if sensitive else ()),
+    )
+    return tuple(dict.fromkeys(first)), sensitive
+
+
 class _AttributeValues(dict[str, Any | None]):
     """Best-effort attribute values without treating failed reads as absence.
 
@@ -2305,13 +2324,14 @@ class MacOS:
     ) -> _AttributeValues:
         """Read AX attributes in one application round trip when supported.
 
-        An unsupported batch API falls back to single reads. A failed
-        batch stays incomplete rather than repeating its failure for each
-        attribute. ``checked`` raises for failed reads on either path.
+        One attribute, or an unsupported batch API, reads singly: a batch
+        of one costs more than the single read. A failed batch stays
+        incomplete rather than repeating its failure for each attribute.
+        ``checked`` raises for failed reads on either path.
         """
         names = tuple(dict.fromkeys(str(attribute) for attribute in attributes))
-        if not names:
-            return _AttributeValues()
+        if len(names) < 2:
+            return MacOS._read_singly(element, names, checked=checked)
         try:
             error, values = AS.AXUIElementCopyMultipleAttributeValues(
                 element, names, 0, None
@@ -2325,19 +2345,9 @@ class MacOS:
                 ((name, None) for name in names),
                 failures=((name, int(error)) for name in names),
             )
-        result = _AttributeValues()
         if error != _AX_SUCCESS or values is None or len(values) != len(names):
-            for name in names:
-                single_error, value = AS.AXUIElementCopyAttributeValue(element, name, None)
-                if single_error != _AX_SUCCESS:
-                    if not _ax_absent(single_error):
-                        if checked:
-                            raise _ax_error(f"Read {name}", single_error)
-                        result.failures[name] = int(single_error)
-                    value = None
-                result[name] = value
-            return result
-
+            return MacOS._read_singly(element, names, checked=checked)
+        result = _AttributeValues()
         for name, value in zip(names, values, strict=True):
             slot_error = MacOS._slot_error(value)
             if slot_error is not None:
@@ -2350,18 +2360,44 @@ class MacOS:
         return result
 
     @staticmethod
+    def _read_singly(element: object, names: Iterable[str], *, checked: bool) -> _AttributeValues:
+        result = _AttributeValues()
+        for name in names:
+            error, value = AS.AXUIElementCopyAttributeValue(element, name, None)
+            if error != _AX_SUCCESS:
+                if not _ax_absent(error):
+                    if checked:
+                        raise _ax_error(f"Read {name}", error)
+                    result.failures[name] = int(error)
+                value = None
+            result[name] = value
+        return result
+
+    @staticmethod
     def _slot_error(value: Any) -> int | None:
         """The AXError an ``AXUIElementCopyMultipleAttributeValues`` slot
         carries in place of a value, ``None`` for a real value."""
-        try:
-            value_type = AS.AXValueGetType(value)
-        except (TypeError, ValueError):
+        if not isinstance(value, AS.AXValueRef) or AS.AXValueGetType(value) != AS.kAXValueAXErrorType:
             return None
-        if value_type != AS.kAXValueAXErrorType:
-            return None
-        # The type was just checked, so the decode cannot fail.
         _, code = AS.AXValueGetValue(value, AS.kAXValueAXErrorType, None)
         return int(code)
+
+    def _read_guarded(
+        self, element: object, first: tuple[str, ...], sensitive: tuple[str, ...]
+    ) -> tuple[_AttributeValues, dict[str, int]]:
+        """Read ``first``, then ``sensitive`` (`_guarded_reads`) only from
+        an element whose role and subrole read in full and name no secure
+        text field. Also returns the role and subrole reads that failed,
+        which left ``sensitive`` unread."""
+        raw = self._copy_attributes(element, first)
+        if not sensitive:
+            return raw, {}
+        unread = {name: raw.failures[name] for name in _FOCUS_IDENTITY_ATTRIBUTES if name in raw.failures}
+        if not unread and not _secure(raw):
+            values = self._copy_attributes(element, sensitive)
+            raw.update(values)
+            raw.failures.update(values.failures)
+        return raw, unread
 
     @staticmethod
     def _actions(element: Any) -> list[str]:
@@ -2407,7 +2443,7 @@ class MacOS:
         if focused is None:
             return sample
         attributes = self._copy_attributes(focused, _FOCUS_IDENTITY_ATTRIBUTES, checked=True)
-        if attributes.get("AXSubrole") != _SECURE_SUBROLE:
+        if not _secure(attributes):
             details = _FOCUS_DETAIL_ATTRIBUTES if include_values else (
                 name for name in _FOCUS_DETAIL_ATTRIBUTES if name not in _SENSITIVE_ATTRIBUTES
             )
@@ -2563,8 +2599,7 @@ class MacOS:
             "AXWindows",
         }
 
-        safe_attributes = tuple(name for name in requested_attributes if name not in _SENSITIVE_ATTRIBUTES)
-        reads_values = len(safe_attributes) != len(requested_attributes)
+        batch_attributes, value_attributes = _guarded_reads(requested_attributes)
 
         def visit(element: Any, depth: int) -> None:
             nonlocal node_cut, depth_cut, read_cut, read_failure, children_cut
@@ -2578,15 +2613,7 @@ class MacOS:
                 return
             seen.add(element)
 
-            failures: dict[str, int] = {}
-            if reads_values:
-                identity = self._copy_attributes(element, _FOCUS_IDENTITY_ATTRIBUTES)
-                allowed = identity.complete and identity.get("AXSubrole") != _SECURE_SUBROLE
-                raw = self._copy_attributes(element, requested_attributes if allowed else safe_attributes)
-                # An identity that did not read in full left the values unread.
-                failures.update(identity.failures)
-            else:
-                raw = self._copy_attributes(element, requested_attributes)
+            raw, failures = self._read_guarded(element, batch_attributes, value_attributes)
             if not raw.conclusive:
                 failures.update(
                     (name, error) for name, error in raw.failures.items() if _hides_match(error)

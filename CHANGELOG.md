@@ -336,6 +336,10 @@ follows [Semantic Versioning](https://semver.org/).
   waits no longer deadlocks: `close()` returns once that request times out.
   Nothing already sent is resent.
 
+- A window walk or focus sample treats an element whose role, not only
+  its subrole, is `AXSecureTextField` as a password field, and never reads
+  its value.
+
 - Public `MacOS`, `mac.ax`, and `mac.do` calls drain temporary Cocoa
   objects before returning, even without an AppKit event loop. Repeated
   window and control reads no longer retain each call's native objects;
@@ -416,6 +420,14 @@ follows [Semantic Versioning](https://semver.org/).
   `mac.state`, queries and checked inputs no longer import the capture
   module or ScreenCaptureKit; an unchecked input still does, for its
   picture.
+
+- A window walk that reads values (`mac.state`, `inspect`, a fallback
+  search over values) reads each element's role and subrole in the same
+  request as its other attributes, then its value alone once those show
+  no password field; it used to read the role and subrole first, then
+  every attribute again. On a 205-element Safari window the walk takes
+  11–16% less time (median of 10 runs, three batches); a whole
+  `mac.state` call stays within run-to-run noise.
 
 - The native skill prefers OMP's readable native tools when available,
   selecting them from the task without requiring the owner to name one.
