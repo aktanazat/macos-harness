@@ -5,16 +5,21 @@ unchanged; accessibility notifications report menus opening and closing
 and where keyboard focus goes. A click is kept as the control under it, a
 click on a menu bar item as a menu step, keys as key and type steps, and
 nothing typed while a secure text field has focus: the route holds a
-``secret`` step there instead.
+``secret`` step there instead. Each type step checks that its field has
+keyboard focus, and so does the step before it.
+The watch saves nothing once it falls behind the person, since what it
+reads of the app may then show their later input.
 """
 
 from __future__ import annotations
 
 import math
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import ApplicationServices as AS
@@ -24,6 +29,7 @@ from .errors import AccessibilityPermissionError, ErrorCode, MacOSError
 from .macos import _KEYCODES, _SECURE_SUBROLE, MacOS
 from .ops import _MAX_TYPE_CHARS, _Deadline
 from .receipts import (
+    Equals,
     ErrorPayload,
     JSONValue,
     OperationError,
@@ -80,14 +86,17 @@ _EDIT_KEYS = frozenset(_KEYCODES[name] for name in (
 _BACKSPACE = _KEYCODES["backspace"]
 _MENU_KEYS = frozenset(_KEYCODES[name] for name in ("escape", "left", "right", "up", "down"))
 _FIELDS = frozenset({"AXTextField", "AXTextArea", "AXComboBox"})
+_ADJUSTERS = frozenset({"AXSlider", "AXIncrementor"})
 _MENU_PARTS = frozenset({"AXMenuBar", "AXMenuBarItem", "AXMenu", "AXMenuItem"})
 _TOPS = frozenset({"AXWindow", "AXSheet", "AXApplication"})
 # Calculator on macOS 27 posted AXMenuItemSelected for a key equivalent and
 # not for a pick made by clicking, so picks are read from the click itself.
 _NOTICES = ("AXMenuOpened", "AXMenuClosed", "AXFocusedUIElementChanged")
+_BEHIND = ("the watch fell behind the person's clicks and keys, so it could not tell for sure what "
+           "each one went to; do the task again a little slower")
 
 _Verb = Literal["press", "focus", "select", "key", "type", "menu", "secret"]
-_Kind = Literal["press", "focus", "select", "item", "menu"]
+_Kind = Literal["press", "focus", "select", "item", "menu", "adjust"]
 _Stop = Literal["hotkey", "timeout", "stop"]
 # The bindings hand over accessibility elements and events as opaque
 # Core Foundation objects, read only through ApplicationServices calls.
@@ -106,12 +115,19 @@ class _Seen:
     anchor: _Locator | None
     after: _Locator | None = None
 
+    def check(self, following: _Seen) -> Postcondition | None:
+        """What to check once this is done: before typing, that the field
+        typed into has keyboard focus; else what ``following`` went to."""
+        if following.verb == "type" and following.target is not None:
+            return _focused(following.target)
+        return None if self.after is None else Present(**self.after.query())
+
     def step(self, expect: Postcondition | None, at: str) -> _Step:
         match self.verb, self.target:
             case "secret", _Locator() as target:
                 return _Secret(target)
-            case "type", None:
-                return _Type(self.text, expect)
+            case "type", _Locator() as target:
+                return _Type(self.text, _focused(target))
             case "focus", _Locator() as target:
                 return _Set(target, True, "AXFocused", expect)
             case "select", _Locator() as target:
@@ -164,6 +180,10 @@ def _point(event: _Event) -> tuple[float, float]:
     return float(location.x), float(location.y)
 
 
+def _focused(target: _Locator) -> Equals:
+    return Equals(**target.query(), attribute="AXFocused", value=True)
+
+
 def _secure_input_holder() -> int | None:
     holder = (AS.CGSessionCopyCurrentDictionary() or {}).get(_SECURE_INPUT)
     return None if holder is None else int(holder)
@@ -190,15 +210,21 @@ class _Watcher:
         self._finder: MacOS | None = None
         self._tap: Any = None
         self._down: tuple[float, float, _Seen | None] | None = None
+        self._read_at = 0
+        self._stop_at = 0
         self._typed_into: Any = None
         self._menus_open = 0
         self._closing = False
         self._callbacks: tuple[Callable[..., Any], ...] = ()
 
-    def stop(self, reason: _Stop) -> None:
+    def stop(self, reason: _Stop, at: int | None = None) -> None:
+        """End the watch after the person's input up to ``at``, an event's
+        timestamp, or else up to now."""
         with self._lock:
             if not self._stopping.is_set():
                 self.stopped_by = reason
+                # Quartz stamps events in nanoseconds of the clock monotonic_ns reads.
+                self._stop_at = time.monotonic_ns() if at is None else at
                 self._stopping.set()
 
     def _fail(self, message: str) -> None:
@@ -224,7 +250,8 @@ class _Watcher:
 
     def _watch(self) -> None:
         def on_event(proxy: object, kind: int, event: _Event, refcon: object) -> _Event:
-            if not self._stopping.is_set():
+            if self.error is None and (not self._stopping.is_set()
+                                       or AS.CGEventGetTimestamp(event) <= self._stop_at):
                 self._event(kind, event)
             return event
 
@@ -275,6 +302,12 @@ class _Watcher:
                     AS.CFRunLoopRunInMode(_MODE, _TURN_S, False)
                     if not self._stopping.is_set():
                         self._check_secure_input()
+            # The tap's queue may still hold the person's input from before the stop.
+            with objc.autorelease_pool():
+                while AS.CFRunLoopRunInMode(_MODE, 0, True) == AS.kCFRunLoopRunHandledSource:
+                    pass
+            if self._down is not None:
+                self._fail("the watch ended before a click finished")
         finally:
             AS.CGEventTapEnable(tap, False)
             for notice in _NOTICES:
@@ -321,16 +354,25 @@ class _Watcher:
                 last.after = last.anchor
         self.seen.append(_Seen(verb, target, text, anchor))
 
+    def _late(self, event: _Event) -> bool:
+        """Whether ``event`` came before the watch's last read of the app,
+        which may then have shown what ``event`` did: the watch is behind."""
+        return AS.CGEventGetTimestamp(event) < self._read_at
+
     def _mouse_down(self, event: _Event) -> None:
-        x, y = _point(event)
         self._down = None
+        if self._late(event):
+            self._fail(_BEHIND)
+            return
+        x, y = _point(event)
         menu_open = self._menu_open()
         self._closing = False
         element = self._hit(x, y)
+        found = None if element is None else self._control(element)
+        self._read_at = time.monotonic_ns()
         if element is None:
             self._skip("click", "outside the app")
             return
-        found = self._control(element)
         if found is None:
             self._skip("click", "closed the open menu" if menu_open else "no control under the pointer")
             return
@@ -341,12 +383,17 @@ class _Watcher:
         if menu_open and kind != "item":
             self._skip("click", "closed the open menu")
             return
+        if kind == "adjust":
+            self._fail(f"a {MacOS._copy_attribute(control, 'AXRole')} set by clicking or dragging, "
+                       "which a route cannot replay")
+            return
         if AS.CGEventGetFlags(event) & (AS.kCGEventFlagMaskCommand | AS.kCGEventFlagMaskControl
                                         | AS.kCGEventFlagMaskAlternate | AS.kCGEventFlagMaskShift):
             self._fail("a click while holding modifier keys, which a route cannot replay")
             return
         clicks = AS.CGEventGetIntegerValueField(event, AS.kCGMouseEventClickState)
         if clicks > 1 and kind == "focus":
+            self._fail("a double click in a text field selects text, which a route cannot repeat")
             return
         if clicks > 1 and kind == "select":
             self._fail("a double click on a row, which a route cannot replay")
@@ -362,7 +409,9 @@ class _Watcher:
         target = self._locate(control)
         if target is None:
             role = MacOS._copy_attribute(control, "AXRole")
-            self._fail(f"the {role} clicked has no unique title, description or identifier")
+            self._fail(f"the {role} clicked has no unique title, description or identifier, or it "
+                       "changed before the watch could read one; if clicking changes it, click a "
+                       "little slower")
             return
         if kind != "focus":
             self._down = (x, y, _Seen("select" if kind == "select" else "press", target, "", target))
@@ -373,12 +422,18 @@ class _Watcher:
         last = self.seen[-1] if self.seen else None
         if last is None or last.verb != "focus" or last.target != target:
             self._act("focus", target=target, anchor=target)
+        self._down = (x, y, _Seen("focus", target, "", target))
 
     def _mouse_up(self, event: _Event) -> None:
         if self._down is None:
             return
         x, y, seen = self._down
         self._down = None
+        # A menu bar title opens its menu on the press, so its release
+        # changes nothing the press read.
+        if seen is not None and self._late(event):
+            self._fail(_BEHIND)
+            return
         dragged = math.dist((x, y), _point(event)) > _CLICK_SLOP
         if seen is None or seen.verb == "menu" or (seen.target is not None and seen.target.role == "AXMenuItem"):
             if dragged:
@@ -390,36 +445,47 @@ class _Watcher:
             return
         if dragged and seen.verb == "select":
             self._fail("a drag across rows, which a route cannot replay")
+        elif dragged and seen.verb == "focus":
+            self._fail("a drag in a text field selects text, which a route cannot repeat")
         elif dragged:
             self._skip("click", "a drag, not a click")
-        else:
+        elif seen.verb != "focus":
             self._act(seen.verb, target=seen.target, anchor=seen.anchor)
 
     def _key(self, event: _Event) -> None:
         keycode = int(AS.CGEventGetIntegerValueField(event, AS.kCGKeyboardEventKeycode))
         flags = int(AS.CGEventGetFlags(event))
         if keycode == _STOP_KEY and flags & _STOP_FLAGS == _STOP_FLAGS:
-            self.stop("hotkey")
+            self.stop("hotkey", AS.CGEventGetTimestamp(event))
             return
         if AS.CGEventGetIntegerValueField(event, AS.kCGEventTargetUnixProcessID) != self._pid:
             return
-        if self._menu_open():
-            if keycode not in _MENU_KEYS:
+        late = self._late(event)
+        menu_open = self._menu_open()
+        error, focused = AS.AXUIElementCopyAttributeValue(self._app, "AXFocusedUIElement", None)
+        self._read_at = time.monotonic_ns()
+        if menu_open:
+            if late:
+                self._fail(_BEHIND)
+            elif keycode not in _MENU_KEYS:
                 self._fail("a key pressed while a menu was open, which the watch cannot read; "
                            "click the menu item instead")
             return
-        error, focused = AS.AXUIElementCopyAttributeValue(self._app, "AXFocusedUIElement", None)
         if error not in (0, AS.kAXErrorNoValue):
             self._fail(f"could not tell which control a key went to (AX error {error})")
             return
         if focused is not None and self._secure(focused):
-            self._secret(focused)
+            if late:
+                self._fail(_BEHIND)
+            else:
+                self._secret(focused)
             return
         held = [name for name, flag in _MODIFIERS if flags & flag]
         typing = self.seen[-1] if self.seen and self.seen[-1].verb == "type" else None
         if (not {"cmd", "ctrl"} & set(held) and focused is not None
                 and MacOS._copy_attribute(focused, "AXRole") in _FIELDS):
-            if keycode == _BACKSPACE and not held and typing is not None and typing.text:
+            if (keycode == _BACKSPACE and not held and typing is not None
+                    and self._typed_into == focused and typing.text):
                 typing.text = typing.text[:-1]
                 if not typing.text:
                     self.seen.pop()
@@ -427,10 +493,16 @@ class _Watcher:
             if keycode not in _EDIT_KEYS:
                 length, chars = AS.CGEventKeyboardGetUnicodeString(event, 16, None, None)
                 text = str(chars[:length]) if chars else ""
-                if text.isprintable():
-                    if text:
-                        self._type(text, focused, typing)
+                if not text:
+                    self._fail("a key typed nothing the watch could read, such as an accent key; "
+                               "a route cannot replay it")
                     return
+                if text.isprintable():
+                    self._type(text, focused, typing)
+                    return
+        if late:
+            self._fail(_BEHIND)
+            return
         name = _KEY_NAMES.get(keycode)
         if name is None:
             self._fail(f"a key the harness cannot press (keycode {keycode})")
@@ -442,8 +514,13 @@ class _Watcher:
                 and len(typing.text) + len(text) <= _MAX_TYPE_CHARS):
             typing.text += text
             return
+        target = self._locate(focused)
+        if target is None:
+            role = MacOS._copy_attribute(focused, "AXRole")
+            self._fail(f"text was typed into a {role} with no unique title, description or identifier")
+            return
         self._typed_into = focused
-        self._act("type", text=text, anchor=self._anchor(focused))
+        self._act("type", target=target, text=text, anchor=target)
 
     def _menu_open(self) -> bool:
         """Whether one of the app's menus is open and not just closing on a
@@ -499,6 +576,8 @@ class _Watcher:
                 return "focus", element
             if role == "AXRow":
                 return "select", element
+            if role in _ADJUSTERS:
+                return "adjust", element
             if role in _TOPS:
                 return None
             error, actions = AS.AXUIElementCopyActionNames(element, None)
@@ -531,8 +610,8 @@ class _Watcher:
         return MacOS._copy_attribute(element, "AXSubrole") == _SECURE_SUBROLE
 
     def _anchor(self, focused: _Element | None) -> _Locator | None:
-        """What a key or typed text went to: the focused control when the
-        route can find it again, else the focused window."""
+        """What a key went to: the focused control when the route can find
+        it again, else the focused window."""
         if focused is not None and (target := self._locate(focused)) is not None:
             return target
         window = MacOS._copy_attribute(self._app, "AXFocusedWindow")
@@ -569,10 +648,9 @@ class _Watcher:
     def steps(self, goal: Postcondition) -> list[_Step]:
         if not self.seen:
             raise _invalid("watch", "saw nothing done in the app")
-        last = len(self.seen) - 1
-        return [seen.step(goal if index == last else (
-                    None if seen.after is None else Present(**seen.after.query())), f"steps[{index}]")
-                for index, seen in enumerate(self.seen)]
+        checks = [seen.check(following) for seen, following in pairwise(self.seen)]
+        return [seen.step(check, f"steps[{index}]")
+                for index, (seen, check) in enumerate(zip(self.seen, [*checks, goal], strict=True))]
 
 
 class RouteWatch:

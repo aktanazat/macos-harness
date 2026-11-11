@@ -37,6 +37,7 @@ from .steps import StepsResult
 if TYPE_CHECKING:
     from .macos import MacOS, SearchMatches
     from .routes import RouteResult
+    from .watch import RouteWatch, WatchResult
 
 # Import the native runtime only when its public exports are requested.
 # Type checkers use the imports above.
@@ -51,6 +52,10 @@ def __getattr__(name: str) -> object:
         from .routes import RouteResult
 
         value = RouteResult
+    elif name in {"RouteWatch", "WatchResult"}:
+        from . import watch
+
+        value = getattr(watch, name)
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = value
@@ -58,7 +63,7 @@ def __getattr__(name: str) -> object:
 
 
 def __dir__() -> list[str]:
-    return sorted(globals().keys() | {"MacOS", "SearchMatches", "RouteResult"})
+    return sorted(globals().keys() | {"MacOS", "SearchMatches", "RouteResult", "RouteWatch", "WatchResult"})
 
 
 __all__ = [
@@ -84,8 +89,10 @@ __all__ = [
     "Present",
     "Receipt",
     "RouteResult",
+    "RouteWatch",
     "SearchMatches",
     "StepsResult",
+    "WatchResult",
     "__version__",
     "canonical_json",
     "canonicalize",

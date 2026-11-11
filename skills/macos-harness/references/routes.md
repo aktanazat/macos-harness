@@ -33,28 +33,35 @@ does. Both return `status` `saved` with `path` and `steps`, or `unsaved` with
 `error`; `skipped` lists ignored clicks. Nothing is saved unless `goal` holds
 at the end.
 
-A click becomes a press, a focus on a text field, or a row select, located by
-role and the first title, description, or identifier that finds exactly that
-control. A click on a menu bar title and then on an item becomes a `menu`
-step, `"View > Scientific"`; a pick in a pop-up button is a press on the
-button and one on the item. Text typed into a text field, text area, or combo
-box becomes a `type` step holding the text verbatim. Every other key, and any
-held with Command or Control, becomes a `key` step, so an app that reads keys
-one at a time, such as Calculator, replays them one at a time. While a secure
-text field has focus nothing typed is kept: the route holds a `secret` step
-naming the field, and replay stops there with status `handoff` and a
-`handoff` to show the person. macOS hides every key from the watch while
-that field has focus, the stop hotkey included, so click outside it first or
-call `watch.stop()`. Each press, key, and menu step checks the control the
-next action went to, or its own control still present; the last checks the
-goal.
+A click becomes a press, a `set` of `AXFocused` on a text field, or a `set`
+of `AXSelected` on a row, located by role and the first title, description,
+or identifier that finds exactly that control. A click on a menu bar title
+and then on an item becomes a `menu` step, `"View > Scientific"`; a pick in a
+pop-up button is a press on the button and one on the item. Text typed into
+a text field, text area, or combo box becomes a `type` step holding the text
+verbatim. It checks that the field has keyboard focus, and so does the step
+before it, so replay stops before typing anywhere else. Every other key, and
+any held with Command or Control, becomes a `key` step, so an app that reads
+keys one at a time, such as Calculator, replays them one at a time. While a
+secure text field has focus nothing typed is kept: the route holds a
+`secret` step naming the field, and replay stops there with status `handoff`
+and a `handoff` to show the person. macOS hides every key from the watch
+while that field has focus, the stop hotkey included, so click outside it
+first or call `watch.stop()`. Each other step checks the control the next
+action went to, or its own control still present; the last checks the goal.
 
 The watch saves nothing on a control it cannot locate, a step it cannot
-check, a right click, a click with modifiers, a double-clicked row, a menu
-item picked by dragging, a key other than Escape or an arrow while a menu is
-open, an unknown key, or secure keyboard entry hiding keys outside a secure
-field. Clicks and keys in other apps are ignored. Watching needs no
-permission beyond Accessibility, which lets macOS show the watch the keys.
+check, a right click, a click with modifiers, a double click or drag in a
+text field, a double-clicked row, a slider or stepper moved with the mouse, a
+menu item picked by dragging, a key other than Escape or an arrow while a
+menu is open, an unknown key, a key that types nothing it can read, such as
+an accent key, a click still under way when the watch ends, or secure
+keyboard entry hiding keys outside a secure field. It also stops when it
+falls behind: a click or key that came before its last read of the app may
+already show in that read, so it asks for the task again, a little slower.
+Clicks and keys in other apps are ignored. Watching needs no permission
+beyond Accessibility, which lets macOS show the watch the keys; if macOS
+still refuses the listener, the error names Input Monitoring.
 
 ## Forms
 
