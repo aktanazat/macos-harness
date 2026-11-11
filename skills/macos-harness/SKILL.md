@@ -5,8 +5,8 @@ description: "Read when a task has to drive a native or Electron macOS app: a wi
 
 # macOS Harness
 
-In OMP, pick the matching `mac_*` tool from the task unasked; Python
-below covers the rest. Never put secrets in tool arguments: `credentials`.
+In OMP, pick the matching `mac_*` tool unasked; Python below covers the
+rest. Never put secrets in tool arguments: `credentials`.
 
 One synchronous call per decision. `mac`, `Path`, `subprocess`, `present`
 and `gone` are preloaded. `-c CODE` runs one line; `run flow.py` a file.
@@ -46,10 +46,10 @@ settled; `see(app, after_change=True)` waits first.
 ## Receipts
 
 For a change, use `mac.do.press/set/fill/type/menu/...`;
-`mac.menus(app, "Edit")` lists a menu. Each returns a `Receipt` or raises
-`OperationError` with `exc.receipt`. `postcondition=` proves the effect;
-`once=` guards an action you cannot repeat. Await the next control in one
-program:
+`mac.menu_search(text, app=)` finds any menu item. Each returns a
+`Receipt` or raises `OperationError` with `exc.receipt`. `postcondition=`
+proves the effect; `once=` guards an action you cannot repeat. Await the
+next control in one program:
 
 ```python
 mac.do.menu("Product > Archive", app="Xcode")

@@ -7,6 +7,17 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `mac.sdef(app)` lists the AppleScript commands, classes, and
+  enumerations an app takes, read from its bundle through OpenScripting
+  without launching it; `macos-harness sdef APP` prints it.
+
+- `mac.menu_index(app)` reads an app's whole menu bar once without
+  opening a menu, kept per bundle ID and version and read again when the
+  app updates; `mac.menu_search(text, app=)` finds an item at any depth,
+  and `mac.do.menu_search(text, app=)` chooses it by its shortcut when the
+  app is in front, else by pressing it. `macos-harness menus APP [TEXT]`
+  prints either.
+
 - `mac.state(app)` prints a window as text, one control a line, as
   `[12] button "All Clear"`. Ids hold across runs for the same agent and
   app launch, and `state[12]` is a match for `click(element=)`,

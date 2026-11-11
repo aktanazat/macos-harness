@@ -1431,6 +1431,10 @@ class _Host(Protocol):
     def _menu_item(
         self, pid: int, steps: Sequence[str | None], *, bar: str
     ) -> dict[str, JSONValue]: ...
+    def _menu_find(
+        self, pid: int, text: str
+    ) -> tuple[dict[str, JSONValue], dict[str, JSONValue]]: ...
+    def _shortcut_types(self, key: str) -> bool: ...
 
 
 # --- receipt construction ---------------------------------------------
@@ -3262,6 +3266,99 @@ class Operations:
             timeout=timeout, postcondition=postcondition, once=once, dry_run=dry_run,
         )
 
+    def menu_search(
+        self,
+        text: str,
+        *,
+        app: str | int,
+        timeout: float = 5.0,
+        postcondition: Postcondition | None = None,
+        once: str | None = None,
+        dry_run: bool = False,
+    ) -> Receipt:
+        """Choose the item of ``app``'s menus that `MacOS.menu_search`
+        ranks first for ``text``, as ``"plain text"``, at any depth: by
+        its keyboard shortcut when it has one, the keyboard layout types
+        it, and ``app`` is in front, the only app AppKit passes menu
+        shortcuts to, else by pressing it through Accessibility as `menu`
+        does. ``target`` names the ``path`` chosen and ``via``,
+        ``"shortcut"`` or ``"press"``. Several items matching equally, a
+        best match that opens a submenu, or a disabled item is refused
+        before anything is sent, as is a shortcut once ``app`` has left
+        the front.
+        """
+        chosen: dict[str, JSONValue] = {}
+        quits = False
+
+        def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
+            nonlocal quits
+            del deadline
+            match, item = host._menu_find(pid, text)
+            if match.get("enabled") is False:
+                raise MacOSError(
+                    "That menu item is disabled, so choosing it would do nothing",
+                    code=ErrorCode.UNSUPPORTED_OP,
+                    details={"parameter": "text"},
+                )
+            quits = _is_quit_item(match)
+            steps = item["steps"]
+            assert isinstance(steps, list)
+            shortcut = item.get("shortcut")
+            front = host._frontmost_app()
+            keyed = (
+                isinstance(shortcut, str) and front is not None and int(front["pid"]) == pid
+                and host._shortcut_types(shortcut)
+            )
+            chosen.update(
+                element_index=match["element_index"],
+                field=host._focused_element(pid, None) if keyed else None,
+                path=" > ".join(str(step) for step in steps),
+                via="shortcut" if keyed else "press",
+            )
+            if keyed:
+                chosen["shortcut"] = shortcut
+            return {key: chosen[key] for key in ("path", "via", "shortcut") if key in chosen}
+
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            if chosen["via"] == "press":
+                element_index = chosen["element_index"]
+                assert isinstance(element_index, int)
+                _perform_guarded(
+                    host, element_index, "AXPress", pid, "mac.do.menu_search", host._frontmost_app()
+                )
+                return
+            shortcut, field = chosen["shortcut"], chosen["field"]
+            assert isinstance(shortcut, str) and (field is None or isinstance(field, int))
+            host._yield_to_person(pid, f"pressing {shortcut} in the app in front")
+            _require_focus(host, pid, field, None, "menu_search")
+            front = host._frontmost_app()
+            if front is None or int(front["pid"]) != pid:
+                raise FocusChangedError(
+                    "The app left the front before its menu shortcut went out, and an app "
+                    "behind takes no menu shortcuts; nothing was sent",
+                    details={
+                        "reason": "focus_moved_before_dispatch", "operation": "menu_search",
+                        "target_pid": pid,
+                    },
+                )
+            deadline.check_dispatch()
+            host.key(shortcut, app=pid)
+
+        def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            if quits and postcondition is None:
+                return self._await_effect(deadline, lambda: host._exited(pid), {"exited": True})
+            return None
+
+        return self._input_verb(
+            op="menu_search", app=app, request={"text": text}, timeout=timeout,
+            postcondition=postcondition, once=once, dry_run=dry_run,
+            prepare=prepare, dispatch=dispatch, settle=settle,
+            executor=Executor.PYTHON, quits=lambda: quits,
+            executor_after_prepare=lambda: (
+                Executor.INPUT if chosen.get("via") == "shortcut" else Executor.PYTHON
+            ),
+        )
+
     def status_item(
         self,
         path: str | None = None,
@@ -3466,6 +3563,7 @@ class Operations:
         executor: Executor = Executor.INPUT,
         quits: Callable[[], bool] | None = None,
         prepare_under_input: bool = False,
+        executor_after_prepare: Callable[[], Executor] | None = None,
     ) -> Receipt:
         """The pipeline every verb aimed at one exact ``app`` shares: the
         input verbs (``key``, ``click``, ``type``, ``fill``) and the menu
@@ -3477,6 +3575,8 @@ class Operations:
         it sent nothing, so it fails with ``acted=NO`` and frees the
         ``once`` token. ``quits`` says, once ``prepare`` has run, whether
         the dispatch is the app's own Quit, whose exit is then its effect.
+        ``executor_after_prepare`` names the executor once ``prepare`` has
+        chosen how to act.
 
         ``prepare`` runs once the app is resolved and before anything is
         reserved or dispatched: it validates what is about to be sent and
@@ -3571,6 +3671,8 @@ class Operations:
                     )
                 )
             builder.quits = quits is not None and quits()
+            if executor_after_prepare is not None:
+                builder.executor = executor_after_prepare()
             if isinstance(extras, Mapping):
                 target.update(extras)
 
