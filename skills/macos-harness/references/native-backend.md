@@ -29,7 +29,10 @@ helper and close their socket or pipe; `close()` is idempotent and also
 cleans up the pointer on the `python` backend. A closed instance raises
 `MacOSError` on further native-routed
 calls instead of relaunching; construct a new `MacOS()` to use `native`/
-`auto` again.
+`auto` again. When an agent stops answering, as a reply that times out or
+an agent that exits, that call raises and nothing it sent is resent; the
+next routed call launches a fresh agent, and `auto` falls back to Python
+only when that launch cannot reach one.
 
 Only `list_apps`, `ax.query`/`ax.query_all`, `ax.press`, and the element
 primitives `ax.get`/`ax.get_attributes`/`ax.set`/`ax.perform` can route to

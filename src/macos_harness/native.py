@@ -365,19 +365,14 @@ class NativeClient:
         successful handshake, with a hook that weakly reaps the owning
         ``AgentSession`` — this module never imports ``agent.py`` or
         knows what the hook actually does, and never reconnects or falls
-        back on its own. Any exception the hook itself raises is
-        swallowed so it can never mask the transport error that
-        triggered it.
+        back on its own. ``_request`` fires it only after releasing
+        ``self._lock``: the hook closes the session, which takes the
+        session's lock and then this one, so firing it under this lock
+        would deadlock against a ``close()`` already in progress. Any
+        exception the hook itself raises is swallowed so it can never
+        mask the transport error that triggered it.
         """
         self._terminal_failure_hook = hook
-
-    def _fail_transport(self) -> None:
-        """Close the socket and, if armed, fire the terminal-failure hook."""
-        self.close()
-        hook = self._terminal_failure_hook
-        if hook is not None:
-            with contextlib.suppress(Exception):
-                hook()
 
     # --- connection lifecycle -------------------------------------------
 
@@ -474,7 +469,17 @@ class NativeClient:
         self._check_owner()
         with self._lock:
             self.connect()
-            return self._dispatch(op, params or {})
+            try:
+                return self._dispatch(op, params or {})
+            except NativeProtocolError as exc:
+                if self._sock is not None:
+                    raise
+                failure = exc
+        hook = self._terminal_failure_hook
+        if hook is not None:
+            with contextlib.suppress(Exception):
+                hook()
+        raise failure
 
     def _dispatch(self, op: str, params: dict[str, Any]) -> dict[str, Any]:
         """Send exactly one request and read exactly one response.
@@ -504,14 +509,14 @@ class NativeClient:
         try:
             self._sock.sendall(frame)
         except TimeoutError as exc:
-            self._fail_transport()
+            self.close()
             raise NativeConnectionError(
                 f"Timed out sending {op!r} to the native agent: {exc}",
                 code=ErrorCode.TIMEOUT,
                 details={"op": op, "phase": "send"},
             ) from exc
         except OSError as exc:
-            self._fail_transport()
+            self.close()
             raise NativeConnectionError(
                 f"Failed sending {op!r} to the native agent: {exc}",
                 code=ErrorCode.AX_ERROR,
@@ -520,17 +525,17 @@ class NativeClient:
         try:
             raw = self._recv_line()
         except NativeProtocolError:
-            self._fail_transport()
+            self.close()
             raise
         except TimeoutError as exc:
-            self._fail_transport()
+            self.close()
             raise NativeConnectionError(
                 f"Timed out reading the {op!r} response: {exc}",
                 code=ErrorCode.TIMEOUT,
                 details={"op": op, "phase": "recv"},
             ) from exc
         except OSError as exc:
-            self._fail_transport()
+            self.close()
             raise NativeConnectionError(
                 f"Failed reading the {op!r} response: {exc}",
                 code=ErrorCode.AX_ERROR,
@@ -551,7 +556,7 @@ class NativeClient:
                 details={"op": op},
             )
         if response.get("id") != request_id:
-            self._fail_transport()
+            self.close()
             raise NativeProtocolError(
                 f"Response id {response.get('id')!r} for {op!r} did not match "
                 f"request id {request_id}; connection desynced",

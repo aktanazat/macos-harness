@@ -276,6 +276,13 @@ follows [Semantic Versioning](https://semver.org/).
   treats the two alike: VS Code 1.146 read 315 to 318 nodes and 136 to
   137 controls with either, once Electron's 2 s delay after the first
   look had passed.
+- A native agent that stops answering no longer breaks its `MacOS`
+  instance: the call whose reply timed out still raises, and the next call
+  launches a fresh agent, or with `backend="auto"` falls back to the
+  Python engine when none can start, where every later call used to fail
+  on the dead connection. Closing a session while one of its requests
+  waits no longer deadlocks: `close()` returns once that request times out.
+  Nothing already sent is resent.
 
 - Public `MacOS`, `mac.ax`, and `mac.do` calls drain temporary Cocoa
   objects before returning, even without an AppKit event loop. Repeated

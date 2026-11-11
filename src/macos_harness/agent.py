@@ -372,11 +372,14 @@ def _reap_session_on_terminal_failure(session_ref: weakref.ref[AgentSession]) ->
     Fired by ``NativeClient`` itself when a request fails at the
     transport level after that handshake -- the one signal that the
     agent process on the other end is genuinely gone or unreachable, not
-    merely that this call site chose to stop talking to it. Reaps the
-    still-live ``AgentSession`` exactly like an explicit ``close()``
-    would (idempotent, safe to run more than once, never reconnecting or
-    falling back); a dead weakref means the session was already closed
-    or collected through the normal path, so there is nothing left to do.
+    merely that this call site chose to stop talking to it -- once that
+    request has released the client's lock, so this takes the session's
+    lock before the client's, in the same order as an explicit
+    ``close()``. Reaps the still-live ``AgentSession`` exactly like an
+    explicit ``close()`` would (idempotent, safe to run more than once,
+    never reconnecting or falling back); a dead weakref means the
+    session was already closed or collected through the normal path, so
+    there is nothing left to do.
     """
     session = session_ref()
     if session is not None:

@@ -7,8 +7,10 @@ protocol over a real inherited socketpair fd, never the Swift toolchain or
 a real ``swift build``), and ``_close_session``'s cleanup escalation (via a
 lightweight ``Popen``-like double, no subprocess needed at all). Routing
 behavior at the ``MacOS`` level (``_acquire_native``, ``close()``, the
-context manager) is covered separately in ``test_native_smoke.py``; raw
-wire-protocol framing is covered in ``test_native_protocol.py``.
+context manager) is covered separately in ``test_native_smoke.py``, except
+replacing a session whose agent stopped answering, which needs the fake
+agent here; raw wire-protocol framing is covered in
+``test_native_protocol.py``.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ import pytest
 
 import macos_harness.agent as agent_module
 import macos_harness.native as native_module
+from macos_harness.errors import ErrorCode
+from macos_harness.macos import MacOS
 
 # --- a tiny, real, controllable fake agent subprocess ----------------------
 #
@@ -35,9 +39,10 @@ import macos_harness.native as native_module
 # test process:
 #
 #   ok         -- answer every request it receives (its own real pid on
-#                 the handshake), looping until the peer closes -- a
-#                 real, well-behaved agent that stays usable for more
-#                 than just the handshake.
+#                 the handshake, itself as the one running app for
+#                 list_apps), looping until the peer closes -- a real,
+#                 well-behaved agent that stays usable for more than just
+#                 the handshake.
 #   wrong_pid  -- answer the handshake with a pid that is deliberately
 #                 not its own; behaves like "ok" for anything after.
 #   malformed  -- answer the handshake with a line that is not valid
@@ -98,6 +103,8 @@ def main():
             "trusted": True,
             "uptime_s": 0.0,
         }
+        if request["op"] == "list_apps":
+            result = {"apps": [{"name": "fake-e2e", "pid": pid}]}
         payload = json.dumps({"id": request["id"], "ok": True, "result": result}) + "\n"
         sock.sendall(payload.encode())
         first = False
@@ -734,6 +741,61 @@ def test_terminal_transport_failure_after_handshake_reaps_session_without_explic
     session.process.wait(timeout=2.0)
     assert session.process.poll() is not None
     assert session.client.connected is False
+
+
+def test_closing_a_session_while_its_request_waits_returns_once_that_request_times_out(
+    launch_with,
+) -> None:
+    """The request that times out reaps its session through the lock a
+    concurrent ``close()`` already holds, so both must still finish, and
+    the request raises its own timeout."""
+    session = launch_with("hang_after_handshake", timeout=5.0)
+    session.client._sock.settimeout(0.5)
+    failures: list[BaseException] = []
+
+    def request() -> None:
+        try:
+            session.client.list_apps()
+        except BaseException as exc:  # noqa: BLE001 - the assertion reads it
+            failures.append(exc)
+
+    caller = threading.Thread(target=request, daemon=True)
+    caller.start()
+    deadline = time.monotonic() + 5.0
+    while session.client._lock.acquire(blocking=False):
+        session.client._lock.release()
+        assert time.monotonic() < deadline, "the request never started"
+    closer = threading.Thread(target=session.close, daemon=True)
+    closer.start()
+    caller.join(timeout=5.0)
+    closer.join(timeout=5.0)
+
+    assert not caller.is_alive(), "the request never returned"
+    assert not closer.is_alive(), "close() never returned"
+    assert isinstance(failures[0], native_module.NativeConnectionError)
+    assert failures[0].code == ErrorCode.TIMEOUT.value
+    assert session.process.poll() is not None
+
+
+def test_macos_answers_from_a_fresh_agent_after_its_agent_stopped_answering(
+    monkeypatch: pytest.MonkeyPatch, fake_agent_script: Path
+) -> None:
+    """The call whose reply timed out raises; the next call launches a new
+    agent instead of failing on the dead connection, and resends nothing."""
+    monkeypatch.setenv(agent_module._AGENT_BIN_ENV, str(fake_agent_script))
+    monkeypatch.setenv("FAKE_AGENT_MODE", "hang_after_handshake")
+    mac = MacOS(backend="native")
+    try:
+        mac._acquire_native()._sock.settimeout(0.3)
+        with pytest.raises(native_module.NativeConnectionError) as timed_out:
+            mac.list_apps()
+        monkeypatch.setenv("FAKE_AGENT_MODE", "ok")
+        apps = mac.list_apps()
+    finally:
+        mac.close()
+
+    assert timed_out.value.code == ErrorCode.TIMEOUT.value
+    assert [app["name"] for app in apps] == ["fake-e2e"]
 
 
 # --- _close_session: cleanup escalation, idempotency, PID scoping ----------

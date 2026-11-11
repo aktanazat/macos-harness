@@ -36,6 +36,7 @@ class _FakeNativeClient:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, Any]] = []
+        self.connected = True
         self.generation = 3
         self._next_handle = 0
         self.apps: list[dict[str, Any]] = [

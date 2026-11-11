@@ -3090,7 +3090,8 @@ class MacOS:
     def _resolved_native_client(self) -> NativeClient | None | _Unresolved:
         """Return the already-resolved client or ``auto`` fallback, or
         ``_UNRESOLVED`` when a fresh ``agent.launch()`` attempt is still
-        needed.
+        needed -- including when the cached client's connection already
+        failed, which ``_acquire_native`` then replaces.
 
         Raises directly for the four states that must never fall through
         to another launch attempt: this call crossed a fork boundary (see
@@ -3104,8 +3105,9 @@ class MacOS:
         again).
         """
         self._check_native_owner()
-        if self._native_client is not None:
-            return self._native_client
+        client = self._native_client
+        if client is not None and client.connected:
+            return client
         if self._native_closed:
             raise MacOSError(
                 "This MacOS instance's close() already tore down its "
@@ -3154,6 +3156,12 @@ class MacOS:
         under that lock in case another thread already resolved (or
         failed) it while this one was waiting.
 
+        A session whose connection failed after its handshake -- a reply
+        that timed out, an agent that exited -- is closed and dropped on
+        the next call, which launches a fresh agent, or under ``auto``
+        falls back when none can start. The call that hit the failure
+        already raised it; nothing it sent is ever retried.
+
         Each ``MacOS`` instance launches — and, via ``close()``, tears
         down — its own private child, never a client shared with any
         other instance or process.
@@ -3178,6 +3186,10 @@ class MacOS:
             resolved = self._resolved_native_client()
             if resolved is not _UNRESOLVED:
                 return resolved
+            dead, self._native_session_box[0] = self._native_session_box[0], None
+            self._native_client = None
+            if dead is not None:
+                dead.close()
             try:
                 session = agent.launch()
             except Exception as exc:
