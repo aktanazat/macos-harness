@@ -30,7 +30,8 @@ fails with `app.exited`.
 1. When identity depends on local context (`my`, `friend`, or prior activity),
    inspect that context and correlate stable fields; a loose text hit is not
    enough.
-2. Use `mac.script()` for a known exact, focus-safe app command.
+2. Use `mac.script()` for a known exact, focus-safe app command;
+   `mac.sdef(app)` lists the commands and classes the app takes.
 3. Otherwise use `mac.see(app)` and vision.
 4. Prefer a known keyboard route; use a verified coordinate for a visible,
    low-risk target.

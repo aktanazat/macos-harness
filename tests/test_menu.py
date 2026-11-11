@@ -299,3 +299,24 @@ def test_menus_lists_a_menus_items_as_do_menu_presses_them() -> None:
     assert mac.menus("Sona", "File > Export")[0]["shortcut"] == "alt+shift+cmd+p"
     mac.do.menu(items[0]["path"], app="Sona")
     assert mac.pressed == [("AXMenuBar", "File > New Note")]
+
+
+class _Searched(_Sona):
+    """Sona whose menus are also read one item at a time, as a search
+    finds an indexed item in the menu bar again."""
+
+    def _menu_entry_at(self, node: object, position: int) -> object | None:
+        entries = self._menu_entries(node)
+        return entries[position] if 0 <= position < len(entries) else None
+
+
+def test_a_search_whose_best_match_opens_a_submenu_presses_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("MACOS_HARNESS_HOME", str(tmp_path))
+    mac = _Searched()
+
+    with pytest.raises(MacOSError, match=r"Sona opens a submenu") as caught:
+        mac.do.menu_search("Sona", app="Sona")
+
+    assert (caught.value.code, mac.pressed) == (ErrorCode.BAD_REQUEST, [])

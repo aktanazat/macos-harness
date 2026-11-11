@@ -377,6 +377,21 @@ def _build_parser() -> argparse.ArgumentParser:
     state.add_argument("--max-depth", type=int, default=25)
     state.add_argument("--max-nodes", type=int, default=400)
     state.add_argument("--include-menu-bar", action="store_true")
+    sdef = subparsers.add_parser(
+        "sdef", parents=[errors],
+        help="print an app's AppleScript dictionary as JSON: its commands and classes",
+    )
+    sdef.add_argument("app", type=_app_query, help="an app name, bundle ID, path, or pid")
+    menus = subparsers.add_parser(
+        "menus", parents=[errors],
+        help="print an app's menu index as JSON, or the items best matching TEXT one per line",
+    )
+    menus.add_argument("app", type=_app_query, help="a running app's name, bundle ID, or pid")
+    menus.add_argument("text", nargs="?", help="only the best matches for this text")
+    menus.add_argument("--limit", type=int, default=10, help="how many matches TEXT returns")
+    menus.add_argument(
+        "--refresh", action="store_true", help="read the menus again instead of the cached index"
+    )
     run = subparsers.add_parser(
         "run",
         parents=[errors],
@@ -561,6 +576,29 @@ def main(argv: list[str] | None = None) -> int:
                     f"--max-depth {args.max_depth}; raise them to read further",
                     file=sys.stderr,
                 )
+            result = 0
+            return result
+        if args.command == "sdef":
+            from .macos import MacOS
+
+            with MacOS(agent_id=args.agent_id) as mac:
+                found = mac.sdef(args.app)
+            print(json.dumps(found, indent=2, ensure_ascii=False))
+            result = 0
+            return result
+        if args.command == "menus":
+            from .macos import MacOS
+
+            with MacOS(agent_id=args.agent_id) as mac:
+                if args.text is None:
+                    print(json.dumps(
+                        mac.menu_index(args.app, refresh=args.refresh), indent=2, ensure_ascii=False
+                    ))
+                else:
+                    for item in mac.menu_search(
+                        args.text, app=args.app, limit=args.limit, refresh=args.refresh
+                    ):
+                        _print_json_line(item, file=sys.stdout)
             result = 0
             return result
         if args.command is None:

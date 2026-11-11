@@ -4850,6 +4850,69 @@ class MacOS:
             items.append(item)
         return items
 
+    def menu_index(self, app: str | int, *, refresh: bool = False) -> dict[str, JSONValue]:
+        """Every item of ``app``'s menu bar, its submenus' too, read through
+        Accessibility with no menu opened, the Apple menu left out. Each
+        has its ``path`` for `do.menu`, ``enabled``, ``shortcut`` when it
+        has one, and ``submenu`` when it opens one.
+
+        The index is kept per bundle ID, version, and build under
+        ``menus/`` in the harness's data folder, readable only by this
+        user, and read again when the app's version changes or with
+        ``refresh``; ``cached`` says which, ``read_at`` when. It holds
+        what the menus showed then, window titles and history included.
+        """
+        self._ensure_accessibility()
+        from .menu_index import read_index
+
+        return read_index(self, app, refresh=refresh).to_json()
+
+    def menu_search(
+        self, text: str, *, app: str | int, limit: int = 10, refresh: bool = False
+    ) -> list[dict[str, JSONValue]]:
+        """The ``limit`` items of ``app``'s menus that best match ``text``,
+        from `menu_index`: an exact title or path first, then a title
+        ``text`` starts, then one holding all its words, then a path that
+        does. Each is found again in the menu bar now and carries its
+        ``enabled`` from there; a cached index that finds nothing, or an
+        item the menus no longer hold, is read again first.
+        `do.menu_search` chooses the best one.
+        """
+        self._ensure_accessibility()
+        from .menu_index import search
+
+        return search(self, app, text, limit=limit, refresh=refresh)
+
+    def _menu_find(
+        self, pid: int, text: str
+    ) -> tuple[dict[str, JSONValue], dict[str, JSONValue]]:
+        from .menu_index import find
+
+        return find(self, pid, text)
+
+    def sdef(self, app: str | int) -> dict[str, JSONValue]:
+        """``app``'s AppleScript dictionary, what `script` can ask of it:
+        its ``commands`` with their ``direct`` parameter, ``parameters``,
+        and ``result``; its ``classes`` with ``properties`` (``access``
+        ``r`` is read-only), ``elements``, and the commands each
+        ``responds_to``; and its ``enumerations``. Read from the app's
+        bundle, installed or running, without launching it; an app with no
+        dictionary raises `unsupported_op`.
+        """
+        from .sdef import dictionary
+
+        if isinstance(app, int):
+            path = self._resolve_app(app)[1]["path"]
+        else:
+            path = str(self._application_url(app).path())
+        if not path:
+            raise MacOSError(
+                f"Process {app} has no app bundle to read a scripting dictionary from",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"app": app},
+            )
+        return dictionary(Path(path))
+
     def notifications(self) -> list[dict[str, JSONValue]]:
         """The banners and alerts Notification Center shows on screen now.
 
@@ -4940,6 +5003,23 @@ class MacOS:
         ):
             return self._menu_entries(children[0])
         return children
+
+    def _menu_entry_at(self, node: object, position: int) -> object | None:
+        """`_menu_entries`'s item ``position`` of ``node``, read alone: a
+        day of Safari's History holds thousands of items, and reading
+        them all took 335 ms where reading one took 1 ms. None when there
+        is no such item."""
+        if node is None or position < 0:
+            return None
+        error, first = AS.AXUIElementCopyAttributeValues(node, "AXChildren", 0, 2, None)
+        if error != _AX_SUCCESS or not first:
+            return None
+        if len(first) == 1 and (
+            self._copy_attributes(first[0], ("AXRole",)).get("AXRole") == "AXMenu"
+        ):
+            return self._menu_entry_at(first[0], position)
+        error, found = AS.AXUIElementCopyAttributeValues(node, "AXChildren", position, 1, None)
+        return found[0] if error == _AX_SUCCESS and found else None
 
     # --- windows and screenshots ----------------------------------------
 
@@ -7661,6 +7741,22 @@ class MacOS:
     @staticmethod
     def _validate_key(key: str) -> None:
         _parse_key(key)
+
+    def _shortcut_types(self, key: str) -> bool:
+        """Whether `key` would press ``key`` as named: it parses, and a
+        one-character key's keycode, a U.S. position, types that character
+        on the keyboard layout in use. On a French layout the keycode of
+        U.S. ``a`` types ``q``, so ``cmd+a`` would arrive as Quit."""
+        try:
+            keycode, _ = _parse_key(key)
+        except MacOSError:
+            return False
+        base = [part for part in re.split(r"[+-]", key) if part][-1].casefold()
+        if len(base) != 1:
+            return True
+        event = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, True)
+        _, typed = AS.CGEventKeyboardGetUnicodeString(event, 4, None, None)
+        return typed.casefold() == base
 
     def key(
         self, key: str, *, app: str | int | None = None, window_id: int | None = None
