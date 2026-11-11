@@ -172,9 +172,10 @@ by exact title or path, then title prefix, then all words in the title,
 then all words in the path, and checks each against the live menu bar;
 `macos-harness menus Safari "tab overview"` does the same.
 `mac.do.menu_search(text, app=)` chooses the one best match by its
-shortcut when the app is in front and has one, else by pressing it;
-several equal matches, a submenu, or a disabled item is refused, and
-`target` names the `path` and `via`.
+shortcut when it has one, the keyboard layout types it, and the app is in
+front, else by pressing it; several equal matches, a best match that opens
+a submenu, or a disabled item is refused, and `target` names the `path`
+and `via`.
 
 `mac.notifications()` lists the banners and alerts Notification Center
 shows: each has the `app` that sent it, its `title`, `subtitle`, and

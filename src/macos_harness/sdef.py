@@ -127,7 +127,7 @@ class _Reader:
         self.enumerations: dict[str, list[JSONValue]] = {}
 
     def read(self, element: ET.Element, base: Path) -> _Reader:
-        if element.tag in ("dictionary", "suite"):
+        if element.tag == "dictionary" or (element.tag == "suite" and _shown(element)):
             for child in element:
                 self.read(child, base)
         elif element.tag in _XINCLUDE:

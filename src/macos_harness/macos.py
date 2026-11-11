@@ -7742,6 +7742,22 @@ class MacOS:
     def _validate_key(key: str) -> None:
         _parse_key(key)
 
+    def _shortcut_types(self, key: str) -> bool:
+        """Whether `key` would press ``key`` as named: it parses, and a
+        one-character key's keycode, a U.S. position, types that character
+        on the keyboard layout in use. On a French layout the keycode of
+        U.S. ``a`` types ``q``, so ``cmd+a`` would arrive as Quit."""
+        try:
+            keycode, _ = _parse_key(key)
+        except MacOSError:
+            return False
+        base = [part for part in re.split(r"[+-]", key) if part][-1].casefold()
+        if len(base) != 1:
+            return True
+        event = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, True)
+        _, typed = AS.CGEventKeyboardGetUnicodeString(event, 4, None, None)
+        return typed.casefold() == base
+
     def key(
         self, key: str, *, app: str | int | None = None, window_id: int | None = None
     ) -> dict[str, JSONValue]:

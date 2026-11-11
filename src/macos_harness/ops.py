@@ -190,16 +190,6 @@ def _is_quit_key(key: str) -> bool:
     return parts[-1:] == ["q"] and len(parts) > 1 and set(parts[:-1]) <= {"cmd", "command", "super"}
 
 
-def _sendable_key(host: _Host, key: str) -> bool:
-    """Whether ``key`` names keys `key` can post, as a menu shortcut on
-    a key with no keycode the harness knows does not."""
-    try:
-        host._validate_key(key)
-    except MacOSError:
-        return False
-    return True
-
-
 def _is_quit_item(match: Mapping[str, JSONValue]) -> bool:
     """Whether a menu item is its app's Quit command: the item on
     Command-Q, or, where it has no shortcut, as in a status item's menu,
@@ -1444,6 +1434,7 @@ class _Host(Protocol):
     def _menu_find(
         self, pid: int, text: str
     ) -> tuple[dict[str, JSONValue], dict[str, JSONValue]]: ...
+    def _shortcut_types(self, key: str) -> bool: ...
 
 
 # --- receipt construction ---------------------------------------------
@@ -3287,12 +3278,14 @@ class Operations:
     ) -> Receipt:
         """Choose the item of ``app``'s menus that `MacOS.menu_search`
         ranks first for ``text``, as ``"plain text"``, at any depth: by
-        its keyboard shortcut when it has one and ``app`` is in front,
-        the only app AppKit passes menu shortcuts to, else by pressing it
-        through Accessibility as `menu` does. ``target`` names the
-        ``path`` chosen and ``via``, ``"shortcut"`` or ``"press"``.
-        Several items matching equally, a submenu, or a disabled item is
-        refused before anything is sent.
+        its keyboard shortcut when it has one, the keyboard layout types
+        it, and ``app`` is in front, the only app AppKit passes menu
+        shortcuts to, else by pressing it through Accessibility as `menu`
+        does. ``target`` names the ``path`` chosen and ``via``,
+        ``"shortcut"`` or ``"press"``. Several items matching equally, a
+        best match that opens a submenu, or a disabled item is refused
+        before anything is sent, as is a shortcut once ``app`` has left
+        the front.
         """
         chosen: dict[str, JSONValue] = {}
         quits = False
@@ -3314,7 +3307,7 @@ class Operations:
             front = host._frontmost_app()
             keyed = (
                 isinstance(shortcut, str) and front is not None and int(front["pid"]) == pid
-                and _sendable_key(host, shortcut)
+                and host._shortcut_types(shortcut)
             )
             chosen.update(
                 element_index=match["element_index"],
@@ -3338,6 +3331,16 @@ class Operations:
             assert isinstance(shortcut, str) and (field is None or isinstance(field, int))
             host._yield_to_person(pid, f"pressing {shortcut} in the app in front")
             _require_focus(host, pid, field, None, "menu_search")
+            front = host._frontmost_app()
+            if front is None or int(front["pid"]) != pid:
+                raise FocusChangedError(
+                    "The app left the front before its menu shortcut went out, and an app "
+                    "behind takes no menu shortcuts; nothing was sent",
+                    details={
+                        "reason": "focus_moved_before_dispatch", "operation": "menu_search",
+                        "target_pid": pid,
+                    },
+                )
             deadline.check_dispatch()
             host.key(shortcut, app=pid)
 

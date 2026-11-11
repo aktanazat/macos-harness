@@ -266,14 +266,15 @@ def search(
 
 
 def find(host: _MenuHost, pid: int, text: str) -> tuple[dict[str, JSONValue], dict[str, JSONValue]]:
-    """The one item, not a submenu, that best matches ``text`` in ``pid``'s
-    menus, as a search match of its live element and as its index entry.
-    Several equally good matches are refused with their paths; a cached
+    """The one item that best matches ``text`` in ``pid``'s menus, as a
+    search match of its live element and as its index entry. Several
+    equally good matches, or a best match that opens a submenu, are
+    refused, so a weaker match is never chosen in its place; a cached
     index that finds none, or finds one the menus no longer hold, is read
     again."""
     index = read_index(host, pid)
     while True:
-        ranked = [(tier, item) for tier, item in _ranked(index.items, text) if "submenu" not in item]
+        ranked = _ranked(index.items, text)
         best = [item for tier, item in ranked if tier == ranked[0][0]] if ranked else []
         if len(best) > 1:
             paths = [_path(item) for item in best]
@@ -284,6 +285,13 @@ def find(host: _MenuHost, pid: int, text: str) -> tuple[dict[str, JSONValue], di
                 details={"count": len(best), "paths": paths[:_AMBIGUOUS_SHOWN]},
             )
         node = _live(host, pid, best[0]) if best else None
+        if node is not None and "submenu" in best[0]:
+            raise MacOSError(
+                f"{_path(best[0])} opens a submenu; search for the item in it you mean, "
+                "as mac.menus(app, path) lists them",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "text", "path": _path(best[0])},
+            )
         if node is not None:
             return (
                 host._describe_element(
