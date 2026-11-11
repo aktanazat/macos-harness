@@ -71,7 +71,8 @@ their own, as does a call that arrives while another one runs.
 A base is a macOS guest that:
 
 - logs in by itself at boot, so `start` needs no one at the screen;
-- has this harness installed, at the same version as the host, with
+- has this harness installed, at the same version as the host, from a wheel
+  that bundles the native agent, with
   `macos-harness vm install-guest` run once, which starts `macos-harness vm serve`
   from Terminal at each login;
 - has granted Terminal Accessibility and Screen Recording.
@@ -84,11 +85,21 @@ Shut the base down cleanly after setting it up; every clone starts from that
 disk. A change to `vm serve` itself means updating the base; other harness
 changes can run with `--source`.
 
-To rebuild the base after such a change: build a wheel, start a clone of the
-base, write the wheel into the guest with a `--vm` call under its own wheel
-file name and install it there with `uv tool install --offline
---reinstall-package macos-harness` (a guest may not reach PyPI), `vm stop` the
-clone, then `tart clone` it over the base with `--overwrite`.
+To rebuild the base after such a change, run `scripts/build-universal-agent.sh`
+after any test run, since the packaging tests replace and delete its output,
+then `uv build --wheel`, since bare `uv build` leaves the agent out. Check that
+`zipinfo` lists `macos_harness/bin/macos-harness-agent` as `-rwxr-xr-x`: the
+guest has no Swift toolchain, so a wheel without that file leaves every clone
+without the native backend. Start a clone of the base, write the wheel into
+the guest with a `--vm` call under its own wheel file name and install it
+there with `uv tool install --offline --reinstall-package macos-harness
+--python <version>`, the version the tool's `uv-receipt.toml` names (3.12 on
+the current base; a guest may not reach PyPI). Check in the clone that
+`MacOS(backend="native").list_apps()` answers, since `zipinfo` shows the file,
+not a working agent, `vm stop` the clone, then `tart clone` it over the base
+with `--overwrite`. The agent stays in the checkout, where it runs in place of
+a fresh Swift build, and `--source` sends it to guests; delete it before
+changing the Swift code.
 
 ## Requirements and limits
 
