@@ -96,10 +96,12 @@ with repeated keys, clicks, deletion loops, or bulk input.
   list (the click result and `mac.do.click` target carry its `window_id`). A
   point over none of the app's windows raises `bad_request` before anything is
   posted; `clicks` is 1 to 3.
-- `mac.type()` into the frontmost app lands 128 characters in about 30 ms; into
-  an inactive app it sends one character every 10 ms, so long text there costs
-  seconds. `mac.do.type` takes at most 4096 characters; `mac.do.paste` takes
-  any length, 5,000 characters in about 0.4 s, but only into the app in front.
+- `mac.type()` into the frontmost app lands 128 characters in about 30 ms. Into
+  an inactive app, or a focus accessibility names as something other than a
+  text field, text area, or combo box (Calculator's keypad reads one key per
+  event), it sends one character every 10 ms, so long text there costs seconds.
+  `mac.do.type` takes at most 4096 characters; `mac.do.paste` takes any length,
+  5,000 characters in about 0.4 s, but only into the app in front.
 - `mac.do.paste` borrows the user's clipboard: it saves every item and type,
   pastes, and puts them back once the paste shows. It never puts them back
   over something copied in between, and one paste borrows the clipboard at a

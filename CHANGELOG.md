@@ -309,6 +309,17 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `mac.type` and `mac.do.type` send one character per key event, 10 ms
+  apart, to an app in front whose keyboard focus accessibility names as
+  something other than a text field, text area, or combo box, as they do
+  to an app behind: Calculator's keypad reads one key per event, so
+  `mac.do.type("12+34=", app="Calculator")` left "1" on its display in 36
+  of 36 runs in a VM, and now leaves 46 in 12 of 12. Text fields and a
+  focus accessibility cannot name, as in Chrome before its tree is built,
+  still take several characters per event: TextEdit, its find field and
+  font size box, Safari's input, textarea, and contenteditable, and a
+  Chrome input read back exact.
+
 - The native backend ran live on VS Code in a guest and three faults
   surfaced. A search for a role Apple has no search key for, such as
   `role="heading"`, failed on the native backend at the default
