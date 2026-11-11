@@ -1379,6 +1379,7 @@ class _Host(Protocol):
         operation: str,
     ) -> None: ...
     def _yield_to_person(self, pid: int | None, operation: str, *, forward: bool = False) -> None: ...
+    def _checked_input(self, checked: bool) -> contextlib.AbstractContextManager[None]: ...
     def _element(self, element_index: int | Mapping[str, JSONValue]) -> object: ...
     def _element_pid(self, element: int | Mapping[str, JSONValue]) -> int | None: ...
     def _remember_element(self, element: object) -> int: ...
@@ -2039,7 +2040,7 @@ class Operations:
 
         # Serialized against every other mutating call on this one
         # `Operations` instance.
-        with self._dispatch_lock:
+        with self._dispatch_lock, host._checked_input(postcondition is not None):
             if element is not None:
                 assert app is not None
                 return self._finish(self._press_element(
@@ -2432,7 +2433,7 @@ class Operations:
         # Resolve -> precheck -> dispatch -> verify, serialized against
         # every other mutating call on this one `Operations`. `set` takes
         # no `once`, so there is no reservation step here.
-        with self._dispatch_lock:
+        with self._dispatch_lock, host._checked_input(postcondition is not None):
             try:
                 _match, element_index, _app_info, target = self._resolve_target(
                     host,
@@ -2640,7 +2641,7 @@ class Operations:
         # Resolve -> precheck -> dispatch -> verify, serialized against
         # every other mutating call on this one `Operations`. `toggle`
         # takes no `once`, so there is no reservation step here.
-        with self._dispatch_lock:
+        with self._dispatch_lock, host._checked_input(postcondition is not None):
             try:
                 match, element_index, app_info, target = self._resolve_target(
                     host,
@@ -4006,7 +4007,11 @@ class Operations:
         # serialized against every other mutating call on this one
         # `Operations`, and from the focus reading before dispatch until
         # dispatch returns against input to the app from any other call.
-        with self._dispatch_lock, contextlib.ExitStack() as turn:
+        with (
+            self._dispatch_lock,
+            host._checked_input(postcondition is not None),
+            contextlib.ExitStack() as turn,
+        ):
             try:
                 host._ensure_accessibility()
                 host._ensure_post_events()

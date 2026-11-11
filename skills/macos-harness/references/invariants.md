@@ -69,6 +69,13 @@ with repeated keys, clicks, deletion loops, or bulk input.
   pressed button or a spinner, comes before a slower answer, pass a `settle=`
   longer than the gap, or wait on the answer's text with `by="ax"` or
   `mac.ax.wait`.
+- Every input pictures its window first so those waits have a baseline,
+  except a `mac.do` verb given a `postcondition`: its receipt already proves
+  the change, so it takes no picture. The next `wait_change` or
+  `see(after_change=True)` of that app's windows then measures from when it
+  begins, not from an older picture, and says so with
+  `baseline_reason: "checked_input"` (`wait_change` also with
+  `baseline: "now"`); after a checked input, take a plain `mac.see` to look.
 - Use the cheapest strong end-state check: one screenshot for visible state or
   one exact AX query for semantic state; both only when they prove different
   things.

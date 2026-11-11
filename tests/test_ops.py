@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import gc
 import hashlib
@@ -250,6 +251,10 @@ class FakeHost:
         del pid, operation, forward
         if self.person_error is not None:
             raise self.person_error
+
+    def _checked_input(self, checked: bool) -> contextlib.AbstractContextManager[None]:
+        del checked
+        return contextlib.nullcontext()
 
     def _element(self, element_index: int | Mapping[str, object]) -> object:
         if isinstance(element_index, Mapping):

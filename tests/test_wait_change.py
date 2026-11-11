@@ -17,6 +17,7 @@ from Foundation import NSURL
 from macos_harness.capture import WindowCapture
 from macos_harness.errors import ErrorCode
 from macos_harness.macos import MacOS, MacOSError, _TreeSnapshot
+from macos_harness.receipts import Acted, Present, Receipt, present
 
 _SRGB = Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB)
 # A 400 x 300-point window rendered 2x, as on a Retina display.
@@ -399,6 +400,67 @@ def test_a_key_whose_picture_fails_still_goes_out_and_the_wait_measures_from_now
     result = _outcome(lambda: mac.wait_change("Test", timeout=1.0))
 
     assert (mac.posted, result["baseline"]) == (2, "now")
+
+
+class _Display(_Keypad):
+    """`_Keypad` whose app text reads "5" once asked, standing in for the
+    accessibility read a postcondition makes, with keys `_Button` presses."""
+
+    def ax_wait(self, **query: object) -> dict[str, object]:
+        return {"role": "AXStaticText", "value": "5"}
+
+    def _element_pid(self, element: object) -> int:
+        return 42
+
+
+class _Button:
+    """A keypad key a native client presses, as a `state` id is pressed."""
+
+    def __init__(self, keypad: _Keypad) -> None:
+        self.client = self
+        self.keypad = keypad
+
+    def perform(self, element: object, action: str) -> None:
+        self.keypad.posted += 1
+
+
+def _press(mac: _Display, check: Present | None) -> Receipt:
+    return mac.do.press(element=mac._remember_element(_Button(mac)), app="Test", postcondition=check)
+
+
+def _key(mac: _Display, check: Present | None) -> Receipt:
+    return mac.do.key("5", app="Test", postcondition=check)
+
+
+@pytest.mark.parametrize("act", [_press, _key], ids=["press", "key"])
+@pytest.mark.parametrize(
+    ("check", "pictures"), [(None, 1), (present("5", app="Test"), 0)], ids=["unchecked", "checked"]
+)
+def test_an_input_checked_by_its_postcondition_takes_no_picture_before_it(
+    act: Callable[[_Display, Present | None], Receipt], check: Present | None, pictures: int
+) -> None:
+    """The picture before an input, 40 to 1000ms, is there for a later
+    wait to measure from; a postcondition proves the input's effect from
+    the app's text instead, so a checked input took it for nothing."""
+    mac = _Display()
+
+    receipt = act(mac, check)
+
+    assert (receipt.acted, mac.posted > 0, len(mac.captured_after)) == (Acted.YES, True, pictures)
+
+
+def test_a_wait_after_a_checked_key_measures_from_now_and_says_so(tmp_path: Path) -> None:
+    """The look before the checked key shows the window before it: the
+    wait measured from that look and reported the key's own change as new."""
+    mac = _Display()
+    mac.see("Test", path=tmp_path / "before.png")
+    mac.do.key("5", app="Test", postcondition=present("5", app="Test"))
+
+    result = _outcome(lambda: mac.wait_change("Test", timeout=1.0))
+
+    assert (result["changed"], result["baseline"], result["baseline_reason"]) == (
+        False, "now", "checked_input",
+    )
 
 
 def test_a_blinking_caret_is_no_change() -> None:
