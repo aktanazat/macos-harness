@@ -3403,21 +3403,21 @@ class MacOS:
         requested = tuple(
             dict.fromkeys(("AXRole", *(str(item) for item in attributes)))
         )
-        raw = self._copy_attributes(element, requested)
+        raw, _ = self._read_guarded(element, *_guarded_reads(requested))
         non_finite: list[str] = []
         node: dict[str, Any] = {
             "element_index": element_index,
             "role": self._lenient_json(raw, "AXRole", non_finite),
         }
         for source, target in _AX_NODE_MAPPING.items():
-            if source not in raw:
+            if source not in requested:
                 continue
             value = self._lenient_json(raw, source, non_finite)
             if value not in (None, "", [], {}):
                 node[target] = value
         extra = {
             name: value
-            for name in raw
+            for name in requested
             if name not in _AX_NODE_MAPPING and name != "AXRole"
             for value in (self._lenient_json(raw, name, non_finite),)
             if value not in (None, "", [], {})

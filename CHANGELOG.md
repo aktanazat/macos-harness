@@ -336,6 +336,13 @@ follows [Semantic Versioning](https://semver.org/).
   waits no longer deadlocks: `close()` returns once that request times out.
   Nothing already sent is resent.
 
+- A search asked for values (`attributes` naming `AXValue`) no longer asks
+  a password field it matches for its value. AppKit answered with one
+  bullet per character, which told the password's length. A match's role
+  and subrole are now read first, and its value, length, and selection
+  are skipped when either names `AXSecureTextField`, as a window walk
+  already did.
+
 - A window walk or focus sample treats an element whose role, not only
   its subrole, is `AXSecureTextField` as a password field, and never reads
   its value.
