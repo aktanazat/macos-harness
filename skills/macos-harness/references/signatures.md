@@ -432,6 +432,25 @@ A replay step the person at this Mac kept from sending anything
 `inspect` walks at most 5000 nodes and 25 levels; a larger ask walks the
 cap, and the result's `capped` says what was asked and used.
 
+## App data
+
+```text
+mac.data.find_files(query=None, *, name=None, kind=None, content=None, onlyin=None, limit=1000, timeout=10.0)
+mac.data.file_info(path)
+mac.data.shortcuts()
+mac.data.run_shortcut(name, *, input=None, output=None, output_type=None, timeout=60.0)
+mac.data.read_defaults(domain, key=None, *, current_host=False)
+mac.data.read_plist(path)
+mac.data.query_sqlite(path, sql, params=(), *, immutable=False)
+mac.data.wait_file(path, *, contains=None, since=None, timeout=10.0)
+mac.data.wait_value(read, expected, *, timeout=10.0)
+```
+
+`macos-harness files [QUERY] [--name] [--kind] [--content] [--onlyin DIR]`
+prints one path a line; `macos-harness file-info PATH` prints JSON;
+`macos-harness shortcuts` lists, and `shortcuts NAME [--input F] [--output F]`
+runs one. What each reads, and how to prove a save: `data-first`.
+
 ## Scrolling
 
 `mac.scroll` moves pixels unless `unit="line"`; a negative `delta_y` scrolls

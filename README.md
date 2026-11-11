@@ -371,6 +371,33 @@ reads definitions without observing the app. Results report recorded and current
 on-disk bundle versions; a version difference alone does not reject a run.
 Run receipts remain in session history and are not saved beside the definition.
 
+### App data
+
+`mac.data` reads what an app stored without its window, and never writes it:
+
+```python
+found = mac.data.find_files(kind="com.adobe.pdf", onlyin="~/Downloads")
+info = mac.data.file_info(found["paths"][0])   # where_froms, authors, dates
+mac.data.run_shortcut("Resize Image", input="in.png", output="out.png")
+mac.data.read_defaults("com.apple.finder", "ShowHardDrivesOnDesktop")
+mac.data.query_sqlite(store, "select title from notes where id = ?", [7])
+
+before = time.time()
+mac.do.menu("File > Save", app="TextEdit")
+mac.data.wait_file("~/Documents/note.txt", contains="total: 42", since=before)
+```
+
+`find_files` and `file_info` ask the Spotlight index in-process, in about
+8 ms and 2 ms against 45 ms for `mdfind` and `mdls`. `run_shortcut` runs a
+shortcut as `shortcuts run` does, with no window, a timeout, and the exit
+status and stderr in the result or the error. `read_defaults` goes through
+`defaults export` and raises `unsupported_op` for a sandboxed app's
+settings, which macOS hides in its container; `query_sqlite` opens a store `mode=ro` with
+`query_only`, reading a live store's write-ahead log. `wait_file` and
+`wait_value` poll the file or a reader after a save and raise `timeout` when
+the data never changed, whatever the window says. The CLI has `files`,
+`file-info`, and `shortcuts`.
+
 ### Diagnostics
 
 Use `mac.status(app)` to read process identity and on-disk build metadata without

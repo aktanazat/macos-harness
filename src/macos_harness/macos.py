@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     # `from __future__ import annotations` (above) already makes every
     # annotation in this file a deferred string, so this import never
     # needs to run outside a type checker.
+    from .data import AppData
     from .native import NativeClient, _NativeHandle
     from .routes import Routes
 
@@ -1677,6 +1678,12 @@ class MacOS:
         from .routes import Routes
 
         return Routes(self)
+
+    @cached_property
+    def data(self) -> AppData:
+        from .data import AppData
+
+        return AppData()
 
     # --- permissions and app discovery ---------------------------------
 
