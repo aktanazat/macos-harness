@@ -626,11 +626,14 @@ macos-harness vm create t1 && macos-harness vm start t1
 macos-harness --vm t1 -c 'mac.launch("Calculator"); print(mac.see("Calculator"))'
 macos-harness vm snapshot t1 clean
 macos-harness vm reset t1 --to clean
+macos-harness vm suspend t1      # `vm start t1` resumes it in about 3 s
 macos-harness vm delete t1
 ```
 
 `--vm` runs the same verbs inside the guest, and pictures they save come
-back to this Mac. Preparing the base and the limits are in
+back to this Mac. Snapshots keep the guest's memory, so a reset returns to
+open apps in seconds, and `vm start t1 --source CHECKOUT` runs a harness
+checkout live inside the guest. Preparing the base and the limits are in
 `macos-harness skill vm`.
 
 ## Native backend

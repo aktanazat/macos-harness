@@ -250,7 +250,10 @@ def _run_vm(args: argparse.Namespace) -> int:
     elif action == "create":
         result = vm.create(args.name, base=args.base or vm.DEFAULT_BASE)
     elif action == "start":
-        result = vm.start(args.name, timeout=args.timeout)
+        result = vm.start(args.name, source=args.source, timeout=args.timeout)
+    elif action == "suspend":
+        vm.suspend(args.name)
+        result = {"name": args.name, "state": "suspended"}
     elif action == "stop":
         vm.stop(args.name)
         result = {"name": args.name, "state": "stopped"}
@@ -403,11 +406,24 @@ def _build_parser() -> argparse.ArgumentParser:
     vm_create.add_argument(
         "--from", dest="base", help="the tart VM to clone in place of the prepared base"
     )
-    vm_start = vm_actions.add_parser("start", help="boot a VM without a window")
+    vm_start = vm_actions.add_parser(
+        "start", help="boot a VM without a window, or resume a suspended one"
+    )
     vm_start.add_argument("name")
+    vm_start.add_argument(
+        "--source",
+        type=Path,
+        metavar="CHECKOUT",
+        help="a macos-harness checkout whose code each --vm call sends the guest to run",
+    )
     vm_start.add_argument("--timeout", type=float, default=300.0)
+    vm_actions.add_parser(
+        "suspend", help="save a VM's memory and stop it; `start` resumes it in seconds"
+    ).add_argument("name")
     vm_actions.add_parser("stop", help="shut a VM down").add_argument("name")
-    vm_snapshot = vm_actions.add_parser("snapshot", help="keep a VM's disk under a label")
+    vm_snapshot = vm_actions.add_parser(
+        "snapshot", help="keep a VM, with its memory when running, under a label"
+    )
     vm_snapshot.add_argument("name")
     vm_snapshot.add_argument("label")
     vm_reset = vm_actions.add_parser("reset", help="put a VM back to a snapshot or its base")

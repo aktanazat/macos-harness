@@ -1,16 +1,20 @@
 """Disposable macOS virtual machines, so agent work stays off the host's desktop.
 
-The host clones, starts, snapshots, resets and deletes guests with tart
-(https://github.com/cirruslabs/tart), headless. Inside a guest,
+The host clones, starts, suspends, snapshots, resets and deletes guests with
+tart (https://github.com/cirruslabs/tart), headless. Inside a guest,
 `macos-harness vm serve` runs from the guest's Terminal, which holds the
 guest's Accessibility and Screen Recording grants, and runs each program the
-host forwards with the guest's own harness. Files a forwarded program writes
-to its temporary directory, such as `mac.see` pictures, come back to the host.
+host forwards with the guest's own harness, or with the copy of a host checkout
+the host sends it. Files a forwarded program writes to its temporary directory,
+such as `mac.see` pictures, come back to the host.
 """
 
 from __future__ import annotations
 
 import base64
+import fcntl
+import hashlib
+import io
 import json
 import os
 import plistlib
@@ -22,8 +26,10 @@ import socketserver
 import struct
 import subprocess
 import sys
+import threading
 import time
 import uuid
+import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TypedDict
@@ -31,6 +37,7 @@ from typing import TypedDict
 from ._paths import config_dir
 from ._version import __version__
 from .errors import ErrorCode, MacOSError
+from .spare import ENV as SPARE_ENV
 
 TART_ENV = "MACOS_HARNESS_TART"
 DEFAULT_BASE = "macos-harness-base"
@@ -39,7 +46,12 @@ GUEST_AGENT_LABEL = "com.github.macos-harness.vm-guest"
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}")
 _SNAPSHOT = ".snapshot."
-_RUN_FLAGS = ("--no-graphics", "--no-clipboard", "--no-audio", "--no-usb-accessories")
+_RUN_FLAGS = (
+    "--no-graphics", "--no-clipboard", "--no-audio", "--no-usb-accessories", "--suspendable"
+)
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+_SOURCES_KEPT = 3
+_RELEASE_SECONDS = 30.0
 _FRAME = struct.Struct(">I")
 _LARGEST_FRAME = 1 << 28
 _LARGEST_FILES = 1 << 26
@@ -58,6 +70,12 @@ class Guest(TypedDict):
     name: str
     version: str
     address: str
+    source: str | None
+
+
+class _Record(TypedDict):
+    base: str
+    source: str | None
 
 
 class _Ran(TypedDict):
@@ -114,16 +132,31 @@ def _tart_vms() -> dict[str, str]:
     return {vm["Name"]: vm["State"] for vm in json.loads(_tart("list", "--format", "json"))}
 
 
-def _base(name: str) -> str:
-    """The VM ``name`` was cloned from; refuses a VM `create` did not make."""
+def _tart_folder(name: str) -> Path:
+    return Path(os.environ.get("TART_HOME") or Path.home() / ".tart") / "vms" / name
+
+
+def _record(name: str) -> _Record:
+    """What `create` and `start` noted about ``name``; refuses a VM `create`
+    did not make."""
     _check_name(name, "VM name")
     try:
-        return json.loads((_home(name) / "vm.json").read_text(encoding="utf-8"))["base"]
+        saved = json.loads((_home(name) / "vm.json").read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise MacOSError(
             f"no VM named {name!r} was made with `macos-harness vm create`",
             code=ErrorCode.BAD_REQUEST,
         ) from None
+    return {"base": saved["base"], "source": saved.get("source")}
+
+
+def _save(name: str, record: _Record) -> None:
+    (_home(name) / "vm.json").write_text(json.dumps(record), encoding="utf-8")
+
+
+def _base(name: str) -> str:
+    """The VM ``name`` was cloned from; refuses a VM `create` did not make."""
+    return _record(name)["base"]
 
 
 def _snapshot_name(name: str, label: str) -> str:
@@ -165,7 +198,7 @@ def create(name: str, *, base: str = DEFAULT_BASE) -> VM:
     _refuse_running(base, vms)
     home = _home(name)
     home.mkdir(parents=True)
-    (home / "vm.json").write_text(json.dumps({"base": base}), encoding="utf-8")
+    _save(name, {"base": base, "source": None})
     try:
         _tart("clone", base, name)
     except BaseException:
@@ -174,10 +207,26 @@ def create(name: str, *, base: str = DEFAULT_BASE) -> VM:
     return _describe(name, _tart_vms())
 
 
-def start(name: str, *, timeout: float = 300.0) -> Guest:
-    """Boot ``name`` without a window and return once its guest harness
-    answers: its address and harness version."""
-    _base(name)
+def _checked_source(source: str | os.PathLike[str]) -> str:
+    found = Path(source).expanduser().resolve()
+    if not (found / "src" / "macos_harness" / "__init__.py").is_file():
+        raise MacOSError(
+            f"{found} is not a macos-harness checkout: it has no src/macos_harness",
+            code=ErrorCode.BAD_REQUEST,
+        )
+    return str(found)
+
+
+def start(
+    name: str, *, source: str | os.PathLike[str] | None = None, timeout: float = 300.0
+) -> Guest:
+    """Boot ``name`` without a window, or resume it if suspended, and return
+    once its guest harness answers. With ``source``, a macos-harness checkout
+    on this Mac, every later `run` sends the guest that checkout's code as it
+    stands then, and the guest runs it in place of its installed harness;
+    without it, the guest runs its own."""
+    record = _record(name)
+    record["source"] = _checked_source(source) if source is not None else None
     deadline = time.monotonic() + timeout
     process = None
     if _tart_vms().get(name) != "running":
@@ -190,7 +239,7 @@ def start(name: str, *, timeout: float = 300.0) -> Guest:
     while True:
         try:
             reply = _call(name, {"op": "ping"}, wait=_CONNECT_SECONDS)
-            return {"name": name, "version": str(reply["version"]), "address": str(reply["address"])}
+            break
         except OSError:
             pass
         if process is not None and process.poll() is not None:
@@ -204,51 +253,122 @@ def start(name: str, *, timeout: float = 300.0) -> Guest:
                 code=ErrorCode.TIMEOUT,
             )
         time.sleep(1)
+    if record["source"] is not None and reply.get("sources") is not True:
+        raise MacOSError(
+            f"{name!r} runs a harness too old to take a source; rebuild its base",
+            code=ErrorCode.UNSUPPORTED_OP,
+        )
+    _save(name, record)
+    return {
+        "name": name,
+        "version": str(reply["version"]),
+        "address": str(reply["address"]),
+        "source": record["source"],
+    }
+
+
+def suspend(name: str) -> None:
+    """Save ``name``'s memory to disk and stop it; the next `start` resumes
+    it where it was in a few seconds instead of booting."""
+    _base(name)
+    if _tart_vms().get(name) != "running":
+        raise MacOSError(f"{name!r} is not running", code=ErrorCode.BAD_REQUEST)
+    _tart("suspend", name)
+    _wait_released(name)
+
+
+def _wait_released(name: str) -> None:
+    """Return once the tart process that ran ``name`` let go of its files;
+    tart reports a VM stopped or suspended before it does, and a `tart run`
+    started meanwhile fails to lock them."""
+    deadline = time.monotonic() + _RELEASE_SECONDS
+    while True:
+        with (_tart_folder(name) / "nvram.bin").open("rb") as nvram:
+            try:
+                fcntl.flock(nvram, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                return
+        if time.monotonic() > deadline:
+            raise MacOSError(
+                f"tart still holds {name!r} {_RELEASE_SECONDS:g}s after stopping it",
+                code=ErrorCode.TIMEOUT,
+            )
+        time.sleep(0.1)
 
 
 def stop(name: str) -> None:
     """Power ``name`` off. tart cuts the guest's power instead of shutting
-    macOS down, so the guest flushes its disk first when it can."""
+    macOS down, so the guest flushes its disk first when it can. A suspended
+    VM loses the memory it saved."""
     _base(name)
-    if _tart_vms().get(name) != "running":
+    state = _tart_vms().get(name)
+    if state == "running":
+        try:
+            _call(name, {"op": "sync"}, wait=_SYNC_SECONDS)
+        except (OSError, MacOSError):
+            pass
+    elif state != "suspended":
         return
-    try:
-        _call(name, {"op": "sync"}, wait=_SYNC_SECONDS)
-    except (OSError, MacOSError):
-        pass
     _tart("stop", name)
+    _wait_released(name)
 
 
-def _copy_disk(name: str, source: str, target: str) -> VM:
-    """Clone ``source`` over ``target`` while ``name`` is shut down, then
-    boot ``name`` again if it ran."""
-    vms = _tart_vms()
-    if source != name:
-        _refuse_running(source, vms)
-    running = vms.get(name) == "running"
-    if running:
-        stop(name)
-    _tart("clone", source, target, "--overwrite")
-    if running:
-        start(name)
-    return _describe(name, _tart_vms())
+def _copy_vm(source: str, target: str) -> None:
+    """Make tart VM ``target`` an APFS clone of stopped or suspended VM
+    ``source``, saved memory and network identity included."""
+    origin, copy = _tart_folder(source), _tart_folder(target)
+    files = [str(path) for path in origin.iterdir() if path.is_file()]
+    shutil.rmtree(copy, ignore_errors=True)
+    copy.mkdir(parents=True)
+    done = subprocess.run(
+        ["/bin/cp", "-c", *files, str(copy)], capture_output=True, text=True, check=False
+    )
+    if done.returncode:
+        shutil.rmtree(copy, ignore_errors=True)
+        raise MacOSError(
+            f"copying {source!r} to {target!r} failed: {done.stderr.strip()}",
+            code="vm.tart_failed",
+        )
 
 
 def snapshot(name: str, label: str) -> VM:
-    """Keep ``name``'s disk as snapshot ``label``, replacing one of that
-    label. A running VM shuts down for the copy and boots again."""
-    _base(name)
-    return _copy_disk(name, name, _snapshot_name(name, label))
+    """Keep ``name`` as snapshot ``label``, replacing one of that label. A
+    running VM is suspended for the copy and resumed, so the snapshot keeps
+    its open apps and memory and `reset` returns to them in seconds."""
+    record = _record(name)
+    target = _snapshot_name(name, label)
+    running = _tart_vms().get(name) == "running"
+    if running:
+        suspend(name)
+    _copy_vm(name, target)
+    if running:
+        start(name, source=record["source"])
+    return _describe(name, _tart_vms())
 
 
 def reset(name: str, *, to: str | None = None) -> VM:
     """Put ``name`` back to snapshot ``to``, or to its base when ``to`` is
-    None. A running VM boots again afterward."""
-    base = _base(name)
-    source = _snapshot_name(name, to) if to is not None else base
-    if source not in _tart_vms():
+    None. A VM that was running runs again afterward: from the snapshot's
+    saved memory when it has one, else from a boot."""
+    record = _record(name)
+    origin = _snapshot_name(name, to) if to is not None else record["base"]
+    vms = _tart_vms()
+    if origin not in vms:
         raise MacOSError(f"{name!r} has no snapshot {to!r}", code=ErrorCode.BAD_REQUEST)
-    return _copy_disk(name, source, name)
+    if to is None:
+        _refuse_running(origin, vms)
+    running = vms.get(name) == "running"
+    if vms.get(name) in ("running", "suspended"):
+        _tart("stop", name)
+    if to is None:
+        _tart("clone", origin, name, "--overwrite")
+    else:
+        _copy_vm(origin, name)
+    if running:
+        start(name, source=record["source"])
+    return _describe(name, _tart_vms())
 
 
 def delete(name: str) -> None:
@@ -339,13 +459,22 @@ def run(name: str, argv: Sequence[str], stdin: str | None) -> int:
     directory land under this VM's folder on the host, and the paths it
     printed are rewritten to match; host paths under that folder in
     ``argv`` or ``stdin`` reach the guest as its own."""
-    _base(name)
+    source = _record(name)["source"]
     files = _home(name) / "files"
     files.mkdir(exist_ok=True)
     root = files.resolve()
-    request = {"op": "run", "argv": list(argv), "stdin": stdin, "files": str(root)}
+    request: dict[str, object] = {"op": "run", "argv": list(argv), "stdin": stdin, "files": str(root)}
     try:
-        reply = _ran(name, _call(name, request, wait=None))
+        if source is None:
+            reply = _ran(name, _call(name, request, wait=None))
+        else:
+            package = _package_files(source)
+            request["source"] = _package_digest(package)
+            answer = _call(name, request, wait=None)
+            if answer.get("need_source") is True:
+                request["source_zip"] = _package_zip(package)
+                answer = _call(name, request, wait=None)
+            reply = _ran(name, answer)
     except OSError as exc:
         raise MacOSError(
             f"{name} did not answer ({exc}); is it started? `macos-harness vm start {name}`",
@@ -362,6 +491,29 @@ def run(name: str, argv: Sequence[str], stdin: str | None) -> int:
     sys.stdout.write(reply["stdout"])
     sys.stderr.write(reply["stderr"])
     return reply["exit"]
+
+
+def _package_files(source: str) -> dict[str, Path]:
+    """The files of ``source``'s package, by their path in a zip."""
+    root = Path(source) / "src"
+    return {
+        path.relative_to(root).as_posix(): path
+        for path in sorted((root / "macos_harness").rglob("*"))
+        if path.is_file() and "__pycache__" not in path.parts
+    }
+
+
+def _package_digest(package: Mapping[str, Path]) -> str:
+    stamps = [(name, path.stat().st_mtime_ns, path.stat().st_size) for name, path in package.items()]
+    return hashlib.sha256(repr(stamps).encode()).hexdigest()
+
+
+def _package_zip(package: Mapping[str, Path]) -> str:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, path in package.items():
+            archive.write(path, name)
+    return base64.b64encode(buffer.getvalue()).decode()
 
 
 def _guest_home() -> Path:
@@ -396,7 +548,80 @@ def _gateway() -> str | None:
     return found[1] if found else None
 
 
-def _run_forwarded(request: Mapping[str, object], requests: Path) -> _Ran:
+class _NeedSource(Exception):
+    """The guest lacks the package a run names; the host sends it again."""
+
+
+def _guest_source(request: Mapping[str, object], sources: Path) -> Path | None:
+    """The folder holding the package the host sent for ``request``, None
+    for the installed one; unpacked from ``source_zip`` when new."""
+    digest = request.get("source")
+    if digest is None:
+        return None
+    if not (isinstance(digest, str) and _DIGEST.fullmatch(digest)):
+        raise ValueError("a source is a sha256 digest")
+    folder = sources / digest
+    if folder.is_dir():
+        os.utime(folder)
+        return folder
+    data = request.get("source_zip")
+    if data is None:
+        raise _NeedSource
+    if not isinstance(data, str):
+        raise TypeError("source_zip is base64 text")
+    unpacking = sources / f"{digest}.{uuid.uuid4().hex}"
+    with zipfile.ZipFile(io.BytesIO(base64.b64decode(data))) as archive:
+        archive.extractall(unpacking)
+    try:
+        unpacking.rename(folder)
+    except OSError:
+        shutil.rmtree(unpacking)
+    kept = sorted(
+        (path for path in sources.iterdir() if _DIGEST.fullmatch(path.name)),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in kept[_SOURCES_KEPT:]:
+        shutil.rmtree(stale, ignore_errors=True)
+    return folder
+
+
+class _Warm:
+    """One `macos-harness spare` broker the guest's runs share, one run at a
+    time, so a run skips loading the harness. Its runs share one temporary
+    directory, which a spare fixes when it loads."""
+
+    def __init__(self, requests: Path) -> None:
+        self.lock = threading.Lock()
+        self.folder = requests / "warm"
+        self._broker: subprocess.Popen[bytes] | None = None
+        self._pipes = (-1, -1)
+        self._env: dict[str, str] = {}
+
+    def channel(self, env: Mapping[str, str]) -> tuple[dict[str, str], tuple[int, int]]:
+        """``env`` with the broker's pipes named, and those pipes; a broker
+        that died or loaded other settings is replaced."""
+        broker = self._broker
+        if broker is None or broker.poll() is not None or env != self._env:
+            if broker is not None:
+                broker.kill()
+                broker.wait()
+                for fd in self._pipes:
+                    os.close(fd)
+            replies, its_replies = os.pipe()
+            its_requests, requests = os.pipe()
+            self._broker = subprocess.Popen(
+                [sys.executable, "-m", "macos_harness.cli", "spare"],
+                stdin=its_requests, stdout=its_replies, env=dict(env),
+            )
+            os.close(its_requests)
+            os.close(its_replies)
+            self._pipes = (replies, requests)
+            self._env = dict(env)
+        return {**env, SPARE_ENV: f"{self._pipes[0]},{self._pipes[1]}"}, self._pipes
+
+
+def _run_forwarded(request: Mapping[str, object], requests: Path, warm: _Warm) -> _Ran:
     host_root, argv, stdin = request.get("files"), request.get("argv"), request.get("stdin")
     if not (
         isinstance(host_root, str)
@@ -405,9 +630,36 @@ def _run_forwarded(request: Mapping[str, object], requests: Path) -> _Ran:
         and (stdin is None or isinstance(stdin, str))
     ):
         raise ValueError("a run needs files, argv and stdin")
-    work = requests / uuid.uuid4().hex
-    work.mkdir()
+    env = dict(os.environ)
+    package = _guest_source(request, requests.parent / "sources")
+    if package is not None:
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(package), env.get("PYTHONPATH"))))
+    pipes: tuple[int, ...] = ()
+    shared = warm.lock.acquire(blocking=False)
+    if shared:
+        work = warm.folder
+        env, pipes = warm.channel({**env, "TMPDIR": f"{work}/"})
+    else:
+        work = requests / uuid.uuid4().hex
+        env["TMPDIR"] = f"{work}/"
+    try:
+        work.mkdir(exist_ok=True)
+        return _ran_in(work, requests, host_root, argv, stdin, env, pipes)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        if shared:
+            warm.lock.release()
 
+
+def _ran_in(
+    work: Path,
+    requests: Path,
+    host_root: str,
+    argv: Sequence[str],
+    stdin: str | None,
+    env: Mapping[str, str],
+    pipes: tuple[int, ...],
+) -> _Ran:
     def inward(text: str) -> str:
         return text.replace(host_root, str(requests))
 
@@ -418,8 +670,7 @@ def _run_forwarded(request: Mapping[str, object], requests: Path) -> _Ran:
         [sys.executable, "-m", "macos_harness.cli", *(inward(arg) for arg in argv)],
         input=inward(stdin) if stdin is not None else None,
         stdin=subprocess.DEVNULL if stdin is None else None,
-        capture_output=True, text=True, check=False,
-        env={**os.environ, "TMPDIR": f"{work}/"},
+        capture_output=True, text=True, check=False, env=env, pass_fds=pipes,
     )
     files: dict[str, str] = {}
     left_behind: list[str] = []
@@ -433,7 +684,6 @@ def _run_forwarded(request: Mapping[str, object], requests: Path) -> _Ran:
             continue
         total += size
         files[path.relative_to(requests).as_posix()] = base64.b64encode(path.read_bytes()).decode()
-    shutil.rmtree(work)
     note = (
         f"macos-harness vm: not sent back, past {_LARGEST_FILES >> 20} MiB: {', '.join(left_behind)}\n"
         if left_behind
@@ -453,6 +703,14 @@ def serve(port: int = GUEST_PORT) -> int:
     requests = _guest_home() / "requests"
     shutil.rmtree(requests, ignore_errors=True)
     requests.mkdir(parents=True)
+    (requests.parent / "sources").mkdir(exist_ok=True)
+    warm = _Warm(requests)
+    # A guest left without input sleeps its display within minutes, which
+    # locks the screen and leaves Screen Recording no display to capture.
+    subprocess.Popen(
+        ["/usr/bin/caffeinate", "-d", "-i", "-w", str(os.getpid())],
+        stdin=subprocess.DEVNULL, start_new_session=True,
+    )
 
     class Handler(socketserver.BaseRequestHandler):
         def handle(self) -> None:
@@ -463,12 +721,19 @@ def serve(port: int = GUEST_PORT) -> int:
             reply: Mapping[str, object]
             try:
                 if request.get("op") == "ping":
-                    reply = {"version": __version__, "address": sock.getsockname()[0]}
+                    reply = {
+                        "version": __version__,
+                        "address": sock.getsockname()[0],
+                        "sources": True,
+                    }
                 elif request.get("op") == "sync":
                     os.sync()
                     reply = {"synced": True}
                 elif request.get("op") == "run":
-                    reply = _run_forwarded(request, requests)
+                    try:
+                        reply = _run_forwarded(request, requests, warm)
+                    except _NeedSource:
+                        reply = {"need_source": True}
                 else:
                     reply = {"error": f"unknown op {request.get('op')!r}"}
             except Exception as exc:  # noqa: BLE001

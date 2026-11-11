@@ -56,3 +56,35 @@ def test_run_refuses_a_guest_file_outside_the_vm_folder(tmp_path, monkeypatch, r
     guest.join(timeout=5)
     files = tmp_path / "home" / "vms" / "t1" / "files"
     assert not (files / relative).resolve().exists()
+
+
+def _checkout(root: Path, version: str) -> Path:
+    package = root / "src" / "macos_harness"
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "__init__.py").write_text(f"VERSION = {version!r}\n", encoding="utf-8")
+    return root
+
+
+def _guest_copy(checkout: Path, sources: Path) -> Path:
+    """What a guest holds after the host's two-step send for ``checkout``."""
+    package = vm._package_files(str(checkout))
+    request = {"source": vm._package_digest(package)}
+    with pytest.raises(vm._NeedSource):
+        vm._guest_source(request, sources)
+    folder = vm._guest_source({**request, "source_zip": vm._package_zip(package)}, sources)
+    assert folder is not None
+    assert vm._guest_source(request, sources) == folder
+    return folder
+
+
+def test_a_changed_checkout_reaches_the_guest_as_a_new_copy(tmp_path):
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    checkout = _checkout(tmp_path / "checkout", "one")
+    first = _guest_copy(checkout, sources)
+    _checkout(checkout, "two")
+
+    second = _guest_copy(checkout, sources)
+
+    assert second != first
+    assert "two" in (second / "macos_harness" / "__init__.py").read_text(encoding="utf-8")

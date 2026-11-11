@@ -14,6 +14,13 @@ follows [Semantic Versioning](https://semver.org/).
   to the host. This Mac's screen, pointer, focus, and clipboard stay
   untouched; see `macos-harness skill vm`.
 
+- `macos-harness vm suspend NAME` saves a running guest's memory and stops
+  it; `vm start` resumes it in about 3 s instead of a 60 s boot. A
+  snapshot of a running VM keeps its memory, so `reset --to` returns to
+  the open apps in about 10 s. `vm start NAME --source CHECKOUT` runs a
+  harness checkout from this Mac live in the guest, and the guest keeps a
+  loaded process ready for the next `--vm` call.
+
 - `mac.state(app)` prints a window as text, one control a line, as
   `[12] button "All Clear"`. Ids hold across runs for the same agent and
   app launch, and `state[12]` is a match for `click(element=)`,
