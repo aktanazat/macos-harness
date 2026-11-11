@@ -332,6 +332,18 @@ follows [Semantic Versioning](https://semver.org/).
   executable and every native call failed; the guest now keeps each
   file's mode (a guest's server must be updated to take this).
 
+- `mac.route.watch` no longer saves text the app did not show. A key held
+  down for the accent menu saved every repeat (`cafeeeeeeeeeeeeeee2` for
+  "café"), and Option-E posted with its text left as "e" saved "cafee";
+  both now stop the watch with the reason, as an accent key already did.
+  A password typed right after Tab, before the watch read the app, no
+  longer stops it as fallen behind: keys that find a secure text field
+  are kept as its `secret` step. A late key whose read may still show the
+  field from before a Tab or click stops the watch instead of landing in
+  a `type` step. In a VM, 10 of 10 such watches saved (0 before) and
+  replayed to the handoff, with no password character in any route,
+  result, or log.
+
 - `mac.data.run_shortcut` no longer hangs until its timeout when the
   caller's stdin is an open pipe, as in a driver process: `shortcuts run`
   read that pipe as the shortcut's input, so a missing name took 60 s to

@@ -353,14 +353,14 @@ become press steps, `set` steps on `AXFocused` or `AXSelected`, and menu bar
 picks `menu` steps. Text typed into a text field becomes a `type` step that,
 like the step before it, checks the field has keyboard focus; every other
 key, and any held with Command or Control, becomes a `key` step. While a
-secure text field has focus nothing typed is kept: the route saves a
-`secret` step naming the field, and replay stops there with status
-`handoff`. macOS hides every key from the watch while that field has focus,
-the stop hotkey included. The watch saves nothing when a control has no
-unique label, a step has nothing to check, an input selects text, moves a
-slider, or types an accent, the watch falls behind the person, secure
-keyboard entry hides keys outside a secure field, or the goal does not hold
-at the end. Watching needs no permission beyond Accessibility; if macOS
+secure text field has focus nothing typed is kept, however fast it follows
+Tab: the route saves a `secret` step naming the field, and replay stops
+there with status `handoff`. macOS hides every key from the watch while that
+field has focus, the stop hotkey included. The watch saves nothing when a
+control has no unique label, a step has nothing to check, an input selects
+text, moves a slider, or types an accent, the watch falls behind the person,
+secure keyboard entry hides keys outside a secure field, or the goal does not
+hold at the end. Watching needs no permission beyond Accessibility; if macOS
 still refuses the listener, the error names Input Monitoring.
 
 Replay validates the whole definition before input. For routes without form
