@@ -123,17 +123,22 @@ class _AppIdentity(NamedTuple):
 class _Picture:
     """A window as this process last pictured it, where the next
     `wait_change` of it measures from, ``taken`` at that `_now`.
-    ``first_of`` is the pid whose first window it was then, the one input
-    naming only that app reaches; ``acted`` says an input has reached the
-    window since. ``still`` is two pictures with no input between them,
-    the second taken just before an input since the last `see`: what
-    differs between them changed by itself, like a clock."""
+    ``owner`` is the pid whose window it is, and ``first_of`` the pid
+    whose first window it was then, the one input naming only that app
+    reaches; ``acted`` says an input has reached the window since, and
+    ``checked`` that one checked by its postcondition reached its app
+    without a picture, so the window may have changed since in a way
+    this picture does not show. ``still`` is two pictures with no input
+    between them, the second taken just before an input since the last
+    `see`: what differs between them changed by itself, like a clock."""
 
     window_id: int
     capture: WindowCapture
     taken: float
+    owner: int
     first_of: int | None = None
     acted: bool = False
+    checked: bool = False
     still: tuple[WindowCapture, WindowCapture] | None = None
 
 
@@ -1346,10 +1351,13 @@ class MacOS:
         self._last_capture: _Picture | None = None
         # The same for one window no `see` holds, at most 640 pixels a side.
         self._before_input: _Picture | None = None
-        # Apps whose latest input was checked by its postcondition and so
-        # took no picture first: their next wait measures from when it begins.
+        # Apps whose latest input was checked by its postcondition, taking no
+        # picture: a wait on one of their windows with none held says why
+        # it measures from when it begins.
         self._unpictured: set[int] = set()
-        self._input_checked = False
+        # The thread whose `mac.do` input is checked: its inputs take no
+        # picture, while plain inputs from other threads still do.
+        self._checked_thread: int | None = None
         self._event_source = AS.CGEventSourceCreate(AS.kCGEventSourceStatePrivate)
         if self._event_source is None:
             raise MacOSError(
@@ -5895,8 +5903,7 @@ class MacOS:
             if not reframe:
                 seen = int(window["window_id"])
                 first_of = int(info["pid"]) if window_id is None and window_index == 0 else None
-                self._last_capture = _Picture(seen, captured, self._now(), first_of)
-                self._unpictured.discard(int(info["pid"]))
+                self._last_capture = _Picture(seen, captured, self._now(), int(info["pid"]), first_of)
                 if self._before_input is not None and self._before_input.window_id == seen:
                     self._before_input = None
         self._last_screenshot = screenshot
@@ -6260,17 +6267,18 @@ class MacOS:
                 windows = self._ready_windows(running, info, timeout=_LAUNCH_WINDOW_TIMEOUT)
                 window_id = int(self._indexed_window(windows, window_index)["window_id"])
             pid = int(info["pid"])
-            unpictured = pid in self._unpictured
             picture = self._held_picture(window_id)
+            fresh = picture is not None and picture.checked
+            unpictured = fresh or (picture is None and pid in self._unpictured)
             framed = picture is not None and picture is self._last_capture
             look, baseline, threshold, ignored = self._pixel_looks(
-                window_id, picture, region, framed=framed, fresh=unpictured,
+                window_id, picture, region, framed=framed, fresh=fresh,
             )
             from .capture import changed_area
 
             changed, settled, polls = self._until_settled(
                 look, baseline, lambda before, after: changed_area(before, after) >= threshold,
-                look_now=picture is not None and not unpictured, deadline=deadline, settle=settle,
+                look_now=picture is not None and not fresh, deadline=deadline, settle=settle,
             )
             self._unpictured.discard(pid)
             watched.update(
@@ -6354,6 +6362,7 @@ class MacOS:
             if picture is not None:
                 # The next wait measures from here, not from a change this one saw.
                 picture.capture, picture.taken, picture.acted = captured, self._now(), False
+                picture.checked = False
             return blanked(shrink(captured.image), boxes)
 
         return look, blanked(shrink(first.image), boxes), threshold, round(
@@ -6468,15 +6477,19 @@ class MacOS:
         An input naming only the app skips the window listing when that
         look was of the app's first window. Without Screen Recording, a
         window, or a capture it keeps what it held, and the input goes out
-        regardless. An input inside `_checked_input` takes no picture: it
-        counts as an input to every held picture, and the next wait on
-        ``pid``'s windows measures from when that wait begins."""
+        regardless. An input inside `_checked_input` on its thread takes
+        no picture: every held picture of ``pid``'s windows counts it as an
+        input that may have changed them, and a wait on one measures from
+        when it begins."""
         if pid is None:
             return
-        if self._input_checked:
-            self._pictures_acted()
+        if self._checked_thread == threading.get_ident():
+            for held in (self._last_capture, self._before_input):
+                if held is not None and held.owner == pid:
+                    held.acted = held.checked = True
             self._unpictured.add(pid)
             return
+        self._unpictured.discard(pid)
         try:
             first_of = None
             picture = None
@@ -6499,12 +6512,10 @@ class MacOS:
                 self._ensure_screen_recording()
                 self._before_input = _Picture(window_id, self._window_image(
                     window_id, max_width=_CHANGE_BASELINE_SIZE, max_height=_CHANGE_BASELINE_SIZE
-                ), self._now(), first_of, acted=True)
-                self._unpictured.discard(pid)
+                ), self._now(), pid, first_of, acted=True)
                 return
             if not picture.acted and self._now() - picture.taken < _STILL_GAP_SECONDS:
                 picture.acted = True
-                self._unpictured.discard(pid)
                 return
             earlier = None if picture.acted else picture.capture
             picture.acted = True
@@ -6514,9 +6525,9 @@ class MacOS:
                 size=(picture.capture.width, picture.capture.height),
             )
             picture.taken = self._now()
+            picture.checked = False
             if earlier is not None:
                 picture.still = (earlier, picture.capture)
-            self._unpictured.discard(pid)
         except MacOSError:
             return
 
@@ -6530,10 +6541,9 @@ class MacOS:
         return int(info["pid"])
 
     def _pictures_acted(self) -> None:
-        """Count an activation, a script, or an input that took no picture
-        as an input to every held picture: each can change how any window
-        looks, so two pictures around it no longer show only what changes
-        by itself."""
+        """Count an activation or a script as an input to every held
+        picture: each can change how any window looks, so two pictures
+        around it no longer show only what changes by itself."""
         for picture in (self._last_capture, self._before_input):
             if picture is not None:
                 picture.acted = True
@@ -6543,12 +6553,13 @@ class MacOS:
         """Inputs inside take no picture before them when ``checked``:
         their caller confirms the effect by a postcondition on the app's
         text, so the 40 to 1000ms capture would buy nothing."""
-        outer = self._input_checked
-        self._input_checked = outer or checked
+        outer = self._checked_thread
+        if checked:
+            self._checked_thread = threading.get_ident()
         try:
             yield
         finally:
-            self._input_checked = outer
+            self._checked_thread = outer
 
     def _input_pid(self, app: str | int | None, window_id: int | None, what: str) -> int:
         """The pid pointer input goes to: ``app``'s, else the owner's of

@@ -402,8 +402,9 @@ follows [Semantic Versioning](https://semver.org/).
   unchecked presses are unchanged and still picture first. The next
   `wait_change` or `see(after_change=True)` after a checked input measures
   from when it begins and says `baseline_reason: "checked_input"`.
-  Text-only commands no longer import the capture module or
-  ScreenCaptureKit.
+  `mac.state`, queries and checked inputs no longer import the capture
+  module or ScreenCaptureKit; an unchecked input still does, for its
+  picture.
 
 - The native skill prefers OMP's readable native tools when available,
   selecting them from the task without requiring the owner to name one.

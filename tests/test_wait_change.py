@@ -7,6 +7,7 @@ comparison under test is the one a live window gets."""
 from __future__ import annotations
 
 import math
+import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -461,6 +462,101 @@ def test_a_wait_after_a_checked_key_measures_from_now_and_says_so(tmp_path: Path
     assert (result["changed"], result["baseline"], result["baseline_reason"]) == (
         False, "now", "checked_input",
     )
+
+
+class _Panel(_Display):
+    """`_Display` with a second window, 8, focused, where keys show their
+    result; the first, 7, never changes."""
+
+    def windows(
+        self, app: str | int | None = None, *, all_layers: bool = False
+    ) -> list[dict[str, object]]:
+        panel = {"window_id": 8, "title": "Panel", "on_screen": True, "layer": 0}
+        return [*super().windows(app, all_layers=all_layers), panel]
+
+    def _described_window(self, window_id: int) -> dict[str, object]:
+        listed = next(window for window in self.windows() if window["window_id"] == window_id)
+        return {**listed, "pid": 42, "owner": "Test"}
+
+    def _focused_window_id(self, pid: int) -> int:
+        return 8
+
+    def _window_image(
+        self,
+        window_id: int,
+        *,
+        max_width: int | None,
+        max_height: int | None,
+        size: tuple[int, int] | None = None,
+    ) -> WindowCapture:
+        shot = super()._window_image(window_id, max_width=max_width, max_height=max_height, size=size)
+        if window_id == 8:
+            return shot
+        return WindowCapture(
+            image=_BLANK, width=800, height=600, bounds=_BOUNDS, on_screen=True, captured_at=0.0
+        )
+
+
+def test_a_look_at_another_window_leaves_the_checked_key_s_window_measured_from_now(
+    tmp_path: Path,
+) -> None:
+    """The panel's picture predates the plain key whose result it then
+    showed; after a checked key there and a look at the other window, the
+    wait measured from that picture and reported the plain key's change."""
+    mac = _Panel()
+    mac.key("5", app="Test", window_id=8)
+    mac.do.key("5", app="Test", window_id=8, postcondition=present("5", app="Test"))
+    mac.see("Test", path=tmp_path / "doc.png")
+
+    result = _outcome(lambda: mac.wait_change("Test", window_id=8, timeout=1.0))
+
+    assert (result["changed"], result["baseline"], result["baseline_reason"]) == (
+        False, "now", "checked_input",
+    )
+
+
+def test_a_plain_key_from_another_thread_during_a_checked_press_still_pictures_first() -> None:
+    """The checked press held its flag on the shared `MacOS` while it
+    verified, so a plain key another thread sent then took no picture and
+    its wait missed the change."""
+    verifying, verified = threading.Event(), threading.Event()
+
+    class _Slow(_Display):
+        """`_Display` whose press shows a dot and whose key the result,
+        and whose text read waits until the key went out."""
+
+        def ax_wait(self, **query: object) -> dict[str, object]:
+            verifying.set()
+            verified.wait(5)
+            return super().ax_wait(**query)
+
+        def _window_image(
+            self,
+            window_id: int,
+            *,
+            max_width: int | None,
+            max_height: int | None,
+            size: tuple[int, int] | None = None,
+        ) -> WindowCapture:
+            self.captured_after.append(self.posted)
+            return WindowCapture(
+                image=(_BLANK, _DOT)[self.posted] if self.posted < 2 else _RESULT,
+                width=800, height=600, bounds=_BOUNDS, on_screen=True, captured_at=0.0,
+            )
+
+    mac = _Slow()
+    press = threading.Thread(target=_press, args=(mac, present("5", app="Test")))
+    press.start()
+    verifying.wait(5)
+    try:
+        mac.key("5", app="Test")
+    finally:
+        verified.set()
+        press.join(5)
+
+    result = _outcome(lambda: mac.wait_change("Test", timeout=1.0))
+
+    assert (mac.captured_after[0], result["changed"], result["baseline"]) == (1, True, "input")
 
 
 def test_a_blinking_caret_is_no_change() -> None:
