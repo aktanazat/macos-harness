@@ -57,7 +57,9 @@ incomplete because some processes do not answer, so give an exact selector one
 app: `mac.ax.press(title="Allow", role="button", app="UserNotificationCenter")`.
 
 Cross-process calls need non-empty text or an exact selector. Default
-attributes exclude `AXValue`; read it with `ax.get` or explicit attributes.
+attributes exclude `AXValue`; read it with `ax.get` or explicit attributes. A
+search never asks a password field (role or subrole `AXSecureTextField`) for its
+value, length, or selection; it reads the role and subrole first.
 
 ## Completeness
 

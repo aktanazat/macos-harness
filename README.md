@@ -567,7 +567,9 @@ remain valid until the next AX snapshot or search.
 
 Cross-process calls require non-empty search text or an exact selector. Default
 result attributes exclude `AXValue`. Reading a value remains a separate, explicit
-`ax.get` call or custom `attributes` choice.
+`ax.get` call or custom `attributes` choice. Even then, a search never asks a
+password field (role or subrole `AXSecureTextField`) for its value, length, or
+selection: it reads the role and subrole first.
 
 `wait` polls its scope until one match appears. Zero matches keep polling until
 `timeout`. Multiple matches fail closed with owner, role, and title details.

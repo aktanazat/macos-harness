@@ -343,6 +343,11 @@ follows [Semantic Versioning](https://semver.org/).
   are skipped when either names `AXSecureTextField`, as a window walk
   already did.
 
+- The native agent follows the same rule: it reads a match's role and
+  subrole before its value, and never requests a password field's value,
+  length, or selection, whether it describes a match or walks a window
+  that lacks the search predicate.
+
 - A window walk or focus sample treats an element whose role, not only
   its subrole, is `AXSecureTextField` as a password field, and never reads
   its value.
