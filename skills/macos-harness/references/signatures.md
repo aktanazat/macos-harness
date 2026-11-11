@@ -330,6 +330,8 @@ mac.do.toggle(desired, *, app=None, all_apps=False, apps=None, role=None, text=N
 mac.do.fill(value, *, app, role="text field", text=None, title=None, identifier=None, description=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.key(key, *, app, window_id=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.type(text, *, app, window_id=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.paste(text=None, *, app, html=None, rtf=None, tsv=None, files=(), window_id=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.open_files(files, *, app, timeout=10.0, postcondition=None, once=None, dry_run=False)
 mac.do.click(x=None, y=None, *, element=None, app, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.menu(path, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.menu_search(text, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
@@ -355,6 +357,12 @@ another element since they were prepared (`focus.changed`, reason
 `focus_moved_before_dispatch`, `acted="no"`). Without a postcondition,
 `do.type` into a plain text field is verified once the field shows the
 typed text, with `observed["input"]["landed"]`.
+
+`do.paste` puts its payload on the clipboard, sends cmd+v as `do.key`
+does, and puts back every item and type the clipboard held once the
+focused element shows the paste; `observed["input"]["pasteboard"]` says
+whether it went back. It needs the app in front. `do.open_files` opens
+files in a running app without activating it.
 
 `do.key`, `do.type`, `do.fill`, `do.click`, `do.press`, and `do.toggle`
 wait for the person in the same way when the app is in front, and
