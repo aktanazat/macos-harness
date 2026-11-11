@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import socket
 import struct
 import threading
@@ -88,6 +89,22 @@ def test_a_changed_checkout_reaches_the_guest_as_a_new_copy(tmp_path):
 
     assert second != first
     assert "two" in (second / "macos_harness" / "__init__.py").read_text(encoding="utf-8")
+
+
+def test_a_bundled_agent_stays_executable_in_the_guest_copy(tmp_path):
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    checkout = _checkout(tmp_path / "checkout", "one")
+    agent = checkout / "src" / "macos_harness" / "bin" / "macos-harness-agent"
+    agent.parent.mkdir()
+    agent.write_text("#!/bin/sh\necho agent\n", encoding="utf-8")
+    agent.chmod(0o755)
+
+    folder = _guest_copy(checkout, sources)
+
+    copied = folder / "macos_harness" / "bin" / "macos-harness-agent"
+    assert os.access(copied, os.X_OK)
+
 
 
 def test_a_picture_from_an_earlier_call_reaches_the_guest_with_its_record(tmp_path):

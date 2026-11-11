@@ -620,7 +620,9 @@ def _guest_source(request: Mapping[str, object], sources: Path) -> Path | None:
         raise TypeError("source_zip is base64 text")
     unpacking = sources / f"{digest}.{uuid.uuid4().hex}"
     with zipfile.ZipFile(io.BytesIO(base64.b64decode(data))) as archive:
-        archive.extractall(unpacking)
+        for member in archive.infolist():
+            # extract() ignores stored modes; the bundled agent must stay executable.
+            Path(archive.extract(member, unpacking)).chmod(member.external_attr >> 16 & 0o777)
     try:
         unpacking.rename(folder)
     except OSError:
