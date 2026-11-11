@@ -460,6 +460,15 @@ def test_application_element_enables_enhanced_ax(monkeypatch) -> None:
     assert writes == []
 
 
+@pytest.mark.parametrize("ships_electron", [True, False])
+def test_ships_electron_reads_the_bundle_around_the_executable(tmp_path: Path, ships_electron: bool) -> None:
+    contents = tmp_path / "Demo.app" / "Contents"
+    (contents / "MacOS").mkdir(parents=True)
+    if ships_electron:
+        (contents / "Frameworks" / "Electron Framework.framework").mkdir(parents=True)
+    assert macos_module._ships_electron(contents / "MacOS" / "Demo") is ships_electron
+
+
 class _Refused(NamedTuple):
     """The AXError an app answers a read with, in place of a value."""
 
