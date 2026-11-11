@@ -392,8 +392,8 @@ mac.data.wait_file("~/Documents/note.txt", contains="total: 42", since=before)
 shortcut as `shortcuts run` does, with no window, a timeout, and the exit
 status and stderr in the result or the error. `read_defaults` goes through
 `defaults export` and raises `unsupported_op` for a sandboxed app's
-settings, which macOS hides in its container; `query_sqlite` opens a store `mode=ro` with
-`query_only`, reading a live store's write-ahead log. `wait_file` and
+settings, which macOS hides in its container; `query_sqlite` opens a store
+`mode=ro`, runs reads only, and reads a live store's write-ahead log. `wait_file` and
 `wait_value` poll the file or a reader after a save and raise `timeout` when
 the data never changed, whatever the window says. The CLI has `files`,
 `file-info`, and `shortcuts`.

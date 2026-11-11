@@ -65,7 +65,8 @@ follows [Semantic Versioning](https://semver.org/).
   and a `timeout` that holds when Spotlight does not answer;
   `shortcuts` and `run_shortcut` with no window, a timeout, and exit
   status and stderr; `read_defaults`, `read_plist`, and `query_sqlite` on
-  a `mode=ro` connection that reads a live store's write-ahead log. A
+  a `mode=ro` connection that runs reads only (a write, `attach` or
+  `vacuum` is refused) and reads a live store's write-ahead log. A
   sandboxed app's settings or a guarded store macOS hides raises
   `unsupported_op` instead of reading as unset. After a GUI save,
   `wait_file` and `wait_value` wait on the stored bytes or value and

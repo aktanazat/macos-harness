@@ -35,8 +35,9 @@ input=path, output=path, timeout=60)` runs one as `shortcuts run` does,
 with no window: input files go in as its input, and its result lands in
 `output` or comes back as `stdout`. The result's `output` is None when
 the shortcut wrote nothing there. A nonzero exit raises with
-`exit_status` and `stderr` in `details`; a run past `timeout` is stopped
-and raises `timeout`. A shortcut can still act on apps and send things:
+`exit_status` and `stderr` in `details`. At `timeout` the `shortcuts`
+command is stopped and the call raises `timeout`; actions the shortcut
+already ran stay done. A shortcut can still act on apps and send things:
 read its actions before running one you did not write.
 
 ## Settings, plists and databases
@@ -46,11 +47,13 @@ read its actions before running one you did not write.
   the global domain.
 - `mac.data.read_plist(path)`: any XML or binary property list.
 - `mac.data.query_sqlite(path, sql, params)`: rows as dicts, from a
-  connection opened `mode=ro` with `query_only`, so a write raises. A
-  store the app has open is read with its write-ahead log, so recent
-  writes count. `immutable=True` skips locks and the log; use it only on
-  a copy or a store nothing is writing, since a live store read that way
-  is missing what the log holds.
+  connection opened `mode=ro` that runs reads only: a write, `attach`,
+  `vacuum` or `pragma` raises "not authorized" (schema is in
+  `sqlite_master`). A store the app has open is read with its write-ahead
+  log, so recent writes count; one the app closed is read without making
+  log files beside it. `immutable=True` skips locks and the log; use it
+  only on a copy or a store nothing is writing, since a live store read
+  that way is missing what the log holds.
 
 A sandboxed app (TextEdit, Notes, most App Store apps) keeps its
 settings and stores in `~/Library/Containers/<bundle id>`, and some

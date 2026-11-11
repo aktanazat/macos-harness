@@ -166,9 +166,9 @@ def _stamp(path: Path | None) -> tuple[int, int] | None:
     return stat.st_mtime_ns, stat.st_size
 
 
-def _gather(predicate: NSPredicate, scopes: list[str], limit: int, stop: threading.Event) -> tuple[list[str], int]:
+def _gather(predicate: NSPredicate, scopes: list[str], count: int, stop: threading.Event) -> tuple[list[str], int]:
     """Run one Spotlight query on this thread's run loop until it has
-    gathered or ``stop`` is set; the first ``limit`` paths and the total."""
+    gathered or ``stop`` is set; the first ``count`` paths and the total."""
     with objc.autorelease_pool():
         search = NSMetadataQuery.alloc().init()
         search.setPredicate_(predicate)
@@ -184,7 +184,7 @@ def _gather(predicate: NSPredicate, scopes: list[str], limit: int, stop: threadi
         total = search.resultCount()
         paths = [
             str(search.resultAtIndex_(index).valueForAttribute_("kMDItemPath"))
-            for index in range(min(total, max(limit, 0)))
+            for index in range(min(total, count))
         ]
         return paths, total
 
@@ -194,6 +194,13 @@ def _settle(future: Future[tuple[list[str], int]], work: Callable[[], tuple[list
         future.set_result(work())
     except (MacOSError, objc.error) as exc:
         future.set_exception(exc)
+
+
+_READS = frozenset({sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE})
+
+
+def _reads_only(action: int, *_: str | None) -> int:
+    return sqlite3.SQLITE_OK if action in _READS else sqlite3.SQLITE_DENY
 
 
 def _domain_args(domain: str, current_host: bool) -> list[str]:
@@ -231,12 +238,13 @@ class AppData:
         if query:
             _predicate(query)
         predicate = _predicate(text)
+        count = max(limit, 0)
         started = time.monotonic()
         stop = threading.Event()
         future: Future[tuple[list[str], int]] = Future()
         threading.Thread(
             target=_settle,
-            args=(future, lambda: _gather(predicate, scopes, limit, stop)),
+            args=(future, lambda: _gather(predicate, scopes, count, stop)),
             name="macos-harness-spotlight",
             daemon=True,
         ).start()
@@ -318,8 +326,9 @@ class AppData:
         several; ``output`` is where its result goes, else it comes back
         as ``stdout``. The result's ``output`` is that path only when the
         run wrote it, else None. A nonzero exit raises with
-        ``exit_status`` and ``stderr`` in its details; one still running
-        at ``timeout`` is stopped and raises ``timeout``."""
+        ``exit_status`` and ``stderr`` in its details; at ``timeout`` the
+        ``shortcuts`` command is stopped and the call raises ``timeout``,
+        though actions the shortcut already ran stay done."""
         if not name:
             raise _bad_request("run_shortcut needs a shortcut name or id")
         inputs = [] if input is None else [input] if isinstance(input, str | Path) else list(input)
@@ -337,7 +346,7 @@ class AppData:
             result = subprocess.run(command, capture_output=True, check=False, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             raise MacOSError(
-                f"Shortcut {name!r} was still running after {timeout:g}s and was stopped",
+                f"Shortcut {name!r} was still running after {timeout:g}s; its shortcuts command was stopped",
                 code=ErrorCode.TIMEOUT,
                 details={"name": name, "timeout": timeout, "stderr": _text(exc.stderr or b"")},
             ) from None
@@ -377,7 +386,7 @@ class AppData:
         values = plistlib.loads(result.stdout)
         container = Path.home() / "Library/Containers" / domain / "Data/Library/Preferences" / f"{domain}.plist"
         if not values and container.exists():
-            raise _hidden(container)
+            _open(container).close()
         return values if key is None else values.get(key)
 
     def read_plist(self, path: str | Path) -> object:
@@ -394,19 +403,23 @@ class AppData:
         immutable: bool = False,
     ) -> list[dict[str, object]]:
         """Rows of one query against an app's SQLite store, opened
-        read-only so nothing can be written. A store an app has open is
-        read with its write-ahead log, as the app sees it.
+        read-only; a statement other than a read (a write, ``attach``,
+        ``vacuum``, ``pragma``) is refused as not authorized. A store an
+        app has open is read with its write-ahead log, as the app sees it;
+        one in that mode with no log beside it (the app closed it) is read
+        as is, so no log files are made beside it.
         ``immutable=True`` skips locks and the log: only for a copy or a
         store no process is writing, since it misses recent writes."""
         resolved = Path(path).expanduser()
         if not resolved.is_file():
             raise _bad_request(f"No database at {str(path)!r}", path=str(path))
-        _open(resolved).close()
+        with _open(resolved) as handle:
+            logged = handle.read(20)[18:20] == b"\x02\x02"
         uri = f"file:{urllib.parse.quote(str(resolved))}?mode=ro"
-        if immutable:
+        if immutable or (logged and not Path(f"{resolved}-wal").exists()):
             uri += "&immutable=1"
         with closing(sqlite3.connect(uri, uri=True)) as connection:
-            connection.execute("PRAGMA query_only = ON")
+            connection.set_authorizer(_reads_only)
             cursor = connection.execute(sql, params)
             columns = [column[0] for column in cursor.description or ()]
             return [dict(zip(columns, row, strict=True)) for row in cursor]
