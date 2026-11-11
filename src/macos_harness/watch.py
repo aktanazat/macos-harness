@@ -8,7 +8,10 @@ nothing typed while a secure text field has focus: the route holds a
 ``secret`` step there instead. Each type step checks that its field has
 keyboard focus, and so does the step before it.
 The watch saves nothing once it falls behind the person, since what it
-reads of the app may then show their later input.
+reads of the app may then show their later input, nor when keys came as
+a secure text field took focus before the app showed it there: an app
+whose accessibility trails its input, such as Chrome, may have put them
+in the password.
 """
 
 from __future__ import annotations
@@ -61,6 +64,7 @@ if TYPE_CHECKING:
 # would hand over the next event while this one is still being read.
 _MODE = "com.github.macos-harness.watch"
 _TURN_S = 0.1
+_SAMPLE_S = 0.01
 # The entry must hold when the watch starts and the goal when it ends; the
 # operations' own default wait covers an app still drawing either.
 _CHECK_S = 5.0
@@ -95,10 +99,21 @@ _TOPS = frozenset({"AXWindow", "AXSheet", "AXApplication"})
 _NOTICES = ("AXMenuOpened", "AXMenuClosed", "AXFocusedUIElementChanged")
 _BEHIND = ("the watch fell behind the person's clicks and keys, so it could not tell for sure what "
            "each one went to; do the task again a little slower")
+_UNSURE_SECRET = ("the app was slow to show which field had focus, so keys typed then may have gone into "
+                  "another field, such as a password field; do the task again and pause a moment after "
+                  "Tab or a click")
 
 _Verb = Literal["press", "focus", "select", "key", "type", "menu", "secret"]
 _Kind = Literal["press", "focus", "select", "item", "menu", "adjust"]
 _Stop = Literal["hotkey", "timeout", "stop"]
+# What the watch saw since the person last moved focus: keys it kept as
+# text, or a secure field taking focus. ``_since_at`` holds when, on the
+# event clock, the person moved focus or the first of those keys came.
+# Keys kept after Tab or Return whose read still showed the field from
+# before it may have gone where it moved focus: ``_unsure`` holds that
+# field and its value at that key, and the person's next move or key in
+# another field must find the value changed.
+_Since = Literal["moved", "typed", "secret"]
 # The bindings hand over accessibility elements and events as opaque
 # Core Foundation objects, read only through ApplicationServices calls.
 _Element: TypeAlias = object
@@ -192,7 +207,8 @@ def _secure_input_holder() -> int | None:
 
 class _Watcher:
     """The tap, the observer and what they saw, all on one thread of their
-    own; the caller reads the results only once that thread has ended."""
+    own, with a second that samples secure keyboard entry; the caller reads
+    the results only once both have ended."""
 
     def __init__(self, pid: int, deadline: _Deadline) -> None:
         self._pid = pid
@@ -214,6 +230,12 @@ class _Watcher:
         self._read_at = 0
         self._stop_at = 0
         self._field: Any = None
+        self._since: _Since = "moved"
+        self._since_at = time.monotonic_ns()
+        self._field_value: object = None
+        self._unsure: tuple[_Element, object] | None = None
+        self._hidden = (0, 0)
+        self._hiding = False
         self._menus_open = 0
         self._closing = False
         self._callbacks: tuple[Callable[..., Any], ...] = ()
@@ -284,6 +306,9 @@ class _Watcher:
         refused = {notice: int(code) for notice in _NOTICES
                    if (code := AS.AXObserverAddNotification(observer, self._app, notice, None)) != 0}
         self._tap = tap
+        done = threading.Event()
+        sampler = threading.Thread(target=self._sample, args=(done,), daemon=True)
+        sampler.start()
         try:
             if refused:
                 self.error = MacOSError("Watching could not observe the app's accessibility notifications",
@@ -307,9 +332,13 @@ class _Watcher:
             with objc.autorelease_pool():
                 while AS.CFRunLoopRunInMode(_MODE, 0, True) == AS.kCFRunLoopRunHandledSource:
                     pass
+            if self._typed_then_hidden(self._stop_at):
+                self._fail(_UNSURE_SECRET)
             if self._down is not None:
                 self._fail("the watch ended before a click finished")
         finally:
+            done.set()
+            sampler.join()
             AS.CGEventTapEnable(tap, False)
             for notice in _NOTICES:
                 AS.AXObserverRemoveNotification(observer, self._app, notice)
@@ -321,6 +350,8 @@ class _Watcher:
         if kind in (AS.kCGEventTapDisabledByTimeout, AS.kCGEventTapDisabledByUserInput):
             AS.CGEventTapEnable(self._tap, True)
             self._fail("macOS paused the event tap, so some of the person's input went unseen")
+        elif self._typed_then_hidden(AS.CGEventGetTimestamp(event)):
+            self._fail(_UNSURE_SECRET)
         elif kind == AS.kCGEventKeyDown:
             self._key(event)
         elif kind == AS.kCGEventRightMouseDown:
@@ -374,6 +405,9 @@ class _Watcher:
         if element is None:
             self._skip("click", "outside the app")
             return
+        if not self._settled():
+            return
+        self._since, self._since_at = "moved", AS.CGEventGetTimestamp(event)
         if found is None:
             self._skip("click", "closed the open menu" if menu_open else "no control under the pointer")
             return
@@ -462,6 +496,7 @@ class _Watcher:
             return
         if AS.CGEventGetIntegerValueField(event, AS.kCGEventTargetUnixProcessID) != self._pid:
             return
+        at = AS.CGEventGetTimestamp(event)
         late = self._late(event)
         menu_open = self._menu_open()
         error, focused = AS.AXUIElementCopyAttributeValue(self._app, "AXFocusedUIElement", None)
@@ -479,13 +514,19 @@ class _Watcher:
         held = [name for name, flag in _MODIFIERS if flags & flag]
         typing = self.seen[-1] if self.seen and self.seen[-1].verb == "type" else None
         if focused is not None and self._secure(focused):
+            moves = _KEY_NAMES.get(keycode) in _FOCUS_KEYS
             # A late key that types and finds a secure field after a step that
             # can move focus went there: a focus change after it came late
-            # too, and stops the watch then.
+            # too, and stops the watch then. Keys kept as text since the
+            # person last moved focus may have gone there as well.
             if late and (typing is not None or keycode in _EDIT_KEYS
                          or {"cmd", "ctrl"} & set(held)):
                 self._fail(_BEHIND)
-            else:
+            elif self._since == "typed" and not moves:
+                self._fail(_UNSURE_SECRET)
+            elif self._settled():
+                if moves:
+                    self._since, self._since_at = "moved", at
                 self._secret(focused)
             return
         if (not {"cmd", "ctrl"} & set(held) and focused is not None
@@ -512,6 +553,20 @@ class _Watcher:
                     if late and self._stale(focused, typing):
                         self._fail(_BEHIND)
                         return
+                    # Focus leaves a secure field unseen only through keys
+                    # macOS hid; without those, the read may predate the field.
+                    if self._since == "secret" and not self._hidden_between(self._since_at, at):
+                        self._fail(_UNSURE_SECRET)
+                        return
+                    if self._since != "typed":
+                        self._since, self._since_at = "typed", at
+                        last = self.seen[-1] if self.seen else None
+                        # Escape mostly closes something and leaves focus be.
+                        if (last is not None and last.verb == "key" and focused == self._field
+                                and last.text.rsplit("+", 1)[-1] in ("tab", "return")):
+                            self._unsure = (focused, self._field_value)
+                    elif self._unsure is not None and focused != self._unsure[0] and not self._settled():
+                        return
                     self._type(text, focused, typing)
                     return
         if late:
@@ -521,7 +576,19 @@ class _Watcher:
         if name is None:
             self._fail(f"a key the harness cannot press (keycode {keycode})")
             return
+        types = keycode not in _EDIT_KEYS and not {"cmd", "ctrl"} & set(held)
+        if types and self._since == "secret" and not self._hidden_between(self._since_at, at):
+            self._fail(_UNSURE_SECRET)
+            return
+        if name in _FOCUS_KEYS and not self._settled():
+            return
         self._act("key", text="+".join([*held, name]), anchor=self._anchor(focused))
+        if name in _FOCUS_KEYS:
+            self._since, self._since_at = "moved", at
+            if self._field is not None:
+                self._field_value = MacOS._copy_attribute(self._field, "AXValue")
+        elif types and self._since != "typed":
+            self._since, self._since_at = "typed", at
 
     def _stale(self, focused: _Element, typing: _Seen | None) -> bool:
         """Whether a late key's read of focus may come from before the app
@@ -579,11 +646,53 @@ class _Watcher:
                 return
         self._fail("macOS secure keyboard entry is on, which hides the person's keys from the watch")
 
+    def _sample(self, done: threading.Event) -> None:
+        """Note when macOS hides keys for this app, on a thread of its own:
+        the watch's thread can spend longer reading the app than the person
+        takes to type a password and leave the field."""
+        while not done.wait(_SAMPLE_S):
+            self._note_hidden()
+
+    def _note_hidden(self) -> None:
+        if _secure_input_holder() != self._pid:
+            self._hiding = False
+            return
+        now = time.monotonic_ns()
+        self._hidden = (self._hidden[0] if self._hiding else now, now)
+        self._hiding = True
+
+    def _hidden_between(self, start: int, end: int) -> bool:
+        """Whether macOS hid keys for this app at some time from ``start``
+        to ``end``, as far as the last stretch of samples that saw it tells."""
+        first, last = self._hidden
+        return first <= end and last >= start
+
+    def _typed_then_hidden(self, before: int) -> bool:
+        """Whether macOS hid keys for this app before ``before`` and after a
+        key kept as text since the person last moved focus: the app may have
+        put a secure field in focus without showing it, and that key in it."""
+        return self._since == "typed" and self._hidden_between(self._since_at, before)
+
+    def _settled(self) -> bool:
+        """Whether keys kept after Tab or Return that still read as the field
+        focus was in went there, as a change in its value shows by the
+        person's next move or key in another field; if not, the watch stops."""
+        if self._unsure is None:
+            return True
+        field, value = self._unsure
+        self._unsure = None
+        if MacOS._copy_attribute(field, "AXValue") == value:
+            self._fail(_UNSURE_SECRET)
+            return False
+        return True
+
     def _secret(self, element: _Element) -> None:
         target = self._locate(element)
         if target is None:
             self._fail("a secure text field with no unique title, description or identifier took focus")
             return
+        if self._since != "typed":
+            self._since = "secret"
         last = self.seen[-1] if self.seen else None
         if last is None or last.verb != "secret" or last.target != target:
             self._act("secret", target=target, anchor=target)

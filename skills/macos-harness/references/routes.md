@@ -61,9 +61,18 @@ keys outside a secure field. It also stops when it falls behind: a click or
 key that came before its last read of the app may already show in that
 read, so it asks for the task again, a little slower. A password typed
 right after Tab or a click, before that read, is still kept as the
-`secret` step. Clicks and keys in other apps are ignored. Watching needs no
-permission beyond Accessibility, which lets macOS show the watch the keys;
-if macOS still refuses the listener, the error names Input Monitoring.
+`secret` step. An app whose accessibility trails its input, such as Chrome,
+can show the field from before Tab or a click while keys already go to a
+password field, so the watch also stops when keys it kept as text since
+the person last moved focus meet a secure field in focus or secure keyboard
+entry coming on. Keys after Tab or Return that still read as the field
+from before it must show in that field's value by the person's next click,
+Tab, Return or key in another field, or the watch stops. The watch also
+stops when a key reads as another field after a secure field took focus
+but before macOS hid keys. Clicks and keys in other apps are ignored.
+Watching needs no permission beyond Accessibility, which lets macOS show
+the watch the keys; if macOS still refuses the listener, the error names
+Input Monitoring.
 
 ## Forms
 

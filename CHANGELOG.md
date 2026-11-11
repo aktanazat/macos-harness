@@ -354,6 +354,21 @@ follows [Semantic Versioning](https://semver.org/).
   VM, 10 of 10 such watches saved (0 before) and replayed to the handoff,
   with no password character in any route, result, or log.
 
+- `mac.route.watch` no longer saves a password as plain text when the app
+  shows focus late. Chrome can still name the field from before Tab or a
+  click while keys already go to the password field, and those keys were
+  saved as a `type` step or one-letter `key` steps. The watch now stops
+  with the reason when keys it kept as text meet a secure field or secure
+  keyboard entry before the person's next move, when a key reads as a
+  plain field right after a secure field took focus, or when keys after
+  Tab or Return that read as the field before it have not shown in that
+  field's value by the person's next step. In a VM, 74 of 180 scripted
+  watches in Chrome saved password characters that way before: 59 where
+  the keys went into the password field, and 15 where the test page
+  itself had put them in the username field. After, the same 180 saved
+  0 and 1, and 72 of the 80 ordinary logins among them still saved (74
+  before).
+
 - `mac.data.run_shortcut` no longer hangs until its timeout when the
   caller's stdin is an open pipe, as in a driver process: `shortcuts run`
   read that pipe as the shortcut's input, so a missing name took 60 s to
