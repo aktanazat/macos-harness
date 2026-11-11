@@ -309,6 +309,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The base rebuild steps in `macos-harness skill vm` now say to build the
+  native agent with `scripts/build-universal-agent.sh` before the wheel.
+  The base had been rebuilt from a wheel without it, and a guest has no
+  Swift toolchain, so in a VM started without `--source`,
+  `backend="native"` failed with `AgentUnavailableError` and `"auto"` fell
+  back to the Python engine. A base rebuilt this way runs the native
+  backend in a fresh clone: Calculator presses read back the same display
+  on both backends, and VS Code's full tree and its Explorer heading read
+  the same as on the Python path.
+
 - `mac.type` and `mac.do.type` send one character per key event, 10 ms
   apart, to an app in front whose keyboard focus accessibility names as
   something other than a text field, text area, or combo box, as they do
