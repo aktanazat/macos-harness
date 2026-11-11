@@ -631,6 +631,27 @@ the system-arrow behavior is unchanged. Each caller still owns its helper:
 closing one leaves the other agents' pointers alone. Nothing moves the
 physical cursor or brings an app forward.
 
+## Disposable VMs
+
+Work that must not touch your desktop can run in a throwaway macOS virtual
+machine, cloned in about a second from a prepared base with
+[tart](https://github.com/cirruslabs/tart) and started without a window:
+
+```bash
+macos-harness vm create t1 && macos-harness vm start t1
+macos-harness --vm t1 -c 'mac.launch("Calculator"); print(mac.see("Calculator"))'
+macos-harness vm snapshot t1 clean
+macos-harness vm reset t1 --to clean
+macos-harness vm suspend t1      # `vm start t1` resumes it in about 3 s
+macos-harness vm delete t1
+```
+
+`--vm` runs the same verbs inside the guest, and pictures they save come
+back to this Mac. Snapshots keep the guest's memory, so a reset returns to
+open apps in seconds, and `vm start t1 --source CHECKOUT` runs a harness
+checkout live inside the guest. Preparing the base and the limits are in
+`macos-harness skill vm`.
+
 ## Native backend
 
 `mac.*` runs entirely in Python by default. A separate, optional Swift agent

@@ -7,6 +7,20 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `macos-harness vm create|start|stop|snapshot|reset|delete|list` runs
+  disposable macOS VMs with tart, headless, cloned from a prepared base,
+  and `--vm NAME` runs `-c`, `run`, `see`, `state`, `apps`, and `doctor`
+  inside one with the same verbs. Pictures a guest program saves come back
+  to the host. This Mac's screen, pointer, focus, and clipboard stay
+  untouched; see `macos-harness skill vm`.
+
+- `macos-harness vm suspend NAME` saves a running guest's memory and stops
+  it; `vm start` resumes it in about 3 s instead of a 60 s boot. A
+  snapshot of a running VM keeps its memory, so `reset --to` returns to
+  the open apps in about 10 s. `vm start NAME --source CHECKOUT` runs a
+  harness checkout from this Mac live in the guest, and the guest keeps a
+  loaded process ready for the next `--vm` call.
+
 - `mac.sdef(app)` lists the AppleScript commands, classes, and
   enumerations an app takes, read from its bundle through OpenScripting
   without launching it; `macos-harness sdef APP` prints it.
