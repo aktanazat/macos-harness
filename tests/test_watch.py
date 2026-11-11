@@ -1,9 +1,15 @@
-"""What a watched route checks between the person's steps."""
+"""What a watched route checks between the person's steps, and what the
+watch keeps of the keys it sees."""
 
 from __future__ import annotations
 
 import json
+import time
 
+import ApplicationServices as AS
+import pytest
+
+from macos_harness.macos import _KEYCODES, MacOS
 from macos_harness.ops import _Deadline
 from macos_harness.receipts import Equals, Present
 from macos_harness.routes import _load_step, _Locator, _step_json
@@ -34,3 +40,129 @@ def test_typed_text_and_the_step_before_it_check_the_field_has_focus_in_the_rout
 
     assert [step.postcondition for step in saved] == [
         _focused(_NAME), _focused(_NAME), _focused(_EMAIL), _focused(_EMAIL), goal]
+
+
+_PID = 41
+_USER = object()
+_MAIL = object()
+_PASSWORD = object()
+_ROLES = {_USER: ("AXTextField", None), _MAIL: ("AXTextField", None),
+          _PASSWORD: ("AXTextField", "AXSecureTextField")}
+_PLACES = {_USER: _Locator("AXTextField", "identifier", "username"),
+           _MAIL: _EMAIL,
+           _PASSWORD: _Locator("AXTextField", "identifier", "password")}
+
+
+class _App:
+    """The app as a key's handling reads it: which field has focus, what
+    kind of field it is, and how a route finds it again."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.focused: object = _USER
+        monkeypatch.setattr(AS, "AXUIElementCopyAttributeValue", lambda element, name, out: (0, self.focused))
+        monkeypatch.setattr(MacOS, "_copy_attribute", staticmethod(
+            lambda element, name, **kwargs: dict(zip(("AXRole", "AXSubrole"), _ROLES[element],
+                                                     strict=True)).get(name)))
+        self.watcher = _Watcher(_PID, _Deadline(1.0, lambda: 0.0))
+        monkeypatch.setattr(self.watcher, "_locate", _PLACES.get)
+
+    def key(self, name: str, text: str, *, late: bool = False, flags: int = 0, repeat: bool = False) -> None:
+        """A key the person typed: ``late`` when it came before the watch's
+        last read of the app."""
+        event = AS.CGEventCreateKeyboardEvent(None, _KEYCODES[name], True)
+        AS.CGEventSetFlags(event, flags)
+        AS.CGEventKeyboardSetUnicodeString(event, len(text), text)
+        AS.CGEventSetIntegerValueField(event, AS.kCGEventTargetUnixProcessID, _PID)
+        AS.CGEventSetIntegerValueField(event, AS.kCGKeyboardEventAutorepeat, int(repeat))
+        AS.CGEventSetTimestamp(event, 1 if late else time.monotonic_ns())
+        self.watcher._key(event)
+
+    def kept(self) -> list[tuple[str, str]]:
+        return [(seen.verb, seen.text) for seen in self.watcher.seen]
+
+
+def _username_then_tab(app: _App) -> None:
+    for letter in "alice":
+        app.key(letter, letter)
+    app.key("tab", "\t")
+
+
+def test_a_password_typed_before_the_watch_read_the_app_after_tab_is_kept_as_the_secret(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _App(monkeypatch)
+    _username_then_tab(app)
+    app.focused = _PASSWORD
+
+    for letter in "zqvw":
+        app.key(letter, letter, late=True)
+
+    assert app.watcher.error is None
+    assert app.kept() == [("type", "alice"), ("key", "tab"), ("secret", "")]
+
+
+def test_a_late_key_whose_read_still_shows_the_field_before_tab_stops_the_watch(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _App(monkeypatch)
+    _username_then_tab(app)
+
+    app.key("z", "z", late=True)
+
+    assert app.watcher.error is not None
+    assert app.kept() == [("type", "alice"), ("key", "tab")]
+
+
+def test_a_late_key_mid_word_that_finds_a_secure_field_stops_the_watch(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _App(monkeypatch)
+    for letter in "alic":
+        app.key(letter, letter)
+    app.focused = _PASSWORD
+
+    app.key("e", "e", late=True)
+
+    assert app.watcher.error is not None
+    assert app.kept() == [("type", "alic")]
+
+
+def test_a_late_key_after_text_typed_and_deleted_past_tab_types_where_tab_went(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _App(monkeypatch)
+    for letter in "alice":
+        app.key(letter, letter)
+    app.focused = _MAIL
+    app.key("tab", "\t")
+    app.key("x", "x")
+    app.key("backspace", "\x7f")
+
+    app.key("y", "y", late=True)
+
+    assert app.watcher.error is None
+    assert app.kept() == [("type", "alice"), ("key", "tab"), ("type", "y")]
+
+
+def test_a_late_key_after_keys_that_only_edit_the_field_types_into_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _App(monkeypatch)
+    for letter in "old":
+        app.key(letter, letter)
+    app.key("a", "a", flags=AS.kCGEventFlagMaskCommand)
+    app.key("backspace", "\x7f")
+
+    app.key("n", "n", late=True)
+
+    assert app.watcher.error is None
+    assert app.kept() == [("type", "old"), ("key", "cmd+a"), ("key", "backspace"), ("type", "n")]
+
+
+@pytest.mark.parametrize("kind", ["option set, plain text", "held until it repeats"])
+def test_a_key_whose_text_is_not_what_the_app_shows_stops_the_watch(
+        monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    app = _App(monkeypatch)
+    for letter in "caf":
+        app.key(letter, letter)
+
+    if kind == "option set, plain text":
+        app.key("e", "e", flags=AS.kCGEventFlagMaskAlternate)
+    else:
+        app.key("e", "e", repeat=True)
+
+    assert app.watcher.error is not None
+    assert app.kept() == [("type", "caf")]

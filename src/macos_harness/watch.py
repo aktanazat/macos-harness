@@ -85,6 +85,7 @@ _EDIT_KEYS = frozenset(_KEYCODES[name] for name in (
 ))
 _BACKSPACE = _KEYCODES["backspace"]
 _MENU_KEYS = frozenset(_KEYCODES[name] for name in ("escape", "left", "right", "up", "down"))
+_FOCUS_KEYS = frozenset({"tab", "return", "escape"})
 _FIELDS = frozenset({"AXTextField", "AXTextArea", "AXComboBox"})
 _ADJUSTERS = frozenset({"AXSlider", "AXIncrementor"})
 _MENU_PARTS = frozenset({"AXMenuBar", "AXMenuBarItem", "AXMenu", "AXMenuItem"})
@@ -212,7 +213,7 @@ class _Watcher:
         self._down: tuple[float, float, _Seen | None] | None = None
         self._read_at = 0
         self._stop_at = 0
-        self._typed_into: Any = None
+        self._field: Any = None
         self._menus_open = 0
         self._closing = False
         self._callbacks: tuple[Callable[..., Any], ...] = ()
@@ -291,7 +292,7 @@ class _Watcher:
             AS.CGEventTapEnable(tap, True)
             self.watching = True
             self.ready.set()
-            focused = MacOS._copy_attribute(self._app, "AXFocusedUIElement")
+            focused = self._field = MacOS._copy_attribute(self._app, "AXFocusedUIElement")
             if focused is not None and self._secure(focused):
                 self._secret(focused)
             while not self._stopping.is_set():
@@ -419,6 +420,7 @@ class _Watcher:
         if self._secure(control):
             self._secret(control)
             return
+        self._field = control
         last = self.seen[-1] if self.seen else None
         if last is None or last.verb != "focus" or last.target != target:
             self._act("focus", target=target, anchor=target)
@@ -474,30 +476,42 @@ class _Watcher:
         if error not in (0, AS.kAXErrorNoValue):
             self._fail(f"could not tell which control a key went to (AX error {error})")
             return
+        held = [name for name, flag in _MODIFIERS if flags & flag]
+        typing = self.seen[-1] if self.seen and self.seen[-1].verb == "type" else None
         if focused is not None and self._secure(focused):
-            if late:
+            # A late key that types and finds a secure field after a step that
+            # can move focus went there: a focus change after it came late
+            # too, and stops the watch then.
+            if late and (typing is not None or keycode in _EDIT_KEYS
+                         or {"cmd", "ctrl"} & set(held)):
                 self._fail(_BEHIND)
             else:
                 self._secret(focused)
             return
-        held = [name for name, flag in _MODIFIERS if flags & flag]
-        typing = self.seen[-1] if self.seen and self.seen[-1].verb == "type" else None
         if (not {"cmd", "ctrl"} & set(held) and focused is not None
                 and MacOS._copy_attribute(focused, "AXRole") in _FIELDS):
             if (keycode == _BACKSPACE and not held and typing is not None
-                    and self._typed_into == focused and typing.text):
+                    and self._field == focused and typing.text):
                 typing.text = typing.text[:-1]
                 if not typing.text:
                     self.seen.pop()
+                    self._field = None
                 return
             if keycode not in _EDIT_KEYS:
                 length, chars = AS.CGEventKeyboardGetUnicodeString(event, 16, None, None)
                 text = str(chars[:length]) if chars else ""
-                if not text:
-                    self._fail("a key typed nothing the watch could read, such as an accent key; "
-                               "a route cannot replay it")
+                # A key with Option set whose text is still the key's own
+                # letter types that letter in some apps and an accent in others.
+                if (not text or ("alt" in held and text.lower() == _KEY_NAMES.get(keycode))
+                        or AS.CGEventGetIntegerValueField(event, AS.kCGKeyboardEventAutorepeat)):
+                    self._fail("a key typed text the watch cannot read, such as an accent key or "
+                               "a key held down until it repeats or opens the accent menu; a "
+                               "route cannot replay it")
                     return
                 if text.isprintable():
+                    if late and self._stale(focused, typing):
+                        self._fail(_BEHIND)
+                        return
                     self._type(text, focused, typing)
                     return
         if late:
@@ -509,8 +523,26 @@ class _Watcher:
             return
         self._act("key", text="+".join([*held, name]), anchor=self._anchor(focused))
 
+    def _stale(self, focused: _Element, typing: _Seen | None) -> bool:
+        """Whether a late key's read of focus may come from before the app
+        took in the person's last step, which may have moved focus into a
+        secure field: the read should show the field a click went to, and
+        not the field the person was in before Tab, a press or the like.
+        ``_field`` is ``None`` once typing there showed where focus went."""
+        if typing is not None or not self.seen:
+            return False
+        last = self.seen[-1]
+        if last.verb == "secret":
+            return True
+        if self._field is None or (last.verb == "key"
+                                   and last.text.rsplit("+", 1)[-1] not in _FOCUS_KEYS):
+            return False
+        if last.verb == "focus":
+            return focused != self._field
+        return focused == self._field
+
     def _type(self, text: str, focused: _Element, typing: _Seen | None) -> None:
-        if (typing is not None and self._typed_into == focused
+        if (typing is not None and self._field == focused
                 and len(typing.text) + len(text) <= _MAX_TYPE_CHARS):
             typing.text += text
             return
@@ -519,7 +551,7 @@ class _Watcher:
             role = MacOS._copy_attribute(focused, "AXRole")
             self._fail(f"text was typed into a {role} with no unique title, description or identifier")
             return
-        self._typed_into = focused
+        self._field = focused
         self._act("type", target=target, text=text, anchor=target)
 
     def _menu_open(self) -> bool:

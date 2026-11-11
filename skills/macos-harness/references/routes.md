@@ -54,14 +54,16 @@ The watch saves nothing on a control it cannot locate, a step it cannot
 check, a right click, a click with modifiers, a double click or drag in a
 text field, a double-clicked row, a slider or stepper moved with the mouse, a
 menu item picked by dragging, a key other than Escape or an arrow while a
-menu is open, an unknown key, a key that types nothing it can read, such as
-an accent key, a click still under way when the watch ends, or secure
-keyboard entry hiding keys outside a secure field. It also stops when it
-falls behind: a click or key that came before its last read of the app may
-already show in that read, so it asks for the task again, a little slower.
-Clicks and keys in other apps are ignored. Watching needs no permission
-beyond Accessibility, which lets macOS show the watch the keys; if macOS
-still refuses the listener, the error names Input Monitoring.
+menu is open, an unknown key, a key whose text it cannot read, such as an
+accent key or a key held down until it repeats or opens the accent menu, a
+click still under way when the watch ends, or secure keyboard entry hiding
+keys outside a secure field. It also stops when it falls behind: a click or
+key that came before its last read of the app may already show in that
+read, so it asks for the task again, a little slower. A password typed
+right after Tab or a click, before that read, is still kept as the
+`secret` step. Clicks and keys in other apps are ignored. Watching needs no
+permission beyond Accessibility, which lets macOS show the watch the keys;
+if macOS still refuses the listener, the error names Input Monitoring.
 
 ## Forms
 
