@@ -1,15 +1,19 @@
 """`mac.state` ids across runs: a later run's look at the same window
 names each control by the id an earlier run printed, even after its label
-changed in place, its diff lists only the controls whose text changed, and
-an id whose line changed since the agent's last look is refused rather
-than handed to another control."""
+changed in place, its diff lists only the controls whose text changed, no
+id names controls in two windows, and an id whose line the agent has not
+seen as it is now, or a newer read found changed, is refused rather than
+handed to another control."""
 
 from __future__ import annotations
+
+import re
+from pathlib import Path
 
 import pytest
 
 from macos_harness.errors import ErrorCode
-from macos_harness.macos import MacOSError
+from macos_harness.macos import MacOS, MacOSError, _TreeSnapshot
 from macos_harness.state import AppState, Memory, build_lines, diff
 
 _WINDOW = {"x": 0.0, "y": 0.0, "width": 230.0, "height": 400.0}
@@ -64,7 +68,7 @@ def _look(tmp_path, nodes, window: str = "window") -> list[tuple[int, str]]:
     """A printed look, remembered as `MacOS.state` remembers it."""
     with Memory.locked(tmp_path, "agent", 4512, 1.5) as memory:
         lines, offscreen, memory.next_id, slots = build_lines(
-            nodes, memory.ids, memory.next_id, _WINDOW, memory.slots.get(window, {}),
+            nodes, memory.ids, memory.next_id, _WINDOW, memory.slots.get(window, {}), window,
         )
         look = [(line.id, line.render(), out) for line, out in zip(lines, offscreen, strict=True)]
         memory.remember(window, look, slots)
@@ -126,10 +130,14 @@ def test_a_new_control_in_the_place_of_one_that_moved_takes_a_new_id(tmp_path) -
     )
 
 
-def _state(lines: list[tuple[int, str]], seen: list[tuple[int, str]]) -> AppState:
+def _state(
+    lines: list[tuple[int, str]], seen: list[tuple[int, str]], shows: set[int] | None = None,
+) -> AppState:
+    read = dict(lines)
     return AppState(
         "", {element_id: {"element_index": element_id} for element_id, _ in lines}, complete=True,
-        lines=dict(lines), seen=dict(seen), on_show=None,
+        lines=read, seen=dict(seen), shows=read if shows is None else shows, on_show=None,
+        owner=lambda _: None, latest=lambda: (read, True),
     )
 
 
@@ -177,3 +185,139 @@ def test_a_relabel_seen_in_one_window_lends_its_id_to_no_other(tmp_path) -> None
 
     with pytest.raises(KeyError, match="not in this window's state"):
         reopened[archive]
+
+
+def test_the_same_controls_in_two_windows_take_different_ids(tmp_path) -> None:
+    """An id printed from one document window must not name the same
+    button in another."""
+    first = _look(tmp_path, _toolbar("Archive", "Reply"), "100")
+    second = _look(tmp_path, _toolbar("Archive", "Reply"), "101")
+
+    assert {element_id for element_id, _ in first} & {element_id for element_id, _ in second} == set()
+
+
+@pytest.mark.parametrize("seen", [[(4, '[4] button "Forward"')], []], ids=["changed since seen", "never seen"])
+def test_a_printed_query_vouches_only_for_the_lines_it_shows(seen) -> None:
+    """A query print shows a few lines; an id it left out is checked
+    against the agent's earlier looks as if nothing had been printed."""
+    state = _state([(3, '[3] button "Archive"'), (4, '[4] button "Reply"')], seen, shows={3})
+
+    str(state)
+
+    assert state[3] == {"element_index": 3}
+    with pytest.raises(MacOSError) as raised:
+        state[4]
+    assert raised.value.code == ErrorCode.ELEMENT_UNKNOWN
+
+
+def _inbox(*names: str, inside: int) -> list[dict[str, object]]:
+    """Unlabeled rows of mail, the first ``inside`` of them inside the
+    window and the rest scrolled out of it."""
+    nodes: list[dict[str, object]] = [{"depth": 0, "role": "AXWindow", "title": "Inbox"}]
+    for place, name in enumerate(names):
+        frame = {**_ON, "y": 50.0 + 30 * place} if place < inside else _OFF
+        nodes += [
+            {"depth": 1, "role": "AXRow", "frame": frame},
+            {"depth": 2, "role": "AXTextField", "value": name, "frame": frame},
+        ]
+    return nodes
+
+
+class _Mail(MacOS):
+    """`MacOS` over one app whose `state` reads ``trees`` (window to nodes,
+    as `_snapshot_tree` walks them) where it would read the screen; unless
+    ``numbered``, the window server numbers none of its windows."""
+
+    def __init__(self, tmp_path: Path, trees: dict[int, list[dict[str, object]]], *, numbered: bool = True) -> None:
+        super().__init__(agent_id="agent")
+        self.trees = trees
+        self.memory_dir = tmp_path
+        self.numbered = numbered
+
+    def _ensure_accessibility(self) -> None:
+        return None
+
+    def _resolve_app(self, query: str | int | None) -> tuple[None, dict[str, object]]:
+        return None, {"pid": 4512, "name": "Mail"}
+
+    def _state_window(self, pid: int, window_id: int | None) -> int | None:
+        return window_id
+
+    def _window_geometry(self, window: int) -> tuple[dict[str, float], bool]:
+        return _WINDOW, False
+
+    def _snapshot_tree(self, root: int, **_: object) -> _TreeSnapshot:
+        nodes = [{**node, "element_index": self._remember_element(object())} for node in self.trees[root]]
+        return _TreeSnapshot(nodes, node_cut=False, depth_cut=False, read_cut=False)
+
+    def _memory_place(self, pid: int) -> tuple[Path, str | None, int, float]:
+        return self.memory_dir, "agent", pid, 1.5
+
+    def _ax_window_id(self, window: int) -> int | None:
+        return window if self.numbered else None
+
+
+def _id(text: str, label: str) -> int:
+    return int(re.findall(rf"^ *\[(\d+)\] .*{re.escape(label)}", text, re.MULTILINE)[0])
+
+
+def test_a_print_vouches_for_no_line_it_left_outside_the_window(tmp_path) -> None:
+    """A row a query showed stays usable while its line holds; once a row
+    inserted above hands its id to another, a whole print that lists the
+    row only as outside the window refuses it, and so does the next run."""
+    windows = {100: _inbox("Alice", "Bob", "Carol", "Dave", inside=2)}
+    mac = _Mail(tmp_path, windows)
+    dave = _id(str(mac.state("Mail", window_id=100, query="Dave")), '"Dave"')
+    str(mac.state("Mail", window_id=100, diff=False))
+
+    assert mac.state("Mail", window_id=100)[dave]["role"] == "AXTextField"
+
+    windows[100] = _inbox("Eve", "Alice", "Bob", "Carol", "Dave", inside=2)
+    whole = mac.state("Mail", window_id=100, diff=False)
+    str(whole)
+
+    for state in (whole, mac.state("Mail", window_id=100)):
+        with pytest.raises(MacOSError, match='it was .*"Dave", now .*"Carol"'):
+            state[dave]
+
+
+def test_a_whole_look_shows_no_line_it_left_outside_the_window(tmp_path) -> None:
+    """A whole print only counts the controls outside the window, so the
+    agent has seen none of their lines."""
+    _look(tmp_path, _toolbar("Archive", "Reply", outside="Reply"))
+
+    with Memory.locked(tmp_path, "agent", 4512, 1.5) as memory:
+        seen = memory.seen("window").values()
+
+    assert [line for line in seen if '"Reply"' in line] == []
+    assert [line for line in seen if '"Archive"' in line] != []
+
+
+def test_a_state_read_earlier_refuses_an_id_a_newer_read_found_changed(tmp_path) -> None:
+    windows = {100: _inbox("Alice", "Bob", inside=9)}
+    mac = _Mail(tmp_path, windows)
+    first = mac.state("Mail", window_id=100, diff=False)
+    bob, inbox = _id(str(first), '"Bob"'), _id(str(first), 'window "Inbox"')
+
+    windows[100] = _inbox("Eve", "Alice", "Bob", inside=9)
+    mac.state("Mail", window_id=100)
+
+    assert first[inbox]["role"] == "AXWindow"
+    with pytest.raises(MacOSError, match="changed since this state was read") as raised:
+        first[bob]
+    assert raised.value.code == ErrorCode.ELEMENT_UNKNOWN
+
+
+def test_two_windows_without_a_window_number_take_different_ids(tmp_path) -> None:
+    windows = {
+        number: [
+            {"depth": 0, "role": "AXWindow", "subrole": "AXStandardWindow", "title": title},
+            {"depth": 1, "role": "AXButton", "description": "Send"},
+        ]
+        for number, title in ((100, "Draft A"), (200, "Draft B"))
+    }
+    mac = _Mail(tmp_path, windows, numbered=False)
+    send = _id(str(mac.state("Mail", window_id=100)), '"Send"')
+
+    with pytest.raises(KeyError, match="not in this window's state"):
+        mac.state("Mail", window_id=200)[send]

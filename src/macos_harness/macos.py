@@ -65,7 +65,7 @@ from .receipts import (
     validate_exact_selectors,
     validate_scope,
 )
-from .state import AppState, Memory, build_lines, project
+from .state import AppState, Memory, Reads, build_lines, project
 from .state import diff as state_diff
 from .text import (
     Match,
@@ -1347,6 +1347,7 @@ class MacOS:
     def __init__(self, *, backend: str | None = None, agent_id: str | None = None) -> None:
         _require_macos()
         self._elements: dict[int, Any] = {}
+        self._state_reads = Reads()
         self._element_seq = 0
         self._last_app: dict[str, Any] | None = None
         self._last_windows: list[dict[str, Any]] = []
@@ -2755,18 +2756,21 @@ class MacOS:
         this agent (``agent_id``) and this launch of the app, also after its
         label changes in place inside the window, as All Clear turning
         Clear; ``state[12]`` is its match for ``click(element=)``,
-        ``ax.perform`` or ``ax.set``. Unlabeled layout groups fold into
-        their children, and controls scrolled out of the window are
-        counted, not listed.
+        ``ax.perform`` or ``ax.set``. Ids belong to one window: another
+        window's id is refused, naming its ``window_id``. Unlabeled layout
+        groups fold into their children, and controls scrolled out of the
+        window are counted, not listed.
 
         Reading the text (``print``, ``str``, ``.text``) makes it this
         agent's last look at the window. ``state[12]`` refuses an id whose
-        line changed since that look until this state is read. With a named
-        agent, ``diff=True`` then returns only what changed since the last
-        look (``~`` changed, ``+`` added, removed ids), or the whole window
-        when that is shorter. ``query`` shows only the lines that mention
-        it, their ancestors, and small subtrees, from the whole window,
-        scrolled out or not; it leaves the last look as it was."""
+        line changed since that look, or that no read of this window showed,
+        until this state is read. With a named agent, ``diff=True`` then
+        returns only what changed since the last look (``~`` changed, ``+``
+        added, removed ids), or the whole window when that is shorter.
+        ``query`` shows only the lines that mention it, their ancestors, and
+        small subtrees, from the whole window, scrolled out or not; it
+        leaves the last look as it was, and only the ids it shows count as
+        read."""
         self._ensure_accessibility()
         if query is not None and not isinstance(query, str):
             raise MacOSError("query must be a string", code=ErrorCode.BAD_REQUEST)
@@ -2787,7 +2791,9 @@ class MacOS:
         agent_id = place[1]
         number = self._ax_window_id(window)
         root = snapshot.nodes[0] if snapshot.nodes else {}
-        window_key = str(number) if number is not None else f"{root.get('role')}:{root.get('subrole', '')}"
+        title = root.get("title", "")
+        # Without a window server number, only the title tells two windows apart.
+        window_key = str(number) if number is not None else f"{root.get('role')}:{root.get('subrole', '')}:{title}"
         # A label that did not read shortens one line; children that did
         # not read may hide a subtree, which a diff would call removed, and
         # a control that moved, which `build_lines` would take as relabelled.
@@ -2795,9 +2801,10 @@ class MacOS:
         with Memory.locked(*place) as memory:
             lines, offscreen, memory.next_id, slots = build_lines(
                 snapshot.nodes, memory.ids, memory.next_id, frame, memory.slots.get(window_key, {}) if complete else {},
+                window_key,
             )
             previous = memory.looks.get(window_key)
-        title = root.get("title", "")
+            seen = memory.seen(window_key)
         header = f"{info['name']} window {json.dumps(title, ensure_ascii=False)}" + (
             f" (window_id {number})" if number is not None else ""
         )
@@ -2819,6 +2826,7 @@ class MacOS:
         look = [(line.id, line.render(), out) for line, out in zip(lines, offscreen, strict=True)]
         if query is not None:
             shown = project(lines, query)
+            shows = {line.id for line in shown or ()}
             label = json.dumps(query, ensure_ascii=False)
             body = (
                 [f"Query {label} matched nothing among {len(lines)} controls; omit query to see the window."]
@@ -2829,6 +2837,7 @@ class MacOS:
         else:
             visible = [(element_id, text) for element_id, text, out in look if not out]
             body = [text for _, text in visible]
+            shows = {element_id for element_id, _ in visible}
             hidden = sum(offscreen)
             if hidden:
                 notes.append(f"{hidden} more controls lie outside the window; scroll, or pass query= to find them.")
@@ -2843,7 +2852,15 @@ class MacOS:
 
         def remember() -> None:
             with Memory.locked(*place) as memory:
-                memory.remember(window_key, look, slots)
+                if query is None and complete:
+                    memory.remember(window_key, look, slots)
+                else:
+                    memory.glance(window_key, {element_id: text for element_id, text, _ in look if element_id in shows})
+
+        def owner(element_id: int) -> int | None:
+            with Memory.locked(*place) as memory:
+                window = memory.window_of(element_id)
+            return int(window) if window is not None and window != window_key and window.isdigit() else None
 
         matches: dict[int, Mapping[str, JSONValue]] = {}
         for line in lines:
@@ -2853,11 +2870,11 @@ class MacOS:
             if number is not None:
                 match["window_id"] = number
             matches[line.id] = _OwnedMatch(match, self)
+        read = {line.id: line.text for line in lines}
         return AppState(
-            "\n".join([header, *body, *notes]), matches, complete=complete,
-            lines={line.id: line.text for line in lines},
-            seen={element_id: text for element_id, text, _ in previous or ()},
-            on_show=remember if query is None and complete else None,
+            "\n".join([header, *body, *notes]), matches, complete=complete, lines=read,
+            seen=seen, shows=shows, on_show=remember, owner=owner,
+            latest=self._state_reads.latest((pid, window_key), read, complete=complete),
         )
 
     def _state_window(self, pid: int, window_id: int | None) -> object:
@@ -3090,7 +3107,8 @@ class MacOS:
     def _resolved_native_client(self) -> NativeClient | None | _Unresolved:
         """Return the already-resolved client or ``auto`` fallback, or
         ``_UNRESOLVED`` when a fresh ``agent.launch()`` attempt is still
-        needed.
+        needed -- including when the cached client's connection already
+        failed, which ``_acquire_native`` then replaces.
 
         Raises directly for the four states that must never fall through
         to another launch attempt: this call crossed a fork boundary (see
@@ -3104,8 +3122,9 @@ class MacOS:
         again).
         """
         self._check_native_owner()
-        if self._native_client is not None:
-            return self._native_client
+        client = self._native_client
+        if client is not None and client.connected:
+            return client
         if self._native_closed:
             raise MacOSError(
                 "This MacOS instance's close() already tore down its "
@@ -3154,6 +3173,12 @@ class MacOS:
         under that lock in case another thread already resolved (or
         failed) it while this one was waiting.
 
+        A session whose connection failed after its handshake -- a reply
+        that timed out, an agent that exited -- is closed and dropped on
+        the next call, which launches a fresh agent, or under ``auto``
+        falls back when none can start. The call that hit the failure
+        already raised it; nothing it sent is ever retried.
+
         Each ``MacOS`` instance launches — and, via ``close()``, tears
         down — its own private child, never a client shared with any
         other instance or process.
@@ -3178,6 +3203,10 @@ class MacOS:
             resolved = self._resolved_native_client()
             if resolved is not _UNRESOLVED:
                 return resolved
+            dead, self._native_session_box[0] = self._native_session_box[0], None
+            self._native_client = None
+            if dead is not None:
+                dead.close()
             try:
                 session = agent.launch()
             except Exception as exc:

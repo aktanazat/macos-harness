@@ -277,6 +277,26 @@ follows [Semantic Versioning](https://semver.org/).
   137 controls with either, once Electron's 2 s delay after the first
   look had passed.
 
+- `mac.state` ids belong to one window. The same control in two windows
+  takes two ids, and a window's state refuses another window's id, naming
+  its `window_id`, where it used to hand back the control at the same place
+  in its own window; a window without a `window_id` is told apart by its
+  title. A print vouches only for the lines it shows: an id it left out,
+  as a line outside the window, or that no print showed, is refused until a
+  print shows it as it is now. A state read earlier refuses an id whose
+  line a newer read of its window shows changed. Ids a query showed stay
+  usable in later calls while their lines hold. Ids renumber once per
+  window, and a window that closes and reopens gets new ids.
+
+- A native agent that stops answering no longer breaks its `MacOS`
+  instance: the call whose reply timed out still raises, and the next call
+  launches a fresh agent, or with `backend="auto"` falls back to the
+  Python engine when none can start, where every later call used to fail
+  on the dead connection. Elements the stopped agent found raise
+  `element.unknown` as stale. Closing a session while one of its requests
+  waits no longer deadlocks: `close()` returns once that request times out.
+  Nothing already sent is resent.
+
 - Public `MacOS`, `mac.ax`, and `mac.do` calls drain temporary Cocoa
   objects before returning, even without an AppKit event loop. Repeated
   window and control reads no longer retain each call's native objects;
