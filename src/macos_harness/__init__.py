@@ -32,6 +32,7 @@ from .receipts import (
     present,
     request_fingerprint,
 )
+from .steps import StepsResult
 
 if TYPE_CHECKING:
     from .macos import MacOS, SearchMatches
@@ -84,6 +85,7 @@ __all__ = [
     "Receipt",
     "RouteResult",
     "SearchMatches",
+    "StepsResult",
     "__version__",
     "canonical_json",
     "canonicalize",

@@ -63,6 +63,14 @@ primitives carry no receipt and no idempotency guarantee.
   wait for apps whose windows name no document or name one of several files,
   as Preview's do. With two copies of the app running, files given to the other
   copy fail with `another_copy_took_files`, its pid under `took`.
+- `mac.do.steps([{"op": "press", "text": "7"}, ...], app=...)` sends several
+  of these verbs in order as one call, every step on that app. Each step
+  keeps its own receipt, person pause, input lock, and `once` token. The first
+  failure ends the run: later steps are not sent, nothing is retried. The
+  `StepsResult` holds the receipts, `changes` in the app's focused window
+  from before the first step to after the last, and for a failure
+  `stopped_at`, `error`, and `strip`: files with the window's pictures from
+  before and after the failed step and its text after it.
 
 ## Errors
 
@@ -71,7 +79,10 @@ A call either returns a `Receipt` or raises `OperationError`; read
 bad argument (an unknown role, a `once` token reused for a different request)
 raises `MacOSError` before anything is dispatched, with no receipt: nothing was
 attempted. An uncaught `OperationError` ends a stdin program, so catch it when
-later steps should still run, then look before acting again.
+later steps should still run, then look before acting again. `mac.do.steps`
+returns instead of raising: a failed step leaves `result.ok` false, its
+error in `result.error`, and its receipt last in `result.receipts` when it
+got that far.
 
 ## What `changed` means
 

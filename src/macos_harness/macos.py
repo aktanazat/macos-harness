@@ -2874,7 +2874,7 @@ class MacOS:
         return AppState(
             "\n".join([header, *body, *notes]), matches, complete=complete, lines=read,
             seen=seen, shows=shows, on_show=remember, owner=owner,
-            latest=self._state_reads.latest((pid, window_key), read, complete=complete),
+            latest=self._state_reads.latest((pid, window_key), read, complete=complete), window_id=number,
         )
 
     def _state_window(self, pid: int, window_id: int | None) -> object:

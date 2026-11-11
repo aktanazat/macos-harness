@@ -45,6 +45,18 @@ follows [Semantic Versioning](https://semver.org/).
   `mac.do.open_files(files, app=)` opens files in a running app without
   bringing it forward and waits until its windows name them.
 
+- `mac.do.steps([...], app=)` sends several `mac.do` verbs in order as one
+  call, each step a dict naming its verb under `"op"` with that verb's own
+  arguments. Every step is checked before the first is sent, and each
+  keeps its own receipt, person pause, input lock, and `once` token. The
+  first failure ends the run: later steps are not sent and nothing is
+  retried. The result holds the receipts and what changed in the app's
+  focused window over the run; a failed step leaves the window's pictures
+  from before and after it, and its text, in files. In a VM, 12+34= in
+  Calculator took one call of about 1.4 s instead of seven forwarded calls
+  (six presses and a look) of about 3.6 s; the window reads and a picture
+  before each step cost about 0.5 s of it.
+
 - `mac.state(app)` prints a window as text, one control a line, as
   `[12] button "All Clear"`. Ids hold across runs for the same agent and
   app launch, and `state[12]` is a match for `click(element=)`,
