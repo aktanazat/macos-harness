@@ -438,7 +438,13 @@ final class AXExecutor {
     let role: String?
     let fields: [String: JSONValue]
 
-    var hidden: Bool { fields["hidden"]?.boolValue ?? false }
+    var hidden: Bool {
+      switch fields["hidden"] {
+      case .bool(let flag)?: return flag
+      case .number(let number)?: return number != 0
+      default: return false
+      }
+    }
     var matchText: [String] { matchFieldOrder.compactMap { fields[$0].map(pythonLikeString) } }
   }
 
