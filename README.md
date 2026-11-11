@@ -359,8 +359,10 @@ replay stops there with status `handoff`. macOS hides every key from the
 watch while that field has focus, the stop hotkey included. The watch saves
 nothing when a control has no unique label, a step has nothing to check, an
 input selects text, moves a slider, or types an accent, the watch falls
-behind the person, secure keyboard entry hides keys outside a secure field,
-or the goal does not hold at the end. Watching needs no permission beyond
+behind the person, keys may have gone into another field, such as a
+secure text field, before the app showed that field in focus (Chrome can
+lag that way), secure keyboard entry hides keys outside a secure field, or
+the goal does not hold at the end. Watching needs no permission beyond
 Accessibility; if macOS still refuses the listener, the error names Input
 Monitoring.
 
