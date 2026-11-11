@@ -413,6 +413,7 @@ window's pictures before and after that step and its text.
 
 ```text
 mac.route.record(name, *, app, entry, goal, timeout=30.0, inputs=None)
+mac.route.watch(name, *, app, entry, goal, timeout=300.0)  # -> RouteWatch: .wait(), .stop() -> WatchResult
 mac.route.run(name, *, app, timeout=30.0, dry_run=False, inputs=None)
 mac.route.list(*, app)
 mac.status(app_or_receipt)
@@ -427,7 +428,9 @@ mac.explain(receipt, *evidence)
 
 A replay step the person at this Mac kept from sending anything
 (`person_active`, `acted="no"`) is tried again while the route's
-`timeout` lasts, and a recording stays open after such a step.
+`timeout` lasts, and a recording stays open after such a step. A watched
+route's `secret` step stops the replay with status `handoff`, and it
+diverges before typing into a field that does not have keyboard focus.
 
 `inspect` walks at most 5000 nodes and 25 levels; a larger ask walks the
 cap, and the result's `capped` says what was asked and used.

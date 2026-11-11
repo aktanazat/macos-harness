@@ -1,4 +1,4 @@
-"""Explicitly recorded navigation, replayed through the existing operations."""
+"""Recorded or watched navigation, replayed through the existing operations."""
 
 from __future__ import annotations
 
@@ -19,7 +19,15 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol
 
 from ._paths import config_dir
 from .errors import ErrorCode, MacOSError
-from .ops import Operations, _Deadline, _validate_fill_value
+from .handoff import HandoffReason, HumanHandoff
+from .ops import (
+    Operations,
+    _Deadline,
+    _has_control_character,
+    _menu_steps,
+    _validate_fill_value,
+    _validate_type_text,
+)
 from .receipts import (
     Acted,
     Equals,
@@ -36,6 +44,7 @@ from .receipts import (
 
 if TYPE_CHECKING:
     from .macos import _AppIdentity
+    from .watch import RouteWatch
 
 
 _MAX_BYTES = 1024 * 1024
@@ -224,16 +233,42 @@ class _Fill:
     verb: ClassVar[str] = "fill"
 
 
-_Step = _Press | _Set | _Toggle | _Key | _Fill
+@dataclass(frozen=True, slots=True)
+class _Type:
+    text: str
+    postcondition: Postcondition | None
+    verb: ClassVar[str] = "type"
+
+
+@dataclass(frozen=True, slots=True)
+class _Menu:
+    path: str
+    postcondition: Postcondition
+    verb: ClassVar[str] = "menu"
+
+
+@dataclass(frozen=True, slots=True)
+class _Secret:
+    target: _Locator
+    postcondition: None = None
+    verb: ClassVar[str] = "secret"
+
+
+_Step = _Press | _Set | _Toggle | _Key | _Fill | _Type | _Menu | _Secret
 
 
 def _step_json(step: _Step) -> dict[str, JSONValue]:
     data: dict[str, JSONValue] = {"verb": step.verb,
         "expect": None if step.postcondition is None else _condition_json(step.postcondition)}
-    if isinstance(step, _Key):
-        data["key"] = step.key
-    else:
-        data["target"] = step.target.to_json()
+    match step:
+        case _Key(key=key):
+            data["key"] = key
+        case _Type(text=text):
+            data["text"] = text
+        case _Menu(path=path):
+            data["path"] = path
+        case _:
+            data["target"] = step.target.to_json()
     if isinstance(step, (_Set, _Toggle)):
         data.update(value=step.value, attribute=step.attribute)
     if isinstance(step, _Fill):
@@ -246,11 +281,14 @@ def _load_step(value: object, app: str) -> _Step:
         raise _invalid("step", "requires an object")
     verb = value.get("verb")
     match verb:
-        case "press" | "key":
-            data = _keys(value, {"verb", "expect", "key" if verb == "key" else "target"}, "step")
+        case "press" | "key" | "menu":
+            field = {"press": "target", "key": "key", "menu": "path"}[verb]
+            data = _keys(value, {"verb", "expect", field}, "step")
             condition = _load_condition(data["expect"], app)
             if verb == "key":
                 return _Key(_text(data["key"], "key"), condition)
+            if verb == "menu":
+                return _Menu(_text(data["path"], "path"), condition)
             return _Press(_load_locator(data["target"]), condition)
         case "set" | "toggle":
             data = _keys(value, {"verb", "expect", "target", "value", "attribute"}, "step")
@@ -267,8 +305,18 @@ def _load_step(value: object, app: str) -> _Step:
             data = _keys(value, {"verb", "expect", "target", "parameter"}, "step")
             condition = None if data["expect"] is None else _load_condition(data["expect"], app)
             return _Fill(_load_locator(data["target"]), _text(data["parameter"], "parameter"), condition)
+        case "type":
+            data = _keys(value, {"verb", "expect", "text"}, "step")
+            condition = None if data["expect"] is None else _load_condition(data["expect"], app)
+            return _Type(_text(data["text"], "text"), condition)
+        case "secret":
+            data = _keys(value, {"verb", "expect", "target"}, "step")
+            if data["expect"] is not None:
+                raise _invalid("step.expect", "a secret step checks nothing")
+            return _Secret(_load_locator(data["target"]))
         case _:
-            raise _invalid("step.verb", "only press, set, toggle, key and fill are supported")
+            raise _invalid("step.verb",
+                           "only press, set, toggle, key, fill, type, menu and secret are supported")
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,15 +370,18 @@ class _RouteHost(Protocol):
     def _process_identity(self, query: str | int) -> _AppIdentity: ...
     def _same_process(self, expected: _AppIdentity) -> bool: ...
     def _bundle_version(self, path: str | None) -> tuple[str | None, str | None]: ...
+    def _ensure_accessibility(self) -> None: ...
+    def handoff(self, *, reason: HandoffReason | str, app: str | int) -> HumanHandoff: ...
 
 
 @dataclass(frozen=True, slots=True)
 class RouteResult:
-    """A run stops at the first divergence and retains its failing receipt."""
+    """A run stops at the first divergence and retains its failing receipt;
+    at a secret step it stops for the person, with the handoff to show them."""
 
     name: str
     run_id: str
-    status: Literal["done", "already", "planned", "diverged", "invalid"]
+    status: Literal["done", "already", "planned", "diverged", "invalid", "handoff"]
     steps_run: tuple[Receipt, ...]
     duration_s: float
     at: str | None = None
@@ -338,19 +389,22 @@ class RouteResult:
     check: Receipt | None = None
     recorded_version: tuple[str | None, str | None] = (None, None)
     current_version: tuple[str | None, str | None] = (None, None)
+    handoff: HumanHandoff | None = None
 
     def to_json(self) -> dict[str, JSONValue]:
         return {"name": self.name, "run_id": self.run_id, "status": self.status,
                 "steps_run": [receipt.to_json() for receipt in self.steps_run],
                 "duration_s": self.duration_s, "at": self.at, "error": self.error,
                 "check": None if self.check is None else self.check.to_json(),
+                "handoff": None if self.handoff is None else self.handoff.to_json(),
                 "app_version": {"source": "on_disk_bundle",
                     "recorded": {"version": self.recorded_version[0], "build": self.recorded_version[1]},
                     "current": {"version": self.current_version[0], "build": self.current_version[1]}}}
 
 
 class Routes:
-    """``mac.route``: explicit recording, private files and sequential replay."""
+    """``mac.route``: explicit recording, watching the person, private files
+    and sequential replay."""
 
     def __init__(self, host: _RouteHost) -> None:
         self._host_ref = weakref.ref(host)
@@ -418,10 +472,17 @@ class Routes:
 
     def _validate_step(self, step: _Step) -> None:
         ops = self._host.do
-        if isinstance(step, _Key):
-            ops._host._validate_key(step.key)
-        else:
-            ops._host.ax._search_key(None, step.target.role)
+        match step:
+            case _Key(key=key):
+                ops._host._validate_key(key)
+            case _Type(text=text):
+                _validate_type_text(text)
+                if _has_control_character(text):
+                    raise _invalid("text", "a type step holds printable text; keys are key steps")
+            case _Menu(path=path):
+                _menu_steps(path, least=2)
+            case _:
+                ops._host.ax._search_key(None, step.target.role)
         ops._validate_postcondition(ops._host, step.postcondition)
 
     def _expect(self, condition: Postcondition, identity: _AppIdentity,
@@ -447,6 +508,10 @@ class Routes:
                 "postcondition": condition}
         if isinstance(step, _Key):
             return ops.key(step.key, **args, once=token)
+        if isinstance(step, _Type):
+            return ops.type(step.text, **args, once=token)
+        if isinstance(step, _Menu):
+            return ops.menu(step.path, **args, once=token)
         if isinstance(step, _Press):
             return ops.press(**step.target.query(), **args, once=token)
         if isinstance(step, _Fill):
@@ -498,6 +563,19 @@ class Routes:
                 recorder._active = False
                 values.clear()
 
+    def watch(self, name: str, *, app: str, entry: Postcondition, goal: Postcondition,
+              timeout: float = 300.0) -> RouteWatch:
+        """Watch the person at this Mac do the task once and save it as ``name``.
+
+        Returns at once. The watch ends at Control-Option-Command-Period,
+        after ``timeout`` seconds or at ``stop()``, and saves the route once
+        ``goal`` holds. Typed text is saved as typed, except in a secure
+        text field: the route holds a secret step there and never its text.
+        """
+        from .watch import watch
+
+        return watch(self, name, app=app, entry=entry, goal=goal, timeout=timeout)
+
     def run(self, name: str, *, app: str, timeout: float = 30.0,
             dry_run: bool = False, inputs: Mapping[str, str] | None = None) -> RouteResult:
         """Replay once. Input-bearing routes always run; a prior goal is not this input's result."""
@@ -543,13 +621,18 @@ class Routes:
                 check = self._expect(route.entry, identity, deadline)
                 if dry_run:
                     first = route.steps[0]
-                    if not isinstance(first, _Key):
+                    if not isinstance(first, (_Key, _Type, _Menu)):
                         at = "steps[0]"
                         check = self._expect(Present(**first.target.query()), identity, deadline)
                     return RouteResult(name, run_id, "planned", (), deadline.elapsed(),
                                        check=check, **versions)
                 for index, step in enumerate(route.steps):
                     at = f"steps[{index}]"
+                    if isinstance(step, _Secret):
+                        check = self._expect(Present(**step.target.query()), identity, deadline)
+                        return RouteResult(name, run_id, "handoff", tuple(receipts), deadline.elapsed(),
+                            at=at, check=check, **versions, handoff=self._host.handoff(
+                                reason=HandoffReason.AUTHENTICATION_REQUIRED, app=identity.pid))
                     try:
                         receipt = self._dispatch_past_person(step, identity, deadline,
                             f"route:{app}:{name}:{run_id}:{index}", values)

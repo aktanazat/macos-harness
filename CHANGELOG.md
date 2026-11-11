@@ -73,6 +73,19 @@ follows [Semantic Versioning](https://semver.org/).
   raise `timeout` when nothing was written. CLI: `files`, `file-info`,
   `shortcuts`.
 
+- `mac.route.watch(name, app=, entry=, goal=)` learns a route by watching
+  the person do the task once. A listen-only event tap sees clicks and keys
+  without changing or holding them: clicks become press steps and `set`
+  steps on `AXFocused` or `AXSelected`, menu bar picks `menu` steps, text
+  typed into a text field `type` steps that check the field has keyboard
+  focus, and other keys `key` steps. Typing in a secure text field is
+  never kept; the route saves a `secret` step there and replay stops at it
+  with status `handoff`. The watch saves nothing once it falls behind the
+  person, or sees text selected with the mouse, a slider moved, or an
+  accent typed. The person ends the watch with
+  Control-Option-Command-Period. It needs no permission beyond
+  Accessibility. `RouteWatch` and `WatchResult` are exported.
+
 - `mac.state(app)` prints a window as text, one control a line, as
   `[12] button "All Clear"`. Ids hold across runs for the same agent and
   app launch, and `state[12]` is a match for `click(element=)`,

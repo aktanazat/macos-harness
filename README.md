@@ -309,11 +309,12 @@ print(mac.route.list(app=app))
 A route requires an exact bundle identifier, an entry condition, and a terminal
 goal. Every target and condition needs a role plus exactly one exact title,
 identifier, or description. There is no substring or alternate-field fallback.
-The supported steps are `press`, `set`, `fill`, `toggle`, and `key`. Presses and
-keys require an explicit postcondition; set and toggle retain their
+The supported steps are `press`, `set`, `fill`, `toggle`, and `key`, and a
+watched route adds `type`, `menu`, and `secret`. Presses, keys and menu picks
+require a postcondition; set and toggle retain their
 value-convergence checks. Only boolean and numeric set/equals values are
-recordable. Selectors and key combinations are stored verbatim, so keep
-secrets out of them.
+recordable. Selectors, key combinations and typed text are stored verbatim, so
+keep secrets out of them.
 
 For forms, record a parameter name with `fill` and supply its text separately:
 
@@ -343,6 +344,25 @@ step prevents saving even if its exception is caught. The previous file stays
 intact. Keep the handle on the thread that entered the block; it closes when the
 block exits. A definition has at most 64 steps and a 1 MiB file limit.
 
+To learn a route from the person at the Mac instead, start
+`watch = mac.route.watch(name, app=app, entry=entry, goal=goal)` and let them
+do the task once. They end it with Control-Option-Command-Period, or call
+`watch.stop()`; `watch.wait()` returns the result either way. A listen-only
+event tap sees their clicks and keys without changing or holding them. Clicks
+become press steps, `set` steps on `AXFocused` or `AXSelected`, and menu bar
+picks `menu` steps. Text typed into a text field becomes a `type` step that,
+like the step before it, checks the field has keyboard focus; every other
+key, and any held with Command or Control, becomes a `key` step. While a
+secure text field has focus nothing typed is kept: the route saves a
+`secret` step naming the field, and replay stops there with status
+`handoff`. macOS hides every key from the watch while that field has focus,
+the stop hotkey included. The watch saves nothing when a control has no
+unique label, a step has nothing to check, an input selects text, moves a
+slider, or types an accent, the watch falls behind the person, secure
+keyboard entry hides keys outside a secure field, or the goal does not hold
+at the end. Watching needs no permission beyond Accessibility; if macOS
+still refuses the listener, the error names Input Monitoring.
+
 Replay validates the whole definition before input. For routes without form
 inputs, it returns `already` if the goal holds, otherwise checks the entry and
 runs each step once. Only a goal read that came back `Observation.UNMET`
@@ -352,7 +372,8 @@ whose state is unknown. One app process and one cooperative timeout
 cover the sequence. A process exit or replacement stops further steps. The
 existing operations own target resolution, dispatch, and verification.
 
-Results have status `done`, `already`, `planned`, `diverged`, or `invalid`.
+Results have status `done`, `already`, `planned`, `diverged`, `invalid`, or
+`handoff`.
 `steps_run` retains the failing step's receipt, including whether it acted.
 `check` retains the latest condition check, and `at` names a failed stage.
 Dry runs validate the whole file but observe only the goal, or the entry and
