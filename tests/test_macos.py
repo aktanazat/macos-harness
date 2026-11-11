@@ -2604,6 +2604,22 @@ def _typing_fakes(monkeypatch, mac: MacOS, *, frontmost_pid: int) -> tuple[list,
     return posted, sleeps
 
 
+def _keyboard_focus(monkeypatch, mac: MacOS, role: str | None) -> None:
+    """Fake accessibility naming an element of ``role`` as the app's
+    keyboard focus, or no focused element for None, at the
+    ApplicationServices boundary."""
+    AS = macos_module.AS
+    root, focused = object(), object()
+    answers = {(root, "AXFocusedUIElement"): focused if role else None, (focused, "AXRole"): role}
+
+    def copy_attribute(element, name, _out):
+        value = answers.get((element, name))
+        return (AS.kAXErrorNoValue, None) if value is None else (0, value)
+
+    monkeypatch.setattr(mac, "_application_element", lambda pid, **kwargs: root)
+    monkeypatch.setattr(AS, "AXUIElementCopyAttributeValue", copy_attribute)
+
+
 def test_type_into_an_inactive_app_posts_one_event_pair_per_character(monkeypatch) -> None:
     mac = MacOS()
     posted, sleeps = _typing_fakes(monkeypatch, mac, frontmost_pid=7)
@@ -2621,12 +2637,16 @@ def test_type_into_an_inactive_app_posts_one_event_pair_per_character(monkeypatc
     assert sleeps == [0.01] * 5
 
 
-def test_type_into_the_frontmost_app_packs_runs_of_text_per_event(monkeypatch) -> None:
+@pytest.mark.parametrize("role", ["AXTextArea", None], ids=["text-area", "focus-not-named"])
+def test_type_into_the_frontmost_app_packs_runs_of_text_per_event(monkeypatch, role) -> None:
     """A frontmost app takes text in runs of up to 20 UTF-16 units per
     key event with no pause, split only between code points; a newline
-    still travels alone as the Return key."""
+    still travels alone as the Return key. Chrome names no focus until
+    its tree is built, and one key per event took 60 characters 0.8 s
+    there instead of 0.06 s."""
     mac = _Unattended()
     posted, sleeps = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    _keyboard_focus(monkeypatch, mac, role)
 
     mac.type("a" * 19 + "😀" + "b\n" + "c", app="Spotify")
 
@@ -2637,6 +2657,18 @@ def test_type_into_the_frontmost_app_packs_runs_of_text_per_event(monkeypatch) -
     assert [event["flags"] for event in downs] == [0, 0, 0, 0]
     assert [pid for _, pid in posted] == [42] * 8
     assert sleeps == []
+
+
+def test_type_into_the_frontmost_app_sends_a_key_per_character_outside_text(monkeypatch) -> None:
+    """Calculator's keypad reads one key per event: "12+34=" packed into
+    one event left only "1" on its display, 36 of 36 runs."""
+    mac = _Unattended()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    _keyboard_focus(monkeypatch, mac, "AXUnknown")
+
+    mac.type("12+34=", app="Calculator")
+
+    assert [event["text"] for event, _ in posted if event["down"]] == list("12+34=")
 
 
 @pytest.mark.parametrize(
@@ -2651,6 +2683,7 @@ def test_typing_waits_for_the_person_at_the_mac_only_in_the_app_in_front(
     the middle of theirs; an app behind keeps its keys apart from theirs."""
     mac = _Typist(stops_ms)
     posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=frontmost_pid)
+    _keyboard_focus(monkeypatch, mac, "AXTextArea")
 
     mac.type("hi", app="Spotify")
 

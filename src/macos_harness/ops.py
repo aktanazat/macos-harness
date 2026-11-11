@@ -649,8 +649,8 @@ _MAX_ARGS = 256
 _MAX_ARG_CHARS = 65_536
 # The most text one `type` call sends. Packed typing lands 128 characters
 # in about 30ms, so this bound is a few seconds of key events at the
-# 10ms-per-character pace an inactive app gets, not a ceiling anyone
-# writing a form hits.
+# 10ms-per-character pace an inactive app or a keypad like Calculator's
+# gets, not a ceiling anyone writing a form hits.
 _MAX_TYPE_CHARS = 4096
 
 

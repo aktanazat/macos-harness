@@ -738,6 +738,10 @@ _KEY_ONLY_CHARACTERS = frozenset("\n\r\t")
 # The most UTF-16 units one packed key event carries: 20 landed exactly
 # in every app measured, and larger payloads were not measured.
 _TYPE_CHUNK_UNITS = 20
+# Roles of a control that takes a key event's text whole, as the text
+# system inserts it. Other keyboard focus may take one key per event:
+# Calculator's keypad kept only the "1" of a packed "12+34=" (36 of 36).
+_TEXT_INPUT_ROLES = frozenset({"AXTextField", "AXTextArea", "AXComboBox"})
 # macOS has no gesture past a triple click.
 _MAX_CLICKS = 3
 # The longest raw input waits while another call sends input to the same
@@ -6685,6 +6689,17 @@ class MacOS:
         )
         return None if focused is None else self._remember_element(focused)
 
+    def _focus_takes_single_keys(self, pid: int) -> bool:
+        """Whether accessibility names ``pid``'s keyboard focus as a control
+        outside `_TEXT_INPUT_ROLES`. A focus it cannot name is not one:
+        Chrome names none until its tree is built, and took packed text
+        exactly."""
+        focused = self._copy_attribute(
+            self._application_element(pid, enhance=False), "AXFocusedUIElement"
+        )
+        role = None if focused is None else self._copy_attribute(focused, "AXRole")
+        return role is not None and role not in _TEXT_INPUT_ROLES
+
     def _focus_window(self, pid: int, window_id: int) -> None:
         """Make ``window_id`` the window ``pid``'s keys go to, raised among
         the app's own windows, without bringing the app forward."""
@@ -7917,11 +7932,14 @@ class MacOS:
         only between code points, with no pause between events. 128
         characters land in about 30ms that way instead of 1.6s, exact in
         TextEdit, Notes, Safari and Chrome (280 of 280 trials). An
-        inactive app gets one event pair per character with a 10ms
-        pause, because a background Chrome drops every event carrying
-        more than one unit. Newline, carriage return and tab always
-        travel alone as Return and Tab key events, so the app sees the
-        key rather than a pasted character.
+        inactive app, or one whose keyboard focus accessibility names as
+        something other than a text field, text area or combo box when
+        typing starts, gets one event pair per character with a 10ms
+        pause: a background Chrome drops every event carrying more than
+        one unit, and Calculator's keypad reads one key per event.
+        Newline, carriage return and tab always travel alone as Return
+        and Tab key events, so the app sees the key rather than a pasted
+        character.
 
         ``window_id`` names the window to type into, and its owner is the
         app: it becomes the app's focused window first, as a click on it
@@ -7943,10 +7961,11 @@ class MacOS:
             self._hold_before_input(pid, window_id)
             target = self._keyboard_window(pid, window_id)
             focus_before = self._frontmost_app()
-            packed = focus_before is not None and int(focus_before["pid"]) == pid
+            in_front = focus_before is not None and int(focus_before["pid"]) == pid
+            packed = in_front and not self._focus_takes_single_keys(pid)
             sent = 0
             for chunk in _typing_chunks(text, packed=packed):
-                if not packed and target is not None:
+                if not in_front and target is not None:
                     self._guard_keyboard_window(pid, target, sent, len(text))
                 if packed and chunk not in _KEY_ONLY_CHARACTERS:
                     keycode, flags = 0, 0
@@ -7963,12 +7982,13 @@ class MacOS:
                 self._post(up, pid)
                 sent += len(chunk)
                 if not packed:
+                    time.sleep(0.01)
+                if not in_front:
                     # A frontmost app took focus already, so the guard that
                     # stops when the target steals it has nothing to catch.
-                    time.sleep(0.01)
                     self._guard_focus(focus_before, pid, "typing")
         return self._keyboard_result(
-            app, pid, target, named_window=window_id is not None, in_front=packed
+            app, pid, target, named_window=window_id is not None, in_front=in_front
         )
 
     @staticmethod
