@@ -43,9 +43,14 @@ final class RequiredValueTests: XCTestCase {
   }
 
   func testSuccessfulNumberIsAValueNotARefusal() throws {
-    // Not 0 or 1: `jsonable` bridges those NSNumbers to `.bool`, a separate conversion
-    // question this read boundary does not decide.
     XCTAssertEqual(try read(.success, NSNumber(value: 3)), .number(3))
+  }
+
+  func testCheckboxStateReadsAsTheNumberPythonReads() throws {
+    // A checkbox, radio button, or disclosure state is an NSNumber 0 or 1, not a CFBoolean.
+    XCTAssertEqual(try read(.success, NSNumber(value: 1)), .number(1))
+    XCTAssertEqual(try read(.success, NSNumber(value: 0)), .number(0))
+    XCTAssertEqual(try read(.success, kCFBooleanTrue), .bool(true))
   }
 
   func testSuccessfulNullStaysDistinguishableFromARefusedRead() throws {
