@@ -1,9 +1,9 @@
 """The general pasteboard, saved before a paste and put back after it.
 
 `save` keeps every item with the data of each of its types, `write` puts
-a paste's payload in their place, and `restore` puts the saved items back
-unless something copied since the payload was written: its contents are
-then the newer ones, and stay.
+a paste's payload in their place unless something copied since the save,
+and `restore` puts the saved items back unless something copied since
+the payload was written: its contents are then the newer ones, and stay.
 
 macOS has no compare-and-swap for a pasteboard. Every clear moves its
 change count by exactly one, so a clear of ours that moved it by more
@@ -107,12 +107,21 @@ def write(
     board: Board, saved: Saved, flavors: Sequence[tuple[str, bytes]], files: Sequence[Path]
 ) -> int:
     """Put one item holding ``flavors`` and one file URL item per path in
-    ``files`` on ``board``; the change count they were written at. A
+    ``files`` on ``board``; the change count they were written at. A copy
+    made since ``saved`` was read stops it before anything is written; a
     refused write puts ``saved`` back and raises with that report."""
     from AppKit import NSURL
 
     objects: list[object] = [_item(flavors)] if flavors else []
     objects.extend(NSURL.fileURLWithPath_(str(path)) for path in files)
+    now = int(board.changeCount())
+    if now != saved.change_count:
+        raise MacOSError(
+            "Something was copied while the clipboard was being saved, so it was "
+            "left as it is and nothing was pasted",
+            code=ErrorCode.AX_ERROR,
+            details={"reason": "copied_before_paste", "change_count": now},
+        )
     written, wrote = _put(board, objects)
     if not wrote:
         raise MacOSError(
@@ -141,7 +150,11 @@ def restore(board: Board, saved: Saved, written: int) -> dict[str, JSONValue]:
         overwrote = overwrote or cleared != written + 1
         if wrote:
             items, _ = _read(board)
-            report = {"restored": True, "items": len(saved.items), "exact": items == kept}
+            report = {
+                "restored": True,
+                "items": len(kept),
+                "exact": items == saved.items and not saved.unreadable,
+            }
         else:
             report = {
                 "restored": False,

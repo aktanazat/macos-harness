@@ -92,9 +92,12 @@ with repeated keys, clicks, deletion loops, or bulk input.
   any length, 5,000 characters in about 0.4 s, but only into the app in front.
 - `mac.do.paste` borrows the user's clipboard: it saves every item and type,
   pastes, and puts them back once the paste shows. It never puts them back
-  over something copied in between. AppKit drops cmd+v to an app in the
-  background and keeps its Paste item disabled there, so a paste refuses such
-  an app before touching the clipboard.
+  over something copied in between, and one paste borrows the clipboard at a
+  time across every harness process. An app that stops answering before the
+  paste shows keeps the payload on the clipboard, since putting the user's
+  clipboard back would let the app paste that instead. AppKit drops cmd+v to
+  an app in the background and keeps its Paste item disabled there, so a
+  paste refuses such an app before touching the clipboard.
 - `mac.do.open_files` gives files to a running app with activation off and
   leaves the app in front where it is; it fails with `focus.changed` if the
   app comes forward anyway.

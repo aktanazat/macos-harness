@@ -6,10 +6,13 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 
+import objc
 import pytest
 from AppKit import NSPasteboard, NSPasteboardItem
+from Foundation import NSObject
 
 from macos_harness import pasteboard
+from macos_harness.errors import MacOSError
 
 
 @pytest.fixture
@@ -98,3 +101,46 @@ def test_a_copy_cleared_by_the_restore_is_reported(board: pasteboard.Board) -> N
     report = pasteboard.restore(_CopiesAfterLooking(board), saved, written)
 
     assert report == {"restored": True, "items": 2, "exact": True, "overwrote_copy": True}
+
+
+def test_a_copy_made_while_saving_stops_the_paste_untouched(board: pasteboard.Board) -> None:
+    _two_items(board)
+    saved = pasteboard.save(board)
+    _copy(board, "copied by someone else")
+
+    with pytest.raises(MacOSError) as stopped:
+        pasteboard.write(board, saved, [(pasteboard.PLAIN_TEXT, b"payload")], [])
+
+    assert stopped.value.details["reason"] == "copied_before_paste"
+    assert _text(board) == ["copied by someone else"]
+
+
+class _NeverSupplies(NSObject, protocols=[objc.protocolNamed("NSPasteboardItemDataProvider")]):
+    """An owner that promised a type and never supplies its data."""
+
+    def pasteboard_item_provideDataForType_(self, board: object, item: object, kind: str) -> None:
+        del board, item, kind
+
+    def pasteboardFinishedWithDataProvider_(self, board: object) -> None:
+        del board
+
+
+def test_a_type_never_supplied_makes_the_restore_inexact(board: pasteboard.Board) -> None:
+    owner = _NeverSupplies.alloc().init()
+    readable = NSPasteboardItem.alloc().init()
+    readable.setString_forType_("kept", pasteboard.PLAIN_TEXT)
+    readable.setDataProvider_forTypes_(owner, ["com.example.promised"])
+    promised = NSPasteboardItem.alloc().init()
+    promised.setDataProvider_forTypes_(owner, ["com.example.promised"])
+    board.clearContents()
+    board.writeObjects_([readable, promised])
+    saved = pasteboard.save(board)
+    written = pasteboard.write(board, saved, [(pasteboard.PLAIN_TEXT, b"payload")], [])
+
+    report = pasteboard.restore(board, saved, written)
+
+    assert _text(board) == ["kept"]
+    assert report == {
+        "restored": True, "items": 1, "exact": False,
+        "unreadable_types": ["com.example.promised", "com.example.promised"],
+    }

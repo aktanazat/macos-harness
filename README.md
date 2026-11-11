@@ -88,12 +88,15 @@ PY
   focused element shows it, and puts the saved clipboard back, reported
   under `observed.input.pasteboard`. 5,000 characters land in about 0.4 s
   where typing them takes about 2 s. A copy made by anything else during
-  the paste is kept (`restored: false`, reason `copied_since_paste`).
-  An app in the background is refused before the clipboard is touched.
+  the paste is kept (`restored: false`, reason `copied_since_paste`), and
+  one paste borrows the clipboard at a time. An app in the background is
+  refused before the clipboard is touched; an app that stops answering
+  keeps the payload on the clipboard, since it may still paste it.
 - Use `open_files(files, app=...)` to hand files to a running app as a
   drop on its Dock icon does, with no drag and the app left behind
   whatever is in front; it waits until a window names each file as its
-  document.
+  document. Preview names one of several files a window shows: pass a
+  postcondition for it.
 - `expect_any({"saved": present(app=app, identifier="saved"),
   "error": present(app=app, identifier="error")}, timeout=5)` waits for the
   first observation pass with a satisfied condition. Read

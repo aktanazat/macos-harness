@@ -24,10 +24,12 @@ follows [Semantic Versioning](https://semver.org/).
   characters landed in TextEdit in 0.39 to 0.44 s, against 1.4 to 2.3 s
   typed. A copy another process makes during the paste is kept and
   reported, never replaced; one landing in the same instant as the
-  restore is reported as `overwrote_copy`. An app in the background is
-  refused before the clipboard is touched. `mac.do.open_files(files,
-  app=)` opens files in a running app without bringing it forward and
-  waits until its windows name them.
+  restore is reported as `overwrote_copy`. One paste borrows the
+  clipboard at a time across processes, and an app that stops answering
+  keeps the payload rather than pasting the user's clipboard later. An
+  app in the background is refused before the clipboard is touched.
+  `mac.do.open_files(files, app=)` opens files in a running app without
+  bringing it forward and waits until its windows name them.
 
 - `mac.state(app)` prints a window as text, one control a line, as
   `[12] button "All Clear"`. Ids hold across runs for the same agent and

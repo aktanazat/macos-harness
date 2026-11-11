@@ -57,6 +57,7 @@ from .errors import (
 from .handoff import HandoffReason, HumanHandoff
 from .ops import _Deadline, _menu_steps, _utc_timestamp
 from .overlay import LivePointerOverlay
+from .pasteboard import Board, general
 from .receipts import (
     JSONValue,
     Receipt,
@@ -7220,9 +7221,11 @@ class MacOS:
             )
         return running
 
-    def _open_documents(self, pid: int, documents: Sequence[Path], *, timeout: float) -> None:
+    def _open_documents(self, pid: int, documents: Sequence[Path], *, timeout: float) -> int:
         """Hand ``documents`` to the running app ``pid`` to open, as a drop
-        on its Dock icon does, leaving it where it is."""
+        on its Dock icon does, leaving it where it is; the pid Launch
+        Services gave them to, which with two copies of the app running
+        can be the other one."""
         running, info = self._resolve_app(pid)
         bundle = running.bundleURL()
         if bundle is None:
@@ -7231,7 +7234,12 @@ class MacOS:
                 code=ErrorCode.UNSUPPORTED_OP,
                 details={"app": info},
             )
-        self._open_application(bundle, timeout=timeout, documents=documents)
+        return int(self._open_application(bundle, timeout=timeout, documents=documents).processIdentifier())
+
+    @staticmethod
+    def _general_pasteboard() -> Board:
+        """The pasteboard cmd+v pastes from."""
+        return general()
 
     def _window_documents(self, pid: int) -> list[str]:
         """The file URLs ``pid``'s windows on this Space say they show."""
