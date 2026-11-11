@@ -2755,18 +2755,21 @@ class MacOS:
         this agent (``agent_id``) and this launch of the app, also after its
         label changes in place inside the window, as All Clear turning
         Clear; ``state[12]`` is its match for ``click(element=)``,
-        ``ax.perform`` or ``ax.set``. Unlabeled layout groups fold into
-        their children, and controls scrolled out of the window are
-        counted, not listed.
+        ``ax.perform`` or ``ax.set``. Ids belong to one window: another
+        window's id is refused, naming its ``window_id``. Unlabeled layout
+        groups fold into their children, and controls scrolled out of the
+        window are counted, not listed.
 
         Reading the text (``print``, ``str``, ``.text``) makes it this
         agent's last look at the window. ``state[12]`` refuses an id whose
-        line changed since that look until this state is read. With a named
-        agent, ``diff=True`` then returns only what changed since the last
-        look (``~`` changed, ``+`` added, removed ids), or the whole window
-        when that is shorter. ``query`` shows only the lines that mention
-        it, their ancestors, and small subtrees, from the whole window,
-        scrolled out or not; it leaves the last look as it was."""
+        line changed since that look, or that no read of this window showed,
+        until this state is read. With a named agent, ``diff=True`` then
+        returns only what changed since the last look (``~`` changed, ``+``
+        added, removed ids), or the whole window when that is shorter.
+        ``query`` shows only the lines that mention it, their ancestors, and
+        small subtrees, from the whole window, scrolled out or not; it
+        leaves the last look as it was, and only the ids it shows count as
+        read."""
         self._ensure_accessibility()
         if query is not None and not isinstance(query, str):
             raise MacOSError("query must be a string", code=ErrorCode.BAD_REQUEST)
@@ -2795,8 +2798,10 @@ class MacOS:
         with Memory.locked(*place) as memory:
             lines, offscreen, memory.next_id, slots = build_lines(
                 snapshot.nodes, memory.ids, memory.next_id, frame, memory.slots.get(window_key, {}) if complete else {},
+                window_key,
             )
             previous = memory.looks.get(window_key)
+            seen = memory.seen(window_key)
         title = root.get("title", "")
         header = f"{info['name']} window {json.dumps(title, ensure_ascii=False)}" + (
             f" (window_id {number})" if number is not None else ""
@@ -2819,6 +2824,7 @@ class MacOS:
         look = [(line.id, line.render(), out) for line, out in zip(lines, offscreen, strict=True)]
         if query is not None:
             shown = project(lines, query)
+            shows = {line.id for line in shown or ()}
             label = json.dumps(query, ensure_ascii=False)
             body = (
                 [f"Query {label} matched nothing among {len(lines)} controls; omit query to see the window."]
@@ -2829,6 +2835,7 @@ class MacOS:
         else:
             visible = [(element_id, text) for element_id, text, out in look if not out]
             body = [text for _, text in visible]
+            shows = {element_id for element_id, _, _ in look} if complete else {element_id for element_id, _ in visible}
             hidden = sum(offscreen)
             if hidden:
                 notes.append(f"{hidden} more controls lie outside the window; scroll, or pass query= to find them.")
@@ -2843,7 +2850,15 @@ class MacOS:
 
         def remember() -> None:
             with Memory.locked(*place) as memory:
-                memory.remember(window_key, look, slots)
+                if query is None and complete:
+                    memory.remember(window_key, look, slots)
+                else:
+                    memory.glance(window_key, {element_id: text for element_id, text, _ in look if element_id in shows})
+
+        def owner(element_id: int) -> int | None:
+            with Memory.locked(*place) as memory:
+                window = memory.window_of(element_id)
+            return int(window) if window is not None and window != window_key and window.isdigit() else None
 
         matches: dict[int, Mapping[str, JSONValue]] = {}
         for line in lines:
@@ -2856,8 +2871,7 @@ class MacOS:
         return AppState(
             "\n".join([header, *body, *notes]), matches, complete=complete,
             lines={line.id: line.text for line in lines},
-            seen={element_id: text for element_id, text, _ in previous or ()},
-            on_show=remember if query is None and complete else None,
+            seen=seen, shows=shows, on_show=remember, owner=owner,
         )
 
     def _state_window(self, pid: int, window_id: int | None) -> object:

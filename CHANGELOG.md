@@ -276,6 +276,15 @@ follows [Semantic Versioning](https://semver.org/).
   treats the two alike: VS Code 1.146 read 315 to 318 nodes and 136 to
   137 controls with either, once Electron's 2 s delay after the first
   look had passed.
+
+- `mac.state` ids belong to one window. The same control in two windows
+  takes two ids, and a window's state refuses another window's id, naming
+  its `window_id`, where it used to hand back the control at the same place
+  in its own window. A query or incomplete print vouches only for the
+  lines it shows: an id it left out, or that no print showed, is refused
+  until a print shows it as it is now. Ids a query showed stay usable in
+  later calls while their lines hold. Ids renumber once per window, and a
+  window that closes and reopens gets new ids.
 - A native agent that stops answering no longer breaks its `MacOS`
   instance: the call whose reply timed out still raises, and the next call
   launches a fresh agent, or with `backend="auto"` falls back to the

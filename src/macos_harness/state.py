@@ -4,14 +4,16 @@ across runs, and after the first look only what changed.
 `MacOS.state` walks one window and hands the nodes here. Lines read
 ``[12] button "All Clear"``; unlabeled layout containers are folded into
 their children, and controls scrolled out of the window are left out.
-Each control's id comes from its path in the tree, remembered per agent
-and process in the user's temporary directory, so the id a program saw
-in one run names the same control in the next; a control whose label
+Each control's id comes from its window and its path in that window's
+tree, remembered per agent and process in the user's temporary
+directory, so the id a program saw in one run names the same control in
+the next, and no id names controls in two windows; a control whose label
 changes in place in the window, as Calculator's "All Clear" turning
 "Clear", keeps its id. The text an agent reads becomes its last look: a
 named agent's next look returns the lines that changed since, or the
-whole window when that is shorter, and an id whose line changed since
-that look is refused until the agent reads again.
+whole window when that is shorter. An id is handed out only as the agent
+last saw it: one whose line changed since, or that no read of its window
+showed, is refused until the agent reads again.
 """
 
 from __future__ import annotations
@@ -70,9 +72,11 @@ class Line:
 class AppState:
     """What `MacOS.state` returns: printable text, and the match each id
     on it names, ready for ``click(element=)``, ``ax.perform`` or ``ax.set``.
-    Reading the text makes it the agent's last look."""
+    Reading the text makes it the agent's last look; ``shows`` are the ids
+    whose lines it shows, and ``owner`` names the window of an id that is
+    not in this one."""
 
-    __slots__ = ("_lines", "_matches", "_on_show", "_seen", "_shown", "_text", "complete")
+    __slots__ = ("_lines", "_matches", "_on_show", "_owner", "_seen", "_shown", "_shows", "_text", "complete")
 
     def __init__(
         self,
@@ -82,14 +86,18 @@ class AppState:
         complete: bool,
         lines: Mapping[int, str],
         seen: Mapping[int, str],
+        shows: Container[int],
         on_show: Callable[[], None] | None,
+        owner: Callable[[int], int | None],
     ) -> None:
         self._text = text
         self.complete = complete
         self._matches = matches
         self._lines = lines
         self._seen = seen
+        self._shows = shows
         self._on_show = on_show
+        self._owner = owner
         self._shown = False
 
     @property
@@ -109,16 +117,23 @@ class AppState:
         try:
             match = self._matches[element_id]
         except KeyError:
+            window = self._owner(element_id)
             raise KeyError(
-                f"[{element_id}] is not in this window's state; read mac.state again"
+                f"[{element_id}] is not in this window's state; read mac.state again" if window is None else
+                f"[{element_id}] names a control in window_id {window}, not in this window; "
+                f"pick it from mac.state(..., window_id={window})"
             ) from None
+        if self._shown and element_id in self._shows:
+            return match
         # An id of an unlabeled control is its place among its siblings, so
         # a row inserted above it hands its id to another control.
         was, now = self._seen.get(element_id, "").strip(), self._lines[element_id].strip()
-        if not self._shown and was and was != now:
+        if was != now:
+            change = f"changed since your last look: it was {was}, now {now}" if was else (
+                f"is in no look you read at this window; it is now {now}"
+            )
             raise MacOSError(
-                f"[{element_id}] changed since your last look: it was {was}, now {now}. "
-                "Print this state, then pick again.",
+                f"[{element_id}] {change}. Print this state, then pick again.",
                 code=ErrorCode.ELEMENT_UNKNOWN,
                 details={"id": element_id, "was": was, "now": now},
             )
@@ -137,9 +152,6 @@ class _Parent(NamedTuple):
     # Label of the nearest printed ancestor, itself included.
     said: str
     in_menu: bool
-
-
-_ROOT = _Parent("", 0, False, False, "", False)
 
 
 class _Control(NamedTuple):
@@ -230,19 +242,22 @@ def build_lines(
     next_id: int,
     window_frame: Mapping[str, float] | None,
     last: Mapping[str, tuple[int, str]],
+    window: str,
 ) -> tuple[list[Line], list[bool], int, Slots]:
-    """Lines for ``nodes`` (a depth-first walk), whether each lies outside
-    ``window_frame``, the next free id, and each line's slot (a digest of
-    its parent, its role, and how many of that role come before it there)
-    with its id and key part.
+    """Lines for ``nodes`` (a depth-first walk of ``window``), whether each
+    lies outside ``window_frame``, the next free id, and each line's slot (a
+    digest of its parent, its role, and how many of that role come before
+    it there) with its id and key part.
 
-    A control takes the id ``ids`` holds for its key, else the id that
-    held its slot in ``last``, the slots of the window's last printed look:
-    under the same label, or under another so long as the control lies in
-    the window, no control here still bears the old label, as one that
-    moved does, and none claims the id by its key. Otherwise it takes a new
-    id, saved in ``ids``. Outside the window, where a diff shows no change,
-    a control never takes an id the last look showed under another label."""
+    A control takes the id ``ids`` holds for its key, its window and path,
+    else the id that held its slot in ``last``, the slots of the window's
+    last printed look: under the same label, or under another so long as
+    the control lies in the window, no control here still bears the old
+    label, as one that moved does, and none claims the id by its key.
+    Otherwise it takes a new id, saved in ``ids``. Outside the window, where
+    a diff shows no change, a control never takes an id the last look showed
+    under another label."""
+    root = _Parent(window, 0, False, False, "", False)
     controls: list[_Control] = []
     stack: list[_Parent] = []
     siblings: dict[tuple[str, str], int] = {}
@@ -250,7 +265,7 @@ def build_lines(
     for node in nodes:
         depth = int(node["depth"])
         del stack[depth:]
-        parent = stack[-1] if stack else _ROOT
+        parent = stack[-1] if stack else root
         part = _key_part(node)
         ordinal = siblings.get((parent.key, part), 0)
         siblings[(parent.key, part)] = ordinal + 1
@@ -378,8 +393,9 @@ def project(lines: Sequence[Line], query: str) -> list[Line] | None:
 
 class Memory:
     """One agent's ids and last looks for one process, kept as a file in
-    the user's temporary directory, with the lines `MacOS.text` last
-    showed it of each window (``texts``). `Memory.locked` opens it."""
+    the user's temporary directory, with the lines `MacOS.state` showed it
+    of each window since its last whole look there (``glances``) and the
+    lines `MacOS.text` last showed it (``texts``). `Memory.locked` opens it."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -396,6 +412,10 @@ class Memory:
         self.slots: dict[str, Slots] = {
             window: {slot: (int(i), str(part)) for slot, (i, part) in held.items()}
             for window, held in saved.get("slots", {}).items()
+        }
+        self.glances: dict[str, dict[int, str]] = {
+            window: {int(i): str(line) for i, line in lines.items()}
+            for window, lines in saved.get("glances", {}).items()
         }
         self.texts: dict[str, dict[str, JSONValue]] = {
             window: dict(lines) for window, lines in saved.get("texts", {}).items()
@@ -422,10 +442,26 @@ class Memory:
         self.looks.pop(window, None)
         self.looks[window] = look
         self.slots[window] = slots
+        self.glances.pop(window, None)
         while len(self.looks) > _REMEMBERED_WINDOWS:
             oldest = next(iter(self.looks))
             del self.looks[oldest]
             self.slots.pop(oldest, None)
+
+    def glance(self, window: str, lines: Mapping[int, str]) -> None:
+        """Make ``lines`` (id to line) what this agent last saw of those ids
+        in ``window``, until its next whole look there."""
+        self.glances[window] = {**self.glances.pop(window, {}), **lines}
+        while len(self.glances) > _REMEMBERED_WINDOWS:
+            del self.glances[next(iter(self.glances))]
+
+    def seen(self, window: str) -> dict[int, str]:
+        """Each id's line as this agent last saw it in ``window``."""
+        return {**{element_id: line for element_id, line, _ in self.looks.get(window, ())}, **self.glances.get(window, {})}
+
+    def window_of(self, element_id: int) -> str | None:
+        """The window whose control holds ``element_id``."""
+        return next((key.partition("/")[0] for key, held in self.ids.items() if held == element_id), None)
 
     def remember_text(self, window: str, lines: Mapping[str, JSONValue]) -> None:
         """Make ``lines`` (id to match) what this agent last saw of each of
@@ -442,6 +478,6 @@ class Memory:
             # json.dump writes token by token: twice as slow on a big window.
             handle.write(json.dumps({
                 "ids": self.ids, "next_id": self.next_id, "looks": self.looks, "slots": self.slots,
-                "texts": self.texts,
+                "glances": self.glances, "texts": self.texts,
             }))
         os.replace(handle.name, self.path)

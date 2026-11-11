@@ -227,9 +227,12 @@ An id names the same control in later runs, for the same `agent_id` and
 the same launch of the app, also after its label changes in place inside
 the window: when Calculator's "All Clear" turns "Clear", it keeps the id
 your last look showed there. A control relabelled outside the window
-takes a new id. `state[12]` is its match. Printing a state makes it your
-last look; `state[12]` refuses an id whose line changed since that look,
-as when a row inserted above shifts unlabeled rows or a label changed,
+takes a new id. Ids belong to one window: the same button in two
+document windows has two ids, and one window's state refuses another's
+id, naming the `window_id` it belongs to. `state[12]` is its match.
+Printing a state makes it your last look; `state[12]` refuses an id whose
+line changed since that look, as when a row inserted above shifts
+unlabeled rows or a label changed, or that no look you printed showed,
 until you print the new state:
 
 ```python
@@ -249,7 +252,8 @@ does; use it when you no longer remember the window, as after a
 compaction. Without an `agent_id` every look prints the whole window.
 `query="macOS version"` lists the lines holding the phrase, or else any
 word of three letters or more, with their ancestors and small subtrees,
-including controls scrolled away; it leaves the last look alone.
+including controls scrolled away; it leaves the last look alone, and of
+its ids only those it shows count as seen.
 
 `print(mac.text(app))` reads the window's pixels with Apple Vision where
 accessibility names nothing, as in iPhone Mirroring: one line of text a

@@ -1,8 +1,8 @@
 """`mac.state` ids across runs: a later run's look at the same window
 names each control by the id an earlier run printed, even after its label
-changed in place, its diff lists only the controls whose text changed, and
-an id whose line changed since the agent's last look is refused rather
-than handed to another control."""
+changed in place, its diff lists only the controls whose text changed, no
+id names controls in two windows, and an id whose line the agent has not
+seen as it is now is refused rather than handed to another control."""
 
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ def _look(tmp_path, nodes, window: str = "window") -> list[tuple[int, str]]:
     """A printed look, remembered as `MacOS.state` remembers it."""
     with Memory.locked(tmp_path, "agent", 4512, 1.5) as memory:
         lines, offscreen, memory.next_id, slots = build_lines(
-            nodes, memory.ids, memory.next_id, _WINDOW, memory.slots.get(window, {}),
+            nodes, memory.ids, memory.next_id, _WINDOW, memory.slots.get(window, {}), window,
         )
         look = [(line.id, line.render(), out) for line, out in zip(lines, offscreen, strict=True)]
         memory.remember(window, look, slots)
@@ -126,10 +126,13 @@ def test_a_new_control_in_the_place_of_one_that_moved_takes_a_new_id(tmp_path) -
     )
 
 
-def _state(lines: list[tuple[int, str]], seen: list[tuple[int, str]]) -> AppState:
+def _state(
+    lines: list[tuple[int, str]], seen: list[tuple[int, str]], shows: set[int] | None = None,
+) -> AppState:
     return AppState(
         "", {element_id: {"element_index": element_id} for element_id, _ in lines}, complete=True,
-        lines=dict(lines), seen=dict(seen), on_show=None,
+        lines=dict(lines), seen=dict(seen), shows=dict(lines) if shows is None else shows, on_show=None,
+        owner=lambda _: None,
     )
 
 
@@ -177,3 +180,26 @@ def test_a_relabel_seen_in_one_window_lends_its_id_to_no_other(tmp_path) -> None
 
     with pytest.raises(KeyError, match="not in this window's state"):
         reopened[archive]
+
+
+def test_the_same_controls_in_two_windows_take_different_ids(tmp_path) -> None:
+    """An id printed from one document window must not name the same
+    button in another."""
+    first = _look(tmp_path, _toolbar("Archive", "Reply"), "100")
+    second = _look(tmp_path, _toolbar("Archive", "Reply"), "101")
+
+    assert {element_id for element_id, _ in first} & {element_id for element_id, _ in second} == set()
+
+
+@pytest.mark.parametrize("seen", [[(4, '[4] button "Forward"')], []], ids=["changed since seen", "never seen"])
+def test_a_printed_query_vouches_only_for_the_lines_it_shows(seen) -> None:
+    """A query print shows a few lines; an id it left out is checked
+    against the agent's earlier looks as if nothing had been printed."""
+    state = _state([(3, '[3] button "Archive"'), (4, '[4] button "Reply"')], seen, shows={3})
+
+    str(state)
+
+    assert state[3] == {"element_index": 3}
+    with pytest.raises(MacOSError) as raised:
+        state[4]
+    assert raised.value.code == ErrorCode.ELEMENT_UNKNOWN
