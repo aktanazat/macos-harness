@@ -15,7 +15,7 @@ different request -- raises a plain `MacOSError` instead, with no
 receipt: nothing was ever attempted (see `OperationError`).
 
 ``mac.do`` is deliberately small: `press`, `set`, `toggle`, `run`, `key`,
-`click`, `type`, `fill`, `expect`, `expect_any`, and `recall`. It is not a workflow
+`click`, `type`, `fill`, `paste`, `open_files`, `expect`, `expect_any`, and `recall`. It is not a workflow
 engine, a selector language of its own,
 or an app-adapter framework -- it reuses `MacOS.ax`'s role/search-key
 vocabulary and `MacOS`'s own AX scope rules verbatim (see `validate_scope`
@@ -73,6 +73,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 import weakref
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -81,8 +82,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Literal, Protocol, TypeVar
 
-from . import receipt_log
-from ._input_lock import app_input
+from . import pasteboard, receipt_log
+from ._input_lock import app_input, pasteboard_turn
 from ._pool import pooled_methods
 from .errors import ApplicationNotFoundError, ErrorCode, FocusChangedError, MacOSError
 from .receipts import (
@@ -391,13 +392,21 @@ def _require_focus(
 
 def _typed_change(host: _Host, field: int, text: str) -> tuple[str, str] | None:
     """What plain text control ``field`` holds now and once ``text`` is
-    typed in place of its selection, counted in UTF-16 units as
-    accessibility counts them; None where that cannot be told -- another
-    kind of element, a secure field, a control character in ``text``, or
-    a value or selection that does not read as text -- or where typing
-    would leave the field as it is, so its reading proves nothing."""
+    typed in place of its selection, as `_spliced_change` tells it; None
+    also for ``text`` holding a control character, which a key event
+    delivers as a key."""
     if _has_control_character(text):
         return None
+    return _spliced_change(host, field, text)
+
+
+def _spliced_change(host: _Host, field: int, text: str) -> tuple[str, str] | None:
+    """What plain text control ``field`` holds now and once ``text`` takes
+    the place of its selection, counted in UTF-16 units as accessibility
+    counts them; None where that cannot be told -- another kind of
+    element, a secure field, or a value or selection that does not read
+    as text -- or where ``text`` would leave the field as it is, so its
+    reading proves nothing."""
     try:
         if (
             host.get(field, "AXRole") not in _PLAIN_TEXT_ROLES
@@ -417,6 +426,57 @@ def _typed_change(host: _Host, field: int, text: str) -> tuple[str, str] | None:
     typed = units[: 2 * start] + text.encode("utf-16-le", "surrogatepass") + units[2 * (start + length) :]
     after = typed.decode("utf-16-le", "surrogatepass")
     return None if after == value else (value, after)
+
+
+def _read_text(host: _Host, field: int) -> object:
+    """``field``'s value, None when accessibility refuses the read."""
+    try:
+        return host.get(field)
+    except MacOSError:
+        return None
+
+
+_PASTE_FLAVORS = (
+    ("text", pasteboard.PLAIN_TEXT),
+    ("html", pasteboard.HTML),
+    ("rtf", pasteboard.RTF),
+    ("tsv", pasteboard.TSV),
+)
+
+
+def _paste_flavors(values: Mapping[str, str | None]) -> list[tuple[str, bytes]]:
+    """The pasteboard types and UTF-8 data of the flavors a `paste` was
+    given, by parameter name."""
+    flavors: list[tuple[str, bytes]] = []
+    for parameter, kind in _PASTE_FLAVORS:
+        value = values[parameter]
+        if value is not None:
+            _validate_utf8_text(value, parameter=parameter)
+            flavors.append((kind, value.encode("utf-8")))
+    return flavors
+
+
+def _document_paths(files: Sequence[str | Path]) -> list[Path]:
+    """``files`` as absolute paths, refusing any that names no file."""
+    if isinstance(files, (str, Path)):
+        files = [files]
+    paths = [Path(file).expanduser().resolve() for file in files]
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise MacOSError(
+            f"No file at {', '.join(missing)}",
+            code=ErrorCode.BAD_REQUEST,
+            details={"parameter": "files", "missing": missing},
+        )
+    return paths
+
+
+def _document_path(url: str) -> Path | None:
+    """The file an ``AXDocument`` URL names, None for another scheme."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "file":
+        return None
+    return Path(urllib.parse.unquote(parsed.path)).resolve()
 
 
 def _changed_focus_fields(before: Mapping[str, JSONValue], after: Mapping[str, JSONValue]) -> list[str]:
@@ -481,15 +541,18 @@ def _atomic_press_acted(exc: MacOSError) -> Acted:
 def _sent_nothing(exc: MacOSError) -> bool:
     """Whether a dispatch that raised ``exc`` stopped before any input
     left: keyboard focus moved off its element first, the deadline ran
-    out first, or the person at this Mac never paused their own input.
-    A `_BlockedEffect` always comes after some input left."""
+    out first, the person at this Mac never paused their own input, or a
+    paste never got the clipboard. A `_BlockedEffect` always comes after
+    some input left."""
     if isinstance(exc, _BlockedEffect):
         return False
     reason = exc.details.get("reason")
     if isinstance(exc, FocusChangedError):
         return reason == "focus_moved_before_dispatch"
+    if reason in {"copied_before_paste", "pasteboard_write_refused"}:
+        return True
     return exc.code == ErrorCode.TIMEOUT.value and reason in {
-        "deadline_exhausted_before_dispatch", "person_active",
+        "deadline_exhausted_before_dispatch", "person_active", "pasteboard_busy",
     }
 
 
@@ -1435,6 +1498,9 @@ class _Host(Protocol):
         self, pid: int, text: str
     ) -> tuple[dict[str, JSONValue], dict[str, JSONValue]]: ...
     def _shortcut_types(self, key: str) -> bool: ...
+    def _open_documents(self, pid: int, documents: Sequence[Path], *, timeout: float) -> int: ...
+    def _window_documents(self, pid: int) -> list[str]: ...
+    def _general_pasteboard(self) -> pasteboard.Board: ...
 
 
 # --- receipt construction ---------------------------------------------
@@ -3242,6 +3308,290 @@ class Operations:
             prepare=prepare, dispatch=dispatch, settle=settle,
         )
 
+    def paste(
+        self,
+        text: str | None = None,
+        *,
+        app: str | int,
+        html: str | None = None,
+        rtf: str | None = None,
+        tsv: str | None = None,
+        files: Sequence[str | Path] = (),
+        window_id: int | None = None,
+        timeout: float = 5.0,
+        postcondition: Postcondition | None = None,
+        once: str | None = None,
+        dry_run: bool = False,
+    ) -> Receipt:
+        """Paste ``text``, a table as ``html``, ``rtf`` or ``tsv``, or
+        ``files`` into exactly ``app`` with cmd+v, then put back what
+        the clipboard held.
+
+        The flavors given go on the clipboard as one item and each file
+        as one more, and the app takes the flavor it reads best: rich
+        text takes ``html`` or ``rtf`` over ``text``, so give ``text`` too
+        for a reader of plain text only. ``app`` must be in front:
+        AppKit drops cmd+v sent to an app in the background and keeps
+        its Paste item disabled there, so such a paste fails with
+        ``acted=NO`` before the clipboard is touched.
+
+        The keys go only to the element that had keyboard focus when
+        the call was prepared, as `type`'s do. Once that element shows
+        the paste -- ``text`` in place of its selection when ``text`` is
+        all that was given, else new text holding still -- every item
+        and type the clipboard held before goes back, read back under
+        ``observed["input"]["pasteboard"]``. Something copied in between
+        stays: ``restored`` is then False, reason ``copied_since_paste``,
+        and something copied while the clipboard was being saved stops
+        the paste with ``acted=NO``, reason ``copied_before_paste``.
+        macOS has no atomic swap, so a copy landing in the same instant
+        as the restore can be cleared; ``overwrote_copy`` then says so.
+        One paste at a time borrows the clipboard, across processes.
+        An element whose text cannot be read needs a ``postcondition``
+        that does not hold yet, which the paste waits for before
+        restoring. A paste that never shows fails with ``timeout``,
+        reason ``paste_not_seen``; the clipboard goes back only if the
+        element's text moved or it still answered with its text, since
+        an app that stopped answering may take the paste later and would
+        paste the clipboard put back in its place. ``restored`` is then
+        False, reason ``paste_still_pending``.
+        """
+        flavors = _paste_flavors({"text": text, "html": html, "rtf": rtf, "tsv": tsv})
+        documents = _document_paths(files)
+        if not flavors and not documents:
+            raise MacOSError(
+                "paste needs text, html, rtf, tsv, or files",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "text"},
+            )
+        exact = text if len(flavors) == 1 and not documents else None
+        field: int | None = None
+
+        def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
+            nonlocal field
+            frontmost = host._frontmost_app()
+            if frontmost is None or frontmost.get("pid") != pid:
+                raise MacOSError(
+                    "cmd+v reaches only the app in front: AppKit drops it in the "
+                    "background and keeps Paste disabled there. Nothing was pasted; "
+                    "mac.activate(app) first",
+                    code=ErrorCode.UNSUPPORTED_OP,
+                    details={"reason": "target_in_background", "frontmost": frontmost},
+                )
+            named = _named_keyboard_window(host, pid, window_id)
+            field = host._focused_element(pid, window_id)
+            readable = field is not None and isinstance(_read_text(host, field), str)
+            if postcondition is None and not readable:
+                raise MacOSError(
+                    "The focused element's text cannot be read, so nothing would show "
+                    "when the app has taken the paste: pass postcondition= for the "
+                    "clipboard to go back once it holds",
+                    code=ErrorCode.BAD_REQUEST,
+                    details={"parameter": "postcondition"},
+                )
+            if not readable and self._verify_postcondition(
+                host, postcondition, deadline, app=pid, all_apps=False, apps=None, budget=0.0
+            ).ok:
+                raise MacOSError(
+                    "The postcondition holds before the paste, so it cannot show when "
+                    "the app has taken it and the clipboard could go back too soon; "
+                    "nothing was pasted",
+                    code=ErrorCode.BAD_REQUEST,
+                    details={"parameter": "postcondition", "reason": "postcondition_already_met"},
+                )
+            return named
+
+        held = contextlib.ExitStack()
+        board: pasteboard.Board | None = None
+        saved: pasteboard.Saved | None = None
+        written = 0
+        before: object = None
+        change: tuple[str, str] | None = None
+
+        def put_back() -> dict[str, JSONValue]:
+            assert board is not None and saved is not None
+            return pasteboard.restore(board, saved, written)
+
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            nonlocal board, saved, written, before, change
+            held.enter_context(pasteboard_turn(deadline.remaining()))
+            try:
+                host._yield_to_person(pid, "pasting into the app in front")
+                _require_focus(host, pid, field, window_id, "paste")
+                frontmost = host._frontmost_app()
+                if frontmost is None or frontmost.get("pid") != pid:
+                    raise FocusChangedError(
+                        "The app left the front after this paste was prepared; nothing was sent",
+                        details={
+                            "reason": "focus_moved_before_dispatch", "operation": "paste",
+                            "target_pid": pid,
+                        },
+                    )
+                if field is not None:
+                    before = _read_text(host, field)
+                    if exact is not None:
+                        change = _spliced_change(host, field, exact)
+                deadline.check_dispatch()
+                board = host._general_pasteboard()
+                saved = pasteboard.save(board)
+                written = pasteboard.write(board, saved, flavors, documents)
+                try:
+                    host.key("cmd+v", app=pid, window_id=window_id)
+                except MacOSError as exc:
+                    raise type(exc)(
+                        str(exc), code=exc.code, details={**exc.details, "pasteboard": put_back()}
+                    ) from exc
+            except BaseException:
+                held.close()
+                raise
+
+        def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
+            seen: str | None = None
+            read: object = None
+            restored: dict[str, JSONValue] | None = None
+            try:
+                if field is not None and isinstance(before, str):
+                    seen, read = self._await_pasted(host, field, before, change, deadline)
+                elif postcondition is not None:
+                    verified = self._verify_postcondition(
+                        host, postcondition, deadline, app=pid, all_apps=False, apps=None
+                    )
+                    seen = "postcondition" if verified.ok else None
+                if seen is None and not isinstance(read, str):
+                    restored = {"restored": False, "reason": "paste_still_pending"}
+                else:
+                    restored = put_back()
+            finally:
+                if restored is None:
+                    put_back()
+                held.close()
+            if seen is None:
+                details: dict[str, JSONValue] = {"reason": "paste_not_seen", "pasteboard": restored}
+                if isinstance(read, str):
+                    details["read"] = _value_summary(read)
+                raise _BlockedEffect(
+                    f"cmd+v went to pid {pid}, and its focused element did not show the "
+                    "paste within the deadline; details['pasteboard'] says whether the "
+                    "clipboard went back",
+                    code=ErrorCode.TIMEOUT,
+                    details=details,
+                )
+            return {"pasted": seen, "pasteboard": restored}
+
+        request: dict[str, JSONValue] = {
+            parameter: _value_summary(value)
+            for parameter, value in (("text", text), ("html", html), ("rtf", rtf), ("tsv", tsv))
+            if value is not None
+        }
+        if documents:
+            request["files"] = [str(path) for path in documents]
+        if window_id is not None:
+            request["window_id"] = window_id
+        return self._input_verb(
+            op="paste",
+            app=app,
+            request=request,
+            timeout=timeout,
+            postcondition=postcondition,
+            once=once,
+            dry_run=dry_run,
+            prepare=prepare,
+            dispatch=dispatch,
+            settle=settle,
+        )
+
+    def open_files(
+        self,
+        files: Sequence[str | Path],
+        *,
+        app: str | int,
+        timeout: float = 10.0,
+        postcondition: Postcondition | None = None,
+        once: str | None = None,
+        dry_run: bool = False,
+    ) -> Receipt:
+        """Hand ``files`` to the running ``app`` to open, as a drop on its
+        Dock icon does, with no drag and without bringing it forward,
+        then wait until its windows show them.
+
+        Launch Services delivers the request with activation off. A file
+        counts as open once one of ``app``'s windows names it as its
+        document (``AXDocument``); they are listed under
+        ``observed["input"]["opened"]``. ``app`` coming to the front
+        fails with ``focus.changed``. A file no window names by the
+        deadline fails with ``timeout``, reason ``documents_not_seen``,
+        under ``missing``. An app may show a file in a window that names
+        no document, or several files in one window that names one, as
+        Preview does: a ``postcondition`` then replaces that wait. With
+        two copies of the app running, Launch Services may give the
+        files to the other one; that fails with ``unsupported_op``,
+        reason ``another_copy_took_files``, its pid under ``took``.
+        """
+        documents = _document_paths(files)
+        if not documents:
+            raise MacOSError(
+                "open_files needs at least one file", code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "files"},
+            )
+        frontmost: dict[str, JSONValue] | None = None
+        took = 0
+
+        def prepare(host: _Host, pid: int, deadline: _Deadline) -> None:
+            del host, pid, deadline
+
+        def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
+            nonlocal frontmost, took
+            frontmost = host._frontmost_app()
+            deadline.check_dispatch()
+            took = host._open_documents(pid, documents, timeout=deadline.remaining())
+
+        def settle(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
+            if took != pid:
+                raise _BlockedEffect(
+                    f"Launch Services gave the files to pid {took}, another copy of the "
+                    f"app, not to pid {pid}",
+                    code=ErrorCode.UNSUPPORTED_OP,
+                    details={"reason": "another_copy_took_files", "took": took},
+                )
+            opened: list[Path] = []
+            while True:
+                host._guard_focus(frontmost, pid, "open_files")
+                try:
+                    shown = {_document_path(url) for url in host._window_documents(pid)}
+                except MacOSError:
+                    shown = set()
+                opened = [path for path in documents if path in shown]
+                if postcondition is not None or len(opened) == len(documents):
+                    return {"opened": [str(path) for path in opened]}
+                pause = min(_EFFECT_POLL_SECONDS, deadline.remaining())
+                if pause <= 0:
+                    break
+                self._sleep(pause)
+            raise _BlockedEffect(
+                f"pid {pid} took the files, but no window of it named "
+                f"{len(documents) - len(opened)} of them as its document within the deadline",
+                code=ErrorCode.TIMEOUT,
+                details={
+                    "reason": "documents_not_seen",
+                    "opened": [str(path) for path in opened],
+                    "missing": [str(path) for path in documents if path not in opened],
+                },
+            )
+
+        return self._input_verb(
+            op="open_files",
+            app=app,
+            request={"files": [str(path) for path in documents]},
+            timeout=timeout,
+            postcondition=postcondition,
+            once=once,
+            dry_run=dry_run,
+            prepare=prepare,
+            dispatch=dispatch,
+            settle=settle,
+            executor=Executor.PYTHON,
+        )
+
     def menu(
         self,
         path: str,
@@ -3811,6 +4161,41 @@ class Operations:
             pause = min(_EFFECT_POLL_SECONDS, deadline.remaining())
             if pause <= 0:
                 return None
+            self._sleep(pause)
+
+    def _await_pasted(
+        self,
+        host: _Host,
+        field: int,
+        before: str,
+        change: tuple[str, str] | None,
+        deadline: _Deadline,
+    ) -> tuple[str | None, object]:
+        """Wait, within ``deadline``, until ``field`` shows a paste, and
+        return how with its last reading: ``"exact"`` once it holds the
+        second of ``change``; without one, ``"changed"`` once its text
+        moved off ``before`` and held still `_TEXT_STILL_SECONDS`. Other
+        text holding still where ``change`` was due, or the deadline,
+        is ``None``. A reading that fails shows nothing: an app too busy
+        to answer may not have taken the paste yet. When the last one
+        failed at the deadline, the last text that moved off ``before``
+        stands in for it, since text that moved shows the app took it."""
+        last: object = before
+        still_since: float | None = None
+        while True:
+            value = _read_text(host, field)
+            if change is not None and value == change[1]:
+                return "exact", value
+            now = self._monotonic()
+            if not isinstance(value, str):
+                still_since = None
+            elif value != last or (still_since is None and value != before):
+                last, still_since = value, now
+            elif still_since is not None and now - still_since >= _TEXT_STILL_SECONDS:
+                return (None if change is not None else "changed"), value
+            pause = min(_EFFECT_POLL_SECONDS, deadline.remaining())
+            if pause <= 0:
+                return None, (last if last != before and not isinstance(value, str) else value)
             self._sleep(pause)
 
     def _focus_effect(

@@ -67,7 +67,8 @@ except OperationError as exc:
 PY
 ```
 
-- `press`, `set`, `fill`, `toggle`, `run`, `key`, `click`, and `type` mutate;
+- `press`, `set`, `fill`, `toggle`, `run`, `key`, `click`, `type`, `paste`,
+  and `open_files` mutate;
   `expect(condition)` and `expect_any(outcomes)` observe conditions, and
   `recall(once)` looks up a past receipt by its token, without dispatching
   anything. `set`/`toggle` are convergent: they read the current state
@@ -81,6 +82,21 @@ PY
   Give `fill` an app-level postcondition when the result matters beyond the
   field itself: `equals(title="Check", role="button", attribute="AXEnabled",
   value=True)` checks that the app accepted the input.
+- Use `paste(text, app=...)` for long text, a table (`html=`, `rtf=`, or
+  `tsv=`), or `files=`: it saves every item and type on the clipboard,
+  writes the payload, sends cmd+v to the app in front, waits until the
+  focused element shows it, and puts the saved clipboard back, reported
+  under `observed.input.pasteboard`. 5,000 characters land in about 0.4 s
+  where typing them takes about 2 s. A copy made by anything else during
+  the paste is kept (`restored: false`, reason `copied_since_paste`), and
+  one paste borrows the clipboard at a time. An app in the background is
+  refused before the clipboard is touched; an app that stops answering
+  keeps the payload on the clipboard, since it may still paste it.
+- Use `open_files(files, app=...)` to hand files to a running app as a
+  drop on its Dock icon does, with no drag and the app left behind
+  whatever is in front; it waits until a window names each file as its
+  document. Preview names one of several files a window shows: pass a
+  postcondition for it.
 - `expect_any({"saved": present(app=app, identifier="saved"),
   "error": present(app=app, identifier="error")}, timeout=5)` waits for the
   first observation pass with a satisfied condition. Read

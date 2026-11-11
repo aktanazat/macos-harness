@@ -26,8 +26,8 @@ primitives carry no receipt and no idempotency guarantee.
 
 ## Verbs
 
-- `press`, `set`, `fill`, `toggle`, `run`, `key`, `click`, and `type` mutate;
-  `expect(condition)` and `expect_any(outcomes)` observe, and `recall(once)`
+- `press`, `set`, `fill`, `toggle`, `run`, `key`, `click`, `type`, `paste`, and
+  `open_files` mutate; `expect(condition)` and `expect_any(outcomes)` observe, and `recall(once)`
   looks up a past receipt without dispatching anything.
 - `set`/`toggle` check first and report `outcome="already"` instead of
   re-mutating a target already in the requested state, so neither takes `once`.
@@ -39,6 +39,30 @@ primitives carry no receipt and no idempotency guarantee.
   app-level postcondition, such as
   `equals(title="Check", role="button", attribute="AXEnabled", value=True)`,
   to prove the app processed the input rather than just displaying it.
+- `mac.do.paste(text, app=...)` pastes long text, a table (`html=`, `rtf=`,
+  `tsv=`; give `text` too for plain-text readers), or `files=` into the app in
+  front with cmd+v and puts the clipboard back: every item and type, read back
+  as `observed["input"]["pasteboard"]` (`restored`, `items`, `exact`; `exact` is
+  false when a type the app promised could not be read, listed under
+  `unreadable_types`). Plain text alone is verified exactly; anything else once
+  new text holds still. A copy made elsewhere during the paste stays
+  (`restored: false`, reason `copied_since_paste`); one made while the clipboard
+  is saved stops the paste with `acted="no"`, reason `copied_before_paste`; one
+  landing in the very instant of the restore can be cleared and is reported as
+  `overwrote_copy`. One paste borrows the clipboard at a time, across processes
+  (`pasteboard_busy` after the deadline). An app in the background fails with
+  `unsupported_op`, reason `target_in_background`, `acted="no"`, before the
+  clipboard is touched; `mac.activate(app)` first. A field whose text cannot be
+  read needs a postcondition that does not hold yet. A paste never seen while
+  the app stops answering leaves the payload on the clipboard (`restored:
+  false`, reason `paste_still_pending`), since the app may still take it.
+- `mac.do.open_files(files, app=...)` hands files to a running app through
+  Launch Services with activation off, as a drop on its Dock icon, and waits
+  until a window names each as its `AXDocument` (`observed["input"]["opened"]`);
+  `documents_not_seen` lists the `missing` ones. A postcondition replaces that
+  wait for apps whose windows name no document or name one of several files,
+  as Preview's do. With two copies of the app running, files given to the other
+  copy fail with `another_copy_took_files`, its pid under `took`.
 
 ## Errors
 

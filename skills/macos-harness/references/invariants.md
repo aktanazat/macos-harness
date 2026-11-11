@@ -88,7 +88,19 @@ with repeated keys, clicks, deletion loops, or bulk input.
   posted; `clicks` is 1 to 3.
 - `mac.type()` into the frontmost app lands 128 characters in about 30 ms; into
   an inactive app it sends one character every 10 ms, so long text there costs
-  seconds. `mac.do.type` takes at most 4096 characters.
+  seconds. `mac.do.type` takes at most 4096 characters; `mac.do.paste` takes
+  any length, 5,000 characters in about 0.4 s, but only into the app in front.
+- `mac.do.paste` borrows the user's clipboard: it saves every item and type,
+  pastes, and puts them back once the paste shows. It never puts them back
+  over something copied in between, and one paste borrows the clipboard at a
+  time across every harness process. An app that stops answering before the
+  paste shows keeps the payload on the clipboard, since putting the user's
+  clipboard back would let the app paste that instead. AppKit drops cmd+v to
+  an app in the background and keeps its Paste item disabled there, so a
+  paste refuses such an app before touching the clipboard.
+- `mac.do.open_files` gives files to a running app with activation off and
+  leaves the app in front where it is; it fails with `focus.changed` if the
+  app comes forward anyway.
 - Input to one app goes out one call at a time across every harness process
   of this user: keys go to whichever window the app has focused, so two runs
   typing into two windows of one app had put both texts, mixed, into one of

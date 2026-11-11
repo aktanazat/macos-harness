@@ -3344,3 +3344,160 @@ def test_receipt_log_rolls_back_a_short_write_without_losing_prior_records(
 
     operations.press("Save", app="Demo")
     assert [json.loads(line)["op"] for line in log.read_bytes().splitlines()] == ["key", "press"]
+
+
+@pytest.fixture
+def clipboard() -> Iterator[object]:
+    """A private pasteboard holding the user's clipboard."""
+    from AppKit import NSPasteboard
+
+    private = NSPasteboard.pasteboardWithUniqueName()
+    private.clearContents()
+    private.setString_forType_("the user's clipboard", "public.utf8-plain-text")
+    yield private
+    private.releaseGlobally()
+
+
+class _PasteHost(FormHost):
+    """A form whose app pastes from ``board``."""
+
+    def __init__(self, board: object) -> None:
+        super().__init__()
+        self.board = board
+        self.focused = True
+
+    def _general_pasteboard(self) -> object:
+        return self.board
+
+
+class _StopsAnsweringOnPaste(_PasteHost):
+    """A form whose app stops answering accessibility once cmd+v arrives,
+    as one that is busy or stopped does before it reads the clipboard."""
+
+    def __init__(self, board: object) -> None:
+        super().__init__(board)
+        self.answering = True
+
+    def key(self, key: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
+        super().key(key, app=app, window_id=window_id)
+        self.answering = key != "cmd+v"
+
+    def get(
+        self, element_index: int, attribute: str = "AXValue", *, missing_ok: bool = False
+    ) -> object:
+        if not self.answering:
+            raise MacOSError("The app did not answer", code=ErrorCode.AX_ERROR)
+        return super().get(element_index, attribute, missing_ok=missing_ok)
+
+
+def test_a_paste_the_app_never_answered_leaves_its_payload_for_the_app(clipboard) -> None:
+    host = _StopsAnsweringOnPaste(clipboard)
+    host.keyboard_focus.extend([7, 7, 7])
+    clock = _SleepClock()
+    operations = Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+
+    error = _failed(lambda: operations.paste(html="<b>pasted</b>", app="Demo", timeout=2.0))
+
+    assert error.receipt.error["details"]["reason"] == "paste_not_seen"
+    assert dict(error.receipt.error["details"]["pasteboard"]) == {
+        "restored": False, "reason": "paste_still_pending",
+    }
+    assert "public.html" in clipboard.types()
+
+
+class _StopsAnsweringAfterPasting(_PasteHost):
+    """A form whose app shows the paste once, then stops answering
+    accessibility before its text could be seen holding still."""
+
+    def __init__(self, board: object) -> None:
+        super().__init__(board)
+        self.reads_left: int | None = None
+
+    def key(self, key: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
+        super().key(key, app=app, window_id=window_id)
+        if key == "cmd+v":
+            self.value, self.reads_left = "pasted", 1
+
+    def get(
+        self, element_index: int, attribute: str = "AXValue", *, missing_ok: bool = False
+    ) -> object:
+        if self.reads_left is not None:
+            if self.reads_left == 0:
+                raise MacOSError("The app did not answer", code=ErrorCode.AX_ERROR)
+            self.reads_left -= 1
+        return super().get(element_index, attribute, missing_ok=missing_ok)
+
+
+def test_a_paste_the_app_showed_puts_the_clipboard_back_though_it_stopped_answering(clipboard) -> None:
+    host = _StopsAnsweringAfterPasting(clipboard)
+    host.keyboard_focus.extend([7, 7, 7])
+    clock = _SleepClock()
+    operations = Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+
+    error = _failed(lambda: operations.paste(html="<b>pasted</b>", app="Demo", timeout=2.0))
+
+    assert error.receipt.error["details"]["reason"] == "paste_not_seen"
+    assert error.receipt.error["details"]["pasteboard"]["restored"] is True
+    assert clipboard.stringForType_("public.utf8-plain-text") == "the user's clipboard"
+
+
+_HOLD_PASTEBOARD = (
+    "import fcntl, os, sys\n"
+    "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+    "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+    "print('held', flush=True)\n"
+    "sys.stdin.read()\n"
+)
+
+
+def test_a_paste_waits_for_another_runs_paste_and_touches_nothing(clipboard, tmp_path) -> None:
+    host = _PasteHost(clipboard)
+    clock = _SleepClock()
+    operations = Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+    host.keyboard_focus.extend([7, 7, 7])
+    untouched = clipboard.changeCount()
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_PASTEBOARD, str(tmp_path / "macos-harness-pasteboard.lock")],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline() == "held\n"
+
+        error = _failed(lambda: operations.paste("pasted", app="Demo", timeout=0.2))
+    finally:
+        assert holder.stdin is not None
+        holder.stdin.close()
+        holder.wait(timeout=5)
+        assert holder.stdout is not None
+        holder.stdout.close()
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.error["details"]["reason"] == "pasteboard_busy"
+    assert clipboard.changeCount() == untouched
+    assert clipboard.stringForType_("public.utf8-plain-text") == "the user's clipboard"
+    assert ("cmd+v", 41) not in host.key_calls
+
+
+class _AnotherCopyTakesFiles(FakeHost):
+    def _open_documents(self, pid: int, documents: Sequence[Path], *, timeout: float) -> int:
+        del documents, timeout
+        return pid + 1
+
+    def _window_documents(self, pid: int) -> list[str]:
+        del pid
+        return []
+
+
+def test_open_files_fails_when_another_copy_of_the_app_took_them(tmp_path) -> None:
+    host = _AnotherCopyTakesFiles()
+    clock = _SleepClock()
+    operations = Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+    document = tmp_path / "note.txt"
+    document.write_text("note")
+
+    error = _failed(lambda: operations.open_files([document], app="Demo", timeout=1.0))
+
+    assert error.receipt.acted is Acted.YES
+    assert error.receipt.error["details"]["reason"] == "another_copy_took_files"
+    assert error.receipt.error["details"]["took"] == 42
