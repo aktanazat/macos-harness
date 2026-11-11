@@ -107,10 +107,13 @@ from .receipts import (
     validate_exact_selectors,
     validate_scope,
 )
+from .steps import StepsResult, run_steps
 from .text import is_text_match
 
 if TYPE_CHECKING:
+    from .capture import WindowCapture
     from .macos import _AppIdentity
+    from .state import AppState
 
 __all__ = ["Operations"]
 
@@ -1348,9 +1351,16 @@ class _Host(Protocol):
 
     _backend: str
     ax: _AXSurface
+    _elements: dict[int, object]
 
     @property
     def _native_client(self) -> object | None: ...
+    def state(self, app: str | int) -> AppState: ...
+    def _window_image(
+        self, window_id: int, *, max_width: int | None, max_height: int | None
+    ) -> WindowCapture: ...
+    def _state_window(self, pid: int, window_id: int | None) -> object: ...
+    def _ax_window_id(self, window: object) -> int | None: ...
 
     def _resolve_app(
         self,
@@ -1675,6 +1685,24 @@ class Operations:
         """Return the latest 256 non-replayed receipts in completion order."""
         self._check_owner()
         return self._ledger.history()
+
+    def steps(self, steps: Sequence[Mapping[str, object]], *, app: str | int) -> StepsResult:
+        """Send ``steps`` in order as one call. Each step is a dict naming
+        a verb under ``"op"`` with that verb's own arguments, such as
+        ``{"op": "press", "text": "7"}``, and acts on ``app``; an
+        ``expect`` step's condition is scoped to it unless it names an app.
+
+        Every step's arguments are matched to its verb before the first is
+        sent; a value the verb refuses stops the run at that step. Each
+        keeps its verb's person pause, input lock, ``once`` token and
+        receipt. The first step that fails ends the run: the rest are not
+        sent, and nothing is retried. The result carries the receipts and
+        what changed in ``app``'s focused window from before the first
+        step to after the last; a failed step leaves the window's picture
+        before and after it, and its text after it, in files.
+        """
+        self._check_owner()
+        return run_steps(self, steps, app=app)
 
     def expect(self, condition: Postcondition) -> Receipt:
         """Observe an explicitly scoped condition without changing the app.

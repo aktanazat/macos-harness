@@ -75,10 +75,12 @@ class AppState:
     Reading the text makes it the agent's last look; ``shows`` are the ids
     whose lines it shows, ``owner`` names the window of an id that is not in
     this one, and ``latest`` reads the window's newest read in this process,
-    which may have found an id's line changed since this one."""
+    which may have found an id's line changed since this one. ``window_id``
+    is the window's id, None where Accessibility gives it none."""
 
     __slots__ = (
         "_latest", "_lines", "_matches", "_on_show", "_owner", "_seen", "_shown", "_shows", "_text", "complete",
+        "window_id",
     )
 
     def __init__(
@@ -93,9 +95,11 @@ class AppState:
         on_show: Callable[[], None] | None,
         owner: Callable[[int], int | None],
         latest: Callable[[], tuple[Mapping[int, str], bool]],
+        window_id: int | None = None,
     ) -> None:
         self._text = text
         self.complete = complete
+        self.window_id = window_id
         self._matches = matches
         self._lines = lines
         self._seen = seen
@@ -104,6 +108,12 @@ class AppState:
         self._owner = owner
         self._latest = latest
         self._shown = False
+
+    @property
+    def lines(self) -> Mapping[int, str]:
+        """Each id's line, in window order, scrolled out of view or not.
+        Reading it leaves the last look as it was."""
+        return self._lines
 
     @property
     def text(self) -> str:
@@ -358,16 +368,24 @@ def build_lines(
 
 
 def diff(old: Sequence[tuple[int, str]], new: Sequence[tuple[int, str]], present: Container[int]) -> str | None:
+    """`changes` since the agent's last look, under their header."""
+    if list(old) == list(new):
+        return f"No changes since your last look; {_WHOLE}."
+    lines = changes(old, new, present)
+    if lines is None:
+        return None
+    return "\n".join([f"Changes since your last look (~ changed, + added; {_WHOLE}):", *lines])
+
+
+def changes(old: Sequence[tuple[int, str]], new: Sequence[tuple[int, str]], present: Container[int]) -> list[str] | None:
     """The change from ``old`` to ``new`` lines in the window, keyed by
     id: removed ids, then each changed (``~``) or added (``+``) line. An id
     still ``present``, as one scrolled out of the window, is not removed.
     None where the ids both hold moved, which a list of changes cannot say."""
-    if list(old) == list(new):
-        return f"No changes since your last look; {_WHOLE}."
     before, after = dict(old), dict(new)
     if [i for i, _ in old if i in after] != [i for i, _ in new if i in before]:
         return None
-    out = [f"Changes since your last look (~ changed, + added; {_WHOLE}):"]
+    out = []
     removed = sorted(i for i in before if i not in after and i not in present)
     if removed:
         out.append("Removed: " + _ranges(removed))
@@ -376,7 +394,7 @@ def diff(old: Sequence[tuple[int, str]], new: Sequence[tuple[int, str]], present
             out.append("+" + line)
         elif before[element_id] != line:
             out.append("~" + line)
-    return "\n".join(out)
+    return out
 
 
 def _ranges(ids: Sequence[int]) -> str:
