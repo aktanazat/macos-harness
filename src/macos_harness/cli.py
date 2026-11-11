@@ -201,6 +201,72 @@ def _program_arg(value: str) -> tuple[str, str]:
     return name, text
 
 
+def _without_vm(argv: Iterable[str]) -> list[str]:
+    """``argv`` with its ``--vm NAME`` or ``--vm=NAME`` left out."""
+    kept: list[str] = []
+    skip = False
+    for token in argv:
+        if skip:
+            skip = False
+        elif token == "--vm":
+            skip = True
+        elif not token.startswith("--vm="):
+            kept.append(token)
+    return kept
+
+
+def _forward_to_vm(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, argv: list[str], program: str | None
+) -> int:
+    """Run this invocation inside VM ``args.vm`` instead of on this Mac;
+    ``program`` is `run`'s file, read here because the guest cannot."""
+    from . import vm
+
+    forwarded = _without_vm(argv)
+    stdin = program
+    if args.command == "run":
+        after_run = forwarded.index("run") + 1
+        file_at = next(
+            at for at in range(after_run, len(forwarded)) if Path(forwarded[at]) == args.file
+        )
+        forwarded[file_at] = "/dev/stdin"
+    elif args.command is None and args.code is None:
+        if sys.stdin.isatty():
+            parser.print_help()
+            return 2
+        stdin = sys.stdin.read()
+    return vm.run(args.vm, forwarded, stdin)
+
+
+def _run_vm(args: argparse.Namespace) -> int:
+    from . import vm
+
+    action = args.vm_action
+    if action == "serve":
+        return vm.serve()
+    result: object
+    if action == "list":
+        result = vm.list_vms()
+    elif action == "create":
+        result = vm.create(args.name, base=args.base or vm.DEFAULT_BASE)
+    elif action == "start":
+        result = vm.start(args.name, timeout=args.timeout)
+    elif action == "stop":
+        vm.stop(args.name)
+        result = {"name": args.name, "state": "stopped"}
+    elif action == "snapshot":
+        result = vm.snapshot(args.name, args.label)
+    elif action == "reset":
+        result = vm.reset(args.name, to=args.to)
+    elif action == "delete":
+        vm.delete(args.name)
+        result = {"name": args.name, "deleted": True}
+    else:
+        result = {"launch_agent": str(vm.install_guest())}
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def _saved_program(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> tuple[str, dict[str, str]]:
@@ -238,6 +304,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("-c", dest="code", metavar="CODE", help="run CODE instead of stdin")
     parser.add_argument("--agent-id", help="name this agent's colored virtual pointer")
+    parser.add_argument(
+        "--vm", metavar="NAME", help="run inside the disposable VM NAME; see `macos-harness vm`"
+    )
     errors = argparse.ArgumentParser(add_help=False)
     errors.add_argument(
         "--json-errors",
@@ -324,6 +393,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "spare",
         help="as this shell's coprocess, keep a loaded process ready for its next step",
     )
+    vm = subparsers.add_parser(
+        "vm", help="create, start, snapshot, reset and delete disposable macOS VMs"
+    )
+    vm_actions = vm.add_subparsers(dest="vm_action", required=True)
+    vm_actions.add_parser("list", help="the VMs `vm create` made, with their snapshots")
+    vm_create = vm_actions.add_parser("create", help="clone the base VM into a new stopped VM")
+    vm_create.add_argument("name")
+    vm_create.add_argument(
+        "--from", dest="base", help="the tart VM to clone in place of the prepared base"
+    )
+    vm_start = vm_actions.add_parser("start", help="boot a VM without a window")
+    vm_start.add_argument("name")
+    vm_start.add_argument("--timeout", type=float, default=300.0)
+    vm_actions.add_parser("stop", help="shut a VM down").add_argument("name")
+    vm_snapshot = vm_actions.add_parser("snapshot", help="keep a VM's disk under a label")
+    vm_snapshot.add_argument("name")
+    vm_snapshot.add_argument("label")
+    vm_reset = vm_actions.add_parser("reset", help="put a VM back to a snapshot or its base")
+    vm_reset.add_argument("name")
+    vm_reset.add_argument("--to", metavar="LABEL", help="a snapshot label; the base without it")
+    vm_actions.add_parser("delete", help="delete a VM and its snapshots").add_argument("name")
+    vm_actions.add_parser("serve", help="inside a guest: run programs the host forwards")
+    vm_actions.add_parser(
+        "install-guest", help="inside a guest: start `vm serve` from Terminal at every login"
+    )
     return parser
 
 
@@ -338,10 +432,13 @@ def main(argv: list[str] | None = None) -> int:
         status = run_in_spare(sys.argv[1:])
         if status is not None:
             return status
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
     if args.code is not None and args.command is not None:
         parser.error(f"-c runs CODE in place of a command; drop -c or {args.command}")
+    if args.vm is not None and args.command in ("repl", "spare", "telemetry", "vm"):
+        parser.error(f"{args.command} runs only on this Mac; drop --vm")
     if args.command == "telemetry":
         return run_telemetry_cli([args.action] if args.action else [])
     if args.command == "spare":
@@ -353,6 +450,12 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     result: int | None = None
     try:
+        if args.vm is not None:
+            result = _forward_to_vm(parser, args, raw_argv, saved[0] if saved else None)
+            return result
+        if args.command == "vm":
+            result = _run_vm(args)
+            return result
         if saved is not None:
             program, program_args = saved
             result = _execute(

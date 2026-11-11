@@ -7,6 +7,13 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `macos-harness vm create|start|stop|snapshot|reset|delete|list` runs
+  disposable macOS VMs with tart, headless, cloned from a prepared base,
+  and `--vm NAME` runs `-c`, `run`, `see`, `state`, `apps`, and `doctor`
+  inside one with the same verbs. Pictures a guest program saves come back
+  to the host. This Mac's screen, pointer, focus, and clipboard stay
+  untouched; see `macos-harness skill vm`.
+
 - `mac.state(app)` prints a window as text, one control a line, as
   `[12] button "All Clear"`. Ids hold across runs for the same agent and
   app launch, and `state[12]` is a match for `click(element=)`,
