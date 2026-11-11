@@ -399,13 +399,15 @@ other window still there leaves the receipt unverified.
 `do.steps([{"op": "press", "text": "7"}, {"op": "key", "key": "return"}],
 app=)` sends verbs in order as one call: each step names its verb under
 `"op"` with that verb's own arguments, every step acts on `app=`, and an
-`expect` step's condition is scoped to it. All steps are checked against
-their verbs before the first is sent; each keeps its own receipt, person
-pause, input lock, and `once` token. The first failure ends the run: later
+`expect` step's condition is scoped to it. Every step's arguments are
+matched to its verb before the first is sent, and a value the verb refuses
+stops the run at that step; each keeps its own receipt, person pause, input
+lock, and `once` token. The first failure ends the run: later
 steps are not sent and nothing is retried. It returns a `StepsResult`,
 not a receipt: `receipts`, `changes` in the focused window from before the
-first step to after the last, and on a failure `stopped_at`, `error`, and
-`strip`, the window's pictures before and after that step and its text.
+first step to right after the last (end with an `expect` step to wait for a
+later effect), and on a failure `stopped_at`, `error`, and `strip`, the
+window's pictures before and after that step and its text.
 
 ## Routes and diagnostics
 

@@ -1692,8 +1692,9 @@ class Operations:
         ``{"op": "press", "text": "7"}``, and acts on ``app``; an
         ``expect`` step's condition is scoped to it unless it names an app.
 
-        Every step is checked against its verb before the first is sent.
-        Each keeps its verb's person pause, input lock, ``once`` token and
+        Every step's arguments are matched to its verb before the first is
+        sent; a value the verb refuses stops the run at that step. Each
+        keeps its verb's person pause, input lock, ``once`` token and
         receipt. The first step that fails ends the run: the rest are not
         sent, and nothing is retried. The result carries the receipts and
         what changed in ``app``'s focused window from before the first

@@ -47,10 +47,11 @@ follows [Semantic Versioning](https://semver.org/).
 
 - `mac.do.steps([...], app=)` sends several `mac.do` verbs in order as one
   call, each step a dict naming its verb under `"op"` with that verb's own
-  arguments. Every step is checked before the first is sent, and each
-  keeps its own receipt, person pause, input lock, and `once` token. The
-  first failure ends the run: later steps are not sent and nothing is
-  retried. The result holds the receipts and what changed in the app's
+  arguments. Every step's arguments are matched to its verb before the
+  first is sent, and each keeps its own receipt, person pause, input lock,
+  and `once` token. The first failure ends the run: later steps are not
+  sent and nothing is retried, and a value a step's verb refuses stops it
+  there. The result holds the receipts and what changed in the app's
   focused window over the run; a failed step leaves the window's pictures
   from before and after it, and its text, in files. In a VM, 12+34= in
   Calculator took one call of about 1.4 s instead of seven forwarded calls

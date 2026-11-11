@@ -226,16 +226,18 @@ mac.do.expect(equals(app="Demo", identifier="sync-status", value="Saved"))
 Use `mac.do.steps(steps, app=)` to send several verbs as one call. Each step
 is a dict naming its verb under `"op"` with that verb's own arguments and no
 `app`: every step acts on the app `steps` names, and an `expect` step's
-condition looks there unless it names its own scope. Every step is checked
-against its verb before the first is sent. Each keeps its own person pause,
-input lock, `once` token, and receipt. The first step that fails ends the
+condition looks there unless it names its own scope. Every step's arguments
+are matched to its verb before the first is sent, and a value the verb
+refuses stops the run at that step. Each keeps its own person pause, input
+lock, `once` token, and receipt. The first step that fails ends the
 run: the steps after it are not sent, and nothing is retried. A failed step
 returns a result rather than raising. `receipts` holds one receipt per step
 that ran, and `changes` says what changed in the app's focused window from
-before the first step to after the last one that ran. When a step fails,
-`stopped_at` is its index, `error` says why, and `strip` names the files it
-left: the window's picture before and after that step, and the window's text
-after it.
+before the first step to after the last one that ran. That read comes right
+after the last step, so end with an `expect` step to wait for an effect the
+app shows later. When a step fails, `stopped_at` is its index, `error` says
+why, and `strip` names the files it left: the window's picture before and
+after that step, and the window's text after it.
 
 ```python
 from macos_harness import equals

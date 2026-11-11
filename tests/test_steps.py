@@ -40,12 +40,25 @@ def test_steps_sends_nothing_after_a_step_whose_dispatch_is_uncertain() -> None:
     result = Operations(host, _sleep=lambda _seconds: None).steps(
         [{"op": "press", "text": "Save"}] * 3, app="Demo"
     )
+    assert isinstance(result.strip, tuple)
     shutil.rmtree(result.strip[-1].parent)
 
     assert (result.status, result.stopped_at, len(host.press_calls)) == ("stopped", 1, 2)
 
 
-def test_steps_checks_every_step_before_sending_the_first() -> None:
+def test_steps_returns_what_ran_when_a_later_step_fails_with_a_plain_python_error() -> None:
+    host = _StepsHost()
+
+    result = Operations(host, _sleep=lambda _seconds: None).steps(
+        [{"op": "press", "text": "1"}, {"op": "type", "text": 5}, {"op": "press", "text": "2"}], app="Demo"
+    )
+    assert isinstance(result.strip, tuple)
+    shutil.rmtree(result.strip[-1].parent)
+
+    assert (result.status, result.stopped_at, len(host.press_calls)) == ("stopped", 1, 1)
+
+
+def test_steps_matches_every_step_to_its_verb_before_sending_the_first() -> None:
     host = _StepsHost()
     operations = Operations(host, _sleep=lambda _seconds: None)
 

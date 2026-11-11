@@ -61,7 +61,7 @@ class StepsResult:
     from before the first step to after the last one that ran. ``strip``
     names the files a failed step leaves: the window's picture before and
     after it, and a text file with ``changes`` and the window's lines
-    after it.
+    after it; or it says why they could not be written.
     """
 
     status: Literal["done", "stopped"]
@@ -71,7 +71,7 @@ class StepsResult:
     duration_s: float
     stopped_at: int | None = None
     error: ErrorPayload | None = None
-    strip: tuple[Path, ...] = ()
+    strip: tuple[Path, ...] | str = ()
 
     @property
     def ok(self) -> bool:
@@ -88,7 +88,10 @@ class StepsResult:
         ]
         if len(self.receipts) > self.stopped_at:
             lines.append(f"steps[{self.stopped_at}] {self.receipts[-1]}")
-        lines.append(f"Files on steps[{self.stopped_at}]: " + " ".join(map(str, self.strip)))
+        lines.append(
+            self.strip if isinstance(self.strip, str)
+            else f"Files on steps[{self.stopped_at}]: " + " ".join(map(str, self.strip))
+        )
         return "\n".join([*lines, self.changes])
 
     def to_json(self) -> dict[str, JSONValue]:
@@ -99,7 +102,7 @@ class StepsResult:
             "error": None if self.error is None else {**self.error},
             "receipts": [receipt.to_json() for receipt in self.receipts],
             "changes": self.changes,
-            "strip": [str(path) for path in self.strip],
+            "strip": self.strip if isinstance(self.strip, str) else [str(path) for path in self.strip],
             "duration_s": self.duration_s,
         }
 
@@ -137,6 +140,11 @@ def run_steps(ops: Operations, steps: Sequence[Mapping[str, object]], *, app: st
                 break
             except MacOSError as exc:
                 stop = index, exc, before
+                break
+            except (TypeError, ValueError, AttributeError) as exc:
+                # Some verbs fail on a value of the wrong type with a plain
+                # Python error; the steps before it were sent all the same.
+                stop = index, MacOSError(f"{type(exc).__name__}: {exc}", code=ErrorCode.BAD_REQUEST), before
                 break
         after = _state(host, app)
         change = _change(first, after)
@@ -220,8 +228,13 @@ def _change(before: AppState | MacOSError, after: AppState | MacOSError) -> str:
         return "\n".join([f"No window to read before steps[0]: {before}. Now:", *now])
     if before.window_id != after.window_id:
         return "\n".join([f"Another window is in front now (window_id {after.window_id}):", *now])
-    moved = changes(list(before.lines.items()), list(after.lines.items()), ())
-    cut = "" if before.complete and after.complete else "; the window holds more than a look reads, so only what both read"
+    old, new = list(before.lines.items()), list(after.lines.items())
+    cut = ""
+    if not (before.complete and after.complete):
+        cut = "; the window holds more than a look reads, so only what both read"
+        old = [(element_id, line) for element_id, line in old if element_id in after.lines]
+        new = [(element_id, line) for element_id, line in new if element_id in before.lines]
+    moved = changes(old, new, ())
     if moved is None:
         return "\n".join([f"Controls moved since before steps[0]{cut}; the window now:", *now])
     if not moved:
@@ -231,20 +244,23 @@ def _change(before: AppState | MacOSError, after: AppState | MacOSError) -> str:
 
 def _strip(
     index: int, before: WindowCapture | str, after: WindowCapture | str, change: str, state: AppState | MacOSError,
-) -> tuple[Path, ...]:
+) -> tuple[Path, ...] | str:
     from .capture import write_png
 
-    folder = Path(tempfile.mkdtemp(prefix="macos-harness-steps-"))
     files: list[Path] = []
     notes: list[str] = []
-    for name, picture in (("before", before), ("after", after)):
-        if isinstance(picture, str):
-            notes.append(f"No picture {name} steps[{index}]: {picture}")
-        else:
-            path = folder / f"steps-{index}-{name}.png"
-            write_png(picture.image, path)
-            files.append(path)
-    window = [f"\nThe window after steps[{index}]:", *state.lines.values()] if isinstance(state, AppState) else []
-    text = folder / f"steps-{index}-ax.txt"
-    text.write_text("\n".join([*notes, change, *window]) + "\n")
+    try:
+        folder = Path(tempfile.mkdtemp(prefix="macos-harness-steps-"))
+        for name, picture in (("before", before), ("after", after)):
+            if isinstance(picture, str):
+                notes.append(f"No picture {name} steps[{index}]: {picture}")
+            else:
+                path = folder / f"steps-{index}-{name}.png"
+                write_png(picture.image, path)
+                files.append(path)
+        window = [f"\nThe window after steps[{index}]:", *state.lines.values()] if isinstance(state, AppState) else []
+        text = folder / f"steps-{index}-ax.txt"
+        text.write_text("\n".join([*notes, change, *window]) + "\n")
+    except (OSError, MacOSError) as exc:
+        return f"No files on steps[{index}]: {exc}"
     return (*files, text)

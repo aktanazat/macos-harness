@@ -80,9 +80,10 @@ bad argument (an unknown role, a `once` token reused for a different request)
 raises `MacOSError` before anything is dispatched, with no receipt: nothing was
 attempted. An uncaught `OperationError` ends a stdin program, so catch it when
 later steps should still run, then look before acting again. `mac.do.steps`
-returns instead of raising: a failed step leaves `result.ok` false, its
-error in `result.error`, and its receipt last in `result.receipts` when it
-got that far.
+raises only for a step that does not fit its verb, before anything is sent.
+After that it returns: a failed step, a value its verb refuses included,
+leaves `result.ok` false, its error in `result.error`, and its receipt last
+in `result.receipts` when it got that far.
 
 ## What `changed` means
 
