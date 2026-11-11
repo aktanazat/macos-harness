@@ -8,8 +8,8 @@ follows [Semantic Versioning](https://semver.org/).
 ### Added
 
 - `mac.sdef(app)` lists the AppleScript commands, classes, and
-  enumerations an app takes, read from its bundle without launching it
-  (about 1 ms for Notes); `macos-harness sdef APP` prints it.
+  enumerations an app takes, read from its bundle through OpenScripting
+  without launching it; `macos-harness sdef APP` prints it.
 
 - `mac.menu_index(app)` reads an app's whole menu bar once without
   opening a menu, kept per bundle ID and version and read again when the
