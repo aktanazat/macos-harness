@@ -88,3 +88,21 @@ def test_a_changed_checkout_reaches_the_guest_as_a_new_copy(tmp_path):
 
     assert second != first
     assert "two" in (second / "macos_harness" / "__init__.py").read_text(encoding="utf-8")
+
+
+def test_a_picture_from_an_earlier_call_reaches_the_guest_with_its_record(tmp_path):
+    root = (tmp_path / "files").resolve()
+    picture = root / "earlier" / "macos-harness-see.png"
+    picture.parent.mkdir(parents=True)
+    picture.write_bytes(b"png")
+    Path(f"{picture}.json").write_text('{"scale": 2}', encoding="utf-8")
+    requests = tmp_path / "requests"
+    requests.mkdir()
+
+    sent = vm._named_files(root, ["-c", f"mac.click(x=1, y=2, screenshot='{picture}')"])
+    placed = [vm._placed(requests, relative, data) for relative, data in sent.items()]
+
+    assert sorted(path.name for path in placed) == ["macos-harness-see.png", "macos-harness-see.png.json"]
+    assert (requests / "earlier" / "macos-harness-see.png").read_bytes() == b"png"
+    with pytest.raises(ValueError):
+        vm._placed(requests, "../outside", base64.b64encode(b"x").decode())

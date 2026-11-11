@@ -12,6 +12,7 @@ such as `mac.see` pictures, come back to the host.
 from __future__ import annotations
 
 import base64
+import contextlib
 import fcntl
 import hashlib
 import io
@@ -19,8 +20,10 @@ import json
 import os
 import plistlib
 import re
+import select
 import shlex
 import shutil
+import signal
 import socket
 import socketserver
 import struct
@@ -320,17 +323,19 @@ def _copy_vm(source: str, target: str) -> None:
     ``source``, saved memory and network identity included."""
     origin, copy = _tart_folder(source), _tart_folder(target)
     files = [str(path) for path in origin.iterdir() if path.is_file()]
-    shutil.rmtree(copy, ignore_errors=True)
-    copy.mkdir(parents=True)
+    partial = copy.parent.parent / f"macos-harness-copy-{uuid.uuid4().hex}"
+    partial.mkdir()
     done = subprocess.run(
-        ["/bin/cp", "-c", *files, str(copy)], capture_output=True, text=True, check=False
+        ["/bin/cp", "-c", *files, str(partial)], capture_output=True, text=True, check=False
     )
     if done.returncode:
-        shutil.rmtree(copy, ignore_errors=True)
+        shutil.rmtree(partial, ignore_errors=True)
         raise MacOSError(
             f"copying {source!r} to {target!r} failed: {done.stderr.strip()}",
             code="vm.tart_failed",
         )
+    shutil.rmtree(copy, ignore_errors=True)
+    partial.rename(copy)
 
 
 def snapshot(name: str, label: str) -> VM:
@@ -362,6 +367,7 @@ def reset(name: str, *, to: str | None = None) -> VM:
     running = vms.get(name) == "running"
     if vms.get(name) in ("running", "suspended"):
         _tart("stop", name)
+        _wait_released(name)
     if to is None:
         _tart("clone", origin, name, "--overwrite")
     else:
@@ -463,13 +469,20 @@ def run(name: str, argv: Sequence[str], stdin: str | None) -> int:
     files = _home(name) / "files"
     files.mkdir(exist_ok=True)
     root = files.resolve()
-    request: dict[str, object] = {"op": "run", "argv": list(argv), "stdin": stdin, "files": str(root)}
+    request: dict[str, object] = {
+        "op": "run",
+        "argv": list(argv),
+        "stdin": stdin,
+        "files": str(root),
+        "inputs": _named_files(root, [*argv, stdin or ""]),
+    }
+    package = None if source is None else _package_files(source)
+    if package is not None:
+        request["source"] = _package_digest(package)
     try:
-        if source is None:
+        if package is None:
             reply = _ran(name, _call(name, request, wait=None))
         else:
-            package = _package_files(source)
-            request["source"] = _package_digest(package)
             answer = _call(name, request, wait=None)
             if answer.get("need_source") is True:
                 request["source_zip"] = _package_zip(package)
@@ -491,6 +504,28 @@ def run(name: str, argv: Sequence[str], stdin: str | None) -> int:
     sys.stdout.write(reply["stdout"])
     sys.stderr.write(reply["stderr"])
     return reply["exit"]
+
+
+def _named_files(root: Path, texts: Sequence[str]) -> dict[str, str]:
+    """The files under ``root`` that ``texts`` name, each picture with the
+    capture record beside it, by their path under ``root``; the guest keeps
+    nothing between runs."""
+    named: dict[str, str] = {}
+    total = 0
+    for text in texts:
+        for found in re.finditer(re.escape(str(root)) + r"/([^\s'\"]+)", text):
+            for relative in (found[1], f"{found[1]}.json"):
+                path = (root / relative).resolve()
+                if not (path.is_relative_to(root) and path.is_file()) or relative in named:
+                    continue
+                total += path.stat().st_size
+                if total > _LARGEST_FILES:
+                    raise MacOSError(
+                        f"the files this call names pass {_LARGEST_FILES >> 20} MiB",
+                        code=ErrorCode.BAD_REQUEST,
+                    )
+                named[relative] = base64.b64encode(path.read_bytes()).decode()
+    return named
 
 
 def _package_files(source: str) -> dict[str, Path]:
@@ -523,6 +558,7 @@ def _guest_home() -> Path:
 def install_guest() -> Path:
     """Inside a guest: start `vm serve` from Terminal at every login, and
     now. Returns the launch agent's path."""
+    _refuse_host("install-guest")
     home = _guest_home()
     home.mkdir(parents=True, exist_ok=True)
     command = home / "serve.command"
@@ -538,6 +574,19 @@ def install_guest() -> Path:
         plistlib.dump({"Label": GUEST_AGENT_LABEL, "ProgramArguments": opener, "RunAtLoad": True}, handle)
     subprocess.run(opener, check=True)
     return agent
+
+
+def _refuse_host(command: str) -> None:
+    """`vm serve` runs any program its gateway sends; on a Mac that is not a
+    VM, the gateway is a router."""
+    done = subprocess.run(
+        ["/usr/sbin/sysctl", "-n", "kern.hv_vmm_present"], capture_output=True, text=True, check=False
+    )
+    if done.stdout.strip() != "1":
+        raise MacOSError(
+            f"`vm {command}` runs only inside a guest; this Mac is not a virtual machine",
+            code=ErrorCode.BAD_REQUEST,
+        )
 
 
 def _gateway() -> str | None:
@@ -621,19 +670,32 @@ class _Warm:
         return {**env, SPARE_ENV: f"{self._pipes[0]},{self._pipes[1]}"}, self._pipes
 
 
-def _run_forwarded(request: Mapping[str, object], requests: Path, warm: _Warm) -> _Ran:
-    host_root, argv, stdin = request.get("files"), request.get("argv"), request.get("stdin")
+def _run_forwarded(
+    request: Mapping[str, object], requests: Path, warm: _Warm, host: socket.socket
+) -> _Ran:
+    host_root, argv, stdin, inputs = (
+        request.get("files"), request.get("argv"), request.get("stdin"), request.get("inputs", {})
+    )
     if not (
         isinstance(host_root, str)
         and isinstance(argv, list)
         and all(isinstance(arg, str) for arg in argv)
         and (stdin is None or isinstance(stdin, str))
+        and isinstance(inputs, dict)
+        and all(isinstance(data, str) for data in inputs.values())
     ):
         raise ValueError("a run needs files, argv and stdin")
     env = dict(os.environ)
     package = _guest_source(request, requests.parent / "sources")
     if package is not None:
         env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(package), env.get("PYTHONPATH"))))
+    placed = [_placed(requests, relative, data) for relative, data in inputs.items()]
+    if stdin is not None and "/dev/stdin" in argv:
+        program = requests / f"{uuid.uuid4().hex}.py"
+        program.write_text(stdin, encoding="utf-8")
+        placed.append(program)
+        argv = [str(program) if arg == "/dev/stdin" else arg for arg in argv]
+        stdin = None
     pipes: tuple[int, ...] = ()
     shared = warm.lock.acquire(blocking=False)
     if shared:
@@ -644,11 +706,32 @@ def _run_forwarded(request: Mapping[str, object], requests: Path, warm: _Warm) -
         env["TMPDIR"] = f"{work}/"
     try:
         work.mkdir(exist_ok=True)
-        return _ran_in(work, requests, host_root, argv, stdin, env, pipes)
+        return _ran_in(work, requests, host_root, argv, stdin, env, pipes, host, set(placed))
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        for path in placed:
+            path.unlink(missing_ok=True)
         if shared:
             warm.lock.release()
+
+
+def _placed(requests: Path, relative: object, data: str) -> Path:
+    """Write a file the host sent where the run's rewritten paths name it."""
+    target = (requests / str(relative)).resolve()
+    if not target.is_relative_to(requests.resolve()) or target == requests.resolve():
+        raise ValueError(f"an input outside the run's folder: {relative!r}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(base64.b64decode(data))
+    return target
+
+
+def _hung_up(host: socket.socket) -> bool:
+    """Whether the host closed its readable connection; a host sends
+    nothing after its request."""
+    try:
+        return host.recv(1, socket.MSG_PEEK) == b""
+    except OSError:
+        return True
 
 
 def _ran_in(
@@ -659,6 +742,8 @@ def _ran_in(
     stdin: str | None,
     env: Mapping[str, str],
     pipes: tuple[int, ...],
+    host: socket.socket,
+    placed: set[Path],
 ) -> _Ran:
     def inward(text: str) -> str:
         return text.replace(host_root, str(requests))
@@ -666,17 +751,36 @@ def _ran_in(
     def outward(text: str) -> str:
         return text.replace(str(requests), host_root)
 
-    done = subprocess.run(
+    process = subprocess.Popen(
         [sys.executable, "-m", "macos_harness.cli", *(inward(arg) for arg in argv)],
-        input=inward(stdin) if stdin is not None else None,
-        stdin=subprocess.DEVNULL if stdin is None else None,
-        capture_output=True, text=True, check=False, env=env, pass_fds=pipes,
+        stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, pass_fds=pipes, start_new_session=True,
     )
+    output: list[str] = []
+    finished, finishing = os.pipe()
+
+    def read() -> None:
+        try:
+            output.extend(process.communicate(inward(stdin) if stdin is not None else None))
+        finally:
+            os.close(finishing)
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        if host in select.select([host, finished], [], [])[0] and _hung_up(host):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+    finally:
+        reader.join()
+        os.close(finished)
+    stdout, stderr = output
     files: dict[str, str] = {}
     left_behind: list[str] = []
     total = 0
     for path in sorted(work.rglob("*")):
-        if path.is_symlink() or not path.is_file():
+        if path.is_symlink() or not path.is_file() or path.resolve() in placed:
             continue
         size = path.stat().st_size
         if total + size > _LARGEST_FILES:
@@ -690,9 +794,9 @@ def _ran_in(
         else ""
     )
     return {
-        "exit": done.returncode,
-        "stdout": outward(done.stdout),
-        "stderr": outward(done.stderr) + note,
+        "exit": process.returncode,
+        "stdout": outward(stdout),
+        "stderr": outward(stderr) + note,
         "files": files,
     }
 
@@ -700,6 +804,7 @@ def _ran_in(
 def serve(port: int = GUEST_PORT) -> int:
     """Inside a guest: answer the host until killed. Only the guest's
     default gateway, which is the host, is answered."""
+    _refuse_host("serve")
     requests = _guest_home() / "requests"
     shutil.rmtree(requests, ignore_errors=True)
     requests.mkdir(parents=True)
@@ -731,14 +836,15 @@ def serve(port: int = GUEST_PORT) -> int:
                     reply = {"synced": True}
                 elif request.get("op") == "run":
                     try:
-                        reply = _run_forwarded(request, requests, warm)
+                        reply = _run_forwarded(request, requests, warm, sock)
                     except _NeedSource:
                         reply = {"need_source": True}
                 else:
                     reply = {"error": f"unknown op {request.get('op')!r}"}
             except Exception as exc:  # noqa: BLE001
                 reply = {"error": f"{type(exc).__name__}: {exc}"}
-            _send(sock, reply)
+            with contextlib.suppress(OSError):
+                _send(sock, reply)
 
     class Server(socketserver.ThreadingTCPServer):
         allow_reuse_address = True

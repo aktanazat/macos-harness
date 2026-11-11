@@ -20,8 +20,10 @@ macos-harness vm delete t1                 # the VM, its snapshots, its files
 and `doctor` inside the guest with the same verbs and output. Pictures and other
 files a program writes to its temporary directory come back under
 `~/Library/Application Support/macos-harness/vms/NAME/files/`, and the paths it
-prints point there. A path you pass in under that folder reaches the guest as
-its own copy's path; other host paths do not exist in the guest.
+prints point there. A file under that folder that a call names, such as a
+picture for `mac.click(screenshot=...)`, is sent to the guest with the call,
+together with its capture record; other host paths do not exist in the guest.
+Stopping a `--vm` call on this Mac stops its program in the guest.
 
 Focus in the guest is the guest's own, so `mac.activate(app)` there is safe and
 keeps a first click from being dropped by a background window.
@@ -58,9 +60,10 @@ and `reset`; `vm start` without `--source` goes back to the guest's own
 harness. The guest's server itself stays the installed version, and a base
 too old to take a source makes `start --source` fail.
 
-The guest keeps one process loaded ahead of time for the next `--vm` call, as
-`macos-harness skill spare` describes, so a call takes about 0.25 s instead
-of 0.5 s. A call that arrives while another one runs loads its own.
+The guest keeps one process loaded ahead of time for the next `-c`, stdin or
+`run FILE` call, as `macos-harness skill spare` describes, so such a call
+takes about 0.25 s instead of 0.5 s. `see`, `state`, `apps` and `doctor` load
+their own, as does a call that arrives while another one runs.
 
 ## The base
 
@@ -82,9 +85,10 @@ disk. A change to `vm serve` itself means updating the base; other harness
 changes can run with `--source`.
 
 To rebuild the base after such a change: build a wheel, start a clone of the
-base, write the wheel into the guest with a `--vm` call and install it there
-with `uv tool install --reinstall`, `vm stop` the clone, then `tart clone` it
-over the base with `--overwrite`.
+base, write the wheel into the guest with a `--vm` call under its own wheel
+file name and install it there with `uv tool install --offline
+--reinstall-package macos-harness` (a guest may not reach PyPI), `vm stop` the
+clone, then `tart clone` it over the base with `--overwrite`.
 
 ## Requirements and limits
 
