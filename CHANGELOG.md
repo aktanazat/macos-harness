@@ -395,6 +395,17 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- A `mac.do` input given a `postcondition` takes no picture of its window
+  before it: the receipt already proves the effect. On Calculator in a VM
+  a checked `do.press` went from 171-291 ms to 88-169 ms (median of 10-20),
+  and the first press of a new process from 318-2196 ms to 164-287 ms;
+  unchecked presses are unchanged and still picture first. The next
+  `wait_change` or `see(after_change=True)` after a checked input measures
+  from when it begins and says `baseline_reason: "checked_input"`.
+  `mac.state`, queries and checked inputs no longer import the capture
+  module or ScreenCaptureKit; an unchecked input still does, for its
+  picture.
+
 - The native skill prefers OMP's readable native tools when available,
   selecting them from the task without requiring the owner to name one.
   Python remains for operations those tools do not cover; credential

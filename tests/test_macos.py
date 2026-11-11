@@ -3140,7 +3140,7 @@ def _fake_window_capture(mac: MacOS, monkeypatch) -> None:
             captured_at=1234.5,
         )
 
-    monkeypatch.setattr(macos_module, "capture_window", capture_window)
+    monkeypatch.setattr(capture_module, "capture_window", capture_window)
 
 
 def _cropped_window_shot(mac: _Described, monkeypatch, tmp_path: Path) -> dict[str, object]:

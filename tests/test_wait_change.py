@@ -7,6 +7,7 @@ comparison under test is the one a live window gets."""
 from __future__ import annotations
 
 import math
+import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from Foundation import NSURL
 from macos_harness.capture import WindowCapture
 from macos_harness.errors import ErrorCode
 from macos_harness.macos import MacOS, MacOSError, _TreeSnapshot
+from macos_harness.receipts import Acted, Present, Receipt, present
 
 _SRGB = Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB)
 # A 400 x 300-point window rendered 2x, as on a Retina display.
@@ -399,6 +401,162 @@ def test_a_key_whose_picture_fails_still_goes_out_and_the_wait_measures_from_now
     result = _outcome(lambda: mac.wait_change("Test", timeout=1.0))
 
     assert (mac.posted, result["baseline"]) == (2, "now")
+
+
+class _Display(_Keypad):
+    """`_Keypad` whose app text reads "5" once asked, standing in for the
+    accessibility read a postcondition makes, with keys `_Button` presses."""
+
+    def ax_wait(self, **query: object) -> dict[str, object]:
+        return {"role": "AXStaticText", "value": "5"}
+
+    def _element_pid(self, element: object) -> int:
+        return 42
+
+
+class _Button:
+    """A keypad key a native client presses, as a `state` id is pressed."""
+
+    def __init__(self, keypad: _Keypad) -> None:
+        self.client = self
+        self.keypad = keypad
+
+    def perform(self, element: object, action: str) -> None:
+        self.keypad.posted += 1
+
+
+def _press(mac: _Display, check: Present | None) -> Receipt:
+    return mac.do.press(element=mac._remember_element(_Button(mac)), app="Test", postcondition=check)
+
+
+def _key(mac: _Display, check: Present | None) -> Receipt:
+    return mac.do.key("5", app="Test", postcondition=check)
+
+
+@pytest.mark.parametrize("act", [_press, _key], ids=["press", "key"])
+@pytest.mark.parametrize(
+    ("check", "pictures"), [(None, 1), (present("5", app="Test"), 0)], ids=["unchecked", "checked"]
+)
+def test_an_input_checked_by_its_postcondition_takes_no_picture_before_it(
+    act: Callable[[_Display, Present | None], Receipt], check: Present | None, pictures: int
+) -> None:
+    """The picture before an input, 40 to 1000ms, is there for a later
+    wait to measure from; a postcondition proves the input's effect from
+    the app's text instead, so a checked input took it for nothing."""
+    mac = _Display()
+
+    receipt = act(mac, check)
+
+    assert (receipt.acted, mac.posted > 0, len(mac.captured_after)) == (Acted.YES, True, pictures)
+
+
+def test_a_wait_after_a_checked_key_measures_from_now_and_says_so(tmp_path: Path) -> None:
+    """The look before the checked key shows the window before it: the
+    wait measured from that look and reported the key's own change as new."""
+    mac = _Display()
+    mac.see("Test", path=tmp_path / "before.png")
+    mac.do.key("5", app="Test", postcondition=present("5", app="Test"))
+
+    result = _outcome(lambda: mac.wait_change("Test", timeout=1.0))
+
+    assert (result["changed"], result["baseline"], result["baseline_reason"]) == (
+        False, "now", "checked_input",
+    )
+
+
+class _Panel(_Display):
+    """`_Display` with a second window, 8, focused, where keys show their
+    result; the first, 7, never changes."""
+
+    def windows(
+        self, app: str | int | None = None, *, all_layers: bool = False
+    ) -> list[dict[str, object]]:
+        panel = {"window_id": 8, "title": "Panel", "on_screen": True, "layer": 0}
+        return [*super().windows(app, all_layers=all_layers), panel]
+
+    def _described_window(self, window_id: int) -> dict[str, object]:
+        listed = next(window for window in self.windows() if window["window_id"] == window_id)
+        return {**listed, "pid": 42, "owner": "Test"}
+
+    def _focused_window_id(self, pid: int) -> int:
+        return 8
+
+    def _window_image(
+        self,
+        window_id: int,
+        *,
+        max_width: int | None,
+        max_height: int | None,
+        size: tuple[int, int] | None = None,
+    ) -> WindowCapture:
+        shot = super()._window_image(window_id, max_width=max_width, max_height=max_height, size=size)
+        if window_id == 8:
+            return shot
+        return WindowCapture(
+            image=_BLANK, width=800, height=600, bounds=_BOUNDS, on_screen=True, captured_at=0.0
+        )
+
+
+def test_a_look_at_another_window_leaves_the_checked_key_s_window_measured_from_now(
+    tmp_path: Path,
+) -> None:
+    """The panel's picture predates the plain key whose result it then
+    showed; after a checked key there and a look at the other window, the
+    wait measured from that picture and reported the plain key's change."""
+    mac = _Panel()
+    mac.key("5", app="Test", window_id=8)
+    mac.do.key("5", app="Test", window_id=8, postcondition=present("5", app="Test"))
+    mac.see("Test", path=tmp_path / "doc.png")
+
+    result = _outcome(lambda: mac.wait_change("Test", window_id=8, timeout=1.0))
+
+    assert (result["changed"], result["baseline"], result["baseline_reason"]) == (
+        False, "now", "checked_input",
+    )
+
+
+def test_a_plain_key_from_another_thread_during_a_checked_press_still_pictures_first() -> None:
+    """The checked press held its flag on the shared `MacOS` while it
+    verified, so a plain key another thread sent then took no picture and
+    its wait missed the change."""
+    verifying, verified = threading.Event(), threading.Event()
+
+    class _Slow(_Display):
+        """`_Display` whose press shows a dot and whose key the result,
+        and whose text read waits until the key went out."""
+
+        def ax_wait(self, **query: object) -> dict[str, object]:
+            verifying.set()
+            verified.wait(5)
+            return super().ax_wait(**query)
+
+        def _window_image(
+            self,
+            window_id: int,
+            *,
+            max_width: int | None,
+            max_height: int | None,
+            size: tuple[int, int] | None = None,
+        ) -> WindowCapture:
+            self.captured_after.append(self.posted)
+            return WindowCapture(
+                image=(_BLANK, _DOT)[self.posted] if self.posted < 2 else _RESULT,
+                width=800, height=600, bounds=_BOUNDS, on_screen=True, captured_at=0.0,
+            )
+
+    mac = _Slow()
+    press = threading.Thread(target=_press, args=(mac, present("5", app="Test")))
+    press.start()
+    verifying.wait(5)
+    try:
+        mac.key("5", app="Test")
+    finally:
+        verified.set()
+        press.join(5)
+
+    result = _outcome(lambda: mac.wait_change("Test", timeout=1.0))
+
+    assert (mac.captured_after[0], result["changed"], result["baseline"]) == (1, True, "input")
 
 
 def test_a_blinking_caret_is_no_change() -> None:
