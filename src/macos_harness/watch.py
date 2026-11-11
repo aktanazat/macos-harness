@@ -85,6 +85,7 @@ _EDIT_KEYS = frozenset(_KEYCODES[name] for name in (
 ))
 _BACKSPACE = _KEYCODES["backspace"]
 _MENU_KEYS = frozenset(_KEYCODES[name] for name in ("escape", "left", "right", "up", "down"))
+_FOCUS_KEYS = frozenset({"tab", "return", "escape"})
 _FIELDS = frozenset({"AXTextField", "AXTextArea", "AXComboBox"})
 _ADJUSTERS = frozenset({"AXSlider", "AXIncrementor"})
 _MENU_PARTS = frozenset({"AXMenuBar", "AXMenuBarItem", "AXMenu", "AXMenuItem"})
@@ -475,17 +476,18 @@ class _Watcher:
         if error not in (0, AS.kAXErrorNoValue):
             self._fail(f"could not tell which control a key went to (AX error {error})")
             return
+        held = [name for name, flag in _MODIFIERS if flags & flag]
+        typing = self.seen[-1] if self.seen and self.seen[-1].verb == "type" else None
         if focused is not None and self._secure(focused):
-            # A late key that types and finds a secure field went there: a
-            # focus change after it came late too, and stops the watch then.
-            if late and (keycode in _EDIT_KEYS or flags & (AS.kCGEventFlagMaskCommand
-                                                           | AS.kCGEventFlagMaskControl)):
+            # A late key that types and finds a secure field after a step that
+            # can move focus went there: a focus change after it came late
+            # too, and stops the watch then.
+            if late and (typing is not None or keycode in _EDIT_KEYS
+                         or {"cmd", "ctrl"} & set(held)):
                 self._fail(_BEHIND)
             else:
                 self._secret(focused)
             return
-        held = [name for name, flag in _MODIFIERS if flags & flag]
-        typing = self.seen[-1] if self.seen and self.seen[-1].verb == "type" else None
         if (not {"cmd", "ctrl"} & set(held) and focused is not None
                 and MacOS._copy_attribute(focused, "AXRole") in _FIELDS):
             if (keycode == _BACKSPACE and not held and typing is not None
@@ -493,6 +495,7 @@ class _Watcher:
                 typing.text = typing.text[:-1]
                 if not typing.text:
                     self.seen.pop()
+                    self._field = None
                 return
             if keycode not in _EDIT_KEYS:
                 length, chars = AS.CGEventKeyboardGetUnicodeString(event, 16, None, None)
@@ -524,13 +527,19 @@ class _Watcher:
         """Whether a late key's read of focus may come from before the app
         took in the person's last step, which may have moved focus into a
         secure field: the read should show the field a click went to, and
-        not the field the person was in before any other step."""
+        not the field the person was in before Tab, a press or the like.
+        ``_field`` is ``None`` once typing there showed where focus went."""
         if typing is not None or not self.seen:
             return False
-        last = self.seen[-1].verb
-        if last == "focus":
+        last = self.seen[-1]
+        if last.verb == "secret":
+            return True
+        if self._field is None or (last.verb == "key"
+                                   and last.text.rsplit("+", 1)[-1] not in _FOCUS_KEYS):
+            return False
+        if last.verb == "focus":
             return focused != self._field
-        return last == "secret" or focused == self._field
+        return focused == self._field
 
     def _type(self, text: str, focused: _Element, typing: _Seen | None) -> None:
         if (typing is not None and self._field == focused

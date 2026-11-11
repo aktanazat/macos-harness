@@ -44,9 +44,12 @@ def test_typed_text_and_the_step_before_it_check_the_field_has_focus_in_the_rout
 
 _PID = 41
 _USER = object()
+_MAIL = object()
 _PASSWORD = object()
-_ROLES = {_USER: ("AXTextField", None), _PASSWORD: ("AXTextField", "AXSecureTextField")}
+_ROLES = {_USER: ("AXTextField", None), _MAIL: ("AXTextField", None),
+          _PASSWORD: ("AXTextField", "AXSecureTextField")}
 _PLACES = {_USER: _Locator("AXTextField", "identifier", "username"),
+           _MAIL: _EMAIL,
            _PASSWORD: _Locator("AXTextField", "identifier", "password")}
 
 
@@ -106,6 +109,47 @@ def test_a_late_key_whose_read_still_shows_the_field_before_tab_stops_the_watch(
 
     assert app.watcher.error is not None
     assert app.kept() == [("type", "alice"), ("key", "tab")]
+
+
+def test_a_late_key_mid_word_that_finds_a_secure_field_stops_the_watch(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _App(monkeypatch)
+    for letter in "alic":
+        app.key(letter, letter)
+    app.focused = _PASSWORD
+
+    app.key("e", "e", late=True)
+
+    assert app.watcher.error is not None
+    assert app.kept() == [("type", "alic")]
+
+
+def test_a_late_key_after_text_typed_and_deleted_past_tab_types_where_tab_went(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _App(monkeypatch)
+    for letter in "alice":
+        app.key(letter, letter)
+    app.focused = _MAIL
+    app.key("tab", "\t")
+    app.key("x", "x")
+    app.key("backspace", "\x7f")
+
+    app.key("y", "y", late=True)
+
+    assert app.watcher.error is None
+    assert app.kept() == [("type", "alice"), ("key", "tab"), ("type", "y")]
+
+
+def test_a_late_key_after_keys_that_only_edit_the_field_types_into_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _App(monkeypatch)
+    for letter in "old":
+        app.key(letter, letter)
+    app.key("a", "a", flags=AS.kCGEventFlagMaskCommand)
+    app.key("backspace", "\x7f")
+
+    app.key("n", "n", late=True)
+
+    assert app.watcher.error is None
+    assert app.kept() == [("type", "old"), ("key", "cmd+a"), ("key", "backspace"), ("type", "n")]
 
 
 @pytest.mark.parametrize("kind", ["option set, plain text", "held until it repeats"])

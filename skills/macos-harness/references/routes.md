@@ -59,12 +59,11 @@ accent key or a key held down until it repeats or opens the accent menu, a
 click still under way when the watch ends, or secure keyboard entry hiding
 keys outside a secure field. It also stops when it falls behind: a click or
 key that came before its last read of the app may already show in that
-read, so it asks for the task again, a little slower. Keys that find a
-secure text field are part of its secret however fast they come, so a
-password typed right after Tab is kept as the `secret` step. Clicks and keys
-in other apps are ignored. Watching needs no permission beyond
-Accessibility, which lets macOS show the watch the keys; if macOS still
-refuses the listener, the error names Input Monitoring.
+read, so it asks for the task again, a little slower. A password typed
+right after Tab or a click, before that read, is still kept as the
+`secret` step. Clicks and keys in other apps are ignored. Watching needs no
+permission beyond Accessibility, which lets macOS show the watch the keys;
+if macOS still refuses the listener, the error names Input Monitoring.
 
 ## Forms
 
