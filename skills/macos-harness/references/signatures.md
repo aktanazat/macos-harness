@@ -229,11 +229,13 @@ the window: when Calculator's "All Clear" turns "Clear", it keeps the id
 your last look showed there. A control relabelled outside the window
 takes a new id. Ids belong to one window: the same button in two
 document windows has two ids, and one window's state refuses another's
-id, naming the `window_id` it belongs to. `state[12]` is its match.
-Printing a state makes it your last look; `state[12]` refuses an id whose
-line changed since that look, as when a row inserted above shifts
-unlabeled rows or a label changed, or that no look you printed showed,
-until you print the new state:
+id, naming the `window_id` it belongs to; a window without a `window_id`
+is told apart by its title. `state[12]` is its match. Printing a state
+makes it your last look; `state[12]` refuses an id whose line changed
+since that look, as when a row inserted above shifts unlabeled rows or a
+label changed, or that no look you printed showed, as a line outside the
+window, until you print the new state. A state read earlier also refuses
+an id whose line a newer read of its window shows changed:
 
 ```python
 print(mac.state("Calculator"))  # [9] button "7", [12] button "Multiply", ...

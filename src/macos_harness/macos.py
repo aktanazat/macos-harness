@@ -65,7 +65,7 @@ from .receipts import (
     validate_exact_selectors,
     validate_scope,
 )
-from .state import AppState, Memory, build_lines, project
+from .state import AppState, Memory, Reads, build_lines, project
 from .state import diff as state_diff
 from .text import (
     Match,
@@ -1347,6 +1347,7 @@ class MacOS:
     def __init__(self, *, backend: str | None = None, agent_id: str | None = None) -> None:
         _require_macos()
         self._elements: dict[int, Any] = {}
+        self._state_reads = Reads()
         self._element_seq = 0
         self._last_app: dict[str, Any] | None = None
         self._last_windows: list[dict[str, Any]] = []
@@ -2790,7 +2791,9 @@ class MacOS:
         agent_id = place[1]
         number = self._ax_window_id(window)
         root = snapshot.nodes[0] if snapshot.nodes else {}
-        window_key = str(number) if number is not None else f"{root.get('role')}:{root.get('subrole', '')}"
+        title = root.get("title", "")
+        # Without a window server number, only the title tells two windows apart.
+        window_key = str(number) if number is not None else f"{root.get('role')}:{root.get('subrole', '')}:{title}"
         # A label that did not read shortens one line; children that did
         # not read may hide a subtree, which a diff would call removed, and
         # a control that moved, which `build_lines` would take as relabelled.
@@ -2802,7 +2805,6 @@ class MacOS:
             )
             previous = memory.looks.get(window_key)
             seen = memory.seen(window_key)
-        title = root.get("title", "")
         header = f"{info['name']} window {json.dumps(title, ensure_ascii=False)}" + (
             f" (window_id {number})" if number is not None else ""
         )
@@ -2835,7 +2837,7 @@ class MacOS:
         else:
             visible = [(element_id, text) for element_id, text, out in look if not out]
             body = [text for _, text in visible]
-            shows = {element_id for element_id, _, _ in look} if complete else {element_id for element_id, _ in visible}
+            shows = {element_id for element_id, _ in visible}
             hidden = sum(offscreen)
             if hidden:
                 notes.append(f"{hidden} more controls lie outside the window; scroll, or pass query= to find them.")
@@ -2868,10 +2870,11 @@ class MacOS:
             if number is not None:
                 match["window_id"] = number
             matches[line.id] = _OwnedMatch(match, self)
+        read = {line.id: line.text for line in lines}
         return AppState(
-            "\n".join([header, *body, *notes]), matches, complete=complete,
-            lines={line.id: line.text for line in lines},
+            "\n".join([header, *body, *notes]), matches, complete=complete, lines=read,
             seen=seen, shows=shows, on_show=remember, owner=owner,
+            latest=self._state_reads.latest((pid, window_key), read, complete=complete),
         )
 
     def _state_window(self, pid: int, window_id: int | None) -> object:

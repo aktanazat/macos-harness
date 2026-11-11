@@ -52,7 +52,7 @@ _VALUE_LIMIT = 300
 _SMALL_SUBTREE = 8
 # Ids remembered per process: the newest this many survive.
 _REMEMBERED_IDS = 20_000
-# Windows whose last look is remembered per agent and process.
+# Windows remembered per agent and process: their last looks and newest reads.
 _REMEMBERED_WINDOWS = 8
 _WHOLE = "diff=False prints the whole window"
 
@@ -73,10 +73,13 @@ class AppState:
     """What `MacOS.state` returns: printable text, and the match each id
     on it names, ready for ``click(element=)``, ``ax.perform`` or ``ax.set``.
     Reading the text makes it the agent's last look; ``shows`` are the ids
-    whose lines it shows, and ``owner`` names the window of an id that is
-    not in this one."""
+    whose lines it shows, ``owner`` names the window of an id that is not in
+    this one, and ``latest`` reads the window's newest read in this process,
+    which may have found an id's line changed since this one."""
 
-    __slots__ = ("_lines", "_matches", "_on_show", "_owner", "_seen", "_shown", "_shows", "_text", "complete")
+    __slots__ = (
+        "_latest", "_lines", "_matches", "_on_show", "_owner", "_seen", "_shown", "_shows", "_text", "complete",
+    )
 
     def __init__(
         self,
@@ -89,6 +92,7 @@ class AppState:
         shows: Container[int],
         on_show: Callable[[], None] | None,
         owner: Callable[[int], int | None],
+        latest: Callable[[], tuple[Mapping[int, str], bool]],
     ) -> None:
         self._text = text
         self.complete = complete
@@ -98,6 +102,7 @@ class AppState:
         self._shows = shows
         self._on_show = on_show
         self._owner = owner
+        self._latest = latest
         self._shown = False
 
     @property
@@ -123,6 +128,15 @@ class AppState:
                 f"[{element_id}] names a control in window_id {window}, not in this window; "
                 f"pick it from mac.state(..., window_id={window})"
             ) from None
+        latest, whole = self._latest()
+        mine, newest = self._lines[element_id].strip(), latest.get(element_id, "").strip()
+        if (newest or whole) and newest != mine:
+            raise MacOSError(
+                f"[{element_id}] changed since this state was read: it was {mine}, now {newest or 'gone'}. "
+                "Read and print mac.state again, then pick again.",
+                code=ErrorCode.ELEMENT_UNKNOWN,
+                details={"id": element_id, "was": mine, "now": newest},
+            )
         if self._shown and element_id in self._shows:
             return match
         # An id of an unlabeled control is its place among its siblings, so
@@ -141,6 +155,26 @@ class AppState:
 
     def __contains__(self, element_id: object) -> bool:
         return element_id in self._matches
+
+
+class Reads:
+    """Each window's lines at its newest `MacOS.state` read in this process,
+    and whether that read was complete, for the last few windows read."""
+
+    def __init__(self) -> None:
+        self._reads: dict[tuple[int, str], tuple[Mapping[int, str], bool]] = {}
+
+    def latest(
+        self, window: tuple[int, str], lines: Mapping[int, str], *, complete: bool,
+    ) -> Callable[[], tuple[Mapping[int, str], bool]]:
+        """Make ``lines`` ``window``'s newest read; return what reads the
+        newest one later."""
+        read = (lines, complete)
+        self._reads.pop(window, None)
+        self._reads[window] = read
+        while len(self._reads) > _REMEMBERED_WINDOWS:
+            del self._reads[next(iter(self._reads))]
+        return lambda: self._reads.get(window, read)
 
 
 class _Parent(NamedTuple):
@@ -393,9 +427,9 @@ def project(lines: Sequence[Line], query: str) -> list[Line] | None:
 
 class Memory:
     """One agent's ids and last looks for one process, kept as a file in
-    the user's temporary directory, with the lines `MacOS.state` showed it
-    of each window since its last whole look there (``glances``) and the
-    lines `MacOS.text` last showed it (``texts``). `Memory.locked` opens it."""
+    the user's temporary directory, with the lines of each window it saw
+    outside its last whole look there (``glances``) and the lines
+    `MacOS.text` last showed it (``texts``). `Memory.locked` opens it."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -439,10 +473,14 @@ class Memory:
             os.close(fd)
 
     def remember(self, window: str, look: Look, slots: Slots) -> None:
+        seen = self.seen(window)
         self.looks.pop(window, None)
         self.looks[window] = look
         self.slots[window] = slots
+        kept = {element_id: seen[element_id] for element_id, _, out in look if out and element_id in seen}
         self.glances.pop(window, None)
+        if kept:
+            self.glance(window, kept)
         while len(self.looks) > _REMEMBERED_WINDOWS:
             oldest = next(iter(self.looks))
             del self.looks[oldest]
@@ -450,14 +488,17 @@ class Memory:
 
     def glance(self, window: str, lines: Mapping[int, str]) -> None:
         """Make ``lines`` (id to line) what this agent last saw of those ids
-        in ``window``, until its next whole look there."""
+        in ``window``, until a whole look there shows them."""
         self.glances[window] = {**self.glances.pop(window, {}), **lines}
         while len(self.glances) > _REMEMBERED_WINDOWS:
             del self.glances[next(iter(self.glances))]
 
     def seen(self, window: str) -> dict[int, str]:
-        """Each id's line as this agent last saw it in ``window``."""
-        return {**{element_id: line for element_id, line, _ in self.looks.get(window, ())}, **self.glances.get(window, {})}
+        """Each id's line as this agent last saw it in ``window``: as its last
+        whole look listed it, or as a later or earlier look showed it while
+        that one left it outside the window."""
+        look = self.looks.get(window, ())
+        return {**{element_id: line for element_id, line, out in look if not out}, **self.glances.get(window, {})}
 
     def window_of(self, element_id: int) -> str | None:
         """The window whose control holds ``element_id``."""
