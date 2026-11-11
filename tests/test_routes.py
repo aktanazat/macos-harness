@@ -12,6 +12,8 @@ from test_ops import FakeHost, FormHost, _SleepClock
 from macos_harness import (
     Acted,
     ErrorCode,
+    HandoffReason,
+    HumanHandoff,
     MacOSError,
     OperationError,
     Outcome,
@@ -81,6 +83,9 @@ class RouteHost(FakeHost):
             self.page += 1
         if self.page == self.replace_at:
             self.identity = self.identity._replace(launched_at=2000.0)
+
+    def handoff(self, *, reason: HandoffReason | str, app: str | int) -> HumanHandoff:
+        return HumanHandoff(reason=HandoffReason(reason), target_is_frontmost=app == self.identity.pid)
 
 
 @pytest.fixture
@@ -164,6 +169,21 @@ def test_a_bad_later_step_is_rejected_before_the_first_mutation(host: RouteHost)
     assert result.error["details"]["field"] == "value"
     assert host.pressed_pages == []
     assert result.steps_run == ()
+
+
+def test_a_watched_secret_step_stops_the_run_for_the_person_before_later_steps(host: RouteHost) -> None:
+    path = record_navigation(host)
+    data = json.loads(path.read_text())
+    data["steps"][1] = {"verb": "secret", "target": data["steps"][1]["target"], "expect": None}
+    path.write_text(json.dumps(data))
+
+    result = host.route.run("navigate", app=_APP)
+
+    assert result.status == "handoff"
+    assert result.at == "steps[1]"
+    assert result.handoff == HumanHandoff(reason=HandoffReason.AUTHENTICATION_REQUIRED,
+                                          target_is_frontmost=True)
+    assert host.pressed_pages == [0]
 
 
 def test_caught_string_recording_attempt_does_not_replace_a_saved_route(host: RouteHost) -> None:
