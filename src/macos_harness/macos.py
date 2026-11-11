@@ -3551,7 +3551,7 @@ class MacOS:
                     text=text,
                     exact=exact,
                     visible_only=visible_only,
-                    limit=limit if role is None or limit < 0 else max_nodes,
+                    limit=limit if role is None else -1,
                     direction=direction.casefold(),
                     immediate_descendants_only=immediate_descendants_only,
                     attributes=attributes,
