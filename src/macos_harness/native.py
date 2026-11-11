@@ -320,9 +320,10 @@ class NativeClient:
     def generation(self) -> int:
         """Current agent-side element registry epoch known to this client.
 
-        Bumps on every fresh connection and on every ``query()`` call whose
+        Bumps on every fresh connection, on every ``query()`` call whose
         effective ``reset_elements`` is truthy — mirroring the local
-        ``MacOS`` code's own ``self._elements = {}`` reset one for one.
+        ``MacOS`` code's own ``self._elements = {}`` reset one for one — and
+        when a live connection closes, whose agent held every handle.
         """
         return self._generation
 
@@ -461,6 +462,7 @@ class NativeClient:
                     self._sock.close()
                 finally:
                     self._sock = None
+                    self._generation += 1
             self._recv_buffer.clear()
 
     # --- wire transport ---------------------------------------------------

@@ -292,7 +292,8 @@ follows [Semantic Versioning](https://semver.org/).
   instance: the call whose reply timed out still raises, and the next call
   launches a fresh agent, or with `backend="auto"` falls back to the
   Python engine when none can start, where every later call used to fail
-  on the dead connection. Closing a session while one of its requests
+  on the dead connection. Elements the stopped agent found raise
+  `element.unknown` as stale. Closing a session while one of its requests
   waits no longer deadlocks: `close()` returns once that request times out.
   Nothing already sent is resent.
 

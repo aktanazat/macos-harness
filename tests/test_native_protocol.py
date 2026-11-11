@@ -513,6 +513,25 @@ def test_stale_generation_handle_rejected_without_wire_call() -> None:
         agent.close()
 
 
+def test_a_handle_from_a_connection_that_dropped_is_stale() -> None:
+    """The agent that held the handle is gone; the caller is told to query
+    again, not that the connection cannot be reopened."""
+    agent = _FakeAgent([_ok(1, _ping_result()), CLOSE])
+    try:
+        client = _client(agent)
+        client.connect()
+        handle = _NativeHandle(client, 7, client.generation)
+        with pytest.raises(NativeConnectionError):
+            client.list_apps()
+
+        with pytest.raises(MacOSError, match="stale") as raised:
+            client.get(handle, "AXValue")
+        assert raised.value.code == ErrorCode.ELEMENT_UNKNOWN
+    finally:
+        agent.close()
+
+
+
 def test_handle_from_different_client_rejected_without_wire_call() -> None:
     agent = _FakeAgent([_ok(1, _ping_result())])
     try:
