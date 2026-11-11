@@ -539,7 +539,11 @@ def _package_files(source: str) -> dict[str, Path]:
 
 
 def _package_digest(package: Mapping[str, Path]) -> str:
-    stamps = [(name, path.stat().st_mtime_ns, path.stat().st_size) for name, path in package.items()]
+    stamps = [
+        (name, stat.st_mtime_ns, stat.st_size, stat.st_mode)
+        for name, path in package.items()
+        for stat in (path.stat(),)
+    ]
     return hashlib.sha256(repr(stamps).encode()).hexdigest()
 
 
