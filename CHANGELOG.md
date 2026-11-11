@@ -296,6 +296,17 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `mac.data.run_shortcut` no longer hangs until its timeout when the
+  caller's stdin is an open pipe, as in a driver process: `shortcuts run`
+  read that pipe as the shortcut's input, so a missing name took 60 s to
+  fail instead of failing at once. Piped text now reaches a shortcut only
+  through `input="-"` (`--input -` on the command line).
+- `mac.data.query_sqlite` raises `MacOSError` instead of a bare
+  `sqlite3.Error` that callers expecting `MacOSError` let crash:
+  `timeout` when another process kept the store locked, `bad_request`
+  with SQLite's message otherwise; `details["sqlite_error"]` names the
+  SQLite error.
+
 - Turning on accessibility for an Electron app, one whose bundle ships
   `Electron Framework.framework`, also sets `AXManualAccessibility`, the
   switch Electron documents for assistive apps; other apps never get it.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import plistlib
 import sqlite3
 import subprocess
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from macos_harness.data import AppData
+from macos_harness.errors import ErrorCode, MacOSError
 
 
 def _files(folder: Path) -> dict[str, int]:
@@ -30,8 +32,9 @@ def test_query_sqlite_refuses_attach_and_leaves_a_pending_log_in_place(tmp_path:
     subprocess.run([sys.executable, "-c", writer, str(store)], check=True)
     before = _files(tmp_path)
 
-    with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+    with pytest.raises(MacOSError, match="not authorized") as refused:
         AppData().query_sqlite(store, f"attach 'file:{store}?mode=rw' as w")
+    assert refused.value.code == ErrorCode.BAD_REQUEST
 
     assert _files(tmp_path) == before
     assert AppData().query_sqlite(store, "select count(*) as n from t") == [{"n": 500}]
@@ -49,6 +52,21 @@ def test_query_sqlite_makes_no_files_beside_a_closed_store(tmp_path: Path) -> No
 
     assert rows == [{"x": 1}]
     assert sorted(_files(tmp_path)) == ["app.sqlite"]
+
+
+def test_run_shortcut_answers_at_once_while_the_caller_reads_an_open_pipe() -> None:
+    reader, writer = os.pipe()
+    saved = os.dup(0)
+    os.dup2(reader, 0)
+    try:
+        with pytest.raises(MacOSError) as refused:
+            AppData().run_shortcut("macos-harness test 0b6e no such shortcut", timeout=3)
+    finally:
+        os.dup2(saved, 0)
+        for descriptor in (saved, reader, writer):
+            os.close(descriptor)
+
+    assert refused.value.code != ErrorCode.TIMEOUT
 
 
 def test_read_defaults_reads_an_empty_readable_container_domain_as_unset(

@@ -323,7 +323,8 @@ class AppData:
     ) -> dict[str, JSONValue]:
         """Run a shortcut by name or id in the background, as ``shortcuts
         run`` does, with no Shortcuts window. ``input`` is one file or
-        several; ``output`` is where its result goes, else it comes back
+        several, ``"-"`` for the caller's stdin, which the run otherwise
+        never reads; ``output`` is where its result goes, else it comes back
         as ``stdout``. The result's ``output`` is that path only when the
         run wrote it, else None. A nonzero exit raises with
         ``exit_status`` and ``stderr`` in its details; at ``timeout`` the
@@ -343,7 +344,14 @@ class AppData:
         before = _stamp(target)
         started = time.monotonic()
         try:
-            result = subprocess.run(command, capture_output=True, check=False, timeout=timeout)
+            # `shortcuts run` waits on a piped stdin as the shortcut's input.
+            result = subprocess.run(
+                command,
+                stdin=None if "-" in map(str, inputs) else subprocess.DEVNULL,
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+            )
         except subprocess.TimeoutExpired as exc:
             raise MacOSError(
                 f"Shortcut {name!r} was still running after {timeout:g}s; its shortcuts command was stopped",
@@ -418,11 +426,25 @@ class AppData:
         uri = f"file:{urllib.parse.quote(str(resolved))}?mode=ro"
         if immutable or (logged and not Path(f"{resolved}-wal").exists()):
             uri += "&immutable=1"
-        with closing(sqlite3.connect(uri, uri=True)) as connection:
-            connection.set_authorizer(_reads_only)
-            cursor = connection.execute(sql, params)
-            columns = [column[0] for column in cursor.description or ()]
-            return [dict(zip(columns, row, strict=True)) for row in cursor]
+        try:
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                connection.set_authorizer(_reads_only)
+                cursor = connection.execute(sql, params)
+                columns = [column[0] for column in cursor.description or ()]
+                return [dict(zip(columns, row, strict=True)) for row in cursor]
+        except sqlite3.Error as exc:
+            try:
+                error = exc.sqlite_errorname
+            except AttributeError:
+                # Python's own binding and API errors carry no SQLite code.
+                error = None
+            if error in ("SQLITE_BUSY", "SQLITE_LOCKED"):
+                raise MacOSError(
+                    f"Another process kept {str(path)!r} locked: {exc}",
+                    code=ErrorCode.TIMEOUT,
+                    details={"path": str(path), "sqlite_error": error},
+                ) from None
+            raise _bad_request(f"SQLite refused the query: {exc}", path=str(path), sqlite_error=error) from None
 
     # --- verify a save against the data ----------------------------------
 
