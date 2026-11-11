@@ -954,7 +954,7 @@ class SearchMatches(list[dict[str, JSONValue]]):
     disappearance waits require it before accepting an empty search.
     """
 
-    __slots__ = ("complete", "partial", "unanswered", "visited")
+    __slots__ = ("complete", "partial", "pid", "unanswered", "visited")
 
     def __init__(
         self,
@@ -970,6 +970,9 @@ class SearchMatches(list[dict[str, JSONValue]]):
         # name, and how many apps did not answer at all.
         self.partial: list[str] = []
         self.unanswered = 0
+        # The process one app's search ran in, which a wait watches for
+        # changes between searches (`AppChanges`).
+        self.pid: int | None = None
 
 
 class _OwnedMatch(dict[str, JSONValue]):
@@ -998,6 +1001,7 @@ def _with_pid(matches: SearchMatches, pid: int | None, owner: object) -> SearchM
         for match in matches:
             match["pid"] = pid
     matches[:] = [_OwnedMatch(match, owner) for match in matches]
+    matches.pid = pid
     return matches
 
 
@@ -4264,7 +4268,10 @@ class MacOS:
         (see `_settle_tie`). A search the app did not answer in time
         (AXError -25204) is a poll that found nothing yet. A timeout in one
         app names the query and its poll count and, with ``explain``, what
-        the app shows instead (`_wait_clues`).
+        the app shows instead (`_wait_clues`). Between searches in one app
+        the wait rests up to ``interval``, and searches again as soon as
+        the app reports a change, though never sooner than the last
+        search took (`AppChanges`).
         """
         exact = _ExactSelector.parse(
             title=title, identifier=identifier, description=description
@@ -4289,6 +4296,8 @@ class MacOS:
                 details={"parameter": "interval", "value": interval},
             )
 
+        from ._ax_changes import AppChanges
+
         # Text is a substring search, so a wait for "Allow" also finds
         # "Don't Allow": reading up to _AX_LABEL_SEARCH_LIMIT matches lets
         # `_settle_tie` settle that tie from this one search. Without
@@ -4296,118 +4305,123 @@ class MacOS:
         limit = _AX_LABEL_SEARCH_LIMIT if text else 2
         deadline = time.monotonic() + timeout
         polls = 0
-        while True:
-            polls += 1
-            try:
-                if cross_process:
-                    matches = self.ax_search_all(
-                        apps=selectors,
-                        search_key=search_key,
+        with AppChanges() as changes:
+            while True:
+                polls += 1
+                started = time.monotonic()
+                try:
+                    if cross_process:
+                        matches = self.ax_search_all(
+                            apps=selectors,
+                            search_key=search_key,
+                            text=text,
+                            title=title,
+                            identifier=identifier,
+                            description=description,
+                            visible_only=visible_only,
+                            limit=limit,
+                            direction=direction,
+                            immediate_descendants_only=immediate_descendants_only,
+                            attributes=attributes,
+                            include_actions=include_actions,
+                            max_nodes=max_nodes,
+                        )
+                    else:
+                        matches = self.ax_search(
+                            app=app,
+                            search_key=search_key,
+                            text=text,
+                            title=title,
+                            identifier=identifier,
+                            description=description,
+                            visible_only=visible_only,
+                            limit=limit,
+                            direction=direction,
+                            immediate_descendants_only=immediate_descendants_only,
+                            attributes=attributes,
+                            include_actions=include_actions,
+                            max_nodes=max_nodes,
+                            enhance=enhance,
+                        )
+                except MacOSError as exc:
+                    if not _did_not_answer(exc):
+                        raise
+                    matches = _unanswered_search()
+                if len(matches) == 1 and (matches.complete or not exact.active):
+                    return matches[0]
+                if len(matches) > 1:
+                    settled = self._settle_tie(
+                        matches,
                         text=text,
-                        title=title,
-                        identifier=identifier,
-                        description=description,
-                        visible_only=visible_only,
                         limit=limit,
-                        direction=direction,
-                        immediate_descendants_only=immediate_descendants_only,
-                        attributes=attributes,
-                        include_actions=include_actions,
-                        max_nodes=max_nodes,
+                        strict=exact.active,
+                        actionable=actionable,
                     )
-                else:
-                    matches = self.ax_search(
-                        app=app,
-                        search_key=search_key,
-                        text=text,
-                        title=title,
-                        identifier=identifier,
-                        description=description,
-                        visible_only=visible_only,
-                        limit=limit,
-                        direction=direction,
-                        immediate_descendants_only=immediate_descendants_only,
-                        attributes=attributes,
-                        include_actions=include_actions,
-                        max_nodes=max_nodes,
-                        enhance=enhance,
+                    if settled is not None:
+                        return settled
+                    summary = "; ".join(self._match_summary(match) for match in matches)
+                    # More than one match is the caller's search criteria being too loose,
+                    # not an unknown element -- and not worth retrying, since a second
+                    # identical search will not resolve the ambiguity either. Mirrors the
+                    # native agent's `PressCoordinator`, which reports the same condition as
+                    # `bad_request` rather than `element.unknown` for exactly this reason.
+                    raise MacOSError(
+                        f"AX wait found {len(matches)} matches: {summary}",
+                        code=ErrorCode.BAD_REQUEST,
+                        details={
+                            "count": len(matches),
+                            "matches": [
+                                {
+                                    "element_index": match.get("element_index"),
+                                    "role": match.get("role"),
+                                    "title": match.get("title"),
+                                    "description": match.get("description"),
+                                    "enabled": match.get("enabled"),
+                                    "frame": match.get("frame"),
+                                    "app": match.get("app"),
+                                }
+                                for match in matches
+                            ],
+                        },
                     )
-            except MacOSError as exc:
-                if not _did_not_answer(exc):
-                    raise
-                matches = _unanswered_search()
-            if len(matches) == 1 and (matches.complete or not exact.active):
-                return matches[0]
-            if len(matches) > 1:
-                settled = self._settle_tie(
-                    matches,
-                    text=text,
-                    limit=limit,
-                    strict=exact.active,
-                    actionable=actionable,
-                )
-                if settled is not None:
-                    return settled
-                summary = "; ".join(self._match_summary(match) for match in matches)
-                # More than one match is the caller's search criteria being too loose,
-                # not an unknown element -- and not worth retrying, since a second
-                # identical search will not resolve the ambiguity either. Mirrors the
-                # native agent's `PressCoordinator`, which reports the same condition as
-                # `bad_request` rather than `element.unknown` for exactly this reason.
-                raise MacOSError(
-                    f"AX wait found {len(matches)} matches: {summary}",
-                    code=ErrorCode.BAD_REQUEST,
-                    details={
-                        "count": len(matches),
-                        "matches": [
-                            {
-                                "element_index": match.get("element_index"),
-                                "role": match.get("role"),
-                                "title": match.get("title"),
-                                "description": match.get("description"),
-                                "enabled": match.get("enabled"),
-                                "frame": match.get("frame"),
-                                "app": match.get("app"),
-                            }
-                            for match in matches
-                        ],
-                    },
-                )
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                query = _wait_query(
-                    app=app, search_key=search_key, text=text, title=title,
-                    identifier=identifier, description=description,
-                    visible_only=visible_only,
-                )
-                sought = ", ".join(
-                    f"{name}={value!r}" for name, value in query.items() if name != "visible_only"
-                )
-                tally = f" for {sought or 'any element'} after {polls} searches in {timeout:g}s"
-                details: dict[str, JSONValue] = {"timeout": timeout, "polls": polls, "query": query}
-                if matches.complete:
-                    message, note = "AX wait timed out without a match" + tally, ""
-                else:
-                    message = (
-                        "AX wait timed out before a complete search confirmed "
-                        "a unique match" + tally
-                        if matches
-                        else "AX wait timed out without a match" + tally
-                        + "; the last search was incomplete"
-                    )
-                    note, gaps = _search_gaps(matches, max_nodes)
-                    details.update(gaps)
-                if explain and not cross_process and not matches and not matches.unanswered:
-                    hint, clues = self._wait_clues(
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    query = _wait_query(
                         app=app, search_key=search_key, text=text, title=title,
                         identifier=identifier, description=description,
-                        visible_only=visible_only, max_nodes=max_nodes, enhance=enhance,
+                        visible_only=visible_only,
                     )
-                    note += hint
-                    details.update(clues)
-                raise MacOSError(message + note, code=ErrorCode.TIMEOUT, details=details)
-            time.sleep(min(interval, remaining))
+                    sought = ", ".join(
+                        f"{name}={value!r}" for name, value in query.items() if name != "visible_only"
+                    )
+                    tally = f" for {sought or 'any element'} after {polls} searches in {timeout:g}s"
+                    details: dict[str, JSONValue] = {"timeout": timeout, "polls": polls, "query": query}
+                    if matches.complete:
+                        message, note = "AX wait timed out without a match" + tally, ""
+                    else:
+                        message = (
+                            "AX wait timed out before a complete search confirmed "
+                            "a unique match" + tally
+                            if matches
+                            else "AX wait timed out without a match" + tally
+                            + "; the last search was incomplete"
+                        )
+                        note, gaps = _search_gaps(matches, max_nodes)
+                        details.update(gaps)
+                    if explain and not cross_process and not matches and not matches.unanswered:
+                        hint, clues = self._wait_clues(
+                            app=app, search_key=search_key, text=text, title=title,
+                            identifier=identifier, description=description,
+                            visible_only=visible_only, max_nodes=max_nodes, enhance=enhance,
+                        )
+                        note += hint
+                        details.update(clues)
+                    raise MacOSError(message + note, code=ErrorCode.TIMEOUT, details=details)
+                changes.follow(matches.pid)
+                changes.rest(
+                    min(interval, remaining), at_least=min(time.monotonic() - started, interval)
+                )
 
     def _wait_clues(
         self,
@@ -4528,7 +4542,10 @@ class MacOS:
         Only a complete empty search counts as an empty poll: a walk that
         ``max_nodes`` cut short before finding anything, or a search the
         app did not answer in time, says nothing about the part it did not
-        reach, so it resets the count.
+        reach, so it resets the count. While the match is there, the wait
+        searches again as soon as its app reports a change, as `ax_wait`
+        does; the confirming poll still comes a full ``interval`` after
+        the first empty one.
         """
         exact = _ExactSelector.parse(
             title=title, identifier=identifier, description=description
@@ -4553,69 +4570,77 @@ class MacOS:
                 details={"parameter": "interval", "value": interval},
             )
 
+        from ._ax_changes import AppChanges
+
         deadline = time.monotonic() + timeout
         empty_polls = 0
-        while True:
-            try:
-                if cross_process:
-                    matches = self.ax_search_all(
-                        apps=selectors,
-                        search_key=search_key,
-                        text=text,
-                        title=title,
-                        identifier=identifier,
-                        description=description,
-                        visible_only=visible_only,
-                        limit=1,
-                        direction=direction,
-                        immediate_descendants_only=immediate_descendants_only,
-                        attributes=attributes,
-                        max_nodes=max_nodes,
-                    )
-                else:
-                    matches = self.ax_search(
-                        app=app,
-                        search_key=search_key,
-                        text=text,
-                        title=title,
-                        identifier=identifier,
-                        description=description,
-                        visible_only=visible_only,
-                        limit=1,
-                        direction=direction,
-                        immediate_descendants_only=immediate_descendants_only,
-                        attributes=attributes,
-                        max_nodes=max_nodes,
-                        enhance=enhance,
-                    )
-            except ApplicationNotFoundError:
-                if app is not None or (selectors is not None and len(selectors) == 1):
-                    return
-                raise
-            except MacOSError as exc:
-                if not _did_not_answer(exc):
+        with AppChanges() as changes:
+            while True:
+                started = time.monotonic()
+                try:
+                    if cross_process:
+                        matches = self.ax_search_all(
+                            apps=selectors,
+                            search_key=search_key,
+                            text=text,
+                            title=title,
+                            identifier=identifier,
+                            description=description,
+                            visible_only=visible_only,
+                            limit=1,
+                            direction=direction,
+                            immediate_descendants_only=immediate_descendants_only,
+                            attributes=attributes,
+                            max_nodes=max_nodes,
+                        )
+                    else:
+                        matches = self.ax_search(
+                            app=app,
+                            search_key=search_key,
+                            text=text,
+                            title=title,
+                            identifier=identifier,
+                            description=description,
+                            visible_only=visible_only,
+                            limit=1,
+                            direction=direction,
+                            immediate_descendants_only=immediate_descendants_only,
+                            attributes=attributes,
+                            max_nodes=max_nodes,
+                            enhance=enhance,
+                        )
+                except ApplicationNotFoundError:
+                    if app is not None or (selectors is not None and len(selectors) == 1):
+                        return
                     raise
-                matches = _unanswered_search()
+                except MacOSError as exc:
+                    if not _did_not_answer(exc):
+                        raise
+                    matches = _unanswered_search()
 
-            empty_polls = empty_polls + 1 if not matches and matches.complete else 0
-            if empty_polls >= 2:
-                return
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                message = (
-                    "AX wait timed out before two consecutive empty polls "
-                    "confirmed the match was gone"
+                empty_polls = empty_polls + 1 if not matches and matches.complete else 0
+                if empty_polls >= 2:
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    message = (
+                        "AX wait timed out before two consecutive empty polls "
+                        "confirmed the match was gone"
+                    )
+                    details: dict[str, JSONValue] = {
+                        "timeout": timeout,
+                        "consecutive_empty_polls": empty_polls,
+                    }
+                    if not matches and not matches.complete:
+                        note, gaps = _search_gaps(matches, max_nodes)
+                        message += note
+                        details.update(gaps)
+                    raise MacOSError(message, code=ErrorCode.TIMEOUT, details=details)
+                changes.follow(matches.pid)
+                changes.rest(
+                    min(interval, remaining),
+                    at_least=interval if empty_polls else min(time.monotonic() - started, interval),
                 )
-                details: dict[str, JSONValue] = {
-                    "timeout": timeout,
-                    "consecutive_empty_polls": empty_polls,
-                }
-                if not matches and not matches.complete:
-                    note, gaps = _search_gaps(matches, max_nodes)
-                    message += note
-                    details.update(gaps)
-                raise MacOSError(message, code=ErrorCode.TIMEOUT, details=details)
-            time.sleep(min(interval, remaining))
 
     def ax_press(
         self,

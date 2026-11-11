@@ -441,6 +441,17 @@ follows [Semantic Versioning](https://semver.org/).
   11–16% less time (median of 10 runs, three batches); a whole
   `mac.state` call stays within run-to-run noise.
 
+- A `wait` in one app rests between searches until the app posts an
+  accessibility notification, though never less than its last search
+  took, instead of always sleeping `interval`. In a VM, after a
+  Calculator button press, the wait reported the new display value in
+  18–21 ms (median of 10 presses, three batches) instead of 44–51 ms, and
+  in 34 ms at worst instead of 116 ms. `interval` is now the longest
+  rest, which catches changes no notification reports, such as a view an
+  AppKit window adds or hides. A wait across apps still searches every
+  `interval`, and `wait_gone` still confirms an empty search a full
+  `interval` later.
+
 - The native skill prefers OMP's readable native tools when available,
   selecting them from the task without requiring the owner to name one.
   Python remains for operations those tools do not cover; credential

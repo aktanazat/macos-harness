@@ -572,12 +572,18 @@ password field (role or subrole `AXSecureTextField`) for its value, length, or
 selection: it reads the role and subrole first.
 
 `wait` polls its scope until one match appears. Zero matches keep polling until
-`timeout`. Multiple matches fail closed with owner, role, and title details.
+`timeout`. In one app, the wait searches again as soon as the app posts an
+Accessibility notification, such as a value or title change, though never
+sooner than its last search took; `interval` is the longest it rests, for
+changes no notification reports, such as a view an AppKit window adds or
+hides. A wait across apps searches every `interval`. Multiple matches fail
+closed with owner, role, and title details.
 With an exact selector, a single match is accepted only from a complete search.
 A sweep of every app is often incomplete because some processes do not answer,
 so give an exact selector one app.
 
-`wait_gone` requires two consecutive complete, empty searches. A named app that
+`wait_gone` requires two consecutive complete, empty searches, the second a full
+`interval` after the first. A named app that
 exits counts as gone. `press` waits for one match, requires `AXPress`, performs it, and
 returns the match. The harness never activates an app on its own;
 `mac.activate(app)` is the one explicit request and reports whether macOS
