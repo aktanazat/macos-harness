@@ -438,7 +438,13 @@ final class AXExecutor {
     let role: String?
     let fields: [String: JSONValue]
 
-    var hidden: Bool { fields["hidden"]?.boolValue ?? false }
+    var hidden: Bool {
+      switch fields["hidden"] {
+      case .bool(let flag)?: return flag
+      case .number(let number)?: return number != 0
+      default: return false
+      }
+    }
     var matchText: [String] { matchFieldOrder.compactMap { fields[$0].map(pythonLikeString) } }
   }
 
@@ -938,7 +944,7 @@ final class AXExecutor {
   /// readable description, mirroring Python's final `str(value)`.
   private static func jsonable(_ value: AnyObject) -> JSONValue {
     if value is NSNull { return .null }
-    if let flag = value as? Bool { return .bool(flag) }
+    if CFGetTypeID(value) == CFBooleanGetTypeID(), let flag = value as? Bool { return .bool(flag) }
     if let number = value as? NSNumber { return .number(number.doubleValue) }
     if let text = value as? String { return .string(text) }
     if let data = value as? Data { return .string(String(decoding: data, as: UTF8.self)) }

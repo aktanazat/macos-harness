@@ -309,6 +309,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The native backend ran live on VS Code in a guest and three faults
+  surfaced. A search for a role Apple has no search key for, such as
+  `role="heading"`, failed on the native backend at the default
+  `max_nodes` with `"limit" must not exceed 1000`; it now asks the agent
+  for every candidate and keeps that role's matches, as the Python path
+  does. The agent read a checkbox or radio button state, an `NSNumber` 0
+  or 1, as `false` or `true` where the Python path reads `0` or `1`; it
+  now reads the number. And `vm start --source` unpacked the checkout in
+  the guest without file modes, so a bundled agent binary arrived not
+  executable and every native call failed; the guest now keeps each
+  file's mode (a guest's server must be updated to take this).
+
 - `mac.data.run_shortcut` no longer hangs until its timeout when the
   caller's stdin is an open pipe, as in a driver process: `shortcuts run`
   read that pipe as the shortcut's input, so a missing name took 60 s to

@@ -539,7 +539,11 @@ def _package_files(source: str) -> dict[str, Path]:
 
 
 def _package_digest(package: Mapping[str, Path]) -> str:
-    stamps = [(name, path.stat().st_mtime_ns, path.stat().st_size) for name, path in package.items()]
+    stamps = [
+        (name, stat.st_mtime_ns, stat.st_size, stat.st_mode)
+        for name, path in package.items()
+        for stat in (path.stat(),)
+    ]
     return hashlib.sha256(repr(stamps).encode()).hexdigest()
 
 
@@ -620,7 +624,9 @@ def _guest_source(request: Mapping[str, object], sources: Path) -> Path | None:
         raise TypeError("source_zip is base64 text")
     unpacking = sources / f"{digest}.{uuid.uuid4().hex}"
     with zipfile.ZipFile(io.BytesIO(base64.b64decode(data))) as archive:
-        archive.extractall(unpacking)
+        for member in archive.infolist():
+            # extract() ignores stored modes; the bundled agent must stay executable.
+            Path(archive.extract(member, unpacking)).chmod(member.external_attr >> 16 & 0o777)
     try:
         unpacking.rename(folder)
     except OSError:

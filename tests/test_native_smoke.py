@@ -70,6 +70,9 @@ class _FakeNativeClient:
 
     def query(self, params: dict[str, JSONValue]) -> NativeQueryResult:
         self.calls.append(("query", params))
+        # The agent refuses a limit above 1000 (Handlers.swift, limitCeiling).
+        if not isinstance(params["limit"], int) or params["limit"] > 1000:
+            raise MacOSError('"limit" must not exceed 1000', code=ErrorCode.BAD_REQUEST)
         matches = [{**match, "handle": self._mint()} for match in self.query_result]
         return NativeQueryResult(matches, self.query_complete, len(matches))
 
@@ -601,6 +604,23 @@ def test_native_backend_routes_targeted_ax_search_and_interns_handles(
     assert params["text"] == "N"
     assert params["limit"] == 5
     assert params["reset_elements"] is True
+
+
+def test_native_search_for_a_role_without_a_search_key_works_at_default_bounds(
+    monkeypatch,
+) -> None:
+    client = _FakeNativeClient()
+    client.query_result = [
+        {"role": "AXGroup", "description": "Explorer"},
+        {"role": "AXHeading", "title": "Explorer"},
+    ]
+    mac = MacOS(backend="native")
+    monkeypatch.setattr(mac, "_acquire_native", lambda: client)
+    monkeypatch.setattr(mac, "_pid", lambda app: 4242)
+
+    matches = mac.ax.query("Explorer", app="Code", role="heading")
+
+    assert [(match["role"], match["title"]) for match in matches] == [("AXHeading", "Explorer")]
 
 
 def test_native_handles_share_the_monotonic_element_registry_with_local_elements(
