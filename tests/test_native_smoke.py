@@ -1484,6 +1484,96 @@ def test_wait_finds_visible_static_labels_without_returning_values(backend: str)
         helper.wait()
 
 
+_CHANGING_LABEL_HELPER = r'''
+import os
+import sys
+from AppKit import (
+    NSApplication, NSApplicationActivationPolicyAccessory,
+    NSApplicationActivationPolicyProhibited, NSBackingStoreBuffered,
+    NSMakeRect, NSObject, NSTextField, NSTimer, NSWindow, NSWindowStyleMaskTitled,
+)
+
+class Ready(NSObject):
+    def applicationDidFinishLaunching_(self, notification):
+        NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        window.orderFrontRegardless()
+        self.ticks = 0
+        if sys.argv[1] == "busy":
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(1 / 60, self, "tick:", None, True)
+        else:
+            for delay, text in ((2.5, "Export finished"), (4.5, "Export archived")):
+                NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(delay, self, "show:", text, False)
+        print(f"READY {os.getpid()}", flush=True)
+
+    def show_(self, timer):
+        label.setStringValue_(timer.userInfo())
+
+    def tick_(self, timer):
+        self.ticks += 1
+        label.setStringValue_(f"Exporting {self.ticks}")
+
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+    NSMakeRect(120, 120, 460, 90), NSWindowStyleMaskTitled, NSBackingStoreBuffered, False
+)
+label = NSTextField.labelWithString_("Exporting")
+label.setFrame_(NSMakeRect(20, 30, 410, 30))
+window.contentView().addSubview_(label)
+target = Ready.alloc().init()
+app.setDelegate_(target)
+app.run()
+'''
+
+
+@pytest.mark.smoke
+def test_wait_sees_a_label_that_lasts_less_than_its_interval() -> None:
+    """A wait in one app rests until the app reports a change, not out
+    its interval: the label reads "Export finished" for two seconds,
+    between searches six seconds apart, and the wait still sees it."""
+    _require_live_ax("python")
+    helper = subprocess.Popen(
+        [sys.executable, "-c", _CHANGING_LABEL_HELPER, "once"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        pid = int(_read_ready_line(helper).split(" ", 1)[1])
+        with MacOS() as mac:
+            found = mac.ax.wait("Export finished", app=pid, timeout=8, interval=6)
+        assert found["role"] == "AXStaticText"
+        assert found["pid"] == pid
+    finally:
+        helper.kill()
+        helper.wait()
+
+
+@pytest.mark.smoke
+def test_wait_searches_a_busy_app_at_most_twice_per_interval() -> None:
+    """While the app keeps reporting changes, a rest still lasts half the
+    interval, so a label that changes 60 times a second does not set the
+    pace: a wait that searched after every change ran 73 to 94 searches
+    here, and one that never woke early, 19."""
+    _require_live_ax("python")
+    helper = subprocess.Popen(
+        [sys.executable, "-c", _CHANGING_LABEL_HELPER, "busy"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    timeout, interval = 2.0, 0.1
+    try:
+        pid = int(_read_ready_line(helper).split(" ", 1)[1])
+        with MacOS() as mac, pytest.raises(MacOSError) as raised:
+            mac.ax.wait("Export finished", app=pid, timeout=timeout, interval=interval)
+        assert raised.value.code == ErrorCode.TIMEOUT
+        assert raised.value.details["polls"] <= 2 + 2 * timeout / interval
+    finally:
+        helper.kill()
+        helper.wait()
+
+
 def test_native_press_retries_only_on_delayed_appearance(monkeypatch) -> None:
     """A native targeted press that finds no unique match yet -- the
     agent's own ``PressCoordinator`` always reports this as

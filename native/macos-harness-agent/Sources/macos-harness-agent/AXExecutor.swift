@@ -101,18 +101,24 @@ final class AXExecutor {
   /// hide a search match, matching `_AttributeValues.conclusive` in `macos.py`: a missing or
   /// unsupported attribute is a known absence, and `.failure` is the app answering that it
   /// cannot produce the value, which no read ever returns, so no search can match on it. Any
-  /// other error (the app did not answer, the element went away) may hide a match.
+  /// other error (the app did not answer, the element went away) may hide a match. `failed`
+  /// names every read that failed rather than found the attribute absent, matching
+  /// `_AttributeValues.failures`.
   struct AttributeValues {
     var values: [String: AnyObject] = [:]
+    var failed: Set<String> = []
     var conclusive = true
 
     mutating func record(_ name: String, status: AXError, value: AnyObject?) {
       switch status {
       case .success:
         if let value { values[name] = value }
-      case .noValue, .attributeUnsupported, .failure:
+      case .noValue, .attributeUnsupported:
         break
+      case .failure:
+        failed.insert(name)
       default:
+        failed.insert(name)
         conclusive = false
       }
     }
@@ -302,6 +308,15 @@ final class AXExecutor {
     "AXFrame": "frame",
   ]
 
+  /// Matches `_SENSITIVE_ATTRIBUTES` in `macos.py`: what would give away a password field's
+  /// contents. `guardedAttributes` never requests them from one.
+  private static let sensitiveAttributeNames: Set<String> = [
+    "AXValue", "AXSelectedText", "AXSelectedTextRange", "AXNumberOfCharacters",
+  ]
+
+  /// Matches `_FOCUS_IDENTITY_ATTRIBUTES` in `macos.py`: the reads that tell a password field.
+  private static let identityAttributeNames = ["AXRole", "AXSubrole"]
+
   /// Matches `_ACTION_ALIASES` in `macos.py`: a friendly action name -> its AX action constant.
   private static let actionAliases: [String: String] = [
     "press": "AXPress",
@@ -377,7 +392,7 @@ final class AXExecutor {
         root: root, searchKey: searchKey, text: text, exact: exact, visibleOnly: visibleOnly,
         limit: limit, direction: direction, immediateDescendantsOnly: immediateDescendantsOnly,
         attributes: attributes, includeActions: includeActions, maxNodes: maxNodes,
-        registry: registry)
+        registry: registry, copy: Self.copyAttributes)
     }
     guard error == .success else {
       throw Self.axAgentError("AXUIElementsForSearchPredicate", error)
@@ -398,7 +413,8 @@ final class AXExecutor {
       let handle = registry.register(element)
       matches.append(
         Self.describeElement(
-          element, handle: handle, attributes: described, includeActions: includeActions))
+          element, handle: handle, attributes: described, includeActions: includeActions,
+          copy: Self.copyAttributes))
     }
     let cut = limit >= 0 && matches.count > limit
     if cut {
@@ -445,11 +461,12 @@ final class AXExecutor {
   /// attributes a match can rest on. A static text's value is its label, so a text search reads
   /// it when needed even if returned attributes omit values. Each match is described afresh.
   /// A search for what is visible, unless it is for menus or menu items, leaves out
-  /// closed-menu contents, matching `_on_screen_only` in `macos.py`.
-  private static func boundedSearch(
+  /// closed-menu contents, matching `_on_screen_only` in `macos.py`. `copy` reads every
+  /// attribute the walk and the match descriptions take.
+  static func boundedSearch(
     root: AXUIElement, searchKey: String, text: String?, exact: ExactSelector, visibleOnly: Bool,
     limit: Int, direction: String, immediateDescendantsOnly: Bool, attributes: [String],
-    includeActions: Bool, maxNodes: Int, registry: ElementRegistry
+    includeActions: Bool, maxNodes: Int, registry: ElementRegistry, copy: AttributeBatch
   ) throws -> QueryResult {
     guard maxNodes > 0 else {
       throw AgentError(code: "bad_request", message: "AX fallback max_nodes must be positive")
@@ -480,7 +497,8 @@ final class AXExecutor {
       includeMenuBar: true,
       skipClosedMenus: visibleOnly && !menuSearchKeys.contains(searchKey),
       attributes: traversalAttributes,
-      registry: registry)
+      registry: registry,
+      copy: copy)
     var nodes = snapshot.nodes
     let visited = nodes.count
     guard !nodes.isEmpty else { return QueryResult(matches: [], complete: false, visited: 0) }
@@ -502,7 +520,7 @@ final class AXExecutor {
       guard exact.matches(node.fields) else { continue }
       if let needle, !node.matchText.contains(where: { $0.lowercased().contains(needle) }) {
         guard readStaticLabels && node.role == "AXStaticText" else { continue }
-        let reading = copyAttributes(node.element, ["AXValue"])
+        let reading = copy(node.element, ["AXValue"])
         readComplete = readComplete && reading.conclusive
         guard let value = reading.values["AXValue"],
           pythonLikeString(jsonable(value)).lowercased().contains(needle)
@@ -514,7 +532,8 @@ final class AXExecutor {
       }
       matches.append(
         describeElement(
-          node.element, handle: node.handle, attributes: described, includeActions: includeActions)
+          node.element, handle: node.handle, attributes: described, includeActions: includeActions,
+          copy: copy)
       )
     }
     // A depth cut only matters when the walk was meant to go deep: an immediate-descendants
@@ -538,7 +557,7 @@ final class AXExecutor {
   /// one that stopped short.
   private static func snapshotTree(
     root: AXUIElement, maxDepth: Int, maxNodes: Int, includeMenuBar: Bool, skipClosedMenus: Bool,
-    attributes: [String], registry: ElementRegistry
+    attributes: [String], registry: ElementRegistry, copy: AttributeBatch
   ) throws -> TreeSnapshot {
     var requestedNames = dedup(attributes)
     for name in ["AXRole", "AXChildren", "AXWindows"] where !requestedNames.contains(name) {
@@ -560,7 +579,7 @@ final class AXExecutor {
       }
       seen.insert(element)
 
-      let reading = copyAttributes(element, requestedNames)
+      let reading = guardedAttributes(element, requestedNames, copy: copy)
       snapshot.readCut = snapshot.readCut || !reading.conclusive
       let raw = reading.values
       let role = raw["AXRole"].map(jsonable)?.stringValue
@@ -658,13 +677,17 @@ final class AXExecutor {
   /// set), maps the recognized subset onto wire field names, carries any other requested
   /// attribute under `attributes`, and includes `actions` only when asked and non-empty.
   private static func describeElement(
-    _ element: AXUIElement, handle: Int, attributes: [String], includeActions: Bool
+    _ element: AXUIElement, handle: Int, attributes: [String], includeActions: Bool,
+    copy: AttributeBatch
   ) -> ElementDescriptor {
     var requestedNames = ["AXRole"]
     for name in dedup(attributes) where name != "AXRole" {
       requestedNames.append(name)
     }
-    let raw = copyAttributes(element, requestedNames).values
+    let requested = Set(requestedNames)
+    let raw = guardedAttributes(element, requestedNames, copy: copy).values.filter {
+      requested.contains($0.key)
+    }
     let role = raw["AXRole"].map(jsonable)?.stringValue
     let fields = mappedFields(from: raw)
     let extra = extraFields(from: raw)
@@ -789,6 +812,35 @@ final class AXExecutor {
       result.record(name, status: status, value: value)
     }
     return result
+  }
+
+  /// One batch of attribute reads from one element. `boundedSearch` takes this as a parameter so
+  /// `AgentTests` can walk a scripted tree without a live target or a trust grant; production
+  /// always passes `copyAttributes`.
+  typealias AttributeBatch = (AXUIElement, [String]) -> AttributeValues
+
+  /// Matches `MacOS._read_guarded` in `macos.py`: reads every name in `names` that is not
+  /// sensitive, with the role and subrole when one is, then the sensitive ones only from an
+  /// element whose role and subrole read in full and name no `AXSecureTextField`. A role or
+  /// subrole read that failed leaves them unread and the reading inconclusive.
+  private static func guardedAttributes(
+    _ element: AXUIElement, _ names: [String], copy: AttributeBatch
+  ) -> AttributeValues {
+    let sensitive = names.filter(sensitiveAttributeNames.contains)
+    guard !sensitive.isEmpty else { return copy(element, names) }
+    var reading = copy(
+      element, dedup(names.filter { !sensitiveAttributeNames.contains($0) } + identityAttributeNames))
+    guard !identityAttributeNames.contains(where: reading.failed.contains) else {
+      reading.conclusive = false
+      return reading
+    }
+    let identity = identityAttributeNames.compactMap { reading.values[$0].map(jsonable)?.stringValue }
+    guard !identity.contains("AXSecureTextField") else { return reading }
+    let values = copy(element, sensitive)
+    reading.values.merge(values.values) { _, value in value }
+    reading.failed.formUnion(values.failed)
+    reading.conclusive = reading.conclusive && values.conclusive
+    return reading
   }
 
   /// One `AXUIElementCopyAttributeValue` call: the status AX reported and whatever value it

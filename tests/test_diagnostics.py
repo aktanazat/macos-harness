@@ -75,12 +75,18 @@ def test_default_inspection_never_acquires_values_or_enhances_accessibility(insp
     assert "value" not in state["focus"]["focused"]
 
 
-@pytest.mark.parametrize("refused_identity", [False, True], ids=["secure-field", "refused-identity"])
-def test_value_inspection_never_reads_a_secure_or_unidentified_fields_content(inspection, refused_identity) -> None:
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"AXSubrole": "AXSecureTextField"},
+        {"AXRole": "AXSecureTextField"},
+        {"AXSubrole": _Refused(macos_module.AS.kAXErrorCannotComplete)},
+    ],
+    ids=["secure-subrole", "secure-role", "refused-identity"],
+)
+def test_value_inspection_never_reads_a_secure_or_unidentified_fields_content(inspection, identity) -> None:
     host, _requested = inspection
-    host.data[host.field]["AXSubrole"] = (
-        _Refused(macos_module.AS.kAXErrorCannotComplete) if refused_identity else "AXSecureTextField"
-    )
+    host.data[host.field].update(identity)
     # Only this field has a value. Other nodes need no value reads for this contract.
     original = macos_module.AS.AXUIElementCopyAttributeValue
     field_requests: list[str] = []
@@ -96,7 +102,7 @@ def test_value_inspection_never_reads_a_secure_or_unidentified_fields_content(in
 
     assert "value" not in state["nodes"][1]
     assert not {"AXValue", "AXNumberOfCharacters", "AXSelectedTextRange"} & set(field_requests)
-    assert state["coverage"]["read_cut"] is refused_identity
+    assert state["coverage"]["read_cut"] is isinstance(identity.get("AXSubrole"), _Refused)
 
 
 def test_partial_inspection_does_not_claim_that_no_dialog_blocks_the_app(inspection) -> None:

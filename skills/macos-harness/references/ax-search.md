@@ -57,7 +57,9 @@ incomplete because some processes do not answer, so give an exact selector one
 app: `mac.ax.press(title="Allow", role="button", app="UserNotificationCenter")`.
 
 Cross-process calls need non-empty text or an exact selector. Default
-attributes exclude `AXValue`; read it with `ax.get` or explicit attributes.
+attributes exclude `AXValue`; read it with `ax.get` or explicit attributes. A
+search never asks a password field (role or subrole `AXSecureTextField`) for its
+value, length, or selection; it reads the role and subrole first.
 
 ## Completeness
 
@@ -75,13 +77,19 @@ did not answer.
 ## Waits and presses
 
 `wait` returns the one match; zero matches keep polling; several fail closed and
-report owner, role, title, frame, and enabled state. An app that does not
+report owner, role, title, frame, and enabled state. In one app a wait searches
+again as soon as the app posts an Accessibility notification (a value or title
+change, say), never sooner than its last search took, at most twice per
+`interval` while the app keeps changing, and at least every `interval`, which
+catches changes with no notification, such as a view an AppKit window adds or
+hides; across apps it searches every `interval`. An app that does not
 answer in time (AXError -25204), as one still launching does for a second or
 more after `open -a`, also keeps the wait polling until its timeout. A timeout
 names the query and how many searches ran; in one app it also names a match
 off screen or of another role under `elsewhere`, and the on-screen labels
 nearest the text under `nearest`.
-`wait_gone` needs two consecutive complete, empty searches; a named app that
+`wait_gone` needs two consecutive complete, empty searches, the second a full
+`interval` after the first; a named app that
 exits counts as gone. `press` waits for one match, needs `AXPress`, and returns
 the match. It never requests activation; if the target makes itself frontmost,
 it raises `FocusChangedError` and cannot undo that.

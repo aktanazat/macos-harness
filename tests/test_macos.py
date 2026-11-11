@@ -634,11 +634,13 @@ def test_focus_sample_requests_no_text_after_a_refused_secure_field_check(
     assert not {"AXValue", "AXNumberOfCharacters", "AXSelectedTextRange"} & set(requested)
 
 
-def _bounded_tree(monkeypatch, mac: MacOS, root: object, children: dict, data: dict) -> None:
+def _bounded_tree(monkeypatch, mac: MacOS, root: object, children: dict, data: dict) -> dict[object, list[str]]:
     """Serve a fake AX tree through the bounded-walk fallback: the app's
     own search predicate is unsupported, so every query walks ``children``
     from ``root`` and reads each element's attributes from ``data``, where
-    a `_Refused` value is a read the app refused with that AXError."""
+    a `_Refused` value is a read the app refused with that AXError.
+    Returns the names read from each element, in order."""
+    asked: dict[object, list[str]] = {}
     monkeypatch.setattr(mac, "_ensure_accessibility", lambda: None)
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_application_element", lambda pid, **kwargs: root)
@@ -660,6 +662,7 @@ def _bounded_tree(monkeypatch, mac: MacOS, root: object, children: dict, data: d
             "AXWindows": None,
         }
         read = {attribute: values.get(attribute) for attribute in attributes}
+        asked.setdefault(element, []).extend(read)
         return macos_module._AttributeValues(
             ((name, None if isinstance(value, _Refused) else value) for name, value in read.items()),
             failures=((name, value.code) for name, value in read.items() if isinstance(value, _Refused)),
@@ -675,6 +678,7 @@ def _bounded_tree(monkeypatch, mac: MacOS, root: object, children: dict, data: d
             None,
         ),
     )
+    return asked
 
 
 def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
@@ -709,6 +713,29 @@ def test_ax_query_falls_back_to_a_bounded_tree(monkeypatch) -> None:
     # never examined and this list may not be every match.
     assert results.complete is False
     assert results.visited == 4
+
+
+def test_a_search_for_values_describes_a_password_field_without_requesting_its_value(monkeypatch) -> None:
+    """AppKit answers a password field's AXValue with one bullet per
+    character, so even asking for it tells its length. A search over
+    values describes the field it matches by role and subrole only."""
+    mac = MacOS()
+    root, password, name = (object() for _ in range(3))
+    children = {root: [password, name]}
+    data = {
+        root: {"AXRole": "AXWindow"},
+        password: {"AXRole": "AXTextField", "AXSubrole": "AXSecureTextField", "AXValue": "\uf79a" * 7},
+        name: {"AXRole": "AXTextField", "AXValue": "Ada"},
+    }
+    asked = _bounded_tree(monkeypatch, mac, root, children, data)
+
+    matches = mac.ax_search(app="Demo", attributes=macos_module._AX_ATTRIBUTES, include_actions=False)
+
+    assert [(match.get("subrole"), match.get("value")) for match in matches] == [
+        ("AXSecureTextField", None),
+        (None, "Ada"),
+    ]
+    assert not macos_module._SENSITIVE_ATTRIBUTES & set(asked[password])
 
 
 def test_ax_search_fallback_keeping_handles_registers_only_its_matches(monkeypatch) -> None:

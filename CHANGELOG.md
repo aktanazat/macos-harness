@@ -336,6 +336,22 @@ follows [Semantic Versioning](https://semver.org/).
   waits no longer deadlocks: `close()` returns once that request times out.
   Nothing already sent is resent.
 
+- A search asked for values (`attributes` naming `AXValue`) no longer asks
+  a password field it matches for its value. AppKit answered with one
+  bullet per character, which told the password's length. A match's role
+  and subrole are now read first, and its value, length, and selection
+  are skipped when either names `AXSecureTextField`, as a window walk
+  already did.
+
+- The native agent follows the same rule: it reads a match's role and
+  subrole before its value, and never requests a password field's value,
+  length, or selection, whether it describes a match or walks a window
+  that lacks the search predicate.
+
+- A window walk or focus sample treats an element whose role, not only
+  its subrole, is `AXSecureTextField` as a password field, and never reads
+  its value.
+
 - Public `MacOS`, `mac.ax`, and `mac.do` calls drain temporary Cocoa
   objects before returning, even without an AppKit event loop. Repeated
   window and control reads no longer retain each call's native objects;
@@ -416,6 +432,27 @@ follows [Semantic Versioning](https://semver.org/).
   `mac.state`, queries and checked inputs no longer import the capture
   module or ScreenCaptureKit; an unchecked input still does, for its
   picture.
+
+- A window walk that reads values (`mac.state`, `inspect`, a fallback
+  search over values) reads each element's role and subrole in the same
+  request as its other attributes, then its value alone once those show
+  no password field; it used to read the role and subrole first, then
+  every attribute again. On a 205-element Safari window the walk takes
+  11–16% less time (median of 10 runs, three batches); a whole
+  `mac.state` call stays within run-to-run noise.
+
+- A `wait` in one app rests between searches until the app posts an
+  accessibility notification, though never less than its last search
+  took, instead of always sleeping `interval`. In a VM, after a
+  Calculator button press, the wait reported the new display value in
+  18–28 ms (median of 10 presses, six batches) instead of 49–69 ms, and
+  in 37 ms at worst instead of 112 ms. `interval` is now the longest
+  rest, which catches changes no notification reports, such as a view an
+  AppKit window adds or hides. While the app keeps posting notifications,
+  a rest lasts at least half of `interval`, so a busy app is searched at
+  most twice per `interval`. A wait across apps still searches every
+  `interval`, and `wait_gone` still confirms an empty search a full
+  `interval` later.
 
 - The native skill prefers OMP's readable native tools when available,
   selecting them from the task without requiring the owner to name one.
