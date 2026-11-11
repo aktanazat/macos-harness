@@ -641,7 +641,7 @@ final class AXExecutor {
   /// Whether `pid` runs from an app bundle that ships Electron, matching `_runs_electron` in
   /// `macos.py`: the kernel's executable path, not AppKit's pid lookup, which misses apps
   /// launched a moment ago.
-  static func runsElectron(_ pid: pid_t) -> Bool {
+  private static func runsElectron(_ pid: pid_t) -> Bool {
     var path = [CChar](repeating: 0, count: 4096)  // PROC_PIDPATHINFO_MAXSIZE
     guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { return false }
     let framework = URL(fileURLWithPath: String(cString: path))
