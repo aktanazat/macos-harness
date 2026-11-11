@@ -57,6 +57,7 @@ mac.scroll(delta_y, delta_x=0, *, app=None, window_id=None, screenshot=None, uni
 mac.drag(from_x, from_y, to_x, to_y, *, app=None, window_id=None, screenshot=None, button="left", coordinate_space="screenshot", duration=0.25, steps=12)
 mac.move(x, y, *, app=None, screenshot=None, coordinate_space="screenshot", duration=0.16)
 mac.script(source, *, language="AppleScript", timeout=15.0)
+mac.sdef(app)
 mac.activate(app=None, *, timeout=0.5)
 mac.launch(app, *, timeout=15.0, window=True)
 mac.quit(app, *, timeout=10.0, force=False)
@@ -66,6 +67,8 @@ mac.windows(app=None, *, all_layers=False)
 mac.wait_for_window(app=None, *, title=None, timeout=2.0, all_layers=False)
 mac.place(app=None, *, window_index=0, window_id=None, x=None, y=None, width=None, height=None, display=None)
 mac.menus(app, path=None)
+mac.menu_index(app, *, refresh=False)
+mac.menu_search(text, *, app, limit=10, refresh=False)
 mac.notifications()
 mac.list_apps()
 mac.show_pointer()
@@ -89,6 +92,14 @@ mac.script('tell application "System Events" to click button "OK" of window 1 of
 
 Name a process by `unix id`, not by name: one name such as `wine` can
 cover several processes.
+
+`mac.sdef(app)` reads the app's own scripting dictionary from its bundle,
+without launching it, so a script asks for what the app takes: its
+`commands`, each with its `direct` parameter, `parameters`, and `result`;
+its `classes`, each with `properties` (`access` `"r"` is read-only),
+`elements`, and the commands it `responds_to`; and its `enumerations`. An
+app with no dictionary raises `unsupported_op`: drive it through System
+Events. On the command line, `macos-harness sdef Notes`.
 
 ## Aiming input
 
@@ -148,6 +159,22 @@ in the window behind it.
 Export"` for a submenu, or with no path the menus in the menu bar: each has
 `title`, `enabled`, `checked`, its full `path` for `do.menu`, and a
 `shortcut` such as `"shift+cmd+s"` when it has one, for `do.key`.
+
+`mac.menu_index(app)` reads every item of the menu bar at once, submenus
+included and the Apple menu left out, without opening a menu: each has
+its `path`, `enabled`, a `shortcut` when it has one, and `submenu` when it
+opens one. It is kept per bundle ID and version under `menus/` in the
+harness's data folder, readable only by you, and read again when the app
+updates or with `refresh=True`; it holds what the menus showed, Safari's
+history included. Safari's 7,300 items take about 2 s the first time and
+30 ms after. `mac.menu_search("tab overview", app="Safari")` ranks items
+by exact title or path, then title prefix, then all words in the title,
+then all words in the path, and checks each against the live menu bar;
+`macos-harness menus Safari "tab overview"` does the same.
+`mac.do.menu_search(text, app=)` chooses the one best match by its
+shortcut when the app is in front and has one, else by pressing it;
+several equal matches, a submenu, or a disabled item is refused, and
+`target` names the `path` and `via`.
 
 `mac.notifications()` lists the banners and alerts Notification Center
 shows: each has the `app` that sent it, its `title`, `subtitle`, and
@@ -304,6 +331,7 @@ mac.do.key(key, *, app, window_id=None, timeout=5.0, postcondition=None, once=No
 mac.do.type(text, *, app, window_id=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.click(x=None, y=None, *, element=None, app, window_id=None, screenshot=None, button="left", clicks=1, coordinate_space="screenshot", timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.menu(path, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
+mac.do.menu_search(text, *, app, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.status_item(path=None, *, app, name=None, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.window(action, *, app, window_id=None, window_index=0, timeout=5.0, postcondition=None, once=None, dry_run=False)
 mac.do.reveal(element, *, app, timeout=5.0, once=None, dry_run=False)
