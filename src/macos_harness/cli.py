@@ -51,13 +51,13 @@ _UNKNOWN_KEYWORD = re.compile(r"unexpected keyword argument '(\w+)'(?:\. Did you
 
 
 def _mac_surfaces(namespace: Mapping[str, object]) -> dict[str, object]:
-    """The preloaded `mac` and the two namespaces programs call through it."""
+    """The preloaded `mac` and the namespaces programs call through it."""
     from .macos import MacOS
 
     mac = namespace.get("mac")
     if not isinstance(mac, MacOS):
         return {}
-    return {"mac": mac, "mac.ax": mac.ax, "mac.do": mac.do}
+    return {"mac": mac, "mac.ax": mac.ax, "mac.do": mac.do, "mac.data": mac.data}
 
 
 def _plain_signature(method: Callable[..., object]) -> str:
@@ -407,6 +407,28 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="NAME=VALUE",
         help="a string the program reads as args[NAME]; repeat for more",
     )
+    files = subparsers.add_parser(
+        "files", parents=[errors], help="find files through Spotlight, one path per line"
+    )
+    files.add_argument("query", nargs="?", help="a raw mdfind query")
+    files.add_argument("--name", help="part of the file name, any case")
+    files.add_argument("--kind", help="a content type, such as com.adobe.pdf or public.image")
+    files.add_argument("--content", help="a word in the file's text")
+    files.add_argument("--onlyin", action="append", help="search only this folder; repeat for more")
+    files.add_argument("--limit", type=int, default=1000)
+    file_info = subparsers.add_parser(
+        "file-info", parents=[errors], help="print one file's Spotlight metadata as JSON"
+    )
+    file_info.add_argument("path")
+    shortcuts = subparsers.add_parser(
+        "shortcuts", parents=[errors],
+        help="list shortcuts as JSON lines, or run one by name with no window",
+    )
+    shortcuts.add_argument("name", nargs="?", help="the shortcut to run")
+    shortcuts.add_argument("--input", action="append", help="an input file; repeat for more")
+    shortcuts.add_argument("--output", help="write the shortcut's result here")
+    shortcuts.add_argument("--output-type", help="the result's content type")
+    shortcuts.add_argument("--timeout", type=float, default=60.0)
     subparsers.add_parser(
         "spare",
         help="as this shell's coprocess, keep a loaded process ready for its next step",
@@ -599,6 +621,42 @@ def main(argv: list[str] | None = None) -> int:
                         args.text, app=args.app, limit=args.limit, refresh=args.refresh
                     ):
                         _print_json_line(item, file=sys.stdout)
+            result = 0
+            return result
+        if args.command == "files":
+            from .data import AppData
+
+            found = AppData().find_files(
+                args.query, name=args.name, kind=args.kind, content=args.content,
+                onlyin=args.onlyin, limit=args.limit,
+            )
+            for path in found["paths"]:
+                print(path)
+            if found["total"] > len(found["paths"]):
+                print(
+                    f"macos-harness: {found['total']} files matched; raise --limit to list more",
+                    file=sys.stderr,
+                )
+            result = 0
+            return result
+        if args.command == "file-info":
+            from .data import AppData
+
+            print(json.dumps(AppData().file_info(args.path), indent=2, ensure_ascii=False))
+            result = 0
+            return result
+        if args.command == "shortcuts":
+            from .data import AppData
+
+            if args.name is None:
+                for shortcut in AppData().shortcuts():
+                    _print_json_line(shortcut, file=sys.stdout)
+            else:
+                ran = AppData().run_shortcut(
+                    args.name, input=args.input, output=args.output,
+                    output_type=args.output_type, timeout=args.timeout,
+                )
+                print(json.dumps(ran, indent=2, ensure_ascii=False))
             result = 0
             return result
         if args.command is None:

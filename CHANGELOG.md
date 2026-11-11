@@ -58,6 +58,21 @@ follows [Semantic Versioning](https://semver.org/).
   (six presses and a look) of about 3.6 s; the window reads and a picture
   before each step cost about 0.5 s of it.
 
+- `mac.data` reads what apps stored before the GUI, read-only:
+  `find_files` and `file_info` over the Spotlight index in-process (7 ms
+  and 1 to 2 ms on a Downloads folder, against 23 to 45 ms for `mdfind`
+  and `mdls`), with download sources, authors, content types and dates,
+  and a `timeout` that holds when Spotlight does not answer;
+  `shortcuts` and `run_shortcut` with no window, a timeout, and exit
+  status and stderr; `read_defaults`, `read_plist`, and `query_sqlite` on
+  a `mode=ro` connection that runs reads only (a write, `attach` or
+  `vacuum` is refused) and reads a live store's write-ahead log. A
+  sandboxed app's settings or a guarded store macOS hides raises
+  `unsupported_op` instead of reading as unset. After a GUI save,
+  `wait_file` and `wait_value` wait on the stored bytes or value and
+  raise `timeout` when nothing was written. CLI: `files`, `file-info`,
+  `shortcuts`.
+
 - `mac.state(app)` prints a window as text, one control a line, as
   `[12] button "All Clear"`. Ids hold across runs for the same agent and
   app launch, and `state[12]` is a match for `click(element=)`,

@@ -24,6 +24,9 @@ fails with `app.exited`.
 
 ## Choose the lowest useful mode
 
+When an app's files, settings or database hold the answer, read them before
+its window, and prove a save there rather than by a banner: `data-first`.
+
 0. For a change, try a `mac.do` verb (`press`, `set`, `toggle`, `fill`, `run`,
    `key`) before its raw primitive: it verifies the effect and a `once` token
    makes a retry safe.

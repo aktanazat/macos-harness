@@ -62,11 +62,11 @@ mac.ax.wait("Distribute App", role="button", app="Xcode", timeout=600)
 - A target that comes forward itself raises `FocusChangedError`; never move focus back.
 - Never launch a closed app or open a URL scheme when focus is forbidden.
 - After one verified failure, switch mode or stop; never repeat keys or clicks.
-- Never close or quit windows, documents, apps, or handoffs you did not open: `invariants`.
+- Never close or quit what you did not open: `invariants`.
 
 ## Handoff and credentials
 
-At Touch ID, a passkey, a CAPTCHA, a verification code, or a sign-in approval,
+At Touch ID, a passkey, a CAPTCHA, a code, or a sign-in approval,
 print `mac.handoff(reason="authentication_required", app=...)` and end the turn.
 Passwords, including an approved local test VM's, and web pages: `credentials`.
 
@@ -81,6 +81,7 @@ Passwords, including an approved local test VM's, and web pages: `credentials`.
 - `ax-search`: roles, scopes, labels, waits
 - `invariants`: cleanup, focus, input, windows
 - `routes`: saved navigation
+- `data-first`: read data first; prove saves
 - `diagnostics`: inspect a failure first
 - `handoff`: the call and what follows
 - `credentials`: logins, permissions
