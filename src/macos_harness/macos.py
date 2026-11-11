@@ -7176,10 +7176,13 @@ class MacOS:
         return copies[0] if copies else None
 
     @staticmethod
-    def _open_application(url: NSURL, *, timeout: float) -> NSRunningApplication:
-        """Ask Launch Services to start the bundle at ``url`` without
-        bringing it forward, and return its running process. Launch
-        Services answers on its own queue, so no run loop turn is needed."""
+    def _open_application(
+        url: NSURL, *, timeout: float, documents: Sequence[Path] = ()
+    ) -> NSRunningApplication:
+        """Ask Launch Services to start the bundle at ``url``, or hand
+        the copy running ``documents`` to open, without bringing it
+        forward, and return its running process. Launch Services answers
+        on its own queue, so no run loop turn is needed."""
         opened = threading.Event()
         outcome: list[tuple[NSRunningApplication | None, object]] = []
 
@@ -7189,13 +7192,21 @@ class MacOS:
 
         configuration = NSWorkspaceOpenConfiguration.configuration()
         configuration.setActivates_(False)
-        NSWorkspace.sharedWorkspace().openApplicationAtURL_configuration_completionHandler_(
-            url, configuration, finished
-        )
+        workspace = NSWorkspace.sharedWorkspace()
+        if documents:
+            workspace.openURLs_withApplicationAtURL_configuration_completionHandler_(
+                [NSURL.fileURLWithPath_(str(path)) for path in documents],
+                url, configuration, finished,
+            )
+        else:
+            workspace.openApplicationAtURL_configuration_completionHandler_(
+                url, configuration, finished
+            )
         bundle = str(url.path())
         if not opened.wait(max(0.0, timeout)):
             raise MacOSError(
-                f"macOS did not start {bundle} within {timeout:g}s",
+                f"macOS did not {'hand the files to' if documents else 'start'} "
+                f"{bundle} within {timeout:g}s",
                 code=ErrorCode.TIMEOUT,
                 details={"path": bundle, "timeout": timeout},
             )
@@ -7208,6 +7219,27 @@ class MacOS:
                 details={"path": bundle},
             )
         return running
+
+    def _open_documents(self, pid: int, documents: Sequence[Path], *, timeout: float) -> None:
+        """Hand ``documents`` to the running app ``pid`` to open, as a drop
+        on its Dock icon does, leaving it where it is."""
+        running, info = self._resolve_app(pid)
+        bundle = running.bundleURL()
+        if bundle is None:
+            raise MacOSError(
+                f"{info['name']} has no app bundle to open files with",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"app": info},
+            )
+        self._open_application(bundle, timeout=timeout, documents=documents)
+
+    def _window_documents(self, pid: int) -> list[str]:
+        """The file URLs ``pid``'s windows on this Space say they show."""
+        return [
+            str(document)
+            for window in self._ax_windows(pid)
+            if (document := self._copy_attribute(window, "AXDocument")) is not None
+        ]
 
     @staticmethod
     def _application_with_pid(pid: int) -> Any | None:
