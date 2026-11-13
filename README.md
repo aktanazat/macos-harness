@@ -737,10 +737,10 @@ macos-harness vm delete t1
 ```
 
 `--vm` runs the same verbs inside the guest, and pictures they save come
-back to this Mac. Snapshots keep the guest's memory, so a reset returns to
-open apps in seconds, and `vm start t1 --source CHECKOUT` runs a harness
-checkout live inside the guest. Preparing the base and the limits are in
-`macos-harness skill vm`.
+back to this Mac. `vm put t1 MyApp.app` copies an app or file in. Snapshots
+keep the guest's memory, so a reset returns to open apps in seconds, and
+`vm start t1 --source CHECKOUT` runs a harness checkout live inside the
+guest. Preparing the base and the limits are in `macos-harness skill vm`.
 
 ## Native backend
 

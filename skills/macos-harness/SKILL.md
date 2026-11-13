@@ -63,19 +63,18 @@ mac.ax.wait("Distribute App", role="button", app="Xcode", timeout=600)
 - Never launch a closed app or open a URL scheme when focus is forbidden.
 - After one verified failure, switch mode or stop; never repeat keys or clicks.
 - Never close or quit what you did not open: `invariants`.
-- Work that must not touch the user's screen or focus: a disposable VM with its own apps and files, not this Mac's: `vm`.
 
 ## Handoff and credentials
 
 At Touch ID, a passkey, a CAPTCHA, a code, or a sign-in approval,
 print `mac.handoff(reason="authentication_required", app=...)` and end the turn.
-Passwords, including an approved local test VM's, and web pages: `credentials`.
+Passwords, a VM's too, web pages: `credentials`.
 
 `macos-harness doctor` only after a permission or connection error.
 
 ## References
 
-`macos-harness skill <name>` prints one:
+`macos-harness skill <name>` prints:
 
 - `signatures`: every signature
 - `receipts`: outcomes, errors, once tokens, logs
@@ -87,5 +86,4 @@ Passwords, including an approved local test VM's, and web pages: `credentials`.
 - `handoff`: the call and what follows
 - `credentials`: logins, permissions
 - `native-backend`: an optional backend
-- `vm`: disposable macOS VMs, `--vm NAME` runs the same verbs in the guest
-- `spare`: a preloaded process for faster steps
+- `vm`: apps off the user's screen

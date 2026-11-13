@@ -261,6 +261,8 @@ def _run_vm(args: argparse.Namespace) -> int:
         result = vm.snapshot(args.name, args.label)
     elif action == "reset":
         result = vm.reset(args.name, to=args.to)
+    elif action == "put":
+        result = vm.put(args.name, args.path, to=args.to)
     elif action == "delete":
         vm.delete(args.name)
         result = {"name": args.name, "deleted": True}
@@ -466,6 +468,16 @@ def _build_parser() -> argparse.ArgumentParser:
     vm_reset = vm_actions.add_parser("reset", help="put a VM back to a snapshot or its base")
     vm_reset.add_argument("name")
     vm_reset.add_argument("--to", metavar="LABEL", help="a snapshot label; the base without it")
+    vm_put = vm_actions.add_parser(
+        "put", help="copy a file or folder, such as an app, from this Mac into a running VM"
+    )
+    vm_put.add_argument("name")
+    vm_put.add_argument("path", type=Path)
+    vm_put.add_argument(
+        "--to",
+        metavar="FOLDER",
+        help="the guest folder it lands in; /Applications for an app, the guest's home otherwise",
+    )
     vm_actions.add_parser("delete", help="delete a VM and its snapshots").add_argument("name")
     vm_actions.add_parser("serve", help="inside a guest: run programs the host forwards")
     vm_actions.add_parser(
