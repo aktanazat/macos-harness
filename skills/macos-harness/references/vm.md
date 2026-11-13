@@ -30,6 +30,27 @@ keeps a first click from being dropped by a background window.
 
 `vm list` shows the VMs `vm create` made, their state, and their snapshots.
 
+## Copying files in and out
+
+```bash
+macos-harness vm put t1 ~/Applications/MyApp.app      # lands in the guest's /Applications
+macos-harness vm put t1 ~/notes/sample.txt --to ~/Documents
+```
+
+`vm put` copies a file or folder from this Mac into a running VM, replacing
+what has its name there. An app lands in /Applications and is registered,
+so `mac.launch("MyApp")` finds it; anything else lands in the guest's home
+unless `--to` names a guest folder. A development build whose provisioning
+profile leaves out the guest's device would not launch there, so its copy is
+signed ad hoc without the entitlements only a profile grants; the result
+lists them under `dropped_entitlements`, and features that need them, such
+as installing a system extension, do not work in the guest. The original on
+this Mac is untouched. Quit the app in the guest before putting a new build.
+
+To bring a file out, copy it into the program's temporary directory, as
+`shutil.copy(path, os.environ["TMPDIR"])`, and it comes back like a picture;
+up to 64 MiB per call. The guest has no sound devices.
+
 ## Suspend, snapshots, and resets
 
 `suspend` saves a running guest's memory to disk and stops it, in about 2 s;

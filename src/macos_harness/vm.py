@@ -29,6 +29,7 @@ import socketserver
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -86,6 +87,71 @@ class _Ran(TypedDict):
     stdout: str
     stderr: str
     files: dict[str, str]
+
+
+class Put(TypedDict):
+    name: str
+    path: str
+    bytes: int
+    resigned: bool
+    dropped_entitlements: list[str]
+
+
+_LSREGISTER = (
+    "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+    "LaunchServices.framework/Support/lsregister"
+)
+_PUT_CHUNK = _LARGEST_FILES
+_PUT_APPEND = """\
+import shutil
+from pathlib import Path
+staging = Path.home() / "Library" / "Caches" / "macos-harness-put" / {token!r}
+staging.parent.mkdir(parents=True, exist_ok=True)
+with open({part!r}, "rb") as part, staging.open("r+b" if {offset} else "wb") as out:
+    out.seek({offset})
+    shutil.copyfileobj(part, out)
+"""
+_PUT_FINISH = """\
+import hashlib, json, shutil, subprocess
+from pathlib import Path
+staging = Path.home() / "Library" / "Caches" / "macos-harness-put" / {token!r}
+folder = Path({folder!r}).expanduser()
+target = folder / {item!r}
+unpacked = folder / ("." + {token!r})
+try:
+    digest = hashlib.sha256()
+    with staging.open("rb") as archive:
+        for block in iter(lambda: archive.read(1 << 20), b""):
+            digest.update(block)
+    if digest.hexdigest() != {digest!r}:
+        raise SystemExit("the copy arrived damaged; run `vm put` again")
+    listed = subprocess.run(
+        ["/bin/ps", "-axww", "-o", "command="], capture_output=True, text=True, check=True
+    ).stdout
+    if any(line.startswith(str(target) + "/") for line in listed.splitlines()):
+        raise SystemExit(f"{{target.name}} is running in the guest; quit it first")
+    folder.mkdir(parents=True, exist_ok=True)
+    done = subprocess.run(
+        ["/usr/bin/ditto", "-x", "-k", str(staging), str(unpacked)], capture_output=True, text=True
+    )
+    if done.returncode:
+        raise SystemExit(f"unpacking failed: {{done.stderr.strip()}}")
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target)
+    else:
+        target.unlink(missing_ok=True)
+    (unpacked / {item!r}).rename(target)
+    if target.suffix == ".app":
+        subprocess.run([{lsregister!r}, "-f", str(target)], check=True)
+    print(json.dumps({{"path": str(target)}}))
+finally:
+    staging.unlink(missing_ok=True)
+    shutil.rmtree(unpacked, ignore_errors=True)
+"""
+_PUT_DISCARD = """\
+from pathlib import Path
+(Path.home() / "Library" / "Caches" / "macos-harness-put" / {token!r}).unlink(missing_ok=True)
+"""
 
 
 def _tart_path() -> str:
@@ -465,6 +531,13 @@ def run(name: str, argv: Sequence[str], stdin: str | None) -> int:
     directory land under this VM's folder on the host, and the paths it
     printed are rewritten to match; host paths under that folder in
     ``argv`` or ``stdin`` reach the guest as its own."""
+    reply = _run(name, argv, stdin)
+    sys.stdout.write(reply["stdout"])
+    sys.stderr.write(reply["stderr"])
+    return reply["exit"]
+
+
+def _run(name: str, argv: Sequence[str], stdin: str | None) -> _Ran:
     source = _record(name)["source"]
     files = _home(name) / "files"
     files.mkdir(exist_ok=True)
@@ -501,9 +574,164 @@ def run(name: str, argv: Sequence[str], stdin: str | None) -> int:
             )
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(base64.b64decode(data))
-    sys.stdout.write(reply["stdout"])
-    sys.stderr.write(reply["stderr"])
-    return reply["exit"]
+    return reply
+
+
+def _guest_program(name: str, program: str) -> str:
+    """Run ``program`` with the guest's harness and return what it printed;
+    a failure raises with what it wrote to stderr."""
+    reply = _run(name, [], program)
+    if reply["exit"]:
+        last = (reply["stderr"].strip().splitlines() or ["no error output"])[-1]
+        raise MacOSError(f"{name}: {last}", code="vm.guest_failed")
+    return reply["stdout"]
+
+
+def put(name: str, path: str | os.PathLike[str], *, to: str | None = None) -> Put:
+    """Copy ``path``, a file or folder on this Mac such as an app, into
+    ``name``'s folder ``to``: /Applications for an app and the guest's home
+    for anything else when None. It replaces what has its name there, and
+    an app is registered so `mac.launch` finds it by name. An app whose
+    provisioning profile leaves out the guest would not launch there, so its
+    copy is signed ad hoc without the entitlements only a profile grants."""
+    _record(name)
+    source = Path(path).expanduser().resolve()
+    if not source.exists():
+        raise MacOSError(f"{source} does not exist", code=ErrorCode.BAD_REQUEST)
+    folder = to if to is not None else "/Applications" if source.suffix == ".app" else "~"
+    if not folder.startswith(("/", "~")):
+        raise MacOSError(
+            f"--to {folder!r} must be an absolute guest path or start with ~",
+            code=ErrorCode.BAD_REQUEST,
+        )
+    token = f"put-{uuid.uuid4().hex}"
+    staging = _home(name) / "files" / token
+    staging.mkdir(parents=True)
+    try:
+        payload, dropped = source, None
+        profiles = _profiles(source) if source.suffix == ".app" and source.is_dir() else []
+        if profiles and not all(_provisions(profile, _guest_udid(name)) for profile in profiles):
+            payload = staging / source.name
+            subprocess.run(["/bin/cp", "-cR", str(source), str(payload)], check=True)
+            dropped = _resign(payload)
+        archive = staging / "archive.zip"
+        # ditto keeps an app's symlinks, modes and signature; zipfile does not.
+        # --keepParent names a folder's own top level, but a file's parent.
+        keep = ["--keepParent"] if payload.is_dir() else []
+        done = subprocess.run(
+            ["/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", *keep, str(payload), str(archive)],
+            capture_output=True, text=True, check=False,
+        )
+        if done.returncode:
+            raise MacOSError(f"packing {source} failed: {done.stderr.strip()}", code=ErrorCode.BAD_REQUEST)
+        digest = hashlib.sha256()
+        offset = 0
+        try:
+            with archive.open("rb") as data:
+                while chunk := data.read(_PUT_CHUNK):
+                    digest.update(chunk)
+                    part = staging.resolve() / f"part-{offset}"
+                    part.write_bytes(chunk)
+                    _guest_program(name, _PUT_APPEND.format(token=token, part=str(part), offset=offset))
+                    part.unlink()
+                    offset += len(chunk)
+            finish = _PUT_FINISH.format(
+                token=token, digest=digest.hexdigest(), folder=folder, item=source.name, lsregister=_LSREGISTER
+            )
+            landed = json.loads(_guest_program(name, finish))
+        except BaseException:
+            with contextlib.suppress(MacOSError):
+                _guest_program(name, _PUT_DISCARD.format(token=token))
+            raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return {
+        "name": name,
+        "path": str(landed["path"]),
+        "bytes": offset,
+        "resigned": dropped is not None,
+        "dropped_entitlements": dropped or [],
+    }
+
+
+_GUEST_UDID = """\
+import json, subprocess
+shown = subprocess.run(
+    ["/usr/sbin/system_profiler", "-json", "SPHardwareDataType"], capture_output=True, check=True
+)
+print(json.loads(shown.stdout)["SPHardwareDataType"][0]["provisioning_UDID"])
+"""
+
+
+def _guest_udid(name: str) -> str:
+    """The device id a provisioning profile must list for ``name``."""
+    return _guest_program(name, _GUEST_UDID).strip()
+
+
+def _profiles(app: Path) -> list[Path]:
+    return [
+        Path(folder) / "embedded.provisionprofile"
+        for folder, _, files in os.walk(app)
+        if "embedded.provisionprofile" in files
+    ]
+
+
+def _provisions(profile: Path, udid: str) -> bool:
+    """Whether ``profile`` lets code it signs run on device ``udid``."""
+    done = subprocess.run(
+        ["/usr/bin/security", "cms", "-D", "-i", str(profile)], capture_output=True, check=False
+    )
+    if done.returncode:
+        return False
+    found = plistlib.loads(done.stdout)
+    return found.get("ProvisionsAllDevices") is True or udid in found.get("ProvisionedDevices", [])
+
+
+_BUNDLES = frozenset({".app", ".appex", ".bundle", ".framework", ".plugin", ".systemextension", ".xpc"})
+_MACHO = frozenset({b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe"})
+
+
+def _resign(app: Path) -> list[str]:
+    """Sign ``app`` and the code inside it ad hoc, deepest first, without
+    its profiles and the entitlements only a profile grants; returns the
+    entitlements it dropped."""
+    code: list[Path] = []
+    for folder, dirs, files in os.walk(app):
+        here = Path(folder)
+        code += [here / d for d in dirs if Path(d).suffix in _BUNDLES and not (here / d).is_symlink()]
+        for file in files:
+            path = here / file
+            if file == "embedded.provisionprofile":
+                path.unlink()
+            elif not path.is_symlink():
+                with path.open("rb") as head:
+                    if head.read(4) in _MACHO:
+                        code.append(path)
+    dropped: set[str] = set()
+    for item in [*sorted(code, key=lambda item: len(item.parts), reverse=True), app]:
+        dropped |= _sign_ad_hoc(item)
+    return sorted(dropped)
+
+
+def _sign_ad_hoc(item: Path) -> set[str]:
+    shown = subprocess.run(
+        ["/usr/bin/codesign", "-d", "--entitlements", "-", "--xml", str(item)],
+        capture_output=True, check=False,
+    )
+    entitlements = plistlib.loads(shown.stdout) if shown.stdout.strip() else {}
+    kept = {key: value for key, value in entitlements.items() if key.startswith("com.apple.security.")}
+    # No hardened runtime: ad hoc code has no team ID, so library validation
+    # would refuse the app's own frameworks.
+    with tempfile.NamedTemporaryFile(suffix=".entitlements") as granted:
+        granted.write(plistlib.dumps(kept))
+        granted.flush()
+        done = subprocess.run(
+            ["/usr/bin/codesign", "--force", "--sign", "-", "--entitlements", granted.name, str(item)],
+            capture_output=True, text=True, check=False,
+        )
+    if done.returncode:
+        raise MacOSError(f"signing {item} failed: {done.stderr.strip()}", code=ErrorCode.BAD_REQUEST)
+    return set(entitlements) - set(kept)
 
 
 def _named_files(root: Path, texts: Sequence[str]) -> dict[str, str]:
