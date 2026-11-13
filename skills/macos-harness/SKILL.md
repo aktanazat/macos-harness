@@ -63,6 +63,7 @@ mac.ax.wait("Distribute App", role="button", app="Xcode", timeout=600)
 - Never launch a closed app or open a URL scheme when focus is forbidden.
 - After one verified failure, switch mode or stop; never repeat keys or clicks.
 - Never close or quit what you did not open: `invariants`.
+- Work that must not touch the user's screen or focus: a disposable VM with its own apps and files, not this Mac's: `vm`.
 
 ## Handoff and credentials
 
@@ -86,3 +87,5 @@ Passwords, including an approved local test VM's, and web pages: `credentials`.
 - `handoff`: the call and what follows
 - `credentials`: logins, permissions
 - `native-backend`: an optional backend
+- `vm`: disposable macOS VMs, `--vm NAME` runs the same verbs in the guest
+- `spare`: a preloaded process for faster steps
