@@ -39,6 +39,7 @@ private func run() -> Never {
   _ = NSApplication.shared
   NSApplication.shared.setActivationPolicy(.accessory)
   holdLock()
+  Battery.resumeLeftovers()
   requireAccessibility(waiting: true)
   for sig in [SIGTERM, SIGINT, SIGHUP] {
     signal(sig, SIG_IGN)

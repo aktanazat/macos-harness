@@ -183,15 +183,22 @@ final class LabelsTests: XCTestCase {
 }
 
 final class PowerTests: XCTestCase {
+  /// Pauses only an idle agent app in the background with no window of his open in it.
   func testOnlyIdleBackgroundAgentAppsPause() {
     let now = Date(timeIntervalSince1970: 1_000_000)
     let idle = now.addingTimeInterval(-601)
+    func app(_ pid: pid_t, launched: Bool = true, frontmost: Bool = false, grabbed: Bool = false,
+             hasUserWindow: Bool = false, lastActivity: Date) -> Power.App {
+      Power.App(pid: pid, launched: launched, frontmost: frontmost, grabbed: grabbed, hasUserWindow: hasUserWindow,
+                lastActivity: lastActivity)
+    }
     let apps = [
-      Power.App(pid: 1, launched: true, frontmost: false, grabbed: false, lastActivity: idle),
-      Power.App(pid: 2, launched: false, frontmost: false, grabbed: false, lastActivity: idle),
-      Power.App(pid: 3, launched: true, frontmost: true, grabbed: false, lastActivity: idle),
-      Power.App(pid: 4, launched: true, frontmost: false, grabbed: true, lastActivity: idle),
-      Power.App(pid: 5, launched: true, frontmost: false, grabbed: false, lastActivity: now.addingTimeInterval(-300)),
+      app(1, lastActivity: idle),
+      app(2, launched: false, lastActivity: idle),
+      app(3, frontmost: true, lastActivity: idle),
+      app(4, grabbed: true, lastActivity: idle),
+      app(5, lastActivity: now.addingTimeInterval(-300)),
+      app(6, hasUserWindow: true, lastActivity: idle),
     ]
     XCTAssertEqual(Power.toPause(apps, now: now), [1])
   }

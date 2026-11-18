@@ -19,20 +19,26 @@ public enum Power {
     public let frontmost: Bool
     /// A window of it is on his screen through the peek.
     public let grabbed: Bool
+    /// It has a window that is neither on an agent display nor one of the agents' claimed
+    /// windows: one he opened himself.
+    public let hasUserWindow: Bool
     public let lastActivity: Date
 
-    public init(pid: pid_t, launched: Bool, frontmost: Bool, grabbed: Bool, lastActivity: Date) {
+    public init(pid: pid_t, launched: Bool, frontmost: Bool, grabbed: Bool, hasUserWindow: Bool,
+                lastActivity: Date) {
       self.pid = pid
       self.launched = launched
       self.frontmost = frontmost
       self.grabbed = grabbed
+      self.hasUserWindow = hasUserWindow
       self.lastActivity = lastActivity
     }
   }
 
   public static func toPause(_ apps: [App], now: Date) -> [pid_t] {
     apps.filter {
-      $0.launched && !$0.frontmost && !$0.grabbed && now.timeIntervalSince($0.lastActivity) >= idleBeforePause
+      $0.launched && !$0.frontmost && !$0.grabbed && !$0.hasUserWindow
+        && now.timeIntervalSince($0.lastActivity) >= idleBeforePause
     }.map(\.pid)
   }
 }

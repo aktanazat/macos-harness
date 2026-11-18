@@ -22,7 +22,10 @@ enum Grabs {
     Battery.resume(pid)
     guard let app = NSRunningApplication(processIdentifier: pid), let ax = axWindow(pid: pid, id: id),
           let home = WindowGuard.moveToUser(ax, app: app) else { return false }
-    book.grab(windowID: id, pid: pid, home: home, safari: app.bundleIdentifier == "com.apple.Safari", at: Date())
+    // A window no agent owns is his: it stays on his screen, never sent back.
+    if WindowGuard.ownedByAgents(app, window: id) {
+      book.grab(windowID: id, pid: pid, home: home, safari: app.bundleIdentifier == "com.apple.Safari", at: Date())
+    }
     AXUIElementPerformAction(ax, kAXRaiseAction as CFString)
     app.activate()
     schedule()

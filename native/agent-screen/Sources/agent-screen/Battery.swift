@@ -17,10 +17,14 @@ enum Battery {
   /// Pids this companion paused, kept on disk so a restarted companion resumes them.
   private static var pausedFile: URL { AgentDisplay.stateDir.appendingPathComponent("paused") }
 
-  static func start() {
+  /// Resumes the apps a previous companion paused and left paused (it crashed or was killed).
+  static func resumeLeftovers() {
     let left = ((try? String(contentsOf: pausedFile, encoding: .utf8)) ?? "").split(whereSeparator: \.isNewline)
     for pid in left.compactMap({ pid_t($0) }) { kill(pid, SIGCONT) }
     persist()
+  }
+
+  static func start() {
     if let loop = IOPSNotificationCreateRunLoopSource({ _ in Battery.update() }, nil)?.takeRetainedValue() {
       CFRunLoopAddSource(CFRunLoopGetMain(), loop, .defaultMode)
     }
@@ -76,21 +80,31 @@ enum Battery {
 
   private static func sweep() {
     let now = Date()
-    let launched = Claims.all().filter(\.launched).map(\.pid)
+    let claims = Claims.all().filter(\.launched)
+    let launched = claims.map(\.pid)
     let signatures = windowSignatures(Set(launched))
     for pid in launched { activity.observe(pid, signature: signatures[pid] ?? 0, at: now) }
     activity.keep(Set(launched))
     let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
     let grabbed = Set(Grabs.book.grabs.map(\.pid))
-    let apps = launched.filter { !paused.contains($0) }.map {
-      Power.App(pid: $0, launched: true, frontmost: $0 == front, grabbed: grabbed.contains($0),
-                lastActivity: activity.last($0) ?? now)
+    let apps = claims.filter { !paused.contains($0.pid) }.map { c in
+      Power.App(pid: c.pid, launched: true, frontmost: c.pid == front, grabbed: grabbed.contains(c.pid),
+                hasUserWindow: hasUserWindow(c), lastActivity: activity.last(c.pid) ?? now)
     }
     for pid in Power.toPause(apps, now: now) where kill(pid, SIGSTOP) == 0 {
       paused.insert(pid)
       log("paused \(NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"): idle 10 min on battery")
     }
     persist()
+  }
+
+  /// Whether the app has a window off the agent displays that the agents never claimed, as the
+  /// quit path judges his windows.
+  private static func hasUserWindow(_ claim: Claim) -> Bool {
+    axWindows(claim.pid).contains { w in
+      if let id = windowID(w), claim.windows.contains(id) { return false }
+      return axFrame(w).map { agentDisplay(containing: $0) == nil } ?? true
+    }
   }
 
   /// A digest of each app's windows: ids, frames and titles.
