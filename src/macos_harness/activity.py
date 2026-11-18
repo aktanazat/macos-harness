@@ -105,7 +105,8 @@ def shortcut_name(key: str | None) -> str | None:
 def _send(message: dict[str, JSONValue]) -> None:
     global _sock, _sock_pid
     message.update(v=1, pid=os.getpid(), t=time.time())
-    data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    # An app's label can hold a lone surrogate; the action already happened.
+    data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
     try:
         if _sock is None or _sock_pid != os.getpid():
             _sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)

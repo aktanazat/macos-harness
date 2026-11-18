@@ -3314,6 +3314,25 @@ def test_activity_names_the_app_and_key_but_never_the_typed_text(
     assert "hunter2" not in json.dumps(sent)
 
 
+def test_activity_send_survives_text_utf8_cannot_encode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An app can report a label holding a lone surrogate; the action has
+    already happened, so the report must neither raise nor go missing."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        path = os.path.join(directory, "activity.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        listener.bind(path)
+        listener.settimeout(2)
+        monkeypatch.setattr(activity, "socket_path", lambda: path)
+
+        activity.action(None, "key", app_pid=41, key="cmd+A\ud800B")
+
+        sent = json.loads(listener.recv(4096))
+        listener.close()
+    assert (sent["op"], sent["app_pid"]) == ("key", 41)
+
+
 def test_receipt_log_is_off_unless_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv(receipt_log.ENV, raising=False)
