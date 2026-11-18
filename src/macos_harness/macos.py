@@ -14,6 +14,7 @@ import math
 import operator
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import threading
@@ -28,6 +29,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
 
+from . import activity
 from ._input_lock import app_input
 from ._paths import user_temp_dir
 from ._pool import pooled_methods
@@ -772,6 +774,14 @@ def _character_key(character: str) -> tuple[int, int]:
     return _KEYCODES.get(base, 0), flags
 
 
+def _resume(pid: int) -> None:
+    """Wake ``pid`` if the agent screen companion paused it (SIGSTOP) to
+    save battery: a stopped app neither answers accessibility nor takes
+    input. SIGCONT does nothing to a running process."""
+    with suppress(OSError):
+        os.kill(pid, signal.SIGCONT)
+
+
 def _typing_chunks(text: str, *, packed: bool) -> Iterator[str]:
     """The strings each key event of `MacOS.type` carries, in order.
 
@@ -1410,7 +1420,7 @@ class MacOS:
         self._pointer_position: tuple[float, float] | None = None
         self._overlay = LivePointerOverlay(agent_id=agent_id)
         self.ax = Accessibility(self)
-        self.do = Operations(self)
+        self.do = Operations(self, agent_id=self._overlay.agent_id)
         self._backend = _resolve_backend(backend)
         self._native_client: NativeClient | None = None
         self._native_error: Exception | None = None
@@ -2296,6 +2306,7 @@ class MacOS:
         AppKit apps animate and lay out, so a caller that only needs the
         root can pass ``enhance=False``.
         """
+        _resume(pid)
         root = AS.AXUIElementCreateApplication(pid)
         if messaging_timeout is not None:
             error = AS.AXUIElementSetMessagingTimeout(root, messaging_timeout)
@@ -6631,6 +6642,7 @@ class MacOS:
                 code=ErrorCode.BAD_REQUEST,
                 details={"parameter": "app"},
             )
+        _resume(pid)
         return pid
 
     def _keyboard_window(self, pid: int, window_id: int | None) -> int | None:
@@ -7557,6 +7569,7 @@ class MacOS:
             if element is not None:
                 self._require_uncovered(element, pid, point, window.window_id)
             in_front = self._post_click(pid, point, window, button=button, clicks=clicks)
+        activity.action(self._overlay.agent_id, "click", app_pid=pid, window_id=window.window_id)
         pointer = self._pointer_info(pid=pid)
         assert pointer is not None
         pointer["window_id"] = window.window_id
@@ -7820,6 +7833,7 @@ class MacOS:
                 time.sleep(max(0.0, duration) / max(1, steps))
             post(up_type, end)
             self._guard_focus(focus_before, pid, "drag")
+        activity.action(self._overlay.agent_id, "drag", app_pid=pid, window_id=window.window_id)
 
     def scroll(
         self,
@@ -7921,6 +7935,7 @@ class MacOS:
                 self._post(event, pid)
                 time.sleep(0.01)
                 self._guard_focus(focus_before, pid, "scroll")
+        activity.action(self._overlay.agent_id, "scroll", app_pid=pid, window_id=window.window_id)
 
     def type(
         self, text: str, *, app: str | int | None = None, window_id: int | None = None
@@ -7987,6 +8002,7 @@ class MacOS:
                     # A frontmost app took focus already, so the guard that
                     # stops when the target steals it has nothing to catch.
                     self._guard_focus(focus_before, pid, "typing")
+        activity.action(self._overlay.agent_id, "type", app_pid=pid, window_id=target)
         return self._keyboard_result(
             app, pid, target, named_window=window_id is not None, in_front=in_front
         )
@@ -8057,6 +8073,7 @@ class MacOS:
                     self._post(event, pid)
             time.sleep(0.01)
             self._guard_focus(focus_before, pid, f"key {key!r}")
+        activity.action(self._overlay.agent_id, "key", app_pid=pid, window_id=target, key=key)
         return self._keyboard_result(
             app,
             pid,

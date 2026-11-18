@@ -17,6 +17,7 @@ import time
 import weakref
 from typing import Any, TextIO
 
+from . import activity
 from .errors import MacOSError
 from .pointer import POINTER_HOTSPOT, POINTER_PRESS_SCALE, PointerIdentity
 
@@ -117,6 +118,10 @@ class LivePointerOverlay:
             process = self._process_box[0]
             return process.pid if process is not None and process.poll() is None else None
 
+    @property
+    def agent_id(self) -> str | None:
+        return self.identity.agent_id if self.identity is not None else None
+
     def move(self, x: float, y: float, *, duration: float = 0.16) -> None:
         self._check_owner()
         with self._lock:
@@ -131,6 +136,7 @@ class LivePointerOverlay:
                     "duration": max(0.0, float(duration)),
                 }
             )
+            activity.pointer(self.agent_id, "move", x, y, max(0.0, float(duration)))
 
     def show(self, x: float, y: float) -> None:
         self._check_owner()
@@ -138,6 +144,7 @@ class LivePointerOverlay:
             self._enabled = True
             self._last_shown = time.monotonic()
             self._send({"cmd": "show", "x": float(x), "y": float(y)})
+            activity.pointer(self.agent_id, "show", x, y)
 
     def hide(self) -> None:
         self._check_owner()
@@ -146,6 +153,7 @@ class LivePointerOverlay:
             self._last_shown = None
             if self.running:
                 self._send({"cmd": "hide"}, start=False)
+            activity.pointer(self.agent_id, "hide")
 
     def click(self) -> None:
         self._check_owner()
@@ -154,6 +162,7 @@ class LivePointerOverlay:
                 return
             self._last_shown = time.monotonic()
             self._send({"cmd": "click"})
+            activity.pointer(self.agent_id, "click")
 
     def close(self) -> None:
         if os.getpid() != self._creator_pid:
