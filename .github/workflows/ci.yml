@@ -29,3 +29,5 @@ jobs:
       - run: scripts/build-universal-agent.sh
       - run: swift test
         working-directory: native/macos-harness-agent
+      - run: swift test
+        working-directory: native/agent-screen
