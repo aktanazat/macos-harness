@@ -7,6 +7,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `native/agent-screen`, a menu bar companion for agents' hidden virtual
+  display: it keeps your windows off it and the display in the corner,
+  peeks at it with each window labelled by its agent, each agent's arrow,
+  and a trail of what each agent did; a click in the peek brings a window
+  to your screen until you send it back or leave it unused. On battery it
+  pauses idle agent-launched apps. The harness tells it about each action
+  over a local socket while it runs (`activity.py`), never typed text, and
+  resumes a paused app (SIGCONT) before acting on it, as the native agent
+  does too.
+
 - `macos-harness vm create|start|stop|snapshot|reset|delete|list` runs
   disposable macOS VMs with tart, headless, cloned from a prepared base,
   and `--vm NAME` runs `-c`, `run`, `see`, `state`, `apps`, and `doctor`

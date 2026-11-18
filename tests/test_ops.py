@@ -8,8 +8,10 @@ import gc
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -19,7 +21,7 @@ from typing import ClassVar, NamedTuple
 
 import pytest
 
-from macos_harness import receipt_log
+from macos_harness import activity, receipt_log
 from macos_harness._input_lock import app_input
 from macos_harness.errors import (
     ApplicationNotFoundError,
@@ -3285,6 +3287,50 @@ def test_receipt_log_names_the_app_of_a_press_that_never_found_its_target(
 
     line = json.loads(_receipt_log(tmp_path).read_text(encoding="utf-8"))
     assert (line["op"], line["outcome"], line["app"]) == ("press", "failed", "Demo")
+
+
+def test_activity_names_the_app_and_key_but_never_the_typed_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        path = os.path.join(directory, "activity.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        listener.bind(path)
+        listener.settimeout(2)
+        monkeypatch.setattr(activity, "socket_path", lambda: path)
+        _host, operations = _ops()
+
+        operations.type("hunter2", app="Demo")
+        operations.key("q", app="Demo")
+        operations.key("cmd+k", app="Demo")
+
+        sent = [json.loads(listener.recv(4096)) for _ in range(3)]
+        listener.close()
+    assert [(m["op"], m["source"], m["app_pid"], m["key"]) for m in sent] == [
+        ("type", "receipt", 41, None),
+        ("key", "receipt", 41, None),
+        ("key", "receipt", 41, "cmd+k"),
+    ]
+    assert "hunter2" not in json.dumps(sent)
+
+
+def test_activity_send_survives_text_utf8_cannot_encode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An app can report a label holding a lone surrogate; the action has
+    already happened, so the report must neither raise nor go missing."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        path = os.path.join(directory, "activity.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        listener.bind(path)
+        listener.settimeout(2)
+        monkeypatch.setattr(activity, "socket_path", lambda: path)
+
+        activity.action(None, "key", app_pid=41, key="cmd+A\ud800B")
+
+        sent = json.loads(listener.recv(4096))
+        listener.close()
+    assert (sent["op"], sent["app_pid"]) == ("key", 41)
 
 
 def test_receipt_log_is_off_unless_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -636,6 +636,7 @@ final class AXExecutor {
   private static func applicationElement(
     pid: pid_t, messagingTimeout: Double?, enhance: Bool
   ) throws -> AXUIElement {
+    resume(pid)
     let root = AXUIElementCreateApplication(pid)
     if let messagingTimeout {
       let error = AXUIElementSetMessagingTimeout(root, Float(messagingTimeout))
@@ -789,7 +790,15 @@ final class AXExecutor {
         code: "element.unknown", message: "Element handle \(handle) is not an AX element")
     }
     let element = object as! AXUIElement
+    var pid: pid_t = 0
+    if AXUIElementGetPid(element, &pid) == .success { resume(pid) }
     return element
+  }
+
+  /// Wakes `pid` if the agent screen companion paused it (SIGSTOP) to save battery: a stopped
+  /// app answers no Accessibility call. SIGCONT does nothing to a running process.
+  private static func resume(_ pid: pid_t) {
+    kill(pid, SIGCONT)
   }
 
   // MARK: - Attribute reading (must only run on `queue`)

@@ -82,7 +82,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Literal, Protocol, TypeVar
 
-from . import pasteboard, receipt_log
+from . import activity, pasteboard, receipt_log
 from ._input_lock import app_input, pasteboard_turn
 from ._pool import pooled_methods
 from .errors import ApplicationNotFoundError, ErrorCode, FocusChangedError, MacOSError
@@ -1621,6 +1621,7 @@ class Operations:
         self,
         host: _Host,
         *,
+        agent_id: str | None = None,
         _spawn: _Spawner = subprocess.Popen,
         _monotonic: Callable[[], float] = time.monotonic,
         _sleep: Callable[[float], None] = time.sleep,
@@ -1636,6 +1637,7 @@ class Operations:
         self._monotonic = _monotonic
         self._sleep = _sleep
         self._wall_clock = _wall_clock
+        self._agent_id = agent_id
         self._spawn = _spawn
         self._creator_pid = os.getpid()
         # Reentrant so a helper called while this thread already holds
@@ -4853,6 +4855,7 @@ class Operations:
     def _finish(self, receipt: Receipt) -> Receipt:
         self._ledger.remember(receipt)
         receipt_log.append(receipt, now=self._wall_clock())
+        activity.receipt(self._agent_id, receipt)
         if receipt.outcome is Outcome.FAILED:
             raise OperationError.from_receipt(receipt)
         return receipt

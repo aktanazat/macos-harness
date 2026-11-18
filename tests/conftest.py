@@ -8,6 +8,7 @@ import sys
 import pytest
 
 import macos_harness._input_lock as input_lock_module
+import macos_harness.activity as activity_module
 import macos_harness.capture as capture_module
 import macos_harness.overlay as overlay_module
 
@@ -27,6 +28,13 @@ def own_capture_lock(monkeypatch, tmp_path):
     yield
     for fd in capture_module._capture_owner or ():
         os.close(fd)
+
+
+@pytest.fixture(autouse=True)
+def own_activity_socket(monkeypatch, tmp_path):
+    """Tests never tell an agent screen companion running on this Mac about
+    their fake actions."""
+    monkeypatch.setattr(activity_module, "socket_path", lambda: str(tmp_path / "activity.sock"))
 
 
 _HOLD_INPUT = (
