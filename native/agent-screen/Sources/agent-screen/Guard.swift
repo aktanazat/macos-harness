@@ -195,12 +195,24 @@ enum WindowGuard {
     noteAgentWindows()
   }
 
-  /// Puts agent displays past the bottom-right corner of the user's screens, side by side.
+  /// Puts agent displays past the bottom-right corner of the user's screens, side by side, when
+  /// one shares a border with his screens. macOS may snap the display to a different corner of
+  /// his arrangement; any corner-only spot is accepted, and a spot macOS keeps refusing is tried
+  /// once per arrangement, so display changes never feed back into each other.
+  private static var lastCornerAttempt: [CGRect] = []
+
   private static func keepAgentDisplaysCornered() {
     let agents = agentDisplays()
     let real = activeDisplays().filter { !agents.contains($0) }.map(CGDisplayBounds)
+    let agentBounds = agents.map(CGDisplayBounds)
+    guard agentBounds.contains(where: { a in real.contains { Geometry.sharesEdge(a, $0) } }) else { return }
+    guard real != lastCornerAttempt else {
+      log("the agent display touches your screens and macOS will not move it to a corner")
+      return
+    }
+    lastCornerAttempt = real
     guard !agents.isEmpty,
-          let origins = Geometry.cornerOrigins(real: real, agentWidths: agents.map { CGDisplayBounds($0).width }) else { return }
+          let origins = Geometry.cornerOrigins(real: real, agentWidths: agentBounds.map(\.width)) else { return }
     var config: CGDisplayConfigRef?
     var changed = false
     guard CGBeginDisplayConfiguration(&config) == .success else { return }

@@ -38,6 +38,17 @@ final class GeometryTests: XCTestCase {
     XCTAssertNil(Geometry.cornerOrigins(real: [], agentWidths: [2560]))
   }
 
+  // The work Mac on 2026-11-18: laptop below a wide monitor; macOS snapped the agent display
+  // to the laptop's corner, and treating that as wrong re-placed it every few seconds.
+  func testCornerOnlyContactIsNotABorder() {
+    let laptop = CGRect(x: 0, y: 0, width: 1352, height: 878)
+    let monitor = CGRect(x: -1055, y: -1440, width: 3440, height: 1440)
+    let agents = CGRect(x: 1352, y: 878, width: 2560, height: 1440)
+    XCTAssertFalse(Geometry.sharesEdge(agents, laptop))
+    XCTAssertFalse(Geometry.sharesEdge(agents, monitor))
+    XCTAssertTrue(Geometry.sharesEdge(CGRect(x: 1352, y: 0, width: 2560, height: 1440), laptop))
+  }
+
   func testWindowKeepsItsPlaceOnTheUsersScreen() {
     let agent = CGRect(x: 2560, y: 1440, width: 2560, height: 1440)
     let area = CGRect(x: 0, y: 25, width: 1512, height: 920)
