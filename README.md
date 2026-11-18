@@ -721,6 +721,37 @@ the system-arrow behavior is unchanged. Each caller still owns its helper:
 closing one leaves the other agents' pointers alone. Nothing moves the
 physical cursor or brings an app forward.
 
+## Agent screen companion
+
+`native/agent-screen` is a menu bar app for agents that work on a hidden
+virtual display made by [agent-display](https://github.com/mikedelgaudio/agent-display).
+It keeps your own windows off that display and the display diagonally past
+the bottom-right corner of your screens, so your pointer cannot cross. Its
+peek shows the display live: each window labelled with the agent using it,
+each agent's named arrow, and beside it a trail of what each agent clicked,
+typed into, and pressed, newest first. Click a window in the peek to bring
+it to your screen; it goes back to exactly where it was when you press Send
+Back, or after two minutes unused (45 s for a Safari helper window).
+Control-Option-Command-B, the menu, or `agent-screen bring-back` move all
+your windows back. On battery or when the Mac runs hot, the peek refreshes
+less often and apps an agent launched that sit idle in the background for 10
+minutes are paused until power returns, you bring one forward, or an agent
+acts on it.
+
+While it runs, the harness sends it one small local datagram per action
+(`activity.py`): the verb, the app, the window, and a `mac.do` control's
+role and labels. Typed text, values and script source are never sent. With
+no companion listening, the send fails at once and nothing is kept.
+
+```bash
+native/agent-screen/install.sh   # build, sign, install ~/.local/bin/agent-screen
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.aktan.agent-screen.plist
+```
+
+It needs Accessibility and Screen Recording for `~/.local/bin/agent-screen`.
+Set `AGENT_SCREEN_SIGN_IDENTITY` to your signing certificate so the grants
+survive rebuilds.
+
 ## Disposable VMs
 
 Work that must not touch your desktop can run in a throwaway macOS virtual
