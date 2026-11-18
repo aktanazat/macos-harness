@@ -14,6 +14,16 @@ public enum Geometry {
     }
   }
 
+  /// Whether two screens share a stretch of border the pointer can cross. Screens that meet at
+  /// a single corner point do not.
+  public static func sharesEdge(_ a: CGRect, _ b: CGRect) -> Bool {
+    let xOverlap = min(a.maxX, b.maxX) - max(a.minX, b.minX)
+    let yOverlap = min(a.maxY, b.maxY) - max(a.minY, b.minY)
+    let sideBySide = (a.maxX == b.minX || b.maxX == a.minX) && yOverlap > 0
+    let stacked = (a.maxY == b.minY || b.maxY == a.minY) && xOverlap > 0
+    return sideBySide || stacked
+  }
+
   /// Where a window on an agent display lands on the user's screen: at the same offset from the
   /// top-left of `area` (his screen less menu bar and Dock) as it had on the agent display,
   /// shrunk and slid until it fits inside `area`.
