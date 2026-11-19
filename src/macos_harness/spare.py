@@ -245,6 +245,29 @@ def run_in_spare(args: list[str]) -> int | None:
     return _relay(frames, spare, requests)
 
 
+def status() -> dict[str, object]:
+    """Ask this shell's broker without consuming its next step."""
+    inactive = {"status": "not running", "start": "macos-harness spare (see references/spare.md)"}
+    channel = _channel()
+    if channel is None:
+        return inactive
+    replies, requests = channel
+    if not _claim(requests):
+        return {"status": "busy"}
+    nonce = os.urandom(8).hex().encode()
+    try:
+        _write_all(requests, _frame(b"s", nonce))
+        frames = _Frames(replies)
+        deadline = time.monotonic() + _ANSWER_SECONDS
+        while (frame := frames.next(deadline)) is not None:
+            kind, payload = frame
+            if kind == b"s" and payload.startswith(nonce + b" "):
+                return {"status": "active", "pid": int(payload.split()[1])}
+    except (OSError, ValueError):
+        pass
+    return inactive
+
+
 def _channel() -> tuple[int, int] | None:
     """The shell's ends of its spare's two pipes, when this process holds them."""
     try:
@@ -619,6 +642,8 @@ class _Broker:
             kind, payload = frame
             if kind == b"q":
                 self._answer(payload)
+            elif kind == b"s":
+                self._reply(b"s", payload + b" " + str(os.getpid()).encode())
             elif kind == b"i" and self._awaiting_input and self._spare is not None:
                 self._awaiting_input = False
                 with contextlib.suppress(OSError):

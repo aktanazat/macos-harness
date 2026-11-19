@@ -529,11 +529,12 @@ def main(argv: list[str] | None = None) -> int:
             return result
         if args.command == "doctor":
             from .macos import MacOS
+            from .spare import status as spare_status
 
             with MacOS(agent_id=args.agent_id) as mac:
                 if args.request:
                     mac.request_permissions()
-                print(json.dumps(mac.doctor(), indent=2))
+                print(json.dumps({**mac.doctor(), "spare": spare_status()}, indent=2))
             result = 0
             return result
         if args.command == "apps":
