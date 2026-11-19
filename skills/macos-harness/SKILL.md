@@ -1,6 +1,6 @@
 ---
 name: macos-harness
-description: "Drive native or Electron macOS apps, dialogs, menus, file prompts, or cross-app steps. Web pages: safari skill. For Mac-control code, read only the needed reference."
+description: "Drive native/Electron macOS apps and cross-app steps. Web: safari skill. Mac-control code: read only needed references."
 ---
 
 # macOS Harness
@@ -10,7 +10,7 @@ Never put secrets in tool arguments: `credentials`.
 
 One synchronous call per decision. Preloaded: `mac`, `Path`, `subprocess`,
 `present`, `gone`. `-c CODE`: one line; `run flow.py`: a file.
-`--agent-id NAME`: pointer name and state diffs. After compaction:
+`--agent-id NAME`: pointer and state diffs. After compaction:
 `macos-harness skill signatures`.
 
 Default: spare per bash shell:
@@ -22,6 +22,12 @@ coproc SPARE { macos-harness spare; }; export MACOS_HARNESS_SPARE="${SPARE[0]},$
 Stdin steps use it when ready, with nonterminal output;
 also `run flow.py </dev/null`. Close the shell to stop.
 [spare](references/spare.md): zsh, fallbacks.
+
+```bash
+macos-harness <<'PY'
+print(mac.see("Finder"))
+PY
+```
 
 In omp, `tool.read` the PNG.
 
