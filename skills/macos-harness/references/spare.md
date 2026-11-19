@@ -40,6 +40,10 @@ spare reloads.
 
 ## Lifetime
 
+`macos-harness doctor` reports whether this shell can reach its spare broker,
+with the broker's PID when active. This does not consume a step or promise
+that the next spare has finished loading.
+
 The spare and the process that keeps it exit with the shell, even when the
 shell is killed. A step running in a spare when the shell exits, such as one
 started with `nohup` or left in the background, runs to its end first, as its

@@ -1,25 +1,27 @@
 ---
 name: macos-harness
-description: "Read when a task has to drive a native or Electron macOS app: a window, dialog, menu, file prompt, or a step that crosses apps. Web pages go to the safari skill. Writing Mac-control code is not driving an app: read only the reference you need."
+description: "Drive native or Electron macOS apps, dialogs, menus, file prompts, or cross-app steps. Web pages: safari skill. For Mac-control code, read only the needed reference."
 ---
 
 # macOS Harness
 
-In OMP, pick the matching `mac_*` tool unasked; Python below covers the
-rest. Never put secrets in tool arguments: `credentials`.
+In OMP, pick `mac_*` tools unasked; otherwise Python.
+Never put secrets in tool arguments: `credentials`.
 
-One synchronous call per decision. `mac`, `Path`, `subprocess`, `present`
-and `gone` are preloaded. `-c CODE` runs one line; `run flow.py` a file.
-`--agent-id NAME` names the pointer and turns on state diffs. After compaction,
-run `macos-harness skill signatures`.
+One synchronous call per decision. Preloaded: `mac`, `Path`, `subprocess`,
+`present`, `gone`. `-c CODE`: one line; `run flow.py`: a file.
+`--agent-id NAME`: pointer name and state diffs. After compaction:
+`macos-harness skill signatures`.
+
+Default: spare per bash shell:
 
 ```bash
-macos-harness <<'PY'
-mac.key("cmd+k", app="Spotify")
-mac.type("Alessia Cara", app="Spotify")
-print(mac.see("Spotify"))
-PY
+coproc SPARE { macos-harness spare; }; export MACOS_HARNESS_SPARE="${SPARE[0]},${SPARE[1]}"
 ```
+
+Stdin steps use it when ready, with nonterminal output;
+also `run flow.py </dev/null`. Close the shell to stop.
+[spare](references/spare.md): zsh, fallbacks.
 
 In omp, `tool.read` the PNG.
 
@@ -33,13 +35,13 @@ identity, an irreversible action, or unexpected state.
 - `mac.key("cmd+k", app=...)`: a key or combo.
 - `mac.type(text, app=...)`: typed text.
 - `mac.click(x, y, app=...)`: a click at screenshot points, or `element=match`.
-- `mac.ax.query/wait/press(text, role=..., app=...)`: find, await or press a control; keep matches, not indexes.
+- `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, press; keep matches, not indexes.
 - `mac.script(source)`: AppleScript with the harness's Accessibility.
 
 `mac.windows(all_layers=True)` lists menus and panels for `window_id=`;
 `see(display=0)` or a `region=` replaces `screencapture`.
 
-`mac.launch(app)` opens an app unfocused, then awaits its window.
+`mac.launch(app)` opens unfocused, awaiting its window.
 Never `sleep`: `mac.wait_change(app)` returns once the window changed and
 settled; `see(app, after_change=True)` waits first.
 
@@ -74,11 +76,11 @@ Passwords, a VM's too, web pages: `credentials`.
 
 ## References
 
-`macos-harness skill <name>` prints:
+`macos-harness skill <name>`:
 
-- `signatures`: every signature
+- `signatures`: signatures
 - `receipts`: outcomes, errors, once tokens, logs
-- `ax-search`: roles, scopes, labels, waits
+- `ax-search`: roles, scopes, waits
 - `invariants`: cleanup, focus, input, windows
 - `routes`: saved navigation
 - `data-first`: read data first; prove saves
