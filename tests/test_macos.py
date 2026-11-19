@@ -32,6 +32,9 @@ from macos_harness.native import NativeQueryResult
 from macos_harness.ops import Operations
 from macos_harness.receipts import Acted, Postcondition, equals, gone, present
 
+# Read at import, before the autouse `no_secure_input` fixture swaps it out.
+real_secure_input_holder = macos_module._secure_input_holder
+
 
 def _on_screen_windows(monkeypatch, *windows: tuple[int | float, ...]) -> list[dict[str, object]]:
     """Fake the window server's front-to-back on-screen list.
@@ -2842,62 +2845,6 @@ def test_set_of_a_non_text_value_goes_on_under_secure_keyboard_entry(monkeypatch
     assert written == [("AXExpanded", True)]
 
 
-@pytest.mark.parametrize("source", [
-    'tell application "System Events" to keystroke "dummy"',
-    'tell application "System Events" to key code 36',
-    'Application("System Events").keyCode(36)',
-], ids=["keystroke", "key-code", "jxa-key-code"])
-def test_a_script_that_sends_keys_runs_not_while_secure_keyboard_entry_is_on(
-    monkeypatch, source: str,
-) -> None:
-    mac = MacOS()
-    ran: list = []
-    monkeypatch.setattr(macos_module.subprocess, "run", lambda *args, **kwargs: ran.append(args))
-    monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "TextEdit", "pid": 42})
-    monkeypatch.setattr(mac, "_application_with_pid", lambda pid: None)
-    monkeypatch.setattr(mac, "_running_applications", list)
-    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 42)
-
-    with pytest.raises(MacOSError) as refused:
-        mac.script(source)
-
-    assert refused.value.details["reason"] == "secure_input_in_app"
-    assert refused.value.details["operation"] == "script"
-    assert ran == []
-
-
-@pytest.mark.parametrize("source", [
-    'tell application "1Password" to activate\ntell application "System Events" to keystroke "v" using command down',
-    'tell application id "com.bitwarden.desktop" to activate\ntell application "System Events" to key code 9',
-], ids=["by-name", "by-bundle-id"])
-def test_a_script_that_brings_a_secret_keeper_forward_sends_it_no_keys(monkeypatch, source: str) -> None:
-    mac = MacOS()
-    ran: list = []
-    monkeypatch.setattr(macos_module.subprocess, "run", lambda *args, **kwargs: ran.append(args))
-    monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "TextEdit", "pid": 42})
-    monkeypatch.setattr(mac, "_application_with_pid", lambda pid: None)
-    monkeypatch.setattr(mac, "_running_applications", list)
-    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: None)
-
-    with pytest.raises(MacOSError) as refused:
-        mac.script(source)
-
-    assert refused.value.details["reason"] == "secret_keeper_app"
-    assert ran == []
-
-
-def test_a_script_that_sends_no_keys_runs_under_secure_keyboard_entry(monkeypatch) -> None:
-    mac = MacOS()
-    monkeypatch.setattr(
-        macos_module.subprocess, "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "ok\n", ""),
-    )
-    monkeypatch.setattr(mac, "_pictures_acted", lambda: None)
-    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 42)
-
-    assert mac.script('tell application "Finder" to get name of front window') == "ok"
-
-
 @pytest.mark.parametrize("bundle_id", sorted(macos_module._SECRET_KEEPERS))
 def test_type_sends_nothing_to_an_app_that_keeps_secrets(monkeypatch, bundle_id: str) -> None:
     mac = MacOS()
@@ -2945,9 +2892,9 @@ def test_type_names_a_secure_input_holder_the_direct_pid_lookup_misses(monkeypat
 def test_secure_input_holder_reads_the_session_dictionary(monkeypatch) -> None:
     monkeypatch.setattr(macos_module.AS, "CGSessionCopyCurrentDictionary",
                         lambda: {"kCGSSessionSecureInputPID": 77})
-    assert macos_module._secure_input_holder() == 77
+    assert real_secure_input_holder() == 77
     monkeypatch.setattr(macos_module.AS, "CGSessionCopyCurrentDictionary", dict)
-    assert macos_module._secure_input_holder() is None
+    assert real_secure_input_holder() is None
 
 
 def test_type_waits_while_another_run_sends_the_app_input(monkeypatch, hold_app_input) -> None:

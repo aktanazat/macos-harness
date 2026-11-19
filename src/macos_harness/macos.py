@@ -420,8 +420,8 @@ _SECURE_SUBROLE = "AXSecureTextField"
 _SECURE_INPUT = "kCGSSessionSecureInputPID"
 # Apps whose text is a password, a PIN or an admin's credentials: macOS's own
 # sign-in and authorization prompts and the password managers in common use.
-# `type`, `key`, `set` with text, `script` keystrokes and the `do` verbs on
-# them refuse to send them any.
+# `type`, `key`, `set` with text and the `do` verbs on them refuse to send
+# them any. `script` runs arbitrary code and is not covered.
 _SECRET_KEEPERS = frozenset({
     "com.apple.SecurityAgent",
     "com.apple.LocalAuthentication.UIAgent",
@@ -661,11 +661,6 @@ def _menu_shortcut(character: object, modifiers: object) -> str | None:
 
 # The app an AppleScript addresses, by name or bundle ID.
 _SCRIPT_TARGET = re.compile(r'\btell application (?:id )?"([^"]+)"', re.IGNORECASE)
-# A script that sends keys sends them to the app in front, as `key` does.
-# One that names a password manager may bring it to the front first.
-_SECRET_KEEPER_NAMES = ("Passwords", "Keychain Access", "1Password", "Bitwarden", "LastPass",
-                        "KeePassXC")
-_SCRIPT_KEYS = re.compile(r"\bkeystroke\b|\bkey\s+code\b|\.keyCode\b", re.IGNORECASE)
 
 
 def _menu_miss(
@@ -8177,23 +8172,7 @@ class MacOS:
     ) -> str:
         """Run ``source`` with osascript and return what it printed; stop it
         after ``timeout`` seconds, since a script that waits on an app's
-        dialog or a permission prompt never returns on its own. A script
-        that sends keystrokes is refused as `key` is for the app in front."""
-        if _SCRIPT_KEYS.search(source):
-            front = self._frontmost_app()
-            self._refuse_secret_input(int(front["pid"]) if front else -1, "script")
-            folded = source.casefold()
-            named = next((keeper for keeper in (*_SECRET_KEEPERS, *_SECRET_KEEPER_NAMES)
-                          if keeper.casefold() in folded), None)
-            if named is not None:
-                raise MacOSError(
-                    f"script refuses to send keystrokes from a script that names {named}, "
-                    "which holds passwords; nothing was run: ask the person at this Mac "
-                    "to do this step",
-                    code=ErrorCode.UNSUPPORTED_OP,
-                    details={"reason": "secret_keeper_app", "operation": "script",
-                             "named": named},
-                )
+        dialog or a permission prompt never returns on its own."""
         self._pictures_acted()
         try:
             result = subprocess.run(

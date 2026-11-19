@@ -40,7 +40,7 @@ primitives carry no receipt and no idempotency guarantee.
   or clipboard write, while any app holds secure keyboard entry
   (`secure_input_in_app` for the target, `secure_input_elsewhere` for another)
   and for sign-in prompts and password managers (`secret_keeper_app`): ask
-  the person to do that step. Add an
+  the person to do that step. `mac.script` is not covered by this guard. Add an
   app-level postcondition, such as
   `equals(title="Check", role="button", attribute="AXEnabled", value=True)`,
   to prove the app processed the input rather than just displaying it.

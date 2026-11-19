@@ -79,14 +79,16 @@ PY
   through the app's input handler, and verifies the text. Unlike an AX value
   write, this sends the keyboard events a SwiftUI binding needs. Pass
   `value=""` to clear. Secure fields are refused, and no Return key is sent.
-- `type`, `key`, `fill`, `paste`, a text `set` and a `script` that sends
-  keystrokes send nothing while any app, the target included, holds secure
+- `type`, `key`, `fill`, `paste` and a text `set` send nothing while any
+  app, the target included, holds secure
   keyboard entry (a password field or prompt has the person's keys), and
   nothing to macOS's sign-in and authorization prompts or a password manager
   (Passwords, Keychain Access, 1Password, Bitwarden, LastPass, KeePassXC).
   Each fails with `unsupported_op`, `acted="no"`, reason
   `secure_input_in_app`, `secure_input_elsewhere` or `secret_keeper_app`,
-  before the clipboard or the field is touched.
+  before the clipboard or the field is touched. `mac.script` runs arbitrary
+  AppleScript or JXA and is not covered by this guard: a script can still
+  send keystrokes anywhere.
   Give `fill` an app-level postcondition when the result matters beyond the
   field itself: `equals(title="Check", role="button", attribute="AXEnabled",
   value=True)` checks that the app accepted the input.
