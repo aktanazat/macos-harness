@@ -414,6 +414,28 @@ _FOCUS_DETAIL_ATTRIBUTES = {
     "AXNumberOfCharacters": "characters",
 }
 _SECURE_SUBROLE = "AXSecureTextField"
+# The session names the process that turned on secure keyboard entry: a
+# password field, or a prompt for one, has the keys of the person at this Mac,
+# and while it is on no event tap sees a key, the watch's stop hotkey included.
+_SECURE_INPUT = "kCGSSessionSecureInputPID"
+# Apps whose text is a password, a PIN or an admin's credentials: macOS's own
+# sign-in and authorization prompts and the password managers in common use.
+# `type`, `key`, `set` with text and the `do` verbs on them refuse to send
+# them any. `script` runs arbitrary code and is not covered.
+_SECRET_KEEPERS = frozenset({
+    "com.apple.SecurityAgent",
+    "com.apple.LocalAuthentication.UIAgent",
+    "com.apple.loginwindow",
+    "com.apple.NetAuthAgent",
+    "com.apple.security.Keychain-Circle-Notification",
+    "com.apple.Passwords",
+    "com.apple.keychainaccess",
+    "com.1password.1password",
+    "com.agilebits.onepassword7",
+    "com.bitwarden.desktop",
+    "com.lastpass.LastPass",
+    "org.keepassxc.keepassxc",
+})
 _SENSITIVE_ATTRIBUTES = frozenset({"AXValue", "AXSelectedText", "AXSelectedTextRange", "AXNumberOfCharacters"})
 _SETTABLE_CANDIDATES = ("AXValue", "AXFocused", "AXSelected")
 _FOCUS_ATTRIBUTES = frozenset({"AXFocused", "AXMain", "AXFrontmost"})
@@ -761,6 +783,11 @@ _HIT_AGAIN_SECONDS = 0.1
 # Mac waits for a pause this long in their input, and at most this long.
 _PERSON_PAUSE_SECONDS = 0.45
 _PERSON_WAIT_SECONDS = 2.5
+
+
+def _secure_input_holder() -> int | None:
+    holder = (AS.CGSessionCopyCurrentDictionary() or {}).get(_SECURE_INPUT)
+    return None if holder is None else int(holder)
 
 
 def _character_key(character: str) -> tuple[int, int]:
@@ -4804,6 +4831,8 @@ class MacOS:
         pid = self._element_pid(element_index)
         if attribute in _FOCUS_ATTRIBUTES:
             self._yield_to_person(pid, f"setting {attribute}", forward=attribute == "AXFrontmost")
+        if isinstance(value, str):
+            self._refuse_secret_input(pid, "set")
         self._hold_before_input(pid)
         self._show_element_pointer(element_index)
         if not self._is_ax_element(element):
@@ -7973,6 +8002,7 @@ class MacOS:
         pid = self._input_pid(app, window_id, "Keyboard input")
         with app_input(pid, _INPUT_WAIT):
             self._yield_to_person(pid, "typing into the app in front")
+            self._refuse_secret_input(pid, "type")
             self._hold_before_input(pid, window_id)
             target = self._keyboard_window(pid, window_id)
             focus_before = self._frontmost_app()
@@ -8005,6 +8035,58 @@ class MacOS:
         activity.action(self._overlay.agent_id, "type", app_pid=pid, window_id=target)
         return self._keyboard_result(
             app, pid, target, named_window=window_id is not None, in_front=in_front
+        )
+
+    def _running_app_with_pid(self, pid: int) -> Any | None:
+        """The running app with ``pid``: AppKit's direct lookup, then the
+        workspace list for a live app that lookup missed."""
+        if pid is None:
+            return None
+        running = self._application_with_pid(pid)
+        if running is not None:
+            return running
+        return next(
+            (app for app in self._running_applications() if int(app.processIdentifier()) == pid),
+            None,
+        )
+
+    def _refuse_secret_input(self, pid: int, operation: str) -> None:
+        """Refuse text or keys for ``pid`` when it is an app in
+        `_SECRET_KEEPERS`, or while any app, ``pid`` included, holds secure
+        keyboard entry: a password field or prompt there has the person's
+        keys, so text sent now could land in it, and no event tap could see
+        what went where. Raises `unsupported_op` having sent nothing."""
+        running = self._running_app_with_pid(pid)
+        bundle_id = running.bundleIdentifier() if running is not None else None
+        if bundle_id is not None and str(bundle_id) in _SECRET_KEEPERS:
+            raise MacOSError(
+                f"{operation} refuses to send text to {bundle_id}, which holds passwords or "
+                "asks for them; nothing was sent: ask the person at this Mac to do this step",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"reason": "secret_keeper_app", "operation": operation,
+                         "pid": pid, "bundle_id": str(bundle_id)},
+            )
+        holder = _secure_input_holder()
+        if holder is None:
+            return
+        if holder == pid:
+            raise MacOSError(
+                f"{operation} refuses to send text while the app it targets holds secure "
+                "keyboard entry: a password field or prompt in it has focus. Nothing was "
+                "sent: ask the person at this Mac to do this step",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"reason": "secure_input_in_app", "operation": operation, "pid": pid,
+                         "holder_pid": holder},
+            )
+        owner = self._running_app_with_pid(holder)
+        name = owner.localizedName() if owner is not None else None
+        raise MacOSError(
+            f"{operation} refuses to send text while {name or f'process {holder}'} holds secure "
+            "keyboard entry: a password field or prompt there has the person's keys. Nothing "
+            "was sent: try again once it is done",
+            code=ErrorCode.UNSUPPORTED_OP,
+            details={"reason": "secure_input_elsewhere", "operation": operation, "pid": pid,
+                     "holder_pid": holder, "holder": str(name) if name else None},
         )
 
     @staticmethod
@@ -8041,6 +8123,7 @@ class MacOS:
         pid = self._input_pid(app, window_id, "Keyboard input")
         with app_input(pid, _INPUT_WAIT):
             self._yield_to_person(pid, f"pressing {key} in the app in front")
+            self._refuse_secret_input(pid, "key")
             self._hold_before_input(pid, window_id)
             target = self._keyboard_window(pid, window_id)
             focus_before = self._frontmost_app()
