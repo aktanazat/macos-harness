@@ -3,31 +3,28 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import re
-import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from importlib import resources
 from pathlib import Path
 from typing import TextIO
 
 from ._version import __version__
-from .browser import BrowserHarness
 from .errors import ErrorCode, MacOSError
-from .receipts import OperationError, equals, gone, present
-from .telemetry import capture_cli
-from .telemetry import run_cli as run_telemetry_cli
 
 
 @contextmanager
 def _namespace(
     program_args: Mapping[str, str] | None = None, *, agent_id: str | None = None
 ) -> Iterator[dict[str, object]]:
+    import subprocess
+
+    from .browser import BrowserHarness
     from .macos import MacOS
+    from .receipts import equals, gone, present
 
     with MacOS(agent_id=agent_id) as mac:
         yield {
@@ -62,6 +59,8 @@ def _mac_surfaces(namespace: Mapping[str, object]) -> dict[str, object]:
 
 def _plain_signature(method: Callable[..., object]) -> str:
     """``method``'s parameters as a call spells them, unannotated."""
+    import inspect
+
     signature = inspect.signature(method)
     return str(
         signature.replace(
@@ -88,6 +87,8 @@ def _abbreviated(keyword: str, parameters: Iterable[str]) -> str | None:
 def _explain_bad_call(exc: TypeError, namespace: Mapping[str, object]) -> None:
     """End a misused harness call's error with the method's real signature,
     and point an abbreviated keyword at the parameter it stands for."""
+    import inspect
+
     call = _BAD_CALL.match(str(exc))
     if call is None or call[2].startswith("_"):
         return
@@ -121,6 +122,8 @@ def _nearness(missing: str, name: str) -> float:
 def _call_text(label: str, surface: object, name: str) -> str:
     """``label.name``, with its parameters when it is a method; a property
     is named without being read."""
+    import inspect
+
     raw = inspect.getattr_static(surface, name)
     if inspect.isfunction(raw) or isinstance(raw, (staticmethod, classmethod)):
         return f"{label}.{name}{_plain_signature(getattr(surface, name))}"
@@ -172,6 +175,8 @@ def _execute(
 
 
 def _skill_text(reference: str | None) -> str:
+    from importlib import resources
+
     root = resources.files("macos_harness").joinpath("skill")
     if not root.joinpath("SKILL.md").is_file():
         root = Path(__file__).resolve().parents[2] / "skills/macos-harness"
@@ -505,6 +510,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.vm is not None and args.command in ("repl", "spare", "telemetry", "vm"):
         parser.error(f"{args.command} runs only on this Mac; drop --vm")
     if args.command == "telemetry":
+        from .telemetry import run_cli as run_telemetry_cli
+
         return run_telemetry_cli([args.action] if args.action else [])
     if args.command == "spare":
         from .spare import serve_shell
@@ -685,6 +692,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"unknown command: {args.command}")
     except (MacOSError, RuntimeError) as exc:
         if args.json_errors and isinstance(exc, MacOSError):
+            from .receipts import OperationError
+
             payload = exc.to_json()
             if isinstance(exc, OperationError):
                 payload["receipt"] = exc.receipt.to_json()
@@ -694,6 +703,8 @@ def main(argv: list[str] | None = None) -> int:
         result = 1
         return result
     finally:
+        from .telemetry import capture_cli
+
         capture_cli(args.command or "python", result == 0, time.monotonic() - started)
 
 

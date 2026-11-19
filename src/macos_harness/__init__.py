@@ -3,48 +3,90 @@
 from typing import TYPE_CHECKING
 
 from ._version import __version__
-from .browser import BrowserHarness
-from .errors import (
-    AccessibilityPermissionError,
-    ApplicationNotFoundError,
-    ErrorCode,
-    FocusChangedError,
-    MacOSError,
-)
-from .handoff import HandoffReason, HumanHandoff
-from .receipts import (
-    Acted,
-    Equals,
-    ErrorPayload,
-    Executor,
-    Gone,
-    JSONValue,
-    Observation,
-    OperationError,
-    Outcome,
-    Postcondition,
-    Present,
-    Receipt,
-    canonical_json,
-    canonicalize,
-    equals,
-    gone,
-    present,
-    request_fingerprint,
-)
-from .steps import StepsResult
+
+if TYPE_CHECKING:
+    from .browser import BrowserHarness
+    from .errors import (
+        AccessibilityPermissionError,
+        ApplicationNotFoundError,
+        ErrorCode,
+        FocusChangedError,
+        MacOSError,
+    )
+    from .handoff import HandoffReason, HumanHandoff
+    from .receipts import (
+        Acted,
+        Equals,
+        ErrorPayload,
+        Executor,
+        Gone,
+        JSONValue,
+        Observation,
+        OperationError,
+        Outcome,
+        Postcondition,
+        Present,
+        Receipt,
+        canonical_json,
+        canonicalize,
+        equals,
+        gone,
+        present,
+        request_fingerprint,
+    )
+    from .steps import StepsResult
 
 if TYPE_CHECKING:
     from .macos import MacOS, SearchMatches
     from .routes import RouteResult
     from .watch import RouteWatch, WatchResult
 
-# Import the native runtime only when its public exports are requested.
-# Type checkers use the imports above.
+_EXPORTS = {
+    **dict.fromkeys(("BrowserHarness",), "browser"),
+    **dict.fromkeys(
+        (
+            "AccessibilityPermissionError",
+            "ApplicationNotFoundError",
+            "ErrorCode",
+            "FocusChangedError",
+            "MacOSError",
+        ),
+        "errors",
+    ),
+    **dict.fromkeys(("HandoffReason", "HumanHandoff"), "handoff"),
+    **dict.fromkeys(
+        (
+            "Acted",
+            "Equals",
+            "ErrorPayload",
+            "Executor",
+            "Gone",
+            "JSONValue",
+            "Observation",
+            "OperationError",
+            "Outcome",
+            "Postcondition",
+            "Present",
+            "Receipt",
+            "canonical_json",
+            "canonicalize",
+            "equals",
+            "gone",
+            "present",
+            "request_fingerprint",
+        ),
+        "receipts",
+    ),
+    "StepsResult": "steps",
+}
 
 
 def __getattr__(name: str) -> object:
-    if name in {"MacOS", "SearchMatches"}:
+    if name in _EXPORTS:
+        from importlib import import_module
+
+        value = getattr(import_module(f".{_EXPORTS[name]}", __name__), name)
+    elif name in {"MacOS", "SearchMatches"}:
         from . import macos
 
         value = getattr(macos, name)
@@ -63,7 +105,7 @@ def __getattr__(name: str) -> object:
 
 
 def __dir__() -> list[str]:
-    return sorted(globals().keys() | {"MacOS", "SearchMatches", "RouteResult", "RouteWatch", "WatchResult"})
+    return sorted(globals().keys() | set(__all__))
 
 
 __all__ = [
