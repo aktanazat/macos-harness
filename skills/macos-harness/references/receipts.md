@@ -35,7 +35,11 @@ primitives carry no receipt and no idempotency guarantee.
   especially when `set` changes visible text but leaves an app button disabled.
   It resolves one enabled field, focuses it, selects its full UTF-16 range,
   types once, and verifies the text. It stops if focus or text changes before
-  typing. `value=""` clears. Secure fields are refused; it never submits. Add an
+  typing. `value=""` clears. Secure fields are refused; it never submits.
+  `type`, `fill` and `paste` also refuse, before any key or clipboard write,
+  while another app holds secure keyboard entry (`secure_input_elsewhere`) and
+  for sign-in prompts and password managers (`secret_keeper_app`): ask the
+  person to do that step. Add an
   app-level postcondition, such as
   `equals(title="Check", role="button", attribute="AXEnabled", value=True)`,
   to prove the app processed the input rather than just displaying it.

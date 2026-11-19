@@ -2585,6 +2585,8 @@ def _typing_fakes(monkeypatch, mac: MacOS, *, frontmost_pid: int) -> tuple[list,
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "Front", "pid": frontmost_pid})
     monkeypatch.setattr(mac, "_post", lambda event, pid: posted.append((event, pid)))
+    monkeypatch.setattr(mac, "_application_with_pid", lambda pid: None)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: None)
     monkeypatch.setattr(macos_module.time, "sleep", sleeps.append)
     monkeypatch.setattr(
         macos_module.AS,
@@ -2704,6 +2706,69 @@ def test_typing_into_the_app_in_front_sends_nothing_while_the_person_never_pause
     assert refused.value.details["reason"] == "person_active"
     assert posted == []
     assert mac.ms == 2500
+
+
+class _RunningApp:
+    def __init__(self, bundle_id: str, name: str) -> None:
+        self._bundle_id, self._name = bundle_id, name
+
+    def bundleIdentifier(self) -> str:
+        return self._bundle_id
+
+    def localizedName(self) -> str:
+        return self._name
+
+
+def test_type_sends_nothing_while_another_app_holds_secure_keyboard_entry(monkeypatch) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=7)
+    apps = {42: _RunningApp("com.apple.TextEdit", "TextEdit"), 77: _RunningApp("com.apple.Terminal", "Terminal")}
+    monkeypatch.setattr(mac, "_application_with_pid", apps.get)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 77)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.type("hunter2", app="TextEdit")
+
+    assert refused.value.code == ErrorCode.UNSUPPORTED_OP.value
+    assert refused.value.details == {
+        "reason": "secure_input_elsewhere", "operation": "type", "pid": 42,
+        "holder_pid": 77, "holder": "Terminal",
+    }
+    assert "hunter2" not in str(refused.value)
+    assert posted == []
+
+
+def test_type_goes_on_while_the_app_itself_holds_secure_keyboard_entry(monkeypatch) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=7)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 42)
+
+    mac.type("hi", app="Spotify")
+
+    assert [event["text"] for event, _ in posted if event["down"]] == ["h", "i"]
+
+
+@pytest.mark.parametrize("bundle_id", sorted(macos_module._SECRET_KEEPERS))
+def test_type_sends_nothing_to_an_app_that_keeps_secrets(monkeypatch, bundle_id: str) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    monkeypatch.setattr(mac, "_application_with_pid", lambda pid: _RunningApp(bundle_id, "Keeper"))
+
+    with pytest.raises(MacOSError) as refused:
+        mac.type("hunter2", app="Keeper")
+
+    assert refused.value.code == ErrorCode.UNSUPPORTED_OP.value
+    assert refused.value.details["reason"] == "secret_keeper_app"
+    assert refused.value.details["bundle_id"] == bundle_id
+    assert posted == []
+
+
+def test_secure_input_holder_reads_the_session_dictionary(monkeypatch) -> None:
+    monkeypatch.setattr(macos_module.AS, "CGSessionCopyCurrentDictionary",
+                        lambda: {"kCGSSessionSecureInputPID": 77})
+    assert macos_module._secure_input_holder() == 77
+    monkeypatch.setattr(macos_module.AS, "CGSessionCopyCurrentDictionary", dict)
+    assert macos_module._secure_input_holder() is None
 
 
 def test_type_waits_while_another_run_sends_the_app_input(monkeypatch, hold_app_input) -> None:

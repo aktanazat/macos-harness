@@ -143,6 +143,11 @@ class FakeHost:
         self.elements: dict[int, object] = {7: object(), 9: object()}
         # Each `_focused_element` call takes the next index; none left is None.
         self.keyboard_focus: deque[int | None] = deque()
+        # `_refuse_secret_input` raises this from its check numbered
+        # ``secret_refused_from`` on, counting from 0.
+        self.secret_refusal: MacOSError | None = None
+        self.secret_refused_from = 0
+        self.secret_checks: list[tuple[int, str]] = []
 
     def _resolve_app(self, query: str | int | None) -> tuple[object, dict[str, object]]:
         if query is None:
@@ -274,6 +279,11 @@ class FakeHost:
         index = max(self.elements, default=0) + 1
         self.elements[index] = element
         return index
+
+    def _refuse_secret_input(self, pid: int, operation: str) -> None:
+        self.secret_checks.append((pid, operation))
+        if self.secret_refusal is not None and len(self.secret_checks) > self.secret_refused_from:
+            raise self.secret_refusal
 
     def _focused_element(self, pid: int, window_id: int | None) -> int | None:
         assert pid == 41
@@ -3552,3 +3562,111 @@ def test_open_files_fails_when_another_copy_of_the_app_took_them(tmp_path) -> No
     assert error.receipt.acted is Acted.YES
     assert error.receipt.error["details"]["reason"] == "another_copy_took_files"
     assert error.receipt.error["details"]["took"] == 42
+
+
+def _secure_input_elsewhere(operation: str) -> MacOSError:
+    return MacOSError(
+        f"{operation} refuses to send text while 1Password holds secure keyboard entry",
+        code=ErrorCode.UNSUPPORTED_OP,
+        details={"reason": "secure_input_elsewhere", "operation": operation, "pid": 41,
+                 "holder_pid": 77, "holder": "1Password"},
+    )
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["run", "dry-run"])
+def test_type_under_secure_input_elsewhere_sends_nothing_and_frees_its_token(dry_run: bool) -> None:
+    host, operations = _ops()
+    host.secret_refusal = _secure_input_elsewhere("type")
+
+    error = _failed(lambda: operations.type("hunter2", app="Demo", once="t", dry_run=dry_run))
+
+    assert error.code == ErrorCode.UNSUPPORTED_OP
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.error["details"]["reason"] == "secure_input_elsewhere"
+    assert host.secret_checks == [(41, "type")]
+    assert host.type_calls == []
+    with pytest.raises(MacOSError, match="Unknown once token 't'"):
+        operations.recall("t")
+
+
+def test_type_refused_by_the_typing_itself_is_acted_no_and_frees_its_token() -> None:
+    """Secure entry that starts after prepare stops `MacOS.type` before
+    any key; the receipt says nothing was sent."""
+    host, operations = _ops()
+    host.type_error = _secure_input_elsewhere("type")
+
+    error = _failed(lambda: operations.type("hunter2", app="Demo", once="t"))
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.changed is False
+    with pytest.raises(MacOSError, match="Unknown once token 't'"):
+        operations.recall("t")
+
+
+@pytest.mark.parametrize("refused_from", [0, 1], ids=["prepare", "dispatch"])
+def test_fill_refused_by_a_secret_keeper_never_focuses_the_field(refused_from: int) -> None:
+    host, operations = _form_ops()
+    host.secret_refusal = MacOSError(
+        "fill refuses to send text to com.1password.1password",
+        code=ErrorCode.UNSUPPORTED_OP,
+        details={"reason": "secret_keeper_app", "operation": "fill", "pid": 41,
+                 "bundle_id": "com.1password.1password"},
+    )
+    host.secret_refused_from = refused_from
+
+    error = _failed(lambda: operations.fill("replacement", app="Demo", once="f"))
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.error["details"]["reason"] == "secret_keeper_app"
+    assert host.secret_checks == [(41, "fill")] * (refused_from + 1)
+    assert host.focused is False
+    assert host.value == "doubleclick.net"
+    with pytest.raises(MacOSError, match="Unknown once token 'f'"):
+        operations.recall("f")
+
+
+class _SecureInputOnAtTyping(FormHost):
+    """A form whose typing is refused once fill has focused the field and
+    selected its text: secure entry turned on in another app between."""
+
+    def type(self, text: str, *, app: str | int | None = None, window_id: int | None = None) -> None:
+        raise _secure_input_elsewhere("type")
+
+
+def test_fill_refused_at_typing_after_selecting_the_text_keeps_its_token() -> None:
+    host = _SecureInputOnAtTyping()
+    clock = _SleepClock()
+    operations = Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+
+    error = _failed(lambda: operations.fill("replacement", app="Demo", once="f"))
+
+    assert error.code == ErrorCode.UNSUPPORTED_OP
+    assert error.receipt.acted is Acted.YES
+    assert error.receipt.error["details"]["reason"] == "secure_input_elsewhere"
+    assert error.receipt.error["details"]["stage"] == "typing"
+    assert (host.focused, host.value) == (True, "doubleclick.net")
+    assert _failed(lambda: operations.fill("replacement", app="Demo", once="f")).receipt.replayed
+
+
+@pytest.mark.parametrize("refused_from", [0, 1], ids=["prepare", "dispatch"])
+def test_paste_under_secure_input_elsewhere_never_touches_the_clipboard(
+    clipboard, refused_from: int,
+) -> None:
+    host = _PasteHost(clipboard)
+    host.keyboard_focus.extend([7, 7, 7])
+    host.secret_refusal = _secure_input_elsewhere("paste")
+    host.secret_refused_from = refused_from
+    clock = _SleepClock()
+    operations = Operations(host, _monotonic=clock.monotonic, _sleep=clock.sleep)
+    untouched = clipboard.changeCount()
+
+    error = _failed(lambda: operations.paste("pasted", app="Demo", once="p"))
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.error["details"]["reason"] == "secure_input_elsewhere"
+    assert host.secret_checks == [(41, "paste")] * (refused_from + 1)
+    assert host.key_calls == []
+    assert clipboard.changeCount() == untouched
+    assert clipboard.stringForType_("public.utf8-plain-text") == "the user's clipboard"
+    with pytest.raises(MacOSError, match="Unknown once token 'p'"):
+        operations.recall("p")

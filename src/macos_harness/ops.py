@@ -541,6 +541,10 @@ def _atomic_press_acted(exc: MacOSError) -> Acted:
     return Acted.UNKNOWN
 
 
+# What `_refuse_secret_input` raises with, before any text leaves.
+_SECRET_REFUSALS = frozenset({"secret_keeper_app", "secure_input_elsewhere"})
+
+
 def _sent_nothing(exc: MacOSError) -> bool:
     """Whether a dispatch that raised ``exc`` stopped before any input
     left: keyboard focus moved off its element first, the deadline ran
@@ -553,6 +557,8 @@ def _sent_nothing(exc: MacOSError) -> bool:
     if isinstance(exc, FocusChangedError):
         return reason == "focus_moved_before_dispatch"
     if reason in {"copied_before_paste", "pasteboard_write_refused"}:
+        return True
+    if reason in _SECRET_REFUSALS:
         return True
     return exc.code == ErrorCode.TIMEOUT.value and reason in {
         "deadline_exhausted_before_dispatch", "person_active", "pasteboard_busy",
@@ -1460,6 +1466,7 @@ class _Host(Protocol):
     def _keyboard_target(self, pid: int, window_id: int) -> None: ...
     def _focus_sample(self, pid: int) -> dict[str, JSONValue]: ...
     def _focused_element(self, pid: int, window_id: int | None) -> int | None: ...
+    def _refuse_secret_input(self, pid: int, operation: str) -> None: ...
     def _exited(self, pid: int) -> bool: ...
     def _window_button(
         self, pid: int, action: str, *, window_id: int | None, window_index: int
@@ -3177,6 +3184,7 @@ class Operations:
             nonlocal field
             del deadline
             _validate_type_text(text)
+            host._refuse_secret_input(pid, "type")
             named = _named_keyboard_window(host, pid, window_id)
             field = host._focused_element(pid, window_id)
             return named
@@ -3247,6 +3255,7 @@ class Operations:
 
         def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue]:
             nonlocal element_index
+            host._refuse_secret_input(pid, "fill")
             match = host.ax_wait(
                 app=pid, search_key=search_key, text=text, title=title,
                 identifier=identifier, description=description,
@@ -3283,6 +3292,7 @@ class Operations:
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
             nonlocal before
             host._yield_to_person(pid, "filling a field in the app in front")
+            host._refuse_secret_input(pid, "fill")
             assert element_index is not None
             frontmost = host._frontmost_app()
             if deadline.exhausted():
@@ -3312,6 +3322,13 @@ class Operations:
                 else:
                     host.key("backspace", app=pid)
             except MacOSError as exc:
+                if exc.details.get("reason") in _SECRET_REFUSALS:
+                    raise _BlockedEffect(
+                        "fill focused the field and selected its text, then refused to type: "
+                        f"{exc}. The field's text stays selected",
+                        code=exc.code,
+                        details={**exc.details, "stage": "typing"},
+                    ) from exc
                 if exc.details.get("reason") != "person_active":
                     raise
                 raise _BlockedEffect(
@@ -3400,6 +3417,7 @@ class Operations:
 
         def prepare(host: _Host, pid: int, deadline: _Deadline) -> dict[str, JSONValue] | None:
             nonlocal field
+            host._refuse_secret_input(pid, "paste")
             frontmost = host._frontmost_app()
             if frontmost is None or frontmost.get("pid") != pid:
                 raise MacOSError(
@@ -3462,6 +3480,7 @@ class Operations:
                     before = _read_text(host, field)
                     if exact is not None:
                         change = _spliced_change(host, field, exact)
+                host._refuse_secret_input(pid, "paste")
                 deadline.check_dispatch()
                 board = host._general_pasteboard()
                 saved = pasteboard.save(board)
