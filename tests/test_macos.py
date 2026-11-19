@@ -3696,7 +3696,7 @@ class _ScriptedMac:
     def __init__(self, monkeypatch, events, *, on_key=None) -> None:
         self.mac = MacOS()
         self.holder: int | None = None
-        self.focus_role = "AXTextArea"
+        self.focus_role: str | None = "AXTextArea"
         self.front = _NOTES_PID
         self.pressed: list[tuple[int, str | None, int]] = []
         self.sent: list[str] = []
@@ -3816,6 +3816,38 @@ def test_a_script_key_is_refused_when_the_focus_is_a_password_field_without_secu
     assert caught.value.code == ErrorCode.UNSUPPORTED_OP
     assert caught.value.details["reason"] == "secure_field"
     assert scripted.pressed == []
+
+
+def test_a_script_key_is_refused_when_the_focused_field_cannot_be_identified(monkeypatch) -> None:
+    """A focus accessibility names but cannot describe may be a password
+    field: the check must not pass by reading nothing."""
+    scripted = _ScriptedMac(monkeypatch, [_script_event(text="dummy")])
+    scripted.focus_role = None
+
+    with pytest.raises(MacOSError) as caught:
+        scripted.mac.script("return 1")
+
+    assert caught.value.details["reason"] == "unreadable_focus"
+    assert scripted.pressed == []
+
+
+def test_a_script_stops_typing_when_its_time_is_up(monkeypatch) -> None:
+    """A long keystroke kept typing past ``timeout`` and only then reported
+    the script as stopped."""
+    clock = [0.0]
+
+    def tick(scripted):
+        clock[0] += 1.0
+
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+    scripted = _ScriptedMac(monkeypatch, [_script_event(text="dummy")], on_key=tick)
+
+    with pytest.raises(MacOSError) as caught:
+        scripted.mac.script("return 1", timeout=2.0)
+
+    assert caught.value.code == ErrorCode.TIMEOUT
+    assert scripted.typed() == "du"
 
 
 @pytest.mark.parametrize("event_id", ["keyF", "keyU"])

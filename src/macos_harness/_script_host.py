@@ -337,7 +337,7 @@ def run(
             if kind == b"R":
                 result = json.loads(payload)
                 return ScriptResult(bool(result["ok"]), str(result["text"]), int(result["number"]))
-            mode, priority, _ = _SEND.unpack_from(payload)
+            mode, priority, asked = _SEND.unpack_from(payload)
             event = AEDesc()
             if _carbon().AEUnflattenDesc(payload[_SEND.size:], byref(event)) != 0:
                 _write(to_child, b"A", struct.pack(">i", NOT_PERMITTED))
@@ -345,6 +345,8 @@ def run(
             try:
                 if decide(_describe(event)):
                     ticks = max(1, int((deadline - time.monotonic()) * 60))
+                    if asked > 0:  # the script's own ``with timeout``
+                        ticks = min(ticks, asked)
                     status, reply = _forward(event, mode, priority, ticks)
                 else:
                     status, reply = 0, b""

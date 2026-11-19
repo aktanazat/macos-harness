@@ -8125,7 +8125,10 @@ class MacOS:
             )
         self._pictures_acted()
         try:
-            result = _script_host.run(source, language, timeout, self._script_event)
+            deadline = time.monotonic() + timeout
+            result = _script_host.run(
+                source, language, timeout, lambda event: self._script_event(event, deadline)
+            )
         except TimeoutError:
             target = _SCRIPT_TARGET.search(source)
             addressed = f"{target[1]} " if target else "the app it addresses "
@@ -8156,7 +8159,7 @@ class MacOS:
             )
         return result.text.rstrip("\n")
 
-    def _script_event(self, event: _script_host.ScriptEvent) -> bool:
+    def _script_event(self, event: _script_host.ScriptEvent, deadline: float) -> bool:
         """Judge one Apple event a script asked to send: True to send it
         on, False once its keys were pressed here, `MacOSError` to stop the
         script. An event whose target cannot be named is judged as one for
@@ -8182,7 +8185,7 @@ class MacOS:
             )
         if event.event_id not in _SCRIPT_KEY_EVENTS:
             return True
-        self._script_keys(event)
+        self._script_keys(event, deadline)
         return False
 
     @staticmethod
@@ -8222,15 +8225,22 @@ class MacOS:
         focused = self._copy_attribute(
             self._application_element(pid, enhance=False), "AXFocusedUIElement"
         )
-        if focused is not None and _secure(
-            self._copy_attributes(focused, ("AXRole", "AXSubrole"))
-        ):
-            raise self._script_refusal(
-                event, "secure_field", "the keyboard focus is a password field", app_pid=pid
-            )
+        if focused is not None:
+            identity = self._copy_attributes(focused, ("AXRole", "AXSubrole"))
+            if identity.get("AXRole") is None:
+                raise self._script_refusal(
+                    event,
+                    "unreadable_focus",
+                    "accessibility could not say what kind of field has the keyboard focus",
+                    app_pid=pid,
+                )
+            if _secure(identity):
+                raise self._script_refusal(
+                    event, "secure_field", "the keyboard focus is a password field", app_pid=pid
+                )
         return pid
 
-    def _script_keys(self, event: _script_host.ScriptEvent) -> None:
+    def _script_keys(self, event: _script_host.ScriptEvent, deadline: float) -> None:
         """Press the keys of a script's ``keystroke`` or ``key code``. Each
         key is posted to the one process `_script_key_target` just cleared,
         so a key cannot follow the focus to an app that came forward after
@@ -8256,6 +8266,8 @@ class MacOS:
         else:
             presses.extend((keycode, held, None) for keycode in event.keycodes or ())
         for keycode, flags, character in presses:
+            if time.monotonic() >= deadline:
+                raise TimeoutError
             pid = self._script_key_target(event)
             active = 0
             for name in modifiers:
