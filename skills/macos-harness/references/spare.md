@@ -40,9 +40,13 @@ spare reloads.
 
 ## Lifetime
 
-`macos-harness doctor` reports whether this shell can reach its spare broker,
-with the broker's PID when active. This does not consume a step or promise
-that the next spare has finished loading.
+`macos-harness doctor` reports this shell's spare status:
+
+- `active`: the broker is reachable, with its PID.
+- `not running`: no broker is reachable; includes startup guidance.
+- `busy`: another step from this shell holds the spare.
+
+This does not consume a step or promise that the next spare has finished loading.
 
 The spare and the process that keeps it exit with the shell, even when the
 shell is killed. A step running in a spare when the shell exits, such as one
