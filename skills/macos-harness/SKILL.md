@@ -1,6 +1,6 @@
 ---
 name: macos-harness
-description: "Drive native/Electron macOS apps and cross-app steps. Web: safari skill. Mac-control code: read only needed references."
+description: "Drive native/Electron macOS apps, dialogs, menus, file prompts, cross-app steps. Web: safari skill. Mac-control code: read only needed references."
 ---
 
 # macOS Harness
@@ -84,7 +84,6 @@ Passwords, a VM's too, web pages: `credentials`.
 
 `macos-harness skill <name>`:
 
-- `signatures`: signatures
 - `receipts`: outcomes, errors, once tokens, logs
 - `ax-search`: roles, scopes, waits
 - `invariants`: cleanup, focus, input, windows
