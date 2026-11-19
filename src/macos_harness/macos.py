@@ -8034,6 +8034,17 @@ class MacOS:
             app, pid, target, named_window=window_id is not None, in_front=in_front
         )
 
+    def _running_app_with_pid(self, pid: int) -> Any | None:
+        """The running app with ``pid``: AppKit's direct lookup, then the
+        workspace list for a live app that lookup missed."""
+        running = self._application_with_pid(pid)
+        if running is not None:
+            return running
+        return next(
+            (app for app in self._running_applications() if int(app.processIdentifier()) == pid),
+            None,
+        )
+
     def _refuse_secret_input(self, pid: int, operation: str) -> None:
         """Refuse text for ``pid`` when it is an app in `_SECRET_KEEPERS`,
         or while another app holds secure keyboard entry: a password field
@@ -8041,7 +8052,7 @@ class MacOS:
         among them, and no event tap could see what went where. ``pid``'s
         own secure entry is its own field, which `fill` refuses itself.
         Raises `unsupported_op` having sent nothing."""
-        running = self._application_with_pid(pid)
+        running = self._running_app_with_pid(pid)
         bundle_id = running.bundleIdentifier() if running is not None else None
         if bundle_id is not None and str(bundle_id) in _SECRET_KEEPERS:
             raise MacOSError(
@@ -8054,7 +8065,7 @@ class MacOS:
         holder = _secure_input_holder()
         if holder is None or holder == pid:
             return
-        owner = self._application_with_pid(holder)
+        owner = self._running_app_with_pid(holder)
         name = owner.localizedName() if owner is not None else None
         raise MacOSError(
             f"{operation} refuses to send text while {name or f'process {holder}'} holds secure "

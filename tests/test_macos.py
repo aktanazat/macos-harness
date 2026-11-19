@@ -2586,6 +2586,7 @@ def _typing_fakes(monkeypatch, mac: MacOS, *, frontmost_pid: int) -> tuple[list,
     monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "Front", "pid": frontmost_pid})
     monkeypatch.setattr(mac, "_post", lambda event, pid: posted.append((event, pid)))
     monkeypatch.setattr(mac, "_application_with_pid", lambda pid: None)
+    monkeypatch.setattr(mac, "_running_applications", list)
     monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: None)
     monkeypatch.setattr(macos_module.time, "sleep", sleeps.append)
     monkeypatch.setattr(
@@ -2709,8 +2710,11 @@ def test_typing_into_the_app_in_front_sends_nothing_while_the_person_never_pause
 
 
 class _RunningApp:
-    def __init__(self, bundle_id: str, name: str) -> None:
-        self._bundle_id, self._name = bundle_id, name
+    def __init__(self, bundle_id: str, name: str, pid: int = 42) -> None:
+        self._bundle_id, self._name, self._pid = bundle_id, name, pid
+
+    def processIdentifier(self) -> int:
+        return self._pid
 
     def bundleIdentifier(self) -> str:
         return self._bundle_id
@@ -2760,6 +2764,35 @@ def test_type_sends_nothing_to_an_app_that_keeps_secrets(monkeypatch, bundle_id:
     assert refused.value.code == ErrorCode.UNSUPPORTED_OP.value
     assert refused.value.details["reason"] == "secret_keeper_app"
     assert refused.value.details["bundle_id"] == bundle_id
+    assert posted == []
+
+
+def test_type_finds_a_secret_keeper_the_direct_pid_lookup_misses(monkeypatch) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    monkeypatch.setattr(mac, "_running_applications",
+                        lambda: [_RunningApp("com.apple.TextEdit", "TextEdit", pid=7),
+                                 _RunningApp("com.bitwarden.desktop", "Bitwarden", pid=42)])
+
+    with pytest.raises(MacOSError) as refused:
+        mac.type("hunter2", app="Bitwarden")
+
+    assert refused.value.details["reason"] == "secret_keeper_app"
+    assert refused.value.details["bundle_id"] == "com.bitwarden.desktop"
+    assert posted == []
+
+
+def test_type_names_a_secure_input_holder_the_direct_pid_lookup_misses(monkeypatch) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    monkeypatch.setattr(mac, "_running_applications",
+                        lambda: [_RunningApp("com.apple.Terminal", "Terminal", pid=77)])
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 77)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.type("hunter2", app="TextEdit")
+
+    assert refused.value.details["holder"] == "Terminal"
     assert posted == []
 
 
