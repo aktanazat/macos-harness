@@ -2866,6 +2866,26 @@ def test_a_script_that_sends_keys_runs_not_while_secure_keyboard_entry_is_on(
     assert ran == []
 
 
+@pytest.mark.parametrize("source", [
+    'tell application "1Password" to activate\ntell application "System Events" to keystroke "v" using command down',
+    'tell application id "com.bitwarden.desktop" to activate\ntell application "System Events" to key code 9',
+], ids=["by-name", "by-bundle-id"])
+def test_a_script_that_brings_a_secret_keeper_forward_sends_it_no_keys(monkeypatch, source: str) -> None:
+    mac = MacOS()
+    ran: list = []
+    monkeypatch.setattr(macos_module.subprocess, "run", lambda *args, **kwargs: ran.append(args))
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "TextEdit", "pid": 42})
+    monkeypatch.setattr(mac, "_application_with_pid", lambda pid: None)
+    monkeypatch.setattr(mac, "_running_applications", list)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: None)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.script(source)
+
+    assert refused.value.details["reason"] == "secret_keeper_app"
+    assert ran == []
+
+
 def test_a_script_that_sends_no_keys_runs_under_secure_keyboard_entry(monkeypatch) -> None:
     mac = MacOS()
     monkeypatch.setattr(
