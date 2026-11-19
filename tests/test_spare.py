@@ -68,7 +68,7 @@ from macos_harness import spare
 
 def write_ready(fd, data):
     assert data == spare._frame(b"r"), data
-    print(json.dumps(sorted(sys.modules)), flush=True)
+    print(json.dumps({"loaded": sorted(sys.modules), "preload": spare._PRELOAD}), flush=True)
     raise SystemExit(0)
 
 spare._write_all = write_ready
@@ -78,12 +78,19 @@ spare.serve_one_step(["-1", "-1", "-1", "-1", str(os.getppid()), spare._code_dig
         [sys.executable, "-c", probe],
         env=_env(), capture_output=True, text=True, timeout=60, check=True,
     )
-    loaded = set(json.loads(ready.stdout))
+    reported = json.loads(ready.stdout)
+    loaded = set(reported["loaded"])
     expected = {
         "macos_harness.browser",
+        "macos_harness.cli",
+        "macos_harness.macos",
+        "macos_harness.capture",
+        "macos_harness.controls",
+        "macos_harness.ops",
         "macos_harness.receipts",
         "macos_harness.telemetry",
     }
+    assert set(reported["preload"]) == expected
     assert expected <= loaded, f"missing before ready: {sorted(expected - loaded)}"
 
 
