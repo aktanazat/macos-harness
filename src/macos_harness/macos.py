@@ -420,7 +420,8 @@ _SECURE_SUBROLE = "AXSecureTextField"
 _SECURE_INPUT = "kCGSSessionSecureInputPID"
 # Apps whose text is a password, a PIN or an admin's credentials: macOS's own
 # sign-in and authorization prompts and the password managers in common use.
-# `type`, `do.type`, `do.fill` and `do.paste` refuse to send them text.
+# `type`, `key`, `set` with text, `script` keystrokes and the `do` verbs on
+# them refuse to send them any.
 _SECRET_KEEPERS = frozenset({
     "com.apple.SecurityAgent",
     "com.apple.LocalAuthentication.UIAgent",
@@ -660,6 +661,8 @@ def _menu_shortcut(character: object, modifiers: object) -> str | None:
 
 # The app an AppleScript addresses, by name or bundle ID.
 _SCRIPT_TARGET = re.compile(r'\btell application (?:id )?"([^"]+)"', re.IGNORECASE)
+# A script that sends keys sends them to the app in front, as `key` does.
+_SCRIPT_KEYS = re.compile(r"\bkeystroke\b|\bkey\s+code\b|\.keyCode\b", re.IGNORECASE)
 
 
 def _menu_miss(
@@ -4830,6 +4833,8 @@ class MacOS:
         pid = self._element_pid(element_index)
         if attribute in _FOCUS_ATTRIBUTES:
             self._yield_to_person(pid, f"setting {attribute}", forward=attribute == "AXFrontmost")
+        if isinstance(value, str):
+            self._refuse_secret_input(pid, "set")
         self._hold_before_input(pid)
         self._show_element_pointer(element_index)
         if not self._is_ax_element(element):
@@ -8037,6 +8042,8 @@ class MacOS:
     def _running_app_with_pid(self, pid: int) -> Any | None:
         """The running app with ``pid``: AppKit's direct lookup, then the
         workspace list for a live app that lookup missed."""
+        if pid is None:
+            return None
         running = self._application_with_pid(pid)
         if running is not None:
             return running
@@ -8046,12 +8053,11 @@ class MacOS:
         )
 
     def _refuse_secret_input(self, pid: int, operation: str) -> None:
-        """Refuse text for ``pid`` when it is an app in `_SECRET_KEEPERS`,
-        or while another app holds secure keyboard entry: a password field
-        or prompt there has the person's keys, so text sent now could land
-        among them, and no event tap could see what went where. ``pid``'s
-        own secure entry is its own field, which `fill` refuses itself.
-        Raises `unsupported_op` having sent nothing."""
+        """Refuse text or keys for ``pid`` when it is an app in
+        `_SECRET_KEEPERS`, or while any app, ``pid`` included, holds secure
+        keyboard entry: a password field or prompt there has the person's
+        keys, so text sent now could land in it, and no event tap could see
+        what went where. Raises `unsupported_op` having sent nothing."""
         running = self._running_app_with_pid(pid)
         bundle_id = running.bundleIdentifier() if running is not None else None
         if bundle_id is not None and str(bundle_id) in _SECRET_KEEPERS:
@@ -8063,8 +8069,17 @@ class MacOS:
                          "pid": pid, "bundle_id": str(bundle_id)},
             )
         holder = _secure_input_holder()
-        if holder is None or holder == pid:
+        if holder is None:
             return
+        if holder == pid:
+            raise MacOSError(
+                f"{operation} refuses to send text while the app it targets holds secure "
+                "keyboard entry: a password field or prompt in it has focus. Nothing was "
+                "sent: ask the person at this Mac to do this step",
+                code=ErrorCode.UNSUPPORTED_OP,
+                details={"reason": "secure_input_in_app", "operation": operation, "pid": pid,
+                         "holder_pid": holder},
+            )
         owner = self._running_app_with_pid(holder)
         name = owner.localizedName() if owner is not None else None
         raise MacOSError(
@@ -8110,6 +8125,7 @@ class MacOS:
         pid = self._input_pid(app, window_id, "Keyboard input")
         with app_input(pid, _INPUT_WAIT):
             self._yield_to_person(pid, f"pressing {key} in the app in front")
+            self._refuse_secret_input(pid, "key")
             self._hold_before_input(pid, window_id)
             target = self._keyboard_window(pid, window_id)
             focus_before = self._frontmost_app()
@@ -8158,7 +8174,11 @@ class MacOS:
     ) -> str:
         """Run ``source`` with osascript and return what it printed; stop it
         after ``timeout`` seconds, since a script that waits on an app's
-        dialog or a permission prompt never returns on its own."""
+        dialog or a permission prompt never returns on its own. A script
+        that sends keystrokes is refused as `key` is for the app in front."""
+        if _SCRIPT_KEYS.search(source):
+            front = self._frontmost_app()
+            self._refuse_secret_input(int(front["pid"]) if front else -1, "script")
         self._pictures_acted()
         try:
             result = subprocess.run(

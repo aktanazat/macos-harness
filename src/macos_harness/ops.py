@@ -542,7 +542,7 @@ def _atomic_press_acted(exc: MacOSError) -> Acted:
 
 
 # What `_refuse_secret_input` raises with, before any text leaves.
-_SECRET_REFUSALS = frozenset({"secret_keeper_app", "secure_input_elsewhere"})
+_SECRET_REFUSALS = frozenset({"secret_keeper_app", "secure_input_elsewhere", "secure_input_in_app"})
 
 
 def _sent_nothing(exc: MacOSError) -> bool:
@@ -3009,12 +3009,14 @@ class Operations:
             nonlocal field
             del deadline
             host._validate_key(key)
+            host._refuse_secret_input(pid, "key")
             named = _named_keyboard_window(host, pid, window_id)
             field = host._focused_element(pid, window_id)
             return named
 
         def dispatch(host: _Host, pid: int, deadline: _Deadline) -> None:
             host._yield_to_person(pid, f"pressing {key} in the app in front")
+            host._refuse_secret_input(pid, "key")
             _require_focus(host, pid, field, window_id, "key")
             deadline.check_dispatch()
             host.key(key, app=pid, window_id=window_id)

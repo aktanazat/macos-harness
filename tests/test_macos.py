@@ -2742,14 +2742,140 @@ def test_type_sends_nothing_while_another_app_holds_secure_keyboard_entry(monkey
     assert posted == []
 
 
-def test_type_goes_on_while_the_app_itself_holds_secure_keyboard_entry(monkeypatch) -> None:
+def test_type_sends_nothing_while_the_app_itself_holds_secure_keyboard_entry(monkeypatch) -> None:
+    """A hidden-answer prompt in the target app holds secure entry itself:
+    its password field has focus, and typed text would land in it."""
     mac = MacOS()
-    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=7)
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
     monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 42)
 
-    mac.type("hi", app="Spotify")
+    with pytest.raises(MacOSError) as refused:
+        mac.type("dummy", app="System Events")
 
-    assert [event["text"] for event, _ in posted if event["down"]] == ["h", "i"]
+    assert refused.value.code == ErrorCode.UNSUPPORTED_OP.value
+    assert refused.value.details == {
+        "reason": "secure_input_in_app", "operation": "type", "pid": 42, "holder_pid": 42,
+    }
+    assert posted == []
+
+
+@pytest.mark.parametrize("holder", [42, 77], ids=["the-app", "another-app"])
+def test_key_sends_nothing_while_secure_keyboard_entry_is_on(monkeypatch, holder: int) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: holder)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.key("cmd+v", app="TextEdit")
+
+    assert refused.value.details["reason"] == (
+        "secure_input_in_app" if holder == 42 else "secure_input_elsewhere"
+    )
+    assert refused.value.details["operation"] == "key"
+    assert posted == []
+
+
+def test_key_sends_nothing_to_an_app_that_keeps_secrets(monkeypatch) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    monkeypatch.setattr(mac, "_application_with_pid",
+                        lambda pid: _RunningApp("com.apple.keychainaccess", "Keychain Access"))
+
+    with pytest.raises(MacOSError) as refused:
+        mac.key("cmd+v", app="Keychain Access")
+
+    assert refused.value.details["reason"] == "secret_keeper_app"
+    assert posted == []
+
+
+def _set_fakes(monkeypatch, mac: MacOS) -> list:
+    written: list = []
+    monkeypatch.setattr(mac, "_element", lambda index: object())
+    monkeypatch.setattr(mac, "_element_pid", lambda index: 42)
+    monkeypatch.setattr(mac, "_yield_to_person", lambda pid, doing, forward=False: None)
+    monkeypatch.setattr(mac, "_hold_before_input", lambda pid: None)
+    monkeypatch.setattr(mac, "_show_element_pointer", lambda index: False)
+    monkeypatch.setattr(mac, "_is_ax_element", lambda element: True)
+    monkeypatch.setattr(mac, "_application_with_pid", lambda pid: None)
+    monkeypatch.setattr(mac, "_running_applications", list)
+    monkeypatch.setattr(
+        macos_module.AS, "AXUIElementSetAttributeValue",
+        lambda element, attribute, value: written.append((attribute, value)) or 0,
+    )
+    return written
+
+
+def test_set_writes_no_text_while_secure_keyboard_entry_is_on(monkeypatch) -> None:
+    mac = MacOS()
+    written = _set_fakes(monkeypatch, mac)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 77)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.set(3, "dummy")
+
+    assert refused.value.details["reason"] == "secure_input_elsewhere"
+    assert refused.value.details["operation"] == "set"
+    assert written == []
+
+
+def test_set_writes_no_text_to_an_app_that_keeps_secrets(monkeypatch) -> None:
+    mac = MacOS()
+    written = _set_fakes(monkeypatch, mac)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: None)
+    monkeypatch.setattr(mac, "_application_with_pid",
+                        lambda pid: _RunningApp("com.1password.1password", "1Password"))
+
+    with pytest.raises(MacOSError) as refused:
+        mac.set(3, "dummy")
+
+    assert refused.value.details["reason"] == "secret_keeper_app"
+    assert written == []
+
+
+def test_set_of_a_non_text_value_goes_on_under_secure_keyboard_entry(monkeypatch) -> None:
+    mac = MacOS()
+    written = _set_fakes(monkeypatch, mac)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 77)
+
+    mac.set(3, True, "AXExpanded")
+
+    assert written == [("AXExpanded", True)]
+
+
+@pytest.mark.parametrize("source", [
+    'tell application "System Events" to keystroke "dummy"',
+    'tell application "System Events" to key code 36',
+    'Application("System Events").keyCode(36)',
+], ids=["keystroke", "key-code", "jxa-key-code"])
+def test_a_script_that_sends_keys_runs_not_while_secure_keyboard_entry_is_on(
+    monkeypatch, source: str,
+) -> None:
+    mac = MacOS()
+    ran: list = []
+    monkeypatch.setattr(macos_module.subprocess, "run", lambda *args, **kwargs: ran.append(args))
+    monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "TextEdit", "pid": 42})
+    monkeypatch.setattr(mac, "_application_with_pid", lambda pid: None)
+    monkeypatch.setattr(mac, "_running_applications", list)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 42)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.script(source)
+
+    assert refused.value.details["reason"] == "secure_input_in_app"
+    assert refused.value.details["operation"] == "script"
+    assert ran == []
+
+
+def test_a_script_that_sends_no_keys_runs_under_secure_keyboard_entry(monkeypatch) -> None:
+    mac = MacOS()
+    monkeypatch.setattr(
+        macos_module.subprocess, "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "ok\n", ""),
+    )
+    monkeypatch.setattr(mac, "_pictures_acted", lambda: None)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 42)
+
+    assert mac.script('tell application "Finder" to get name of front window') == "ok"
 
 
 @pytest.mark.parametrize("bundle_id", sorted(macos_module._SECRET_KEEPERS))

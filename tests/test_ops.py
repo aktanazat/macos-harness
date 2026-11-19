@@ -3603,6 +3603,44 @@ def test_type_refused_by_the_typing_itself_is_acted_no_and_frees_its_token() -> 
         operations.recall("t")
 
 
+def _secure_input_in_app(operation: str) -> MacOSError:
+    return MacOSError(
+        f"{operation} refuses to send text while the app it targets holds secure keyboard entry",
+        code=ErrorCode.UNSUPPORTED_OP,
+        details={"reason": "secure_input_in_app", "operation": operation, "pid": 41,
+                 "holder_pid": 41},
+    )
+
+
+@pytest.mark.parametrize("refused_from", [0, 1], ids=["prepare", "dispatch"])
+def test_key_under_secure_input_sends_nothing_and_frees_its_token(refused_from: int) -> None:
+    host, operations = _ops()
+    host.secret_refusal = _secure_input_in_app("key")
+    host.secret_refused_from = refused_from
+
+    error = _failed(lambda: operations.key("cmd+v", app="Demo", once="k"))
+
+    assert error.code == ErrorCode.UNSUPPORTED_OP
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.error["details"]["reason"] == "secure_input_in_app"
+    assert host.secret_checks == [(41, "key")] * (refused_from + 1)
+    assert host.key_calls == []
+    with pytest.raises(MacOSError, match="Unknown once token 'k'"):
+        operations.recall("k")
+
+
+def test_type_refused_because_the_app_itself_holds_secure_input_is_acted_no() -> None:
+    host, operations = _ops()
+    host.type_error = _secure_input_in_app("type")
+
+    error = _failed(lambda: operations.type("dummy", app="Demo", once="t"))
+
+    assert error.receipt.acted is Acted.NO
+    assert error.receipt.error["details"]["reason"] == "secure_input_in_app"
+    with pytest.raises(MacOSError, match="Unknown once token 't'"):
+        operations.recall("t")
+
+
 @pytest.mark.parametrize("refused_from", [0, 1], ids=["prepare", "dispatch"])
 def test_fill_refused_by_a_secret_keeper_never_focuses_the_field(refused_from: int) -> None:
     host, operations = _form_ops()
