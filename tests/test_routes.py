@@ -203,6 +203,26 @@ def test_caught_string_recording_attempt_does_not_replace_a_saved_route(host: Ro
     assert host.value is False
 
 
+@pytest.mark.parametrize("refused", [
+    lambda rec: rec.fill("unknown", identifier="page-0"),
+    lambda rec: rec.toggle("yes", role="button", identifier="value"),
+])
+def test_a_recording_goes_on_after_a_step_refused_before_sending(
+    host: RouteHost, refused: Callable[[object], object],
+) -> None:
+    with host.route.record("navigate", app=_APP,
+                           entry=present(role="button", identifier="page-0"),
+                           goal=present(role="button", identifier="page-1")) as rec:
+        with pytest.raises(MacOSError):
+            refused(rec)
+        assert host.pressed_pages == []
+        rec.press(role="button", identifier="next-0",
+                  postcondition=present(role="button", identifier="page-1"))
+
+    assert host.pressed_pages == [0]
+    assert rec.path is not None and rec.path.exists()
+
+
 def test_dry_run_checks_only_current_targets_without_enabling_accessibility(host: RouteHost) -> None:
     record_navigation(host)
 

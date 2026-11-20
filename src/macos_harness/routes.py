@@ -681,12 +681,12 @@ class _Recorder:
             raise _invalid("recording", "must stay on its with-block thread")
         if not self._active or self._failed:
             raise _invalid("recording", "is closed or has failed")
-        self._failed = True
         if len(self._steps) >= 64:
             raise _invalid("steps", "cannot record more than 64 steps")
 
     def _apply(self, step: _Step) -> Receipt:
         self._routes._validate_step(step)
+        self._failed = True
         try:
             receipt = self._routes._dispatch(step, self._identity, self._deadline,
                 f"record:{self._app}:{self._run_id}:{len(self._steps)}", self._inputs)
