@@ -15,7 +15,6 @@ import operator
 import os
 import re
 import signal
-import subprocess
 import tempfile
 import threading
 import time
@@ -29,7 +28,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypeVar
 
-from . import activity
+from . import _script_host, activity
 from ._input_lock import app_input
 from ._paths import user_temp_dir
 from ._pool import pooled_methods
@@ -660,6 +659,12 @@ def _menu_shortcut(character: object, modifiers: object) -> str | None:
 
 
 # The app an AppleScript addresses, by name or bundle ID.
+_SECURE_INPUT = "kCGSSessionSecureInputPID"
+# System Events' keystroke and key code events, its key down and key up,
+# and the modifier names a script's ``using`` carries.
+_SCRIPT_KEY_EVENTS = frozenset({"kprs", "kcod"})
+_SCRIPT_HELD_KEYS = frozenset({"keyF", "keyU"})
+_SCRIPT_MODIFIERS = {"Kcmd": "cmd", "Kctl": "ctrl", "Kopt": "alt", "Ksft": "shift"}
 _SCRIPT_TARGET = re.compile(r'\btell application (?:id )?"([^"]+)"', re.IGNORECASE)
 
 
@@ -935,6 +940,13 @@ def _hides_match(error: int) -> bool:
     hide a match.
     """
     return error != AS.kAXErrorFailure
+
+
+def _secure_input_holder() -> int | None:
+    """The process holding Secure Input, None when none does. An app turns
+    it on while a password field has its keyboard focus."""
+    holder = (AS.CGSessionCopyCurrentDictionary() or {}).get(_SECURE_INPUT)
+    return None if holder is None else int(holder)
 
 
 def _secure(identity: Mapping[str, object]) -> bool:
@@ -8170,20 +8182,37 @@ class MacOS:
     def script(
         self, source: str, *, language: str = "AppleScript", timeout: float = 15.0
     ) -> str:
-        """Run ``source`` with osascript and return what it printed; stop it
-        after ``timeout`` seconds, since a script that waits on an app's
-        dialog or a permission prompt never returns on its own."""
+        """Run ``source`` as AppleScript or JavaScript and return what it
+        printed; stop it after ``timeout`` seconds, since a script that
+        waits on an app's dialog or a permission prompt never returns on
+        its own.
+
+        The script runs in a sandboxed process that cannot press a key,
+        set a field or send an Apple event by itself (`_script_host`).
+        Each event it sends comes here first. One for another app goes
+        on. One for System Events goes on only while no process holds
+        Secure Input, which a focused password field does; a keystroke or
+        key code is not passed on at all but pressed here, one key at a
+        time, in the app that is in front at that moment, after checking
+        again that Secure Input is off and that app's keyboard focus is
+        not a password field. A refused event stops the script there with
+        `unsupported_op`. What the script says plays no part: the same
+        check meets a keystroke however the script came to send it, and
+        ``run script`` text or a program started by ``do shell script``
+        cannot control an app at all."""
+        if language.casefold() not in _script_host.LANGUAGES:
+            raise MacOSError(
+                f"script runs AppleScript or JavaScript, not {language!r}",
+                code=ErrorCode.BAD_REQUEST,
+                details={"parameter": "language", "value": language},
+            )
         self._pictures_acted()
         try:
-            result = subprocess.run(
-                ["/usr/bin/osascript", "-l", language, "-"],
-                input=source,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=timeout,
+            deadline = time.monotonic() + timeout
+            result = _script_host.run(
+                source, language, timeout, lambda event: self._script_event(event, deadline)
             )
-        except subprocess.TimeoutExpired:
+        except TimeoutError:
             target = _SCRIPT_TARGET.search(source)
             addressed = f"{target[1]} " if target else "the app it addresses "
             raise MacOSError(
@@ -8194,10 +8223,155 @@ class MacOS:
                 code=ErrorCode.TIMEOUT,
                 details={"timeout": timeout, "language": language},
             ) from None
-        if result.returncode != 0:
+        if not result.ok:
+            message = result.text.strip()
+            if "(-10004)" in message or "(-600)" in message:
+                message += (
+                    ". Only events the script itself sends reach an app: `run script` "
+                    "text and a program started by `do shell script` cannot control one"
+                )
+            elif "(-1713)" in message:
+                message += (
+                    ". The script's own process shows no dialog: have an app show it, "
+                    'as `tell application "System Events" to display dialog ...`'
+                )
             raise MacOSError(
-                (result.stderr or result.stdout).strip(),
+                message,
                 code=ErrorCode.AX_ERROR,
-                details={"returncode": result.returncode, "language": language},
+                details={"returncode": 1, "number": result.number, "language": language},
             )
-        return result.stdout.rstrip("\n")
+        return result.text.rstrip("\n")
+
+    def _script_event(self, event: _script_host.ScriptEvent, deadline: float) -> bool:
+        """Judge one Apple event a script asked to send: True to send it
+        on, False once its keys were pressed here, `MacOSError` to stop the
+        script. An event whose target cannot be named is judged as one for
+        System Events."""
+        bundle = event.target_bundle
+        if bundle is None and event.target_pid is not None:
+            bundle = self._bundle_id(event.target_pid)
+        if bundle is not None and bundle != _script_host.SYSTEM_EVENTS:
+            return True
+        holder = _secure_input_holder()
+        if holder is not None:
+            raise self._script_refusal(
+                event,
+                "secure_input",
+                "a password field has the keyboard (Secure Input is on)",
+                holder_pid=holder,
+            )
+        if event.event_class != "prcs":
+            return True
+        if event.event_id in _SCRIPT_HELD_KEYS:
+            raise self._script_refusal(
+                event, "held_key", "a script may press keys but not hold one down"
+            )
+        if event.event_id not in _SCRIPT_KEY_EVENTS:
+            return True
+        self._script_keys(event, deadline)
+        return False
+
+    @staticmethod
+    def _script_refusal(
+        event: _script_host.ScriptEvent, reason: str, why: str, **details: JSONValue
+    ) -> MacOSError:
+        return MacOSError(
+            f"script was stopped at its {event.name} event for System Events: {why}. "
+            "Nothing after it ran: ask the person at this Mac to do this step",
+            code=ErrorCode.UNSUPPORTED_OP,
+            details={"reason": reason, "operation": "script", "event": event.name, **details},
+        )
+
+    @staticmethod
+    def _bundle_id(pid: int) -> str | None:
+        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        identifier = None if app is None else app.bundleIdentifier()
+        return None if identifier is None else str(identifier)
+
+    def _script_key_target(self, event: _script_host.ScriptEvent) -> int:
+        """The app a script's next key goes to, the one in front, refusing
+        when Secure Input is on or that app's keyboard focus is a password
+        field. Asked again before every key: a script can move the focus
+        between two of them."""
+        holder = _secure_input_holder()
+        if holder is not None:
+            raise self._script_refusal(
+                event,
+                "secure_input",
+                "a password field has the keyboard (Secure Input is on)",
+                holder_pid=holder,
+            )
+        front = self._frontmost_app()
+        if front is None:
+            raise self._script_refusal(event, "no_app_in_front", "no app is in front")
+        pid = int(front["pid"])
+        focused = self._copy_attribute(
+            self._application_element(pid, enhance=False), "AXFocusedUIElement"
+        )
+        if focused is not None:
+            identity = self._copy_attributes(focused, ("AXRole", "AXSubrole"))
+            if identity.get("AXRole") is None:
+                raise self._script_refusal(
+                    event,
+                    "unreadable_focus",
+                    "accessibility could not say what kind of field has the keyboard focus",
+                    app_pid=pid,
+                )
+            if _secure(identity):
+                raise self._script_refusal(
+                    event, "secure_field", "the keyboard focus is a password field", app_pid=pid
+                )
+        return pid
+
+    def _script_keys(self, event: _script_host.ScriptEvent, deadline: float) -> None:
+        """Press the keys of a script's ``keystroke`` or ``key code``. Each
+        key is posted to the one process `_script_key_target` just cleared,
+        so a key cannot follow the focus to an app that came forward after
+        the check."""
+        if event.modifiers is None or (event.text is None and event.keycodes is None):
+            raise self._script_refusal(
+                event, "unreadable_keys", "the keys it asks for could not be read"
+            )
+        try:
+            modifiers = [_SCRIPT_MODIFIERS[name] for name in dict.fromkeys(event.modifiers)]
+        except KeyError:
+            raise self._script_refusal(
+                event, "unreadable_keys", "it names a modifier key this does not know"
+            ) from None
+        held = 0
+        for name in modifiers:
+            held |= _MODIFIER_FLAGS[name]
+        presses: list[tuple[int, int, str | None]] = []
+        if event.text is not None:
+            for character in event.text:
+                keycode, flags = _character_key(character)
+                presses.append((keycode, flags | held, None if modifiers else character))
+        else:
+            presses.extend((keycode, held, None) for keycode in event.keycodes or ())
+        for keycode, flags, character in presses:
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+            pid = self._script_key_target(event)
+            active = 0
+            for name in modifiers:
+                active |= _MODIFIER_FLAGS[name]
+                self._script_post(pid, _MODIFIER_KEYCODES[name], True, active, None)
+            try:
+                self._script_post(pid, keycode, True, flags, character)
+                self._script_post(pid, keycode, False, flags, character)
+            finally:
+                for name in reversed(modifiers):
+                    active &= ~_MODIFIER_FLAGS[name]
+                    self._script_post(pid, _MODIFIER_KEYCODES[name], False, active, None)
+            time.sleep(0.01)
+
+    def _script_post(
+        self, pid: int, keycode: int, down: bool, flags: int, character: str | None
+    ) -> None:
+        key = AS.CGEventCreateKeyboardEvent(self._event_source, keycode, down)
+        if character is not None:
+            AS.CGEventKeyboardSetUnicodeString(
+                key, len(character.encode("utf-16-le")) // 2, character
+            )
+        AS.CGEventSetFlags(key, flags)
+        self._post(key, pid)

@@ -83,6 +83,15 @@ app lacks Accessibility, a System Events call fails with `osascript is not
 allowed assistive access (-25211)`. Run the same source through
 `mac.script`, which carries the harness's permission:
 
+A script cannot type into a password field. It runs in a sandboxed process,
+and each Apple event it sends is checked first: while a password field has
+the keyboard (Secure Input is on) an event for System Events is refused with
+`unsupported_op`, and a `keystroke` or `key code` is pressed key by key in
+the app in front, each key checked again. `run script` text and a program
+started by `do shell script` cannot control an app at all (`-600`), `key
+down`/`key up` are refused, and the script's own process shows no dialog:
+have an app show it (`tell application "System Events" to display dialog`).
+
 ```python
 mac.activate(4242)  # bring a pid forward; falls back to System Events itself
 mac.script('tell application "System Events" to set frontmost of (first process whose unix id is 4242) to true')

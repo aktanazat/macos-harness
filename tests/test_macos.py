@@ -3853,10 +3853,10 @@ def test_a_script_that_never_returns_is_stopped_naming_the_app_it_addressed(monk
     """A script waiting on a dialog or a permission prompt hung the whole
     step until the agent's own timeout killed it."""
 
-    def hang(command, **options):
-        raise subprocess.TimeoutExpired(command, options["timeout"])
+    def hang(source, language, timeout, decide):
+        raise TimeoutError
 
-    monkeypatch.setattr(macos_module.subprocess, "run", hang)
+    monkeypatch.setattr(macos_module._script_host, "run", hang)
 
     with pytest.raises(MacOSError) as caught:
         MacOS().script('tell application "Sona" to activate')
@@ -3864,6 +3864,257 @@ def test_a_script_that_never_returns_is_stopped_naming_the_app_it_addressed(monk
     assert caught.value.code == ErrorCode.TIMEOUT
     assert "within 15s" in str(caught.value)
     assert "Sona may be showing a dialog" in str(caught.value)
+
+
+_SYSTEM_EVENTS_PID = 77
+_NOTES_PID = 42
+
+
+def _script_event(event_id="kprs", *, event_class="prcs", pid=_SYSTEM_EVENTS_PID, **fields):
+    """One Apple event a script sent, built when the script runs."""
+    return lambda: macos_module._script_host.ScriptEvent(
+        event_class=event_class, event_id=event_id, target_pid=pid, target_bundle=None, **fields
+    )
+
+
+class _ScriptedMac:
+    """A `MacOS` whose script host replays ``events`` as the Apple events a
+    script sent, in order, whatever the script's text says. ``holder`` is
+    the process holding Secure Input and ``focus_role`` the front app's
+    keyboard focus; ``on_key`` runs after each key press so a test can move
+    either one while the script is running."""
+
+    def __init__(self, monkeypatch, events, *, on_key=None) -> None:
+        self.mac = MacOS()
+        self.holder: int | None = None
+        self.focus_role: str | None = "AXTextArea"
+        self.front = _NOTES_PID
+        self.pressed: list[tuple[int, str | None, int]] = []
+        self.sent: list[str] = []
+
+        def run(source, language, timeout, decide):
+            for event in (make() for make in events):
+                if decide(event):
+                    self.sent.append(event.name)
+            return macos_module._script_host.ScriptResult(True, "done\n")
+
+        def post(pid, keycode, down, flags, character):
+            if down and keycode not in macos_module._MODIFIER_KEYCODES.values():
+                self.pressed.append((pid, character, keycode))
+                if on_key is not None:
+                    on_key(self)
+
+        mac = self.mac
+        monkeypatch.setattr(macos_module._script_host, "run", run)
+        monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: self.holder)
+        monkeypatch.setattr(
+            mac,
+            "_bundle_id",
+            lambda pid: "com.apple.systemevents" if pid == _SYSTEM_EVENTS_PID else "com.example.app",
+        )
+        monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "Front", "pid": self.front})
+        monkeypatch.setattr(mac, "_application_element", lambda pid, **_: ("app", pid))
+        monkeypatch.setattr(mac, "_copy_attribute", lambda element, name, **_: ("focus", element))
+        monkeypatch.setattr(
+            mac, "_copy_attributes", lambda element, names, **_: {"AXRole": self.focus_role}
+        )
+        monkeypatch.setattr(mac, "_script_post", post)
+
+    def typed(self) -> str:
+        return "".join(character or "" for _, character, _ in self.pressed)
+
+
+# What the script says must play no part, so every one of these runs the
+# same refused events under a different text, the dodges a reviewer used
+# against text matching among them.
+_SCRIPT_TEXTS = [
+    'tell application "System Events" to keystroke "dummy"',
+    'tell application "Finder" to activate\ntell application "System Events" to keystroke "dummy"',
+    (
+        'tell application "System Events" to set frontmost of (first process whose bundle '
+        'identifier ends with ".finder") to true'
+    ),
+    'set n to "Fin" & "der"\ntell application n to activate',
+    'do shell script "open /System/Library/CoreServices/Find*.app"',
+    'run script "tell application \\"System Events\\" to keyst" & "roke \\"dummy\\""',
+    "return 1",
+]
+
+
+@pytest.mark.parametrize("source", _SCRIPT_TEXTS)
+@pytest.mark.parametrize(
+    "event",
+    [
+        _script_event(text="dummy"),
+        _script_event("kcod", keycodes=(36,)),
+        _script_event("setd", event_class="core"),
+        _script_event("actv", event_class="misc"),
+        _script_event(text="dummy", pid=None),
+    ],
+    ids=["keystroke", "key-code", "set", "activate", "unnamed-target"],
+)
+def test_a_script_event_for_system_events_is_refused_under_secure_input(
+    monkeypatch, source, event
+) -> None:
+    """`mac.script` typed into a password field: nothing looked at the keys
+    a script sent, and matching its text was dodged twice."""
+    scripted = _ScriptedMac(monkeypatch, [event])
+    scripted.holder = 4242
+
+    with pytest.raises(MacOSError) as caught:
+        scripted.mac.script(source)
+
+    assert caught.value.code == ErrorCode.UNSUPPORTED_OP
+    assert caught.value.details["reason"] == "secure_input"
+    assert caught.value.details["holder_pid"] == 4242
+    assert scripted.pressed == []
+    assert scripted.sent == []
+
+
+def test_a_script_that_moves_the_focus_to_a_password_field_is_stopped_at_its_next_key(
+    monkeypatch,
+) -> None:
+    """The earlier guard looked once, before the script ran, and the script
+    then brought the password field forward itself."""
+
+    def password_field_takes_focus(scripted):
+        if scripted.typed() == "du":
+            scripted.holder = 4242
+
+    scripted = _ScriptedMac(
+        monkeypatch,
+        [_script_event("actv", event_class="misc", pid=_NOTES_PID), _script_event(text="dummy")],
+        on_key=password_field_takes_focus,
+    )
+
+    with pytest.raises(MacOSError) as caught:
+        scripted.mac.script("return 1")
+
+    assert caught.value.details["reason"] == "secure_input"
+    assert scripted.typed() == "du"
+    assert scripted.sent == ["misc/actv"]
+
+
+def test_a_script_key_is_refused_when_the_focus_is_a_password_field_without_secure_input(
+    monkeypatch,
+) -> None:
+    scripted = _ScriptedMac(monkeypatch, [_script_event(text="dummy")])
+    scripted.focus_role = "AXSecureTextField"
+
+    with pytest.raises(MacOSError) as caught:
+        scripted.mac.script("return 1")
+
+    assert caught.value.code == ErrorCode.UNSUPPORTED_OP
+    assert caught.value.details["reason"] == "secure_field"
+    assert scripted.pressed == []
+
+
+def test_a_script_key_is_refused_when_the_focused_field_cannot_be_identified(monkeypatch) -> None:
+    """A focus accessibility names but cannot describe may be a password
+    field: the check must not pass by reading nothing."""
+    scripted = _ScriptedMac(monkeypatch, [_script_event(text="dummy")])
+    scripted.focus_role = None
+
+    with pytest.raises(MacOSError) as caught:
+        scripted.mac.script("return 1")
+
+    assert caught.value.details["reason"] == "unreadable_focus"
+    assert scripted.pressed == []
+
+
+def test_a_script_stops_typing_when_its_time_is_up(monkeypatch) -> None:
+    """A long keystroke kept typing past ``timeout`` and only then reported
+    the script as stopped."""
+    clock = [0.0]
+
+    def tick(scripted):
+        clock[0] += 1.0
+
+    monkeypatch.setattr(macos_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(macos_module.time, "sleep", lambda seconds: None)
+    scripted = _ScriptedMac(monkeypatch, [_script_event(text="dummy")], on_key=tick)
+
+    with pytest.raises(MacOSError) as caught:
+        scripted.mac.script("return 1", timeout=2.0)
+
+    assert caught.value.code == ErrorCode.TIMEOUT
+    assert scripted.typed() == "du"
+
+
+@pytest.mark.parametrize("event_id", ["keyF", "keyU"])
+def test_a_script_may_not_hold_a_key_down(monkeypatch, event_id) -> None:
+    """A held key would still be down for whatever takes the focus next."""
+    scripted = _ScriptedMac(monkeypatch, [_script_event(event_id)])
+
+    with pytest.raises(MacOSError) as caught:
+        scripted.mac.script("return 1")
+
+    assert caught.value.details["reason"] == "held_key"
+    assert scripted.sent == []
+
+
+@pytest.mark.parametrize(
+    "event",
+    [_script_event(text=None), _script_event(text="a", modifiers=None)],
+    ids=["no-keys", "unreadable-modifiers"],
+)
+def test_a_script_key_event_that_cannot_be_read_is_refused(monkeypatch, event) -> None:
+    scripted = _ScriptedMac(monkeypatch, [event])
+
+    with pytest.raises(MacOSError) as caught:
+        scripted.mac.script("return 1")
+
+    assert caught.value.details["reason"] == "unreadable_keys"
+    assert scripted.pressed == []
+    assert scripted.sent == []
+
+
+def test_a_script_types_into_an_ordinary_app_one_key_at_a_time(monkeypatch) -> None:
+    """Keys are pressed by the harness in the app in front, not passed on
+    to System Events, so each one is checked."""
+    scripted = _ScriptedMac(
+        monkeypatch,
+        [
+            _script_event(text="Hi"),
+            _script_event("kcod", keycodes=(36,)),
+            _script_event("gtqp", event_class="syso", pid=_NOTES_PID),
+            _script_event("getd", event_class="core"),
+        ],
+    )
+
+    assert scripted.mac.script("return 1") == "done"
+
+    assert scripted.pressed == [(_NOTES_PID, "H", 4), (_NOTES_PID, "i", 34), (_NOTES_PID, None, 36)]
+    assert scripted.sent == ["syso/gtqp", "core/getd"]
+
+
+def test_a_script_event_for_another_app_goes_on_under_secure_input(monkeypatch) -> None:
+    """Secure Input stays on while a password manager is merely open:
+    scripts that never use System Events keep working."""
+    scripted = _ScriptedMac(monkeypatch, [_script_event("getd", event_class="core", pid=_NOTES_PID)])
+    scripted.holder = 4242
+
+    assert scripted.mac.script("return 1") == "done"
+    assert scripted.sent == ["core/getd"]
+
+
+def test_the_script_process_is_sandboxed_away_from_keys_fields_and_apple_events() -> None:
+    """`run script` text and a `do shell script` program send no event the
+    harness sees, so the process they run in must not reach an app."""
+    command = macos_module._script_host.command("AppleScript", 3, 4)
+    profile = command[command.index("-p") + 1]
+
+    assert command[0] == "/usr/bin/sandbox-exec"
+    assert "(deny appleevent-send)" in profile
+    assert '(deny mach-lookup (global-name "com.apple.windowserver.active"))' in profile
+    assert '(deny mach-lookup (local-name "com.apple.axserver"))' in profile
+
+
+def test_script_refuses_a_language_it_does_not_run(monkeypatch) -> None:
+    with pytest.raises(MacOSError) as caught:
+        MacOS().script("print(1)", language="Python")
+
+    assert caught.value.code == ErrorCode.BAD_REQUEST
 
 
 @pytest.mark.parametrize(("own", "flagged"), [(True, True), (False, None)], ids=["harness", "an-app"])
