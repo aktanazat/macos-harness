@@ -163,7 +163,7 @@ final class PeekWindow: NSObject, NSWindowDelegate {
   }
 
   private func refresh() {
-    guard !capturing, let id = agentDisplays().first, let panel else { return }
+    guard !capturing, let id = agentsDisplay(), let panel else { return }
     capturing = true
     let bounds = CGDisplayBounds(id)
     let width = Int(picture.bounds.width * panel.backingScaleFactor)
