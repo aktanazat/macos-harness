@@ -13,6 +13,7 @@ import json
 import math
 import operator
 import os
+import pwd
 import re
 import signal
 import subprocess
@@ -801,10 +802,24 @@ def _character_key(character: str) -> tuple[int, int]:
     return _KEYCODES.get(base, 0), flags
 
 
-def _resume(pid: int) -> None:
+# The agent screen companion's folder of wake marks. The account's own home,
+# as the companion reads it, whatever HOME says.
+_ACTING = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".agent-display" / "acting"
+
+
+def _resume(pid: int, acting: Path = _ACTING) -> None:
     """Wake ``pid`` if the agent screen companion paused it (SIGSTOP) to
     save battery: a stopped app neither answers accessibility nor takes
-    input. SIGCONT does nothing to a running process."""
+    input. SIGCONT does nothing to a running process. The mark touched
+    first in ``acting``, the folder the companion keeps, tells it an agent
+    is about to act on ``pid``, so a pause it takes meanwhile undoes
+    itself; without that folder no companion pauses."""
+    with suppress(OSError):
+        fd = os.open(acting / str(pid), os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        try:
+            os.utime(fd)
+        finally:
+            os.close(fd)
     with suppress(OSError):
         os.kill(pid, signal.SIGCONT)
 

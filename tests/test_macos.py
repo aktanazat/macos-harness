@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -4302,3 +4303,27 @@ def test_macos_native_lock_after_fork_fails_fast_instead_of_deadlocking() -> Non
     assert "CHILD close code=unsupported_op" in result.stdout, result.stdout
     assert "CHILD acquire code=unsupported_op" in result.stdout, result.stdout
     assert "PARENT_DONE child_exit_ok=True" in result.stdout, result.stdout
+
+
+def test_waking_an_app_marks_it_for_the_companion_before_continuing_it(tmp_path) -> None:
+    # The mark is a FIFO, so touching it blocks until it is read: the app must
+    # still be stopped then, since the companion re-reads the mark after its
+    # SIGSTOP and only a mark made before SIGCONT undoes that pause.
+    app = subprocess.Popen(["/bin/sleep", "30"])
+    try:
+        os.mkfifo(tmp_path / str(app.pid))
+        os.kill(app.pid, signal.SIGSTOP)
+        assert os.WIFSTOPPED(os.waitpid(app.pid, os.WUNTRACED)[1])
+        waking = threading.Thread(target=macos_module._resume, args=(app.pid, tmp_path))
+        waking.start()
+        time.sleep(0.3)
+
+        while_marking = os.waitpid(app.pid, os.WCONTINUED | os.WNOHANG)
+        os.close(os.open(tmp_path / str(app.pid), os.O_RDONLY | os.O_NONBLOCK))
+        waking.join(5)
+
+        assert while_marking == (0, 0)
+        assert os.WIFCONTINUED(os.waitpid(app.pid, os.WCONTINUED)[1])
+    finally:
+        app.kill()
+        app.wait()
