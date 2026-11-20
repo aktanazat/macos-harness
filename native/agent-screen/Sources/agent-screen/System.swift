@@ -105,6 +105,13 @@ func agentDisplays() -> [CGDirectDisplayID] {
   return AgentDisplay.all().map(\.displayID).filter(active.contains)
 }
 
+/// The agents' screen: the agent display named "Agents", when it is on. Other agent displays
+/// (test displays, ones under agent-display's default name) are never it.
+func agentsDisplay() -> CGDirectDisplayID? {
+  guard let id = AgentDisplay.all().first(where: { $0.name == "Agents" })?.displayID else { return nil }
+  return activeDisplays().contains(id) ? id : nil
+}
+
 func displayFor(point p: CGPoint) -> CGDirectDisplayID? {
   activeDisplays().first { CGDisplayBounds($0).contains(p) }
 }
