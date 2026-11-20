@@ -214,3 +214,23 @@ final class PowerTests: XCTestCase {
     XCTAssertEqual(Power.toPause(apps, now: now), [1])
   }
 }
+
+final class FrontmostTests: XCTestCase {
+  /// The harness brings a claimed app forward in a pause of his typing: his last key is under
+  /// 2 s old, but the agent acted on the app just now, so its windows stay with the agents.
+  func testAnAgentsBringForwardWhileHeTypesIsNotHis() {
+    XCTAssertFalse(Frontmost.isHis(appClaimed: true, sincePerson: 0.5, sinceAgentActed: 0.1))
+  }
+
+  func testAClaimedAppThatCameForwardByItselfIsNotHis() {
+    XCTAssertFalse(Frontmost.isHis(appClaimed: true, sincePerson: 60, sinceAgentActed: nil))
+  }
+
+  func testHeBringsAClaimedAppForward() {
+    XCTAssertTrue(Frontmost.isHis(appClaimed: true, sincePerson: 0.5, sinceAgentActed: 30))
+  }
+
+  func testAnAppNoAgentClaimedIsHis() {
+    XCTAssertTrue(Frontmost.isHis(appClaimed: false, sincePerson: 60, sinceAgentActed: 0.1))
+  }
+}

@@ -7190,6 +7190,9 @@ class MacOS:
         self._yield_to_person(pid, f"bringing {info['name']} forward", forward=True)
         previous = self._frontmost_app()
         started = time.monotonic()
+        # Sent first, so the agent screen companion takes the activation for
+        # the agent's, not for the person typing at the Mac.
+        activity.action(self._overlay.agent_id, "activate", app_pid=pid)
         running.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
         frontmost, activated = self._await_frontmost(pid, timeout)
         via = "appkit" if activated else None

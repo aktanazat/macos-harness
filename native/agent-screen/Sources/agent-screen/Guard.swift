@@ -4,8 +4,10 @@ import ApplicationServices
 
 /// Keeps the user's own windows off agent displays, event-driven.
 ///
-/// - The frontmost app is the user's. When it comes forward, opens a window, or a window of it
-///   changes focus or stops moving on an agent display, that window moves to the screen he is on.
+/// - The frontmost app is the user's, except an app an agent claimed that came forward without
+///   his input or while an agent was acting on it (`Frontmost.isHis`). When it comes forward,
+///   opens a window, or a window of it changes focus or stops moving on an agent display, that
+///   window moves to the screen he is on.
 /// - When displays change (lid closed, monitor unplugged), macOS moves windows from the lost
 ///   screen to a remaining one, which can be an agent display. Windows never seen on an agent
 ///   display before the change and on one after are moved back.
@@ -24,6 +26,14 @@ enum WindowGuard {
   /// Windows the companion just put back on the agents' screen, which the guard must not take
   /// for his while he is still in their app.
   private static var returning: [CGWindowID: Date] = [:]
+  /// When an agent last reported acting on each app (harness activity datagrams).
+  private static var agentActedAt: [pid_t: Date] = [:]
+
+  static func agentActed(on pid: pid_t) {
+    let now = Date()
+    agentActedAt = agentActedAt.filter { now.timeIntervalSince($0.value) < Frontmost.agentWindow }
+    agentActedAt[pid] = now
+  }
 
   static func start() {
     NSWorkspace.shared.notificationCenter.addObserver(
@@ -159,8 +169,15 @@ enum WindowGuard {
     let id = windowID(window)
     guard AXUIElementGetPid(window, &pid) == .success, pid == observedPid,
           (axString(window, kAXSubroleAttribute) ?? kAXStandardWindowSubrole) == kAXStandardWindowSubrole,
-          !ownedByAgents(app, window: id), !isReturning(id) else { return }
+          !ownedByAgents(app, window: id), !isReturning(id), inFrontForHim(app) else { return }
     moveToUser(window, app: app)
+  }
+
+  private static func inFrontForHim(_ app: NSRunningApplication) -> Bool {
+    let pid = app.processIdentifier
+    return Frontmost.isHis(appClaimed: Claims.all().contains { $0.pid == pid },
+                           sincePerson: secondsSincePersonInput(),
+                           sinceAgentActed: agentActedAt[pid].map { Date().timeIntervalSince($0) })
   }
 
   // MARK: display changes

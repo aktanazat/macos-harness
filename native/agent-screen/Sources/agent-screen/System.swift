@@ -173,6 +173,21 @@ func windowTitle(_ id: CGWindowID) -> String? {
   serverWindows([.optionIncludingWindow], relativeTo: id).first?.title
 }
 
+// MARK: - Input
+
+/// Seconds since the person at this Mac last pressed a key or used a mouse, trackpad or tablet.
+/// macOS counts an event posted to one process, the way macos-harness sends input, under
+/// kCGAnyInputEventType but never under its own type, so these clocks leave agents' input out
+/// (macos-harness `MacOS._since_person`, measured on macOS 27).
+func secondsSincePersonInput() -> TimeInterval {
+  let kinds: [CGEventType] = [
+    .keyDown, .keyUp, .flagsChanged, .mouseMoved, .scrollWheel,
+    .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .rightMouseUp, .rightMouseDragged,
+    .otherMouseDown, .otherMouseUp, .otherMouseDragged, .tabletPointer, .tabletProximity,
+  ]
+  return kinds.map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }.min() ?? .infinity
+}
+
 // MARK: - Processes
 
 struct ProcessFacts {
