@@ -4,26 +4,110 @@ import Foundation
 import XCTest
 
 final class ClaimsFileTests: XCTestCase {
-  /// Lines as agent-display's Claims.swift writes them: sets in any order, `-` for none.
+  /// Lines as agent-display writes them: sets in any order, `-` for none, `quitting` for an
+  /// app the companion is quitting.
   func testParsesAgentDisplayLines() {
-    let text = "812 4021,977 1 1 77,12\n913 - 0 0 -\nnot a claim\n"
-    XCTAssertEqual(ClaimsFile.parse(text), [
-      Claim(pid: 812, owners: [977, 4021], launched: true, wholeApp: true, windows: [12, 77]),
-      Claim(pid: 913, owners: [], launched: false, wholeApp: false, windows: []),
+    let text = "812 7 4021,977 1 1 77,12\n913 8 - 0 0 -\n914 9 quitting 1 1 3\n-1 5 9 1 1 -\nnot a claim\n"
+    XCTAssertEqual(ClaimsFile.parse(text, startOf: { _ in nil }), [
+      Claim(pid: 812, start: 7, state: .active(owners: [977, 4021]), launched: true, wholeApp: true,
+            windows: [12, 77]),
+      Claim(pid: 913, start: 8, state: .active(owners: []), launched: false, wholeApp: false, windows: []),
+      Claim(pid: 914, start: 9, state: .quitting, launched: true, wholeApp: true, windows: [3]),
     ])
   }
 
   func testWritesWhatItReads() {
-    let claims = [Claim(pid: 5, owners: [9, 3], launched: true, wholeApp: false, windows: [40, 2])]
-    XCTAssertEqual(ClaimsFile.format(claims), "5 3,9 1 0 2,40")
-    XCTAssertEqual(ClaimsFile.parse(ClaimsFile.format(claims)), claims)
+    let claims = [
+      Claim(pid: 5, start: 11, state: .active(owners: [9, 3]), launched: true, wholeApp: false, windows: [40, 2]),
+      Claim(pid: 6, start: 12, state: .quitting, launched: true, wholeApp: true, windows: []),
+    ]
+    XCTAssertEqual(ClaimsFile.format(claims), "5 11 3,9 1 0 2,40\n6 12 quitting 1 1 -")
+    XCTAssertEqual(ClaimsFile.parse(ClaimsFile.format(claims), startOf: { _ in nil }), claims)
+  }
+
+  /// A line agent-display wrote before start times belongs to the process holding its pid now;
+  /// with no such process it is no claim.
+  func testReadsLinesWithoutAStartTime() {
+    let text = "812 4021 1 1 77\n913 - 0 0 -\n"
+    XCTAssertEqual(ClaimsFile.parse(text, startOf: { $0 == 812 ? 44 : nil }), [
+      Claim(pid: 812, start: 44, state: .active(owners: [4021]), launched: true, wholeApp: true, windows: [77]),
+    ])
   }
 
   /// A window an agent app opens later joins its claim and keeps who owns it.
   func testAddingKeepsOwnersAndLaunch() {
-    let prior = [Claim(pid: 5, owners: [9], launched: true, wholeApp: true, windows: [1])]
-    XCTAssertEqual(ClaimsFile.adding(prior, pid: 5, windows: [2], wholeApp: true, launched: false),
-                   [Claim(pid: 5, owners: [9], launched: true, wholeApp: true, windows: [1, 2])])
+    let prior = [Claim(pid: 5, start: 11, state: .active(owners: [9]), launched: true, wholeApp: true, windows: [1])]
+    XCTAssertEqual(ClaimsFile.adding(prior, pid: 5, start: 11, windows: [2], wholeApp: true, launched: false),
+                   [Claim(pid: 5, start: 11, state: .active(owners: [9]), launched: true, wholeApp: true,
+                          windows: [1, 2])])
+  }
+
+  func testAnAppBeingQuitTakesNoMoreWindows() {
+    let prior = [Claim(pid: 5, start: 11, state: .quitting, launched: true, wholeApp: true, windows: [1])]
+    XCTAssertEqual(ClaimsFile.adding(prior, pid: 5, start: 11, windows: [2], wholeApp: true, launched: false), prior)
+  }
+
+  /// The sweep ends a claim only as it read it: an owner who joined since keeps the app.
+  func testEndingRefusesAClaimChangedSinceItWasRead() {
+    let read = Claim(pid: 5, start: 11, state: .active(owners: [9]), launched: true, wholeApp: true, windows: [1])
+    let joined = Claim(pid: 5, start: 11, state: .active(owners: [9, 10]), launched: true, wholeApp: true,
+                       windows: [1])
+    XCTAssertNil(ClaimsFile.ending([joined], read, quitting: true))
+    XCTAssertEqual(ClaimsFile.ending([read], read, quitting: true),
+                   [Claim(pid: 5, start: 11, state: .quitting, launched: true, wholeApp: true, windows: [1])])
+    XCTAssertEqual(ClaimsFile.ending([read], read, quitting: false), [])
+  }
+
+  /// An app that would not quit (a save sheet) is released at the next sweep and is his from then
+  /// on; apps of ended agents are quit; apps with a live owner stay.
+  func testSweepReleasesAnAppThatDidNotQuit() {
+    let stuck = Claim(pid: 5, start: 11, state: .quitting, launched: true, wholeApp: true, windows: [1])
+    let ended = Claim(pid: 6, start: 12, state: .active(owners: [90]), launched: true, wholeApp: true, windows: [2])
+    let live = Claim(pid: 7, start: 13, state: .active(owners: [91]), launched: true, wholeApp: true, windows: [3])
+    XCTAssertEqual(ClaimsFile.sweep([stuck, ended, live], ownerAlive: { $0 == 91 }),
+                   [.release(stuck), .quit(ended)])
+  }
+}
+
+final class ClaimsStoreTests: XCTestCase {
+  private var directory: URL!
+
+  override func setUpWithError() throws {
+    directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  }
+
+  override func tearDownWithError() throws {
+    try FileManager.default.removeItem(at: directory)
+  }
+
+  /// Two writers adding windows to two apps at once keep every window.
+  func testConcurrentWritersLoseNothing() throws {
+    let store = ClaimsStore(directory: directory)
+    let apps = [getpid(), getppid()]
+    let starts = try apps.map { try XCTUnwrap(ProcessStart.of($0)) }
+    DispatchQueue.concurrentPerform(iterations: 2) { n in
+      for i in 0..<200 {
+        store.update { claims in
+          claims = ClaimsFile.adding(claims, pid: apps[n], start: starts[n], windows: [UInt32(n * 1000 + i)],
+                                     wholeApp: true, launched: true)
+        }
+      }
+    }
+    XCTAssertEqual(store.all().map(\.windows.count).sorted(), [200, 200])
+  }
+
+  /// A line for a process that ended, or for an earlier process given the same pid, is no claim
+  /// and goes at the next write.
+  func testOnlyTheClaimedProcessHoldsTheClaim() throws {
+    let start = try XCTUnwrap(ProcessStart.of(getpid()))
+    let lines = "\(getpid()) \(start) 9 1 1 1\n\(getppid()) 1 9 1 1 2\n"
+    try lines.write(to: directory.appendingPathComponent("claims"), atomically: true, encoding: .utf8)
+    let store = ClaimsStore(directory: directory)
+    XCTAssertEqual(store.all().map(\.pid), [getpid()])
+    store.update { _ in }
+    let kept = try String(contentsOf: directory.appendingPathComponent("claims"), encoding: .utf8)
+    XCTAssertEqual(kept, "\(getpid()) \(start) 9 1 1 1")
   }
 }
 
