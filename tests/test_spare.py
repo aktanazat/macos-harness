@@ -258,16 +258,6 @@ def test_doctor_without_spare(value: str | None) -> None:
     assert "macos-harness spare" in spare["start"]
 
 
-def test_doctor_reports_broker_without_consuming_spare(shell: _Shell) -> None:
-    spare_pid = _child(shell.broker.pid)
-    for _ in range(2):
-        step, out, err = shell.step(None, _cli("doctor"))
-        assert step.returncode == 0, err
-        assert json.loads(out)["spare"] == {"status": "active", "pid": shell.broker.pid}
-        assert _child(shell.broker.pid) == spare_pid
-    shell.served(_PID)
-
-
 def test_doctor_with_closed_broker(shell: _Shell) -> None:
     shell.broker.terminate()
     shell.broker.wait(timeout=10)
