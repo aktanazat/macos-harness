@@ -1,47 +1,10 @@
 # Signatures
 
-Parameters after `*` are keyword-only. When a stdin program passes a wrong
-keyword, its `TypeError` ends with the method's real signature; a name
-`mac`, `mac.ax`, or `mac.do` lacks lists the nearest calls.
+Parameters after `*` are keyword-only. A wrong keyword's `TypeError` ends with the real signature.
 
-```python
-frame = mac.see("Spotify")
-mac.key("cmd+k", app="Spotify")
-mac.type("Alessia Cara", app="Spotify")
-mac.click(640, 420, app="Spotify")
+CLI: `macos-harness see APP_OR_PID --path out.png [--window-index 0 | --window-id N]`; `macos-harness run FILE.py [--arg NAME=VALUE ...]` (strings in `args`); `-c 'CODE'`; `--json-errors`; `apps [NAME]`; `state APP [--max-nodes N]`; `menus APP "words"`; `sdef APP`; `files`, `file-info PATH`, `shortcuts [NAME --input F --output F]`.
 
-item = mac.ax.at(640, 420, app="Spotify")
-mac.ax.perform(item["element_index"], "AXPress")
-
-mac.script('tell application "Spotify" to play')
-```
-
-Without a program, `macos-harness see APP_OR_PID --path out.png --window-index 0`
-captures one window and prints the same result as `mac.see`;
-`macos-harness see --window-id N` captures any window.
-
-`macos-harness run FILE.py [--arg NAME=VALUE ...]` runs a saved program the
-way stdin runs one, with each `--arg` as a string in the `args` dict:
-`pid = int(args["pid"])`. A malformed `--arg`, a name given twice, or an
-unreadable or empty file exits 2 before anything runs.
-`macos-harness -c 'print(mac.windows())'` runs one line the same way.
-`--json-errors` goes before or after any command. `macos-harness apps
-[NAME]` prints one JSON line per running app, only those whose name or
-bundle ID contains NAME in any case. `macos-harness state APP` reads 400
-nodes unless `--max-nodes` says more, and says on stderr where it stopped.
-
-## Agent pointers
-
-`MacOS(*, backend=None, agent_id=None)` names a caller's pointer through
-`agent_id`. The CLI accepts `--agent-id NAME` before or after a command;
-`MACOS_HARNESS_AGENT_ID=NAME` applies when no explicit name is given.
-Names contain 1–64 printable characters. Give each parallel agent a
-different name; its color stays the same across processes.
-
-Named pointers mark `ax.set`, `ax.perform`, and `ax.press` when the target
-has a screen frame. `see(show_pointer=True)` draws the same arrow and label;
-the pointer result includes `agent_id`. `hide_pointer()` stays hidden
-until `show_pointer()`; `close()` reaps only the caller's helper.
+`MacOS(*, backend=None, agent_id=None)`; `--agent-id NAME` or `MACOS_HARNESS_AGENT_ID` names the caller's pointer (1–64 chars, one per parallel agent).
 
 ## Primitives
 
@@ -76,235 +39,42 @@ mac.hide_pointer()
 mac.handoff(*, reason, app)
 ```
 
+- `app` takes a name or pid; a name matching several processes warns: pass the pid or `window_id`.
+- Input that takes focus or keys from the person waits for a 450 ms pause in their input; after 2.5 s it raises `timeout`, reason `person_active`, having sent nothing.
+- `see(crop=(x, y, w, h), zoom=2)` captures part of a window; `see(display=0)` or `region=` captures the screen composited, with `shows` listing visible windows.
+- `place` moves/resizes via Accessibility without activating.
+- `mac.scroll`: negative `delta_y` scrolls down; pixels unless `unit="line"`.
+- `mac.menu_index(app)` caches every menu item per app version; `mac.do.menu_search` picks the single best match and refuses ties, submenus, disabled items.
+- `mac.notifications()` lists banners with `actions`; `mac.ax.perform(note["element"], "Close")` dismisses one.
+- One process at a time holds ScreenCaptureKit; others fall back to `screencapture`.
+
 ## AppleScript
 
-`osascript` in a shell borrows that shell's permissions; where the shell's
-app lacks Accessibility, a System Events call fails with `osascript is not
-allowed assistive access (-25211)`. Run the same source through
-`mac.script`, which carries the harness's permission:
+Shell `osascript` lacks the harness's Accessibility (`-25211`); run the source through `mac.script`. Name processes by `unix id`, not name:
 
 ```python
-mac.activate(4242)  # bring a pid forward; falls back to System Events itself
-mac.script('tell application "System Events" to set frontmost of (first process whose unix id is 4242) to true')
-mac.script('tell application "System Events" to get name of every window of (first process whose unix id is 4242)')
 mac.script('tell application "System Events" to click button "OK" of window 1 of (first process whose unix id is 4242)')
 ```
 
-Name a process by `unix id`, not by name: one name such as `wine` can
-cover several processes.
+`mac.sdef(app)` reads the app's dictionary (`commands`, `classes`, `enumerations`) without launching it; none raises `unsupported_op`: use System Events.
 
-`mac.sdef(app)` reads the app's own scripting dictionary from its bundle,
-without launching it, so a script asks for what the app takes: its
-`commands`, each with its `direct` parameter, `parameters`, and `result`;
-its `classes`, each with `properties` (`access` `"r"` is read-only),
-`elements`, and the commands it `responds_to`; and its `enumerations`. An
-app with no dictionary raises `unsupported_op`: drive it through System
-Events. On the command line, `macos-harness sdef Notes`.
+## State and text ids
 
-## Aiming input
-
-`app` takes a name or a pid; `window_id` alone names its owner too. A name
-that fits several processes, such as `"wine"`, adds a `warning` naming
-the other pids to the result of `see`, `click`, `key`, `type`, and
-`activate`; `see`, `key`, and `type` also warn when the app shows several
-windows and the call let one be picked. Pass the pid or `window_id`.
-
-A screenshot point outside the picture raises before anything is sent,
-and a click read off a picture goes to the window it shows.
-
-`key` and `type` return `pid`, `window_id` (the window that took the keys,
-None where accessibility cannot say), `target_is_frontmost`, and a `note`
-when the app was in the background, where some apps ignore posted keys.
-With `window_id`, that window becomes the app's focused window first,
-without bringing the app forward.
-
-Input that would take the focus or the keys of the person at this Mac
-waits for a 450 ms pause in their keyboard, mouse, trackpad, and tablet
-input: `activate` and `ax.set` of `AXFrontmost` for an app behind;
-`click`, `drag`, `key`, `type`, `ax.set` of `AXFocused` or `AXMain`, and
-`ax.press` or `ax.perform` for the app in front; and, in any app, a press
-that opens a menu: `AXShowMenu`, or `AXPress` on a pop-up button, menu
-button, or menu bar item. A press through an agent's handle, which names
-no process, waits only for `AXShowMenu`. With no pause in 2.5s it raises
-`timeout`, reason `person_active`, having sent nothing: try again, or ask
-the person to do that step. A click in the app in front checks again just
-before its events go and sends nothing if the person has started again;
-`activate` skips its Accessibility request when they used the keyboard or
-mouse during AppKit's attempt. Input from any harness run never counts as
-theirs. Other input to an app behind, `AXScrollToVisible`, scrolls, and
-reads never wait.
-
-`see(app, crop=(x, y, w, h))` captures that part of the window, in window
-points; `zoom=2` draws it at twice the screen's pixels per point, still
-inside `max_width` and `max_height`. Click its pixels with
-`screenshot=` as any picture's.
-
-## Menus, panels, and the screen
-
-`mac.windows()` lists every app's normal windows on screen, front to back;
-`all_layers=True` adds menus, popovers, panels, prompts, and the menu bar.
-Each entry has `window_id`, `pid`, `owner`, and `layer`.
-`mac.wait_for_window(app, title="Settings")` waits for the app to start
-and for a window whose title holds `title`; an untitled window off screen,
-a helper surface, does not end the wait. `see(window_id=N)`
-captures any of them and reports its `layer` and owner `pid`. A window's
-picture shows the sheets, popovers, and tips attached to it where they
-cover it; what hangs past the window's edge is cut off there, and
-`see(window_id=N)` pictures that window whole.
-Pointer input picks only a normal window under the point unless
-`window_id=N` names the surface, so a click meant for a panel never lands
-in the window behind it.
-
-`mac.menus(app, "File")` lists the items of the menu a path names, `"File >
-Export"` for a submenu, or with no path the menus in the menu bar: each has
-`title`, `enabled`, `checked`, its full `path` for `do.menu`, and a
-`shortcut` such as `"shift+cmd+s"` when it has one, for `do.key`.
-
-`mac.menu_index(app)` reads every item of the menu bar at once, submenus
-included and the Apple menu left out, without opening a menu: each has
-its `path`, `enabled`, a `shortcut` when it has one, and `submenu` when it
-opens one. It is kept per bundle ID and version under `menus/` in the
-harness's data folder, readable only by you, and read again when the app
-updates or with `refresh=True`; it holds what the menus showed, Safari's
-history included. Safari's 7,300 items take about 2 s the first time and
-30 ms after. `mac.menu_search("tab overview", app="Safari")` ranks items
-by exact title or path, then title prefix, then all words in the title,
-then all words in the path, and checks each against the live menu bar;
-`macos-harness menus Safari "tab overview"` does the same.
-`mac.do.menu_search(text, app=)` chooses the one best match by its
-shortcut when it has one, the keyboard layout types it, and the app is in
-front, else by pressing it; several equal matches, a best match that opens
-a submenu, or a disabled item is refused, and `target` names the `path`
-and `via`.
-
-`mac.notifications()` lists the banners and alerts Notification Center
-shows: each has the `app` that sent it, its `title`, `subtitle`, and
-`body` (None where it shows none as a text of its own; the `description`
-of its `element` joins them all), the `actions` it takes, an alert's
-buttons such as `"Snooze"` among them, and its `element`, a match:
-`mac.ax.perform(note["element"], "Close")` dismisses it, in this run or a
-later one, and brings nothing forward; `"Show"` and `"AXPress"` open the
-app that sent it, and a button's name presses that button. Only the
-newest banner shows at a time, for about five seconds; a closed one
-leaves the list within a second. A read Notification Center cuts short
-raises `ax.error` rather than list less: read again.
-
-`see(display=0)` (0 is the main display) or `see(region=(x, y, w, h))` in
-screen points captures the screen as it shows, every window composited.
-The result has no `app` or `pid`, and its pixels map a later
-`coordinate_space="screenshot"` click for whichever app owns the window
-there. Its `shows` lists the windows in the picture, the most visible
-first, each with `window_id`, `owner`, `pid`, `title`, and the `share` of
-the area it covers; another app's window in front means the picture shows
-it, not what lies behind.
-
-One process at a time keeps ScreenCaptureKit: macOS treats two live
-harness processes on one Python as one client and answers neither. The
-first to capture keeps it until it exits; any other renders through
-`screencapture`, where a window's sheet that hangs past its edge is cut
-off.
-
-`place(app, x=, y=, width=, height=)` moves or resizes window
-`window_index`, or the one `window_id=` names, through Accessibility,
-without bringing it forward, and returns the `frame` the window reports
-afterwards; an app's own limits can make it differ from `requested`. `x`
-and `y` count from the top-left of `display` (0 is the main one). With
-`display` and no `x` or `y`, a window that does not fit on that display,
-such as one at negative coordinates on another, is centered there. A
-minimized window, or one its app will not move or resize, raises
-`unsupported_op` and nothing changes.
-
-## Window state as text
-
-`print(mac.state(app))` lists the focused window, or `window_id`'s, one
-control a line: `[12] button "All Clear"`, a value after `=`, and
-`(disabled)` or `(selected)`. Unlabeled layout groups fold into their
-children, and controls outside the window are counted, not listed. It
-costs fewer tokens than a screenshot, and a later look far fewer, so look
-with it and keep `see` for what the text does not say.
-
-An id names the same control in later runs, for the same `agent_id` and
-the same launch of the app, also after its label changes in place inside
-the window: when Calculator's "All Clear" turns "Clear", it keeps the id
-your last look showed there. A control relabelled outside the window
-takes a new id. Ids belong to one window: the same button in two
-document windows has two ids, and one window's state refuses another's
-id, naming the `window_id` it belongs to; a window without a `window_id`
-is told apart by its title. `state[12]` is its match. Printing a state
-makes it your last look; `state[12]` refuses an id whose line changed
-since that look, as when a row inserted above shifts unlabeled rows or a
-label changed, or that no look you printed showed, as a line outside the
-window, until you print the new state. A state read earlier also refuses
-an id whose line a newer read of its window shows changed:
+`print(mac.state(app))` lists one control a line (`[12] button "All Clear"`). Ids persist across runs for the same `agent_id` and app launch; `state[12]` refuses an id whose line changed since your last printed look. With an `agent_id`, later looks print only changes; `diff=False` prints all. `query=` lists matching lines.
 
 ```python
-print(mac.state("Calculator"))  # [9] button "7", [12] button "Multiply", ...
-s = mac.state("Calculator")      # a later run
-for key in (9, 12, 13, 24):      # 7 × 4 =
+s = mac.state("Calculator")
+for key in (9, 12, 13, 24):
     mac.ax.perform(s[key], "AXPress")
-print(mac.state("Calculator"))
 ```
 
-With an `agent_id` (`MacOS(agent_id=)`, `--agent-id`, or
-`MACOS_HARNESS_AGENT_ID`), the next printed look holds only what changed
-since your last: removed ids, then `~` changed and `+` added lines, or
-`No changes since your last look`. It prints the whole window when that
-is shorter or the last look was incomplete, and `diff=False` always
-does; use it when you no longer remember the window, as after a
-compaction. Without an `agent_id` every look prints the whole window.
-`query="macOS version"` lists the lines holding the phrase, or else any
-word of three letters or more, with their ancestors and small subtrees,
-including controls scrolled away; it leaves the last look alone, and of
-its ids only those it shows count as seen.
-
-`print(mac.text(app))` reads the window's pixels with Apple Vision where
-accessibility names nothing, as in iPhone Mirroring: one line of text a
-row, `[t3] "Continue"`, top to bottom, with `query=` as above. It needs
-Screen Recording and takes about 0.3 s. `text[3]` or `text["t3"]` is a
-match for `click(element=)` and `do.click(element=)` only: the click
-goes to the center of the line's box once that box, captured and read
-again, still shows the line, in the same window, unmoved; otherwise
-nothing is clicked. Ids count lines from the top, so a line appearing
-above gives t3 to another line. Printing a read makes the lines it shows
-your last look, as with `state`; in a later run, `text[3]` refuses an id
-that no longer reads the same at the same place in the window until you
-print the new read:
-
-```python
-print(mac.text("iPhone Mirroring"))  # [t3] "Continue", ...
-t = mac.text("iPhone Mirroring")      # a later run
-mac.do.click(element=t[3], app="iPhone Mirroring")
-```
+`mac.text(app)` OCRs the window (Screen Recording, ~0.3 s) where accessibility names nothing, such as iPhone Mirroring: `text[3]` is a match for `click(element=)` / `do.click(element=)` only.
 
 ## Across runs
 
-`see` keeps a record beside each PNG (`<png>.json`). In a later run,
-`screenshot="<png>"` on `click`, `drag`, `scroll`, `move`, `ax.at`, or
-`do.click` maps that PNG's pixels and targets its app, with no new `see`.
-If the window has moved or closed since, the call raises `window.changed`
-instead.
-
-An element index lasts until the next search in the same run. A match
-lasts longer: pass the match itself (a `query`, `query_all`, or `wait`
-result) as `element_index`. It is found again in its app by role,
-labels, and frame. If it finds no element, or more than one, the call
-raises `element.unknown`.
-
-```python
-match = {"pid": 4512, "role": "AXButton", "title": "Save"}  # printed by a query
-mac.ax.perform(match, "AXPress")
-```
-
-A control that ignores `AXPress`, as a SwiftUI row can, takes a click:
-`click(element=match)` and `do.click(element=match, app=...)` click the
-center of the element's frame once it holds still, in the element's own
-process, in place of `x` and `y`. An element of another app, one with no
-area on screen, one still moving half a second on, or one whose center
-accessibility finds another element over, in the window the click is
-routed to, on two asks a tenth of a second apart, is refused before
-anything is posted; the error names what is there. One of the app's other
-windows over the element, as a floating panel, takes no click and is not
-a reason to refuse.
+- `screenshot="<png>"` on `click`, `drag`, `scroll`, `move`, `ax.at`, `do.click` maps an earlier `see`'s pixels; a moved window raises `window.changed`.
+- Pass a printed match (not an index) to reuse an element later: `mac.ax.perform({"pid": 4512, "role": "AXButton", "title": "Save"}, "AXPress")`; none or several found raises `element.unknown`.
+- A control that ignores `AXPress` (SwiftUI rows) takes `click(element=match)`.
 
 ## Accessibility
 
@@ -320,12 +90,7 @@ mac.ax.wait_gone(text=None, *, app=None, all_apps=False, apps=None, role=None, t
 mac.ax.press(text=None, *, app=None, all_apps=False, apps=None, role=None, title=None, identifier=None, description=None, max_nodes=5000, timeout=5.0, interval=0.1)
 ```
 
-The AX calls also take rarer keywords: `attributes`, `include_actions`,
-`search_key`, `visible_only`, `direction`, `immediate_descendants_only`, and
-`element_index` on `query`. `help(mac.ax.query)` lists them.
-
-`perform` takes an action an app names itself, which accessibility lists
-as `"Name:Close\nTarget:0x0\nSelector:(null)"`, by that name: `"Close"`.
+Rarer keywords: `help(mac.ax.query)`. `perform` takes an app's own action by name (`"Close"`).
 
 ## Receipted operations
 
@@ -353,61 +118,11 @@ mac.do.history()
 mac.timeline()
 ```
 
-Conditions come from `macos_harness.receipts`: `present(...)`, `gone(...)`,
-and `equals(..., value=, attribute="AXValue")`, all three preloaded in a
-program. They take the same selectors as `mac.ax.wait` plus their
-own `timeout` and `interval`. A receipt that acted with nothing confirming
-its effect prints which postcondition would.
-
-`do.key` and `do.type` send nothing when keyboard focus has moved to
-another element since they were prepared (`focus.changed`, reason
-`focus_moved_before_dispatch`, `acted="no"`). Without a postcondition,
-`do.type` into a plain text field is verified once the field shows the
-typed text, with `observed["input"]["landed"]`.
-
-`do.paste` puts its payload on the clipboard, sends cmd+v as `do.key`
-does, and puts back every item and type the clipboard held once the
-focused element shows the paste; `observed["input"]["pasteboard"]` says
-whether it went back. It needs the app in front. `do.open_files` opens
-files in a running app without activating it.
-
-`do.key`, `do.type`, `do.fill`, `do.click`, `do.press`, and `do.toggle`
-wait for the person in the same way when the app is in front, and
-`do.click` waits before it aims; `do.set` of a focus attribute waits as
-`ax.set` does, and a press that opens a menu waits in any app. With no
-pause they fail with `timeout`, reason `person_active`, and `acted="no"`,
-and the `once` token stays free. A `do.fill` whose person started again
-after it focused the field and selected its text fails with `acted="yes"`
-instead: the text stays selected, and its `once` token replays that
-failure.
-
-`do.press(element=state[12], app=)` presses a match it is handed: about
-50 ms against 360 ms for `do.click(element=)`, with no pointer travel, so a
-button in a background window takes it. A match from the latest look takes
-no search; an older one is found again first. A match of another app, of
-an app it cannot tell, or without a press, fails with `acted="no"`.
-
-`do.window("close" | "minimize" | "zoom", app=)` presses that title bar
-button of window `window_index` or `window_id`, then waits until the window
-is gone, off screen, or resized. A close a sheet stops fails with `timeout`:
-"The window stayed: a save prompt is open (Delete, Cancel, Save)", with the
-buttons in `exc.details["buttons"]` for the `do.press` that answers it; any
-other window still there leaves the receipt unverified.
-`do.reveal(match, app=)` scrolls a search match into view and puts its
-`frame` in `observed["input"]`, ready for `click(element=match)`.
-
-`do.steps([{"op": "press", "text": "7"}, {"op": "key", "key": "return"}],
-app=)` sends verbs in order as one call: each step names its verb under
-`"op"` with that verb's own arguments, every step acts on `app=`, and an
-`expect` step's condition is scoped to it. Every step's arguments are
-matched to its verb before the first is sent, and a value the verb refuses
-stops the run at that step; each keeps its own receipt, person pause, input
-lock, and `once` token. The first failure ends the run: later
-steps are not sent and nothing is retried. It returns a `StepsResult`,
-not a receipt: `receipts`, `changes` in the focused window from before the
-first step to right after the last (end with an `expect` step to wait for a
-later effect), and on a failure `stopped_at`, `error`, and `strip`, the
-window's pictures before and after that step and its text.
+- Conditions: `present(...)`, `gone(...)`, `equals(..., value=, attribute="AXValue")` from `macos_harness.receipts` (preloaded).
+- `do.press(element=state[12], app=)` presses a match directly (~50 ms, works in background windows).
+- `do.window("close"|"minimize"|"zoom")` waits for the effect; a save sheet fails with its buttons in `exc.details["buttons"]`.
+- `do.reveal(match)` scrolls a match into view for `click(element=)`.
+- `do.steps([{"op": "press", "text": "7"}, {"op": "key", "key": "return"}], app=)` runs verbs in order, stops at the first failure, returns a `StepsResult`.
 
 ## Routes and diagnostics
 
@@ -426,15 +141,6 @@ mac.sample(app_or_receipt, *, duration=1, timeout=5.0, max_bytes=1048576)
 mac.explain(receipt, *evidence)
 ```
 
-A replay step the person at this Mac kept from sending anything
-(`person_active`, `acted="no"`) is tried again while the route's
-`timeout` lasts, and a recording stays open after such a step. A watched
-route's `secret` step stops the replay with status `handoff`, and it
-diverges before typing into a field that does not have keyboard focus.
-
-`inspect` walks at most 5000 nodes and 25 levels; a larger ask walks the
-cap, and the result's `capped` says what was asked and used.
-
 ## App data
 
 ```text
@@ -447,20 +153,4 @@ mac.data.read_plist(path)
 mac.data.query_sqlite(path, sql, params=(), *, immutable=False)
 mac.data.wait_file(path, *, contains=None, since=None, timeout=10.0)
 mac.data.wait_value(read, expected, *, timeout=10.0)
-```
-
-`macos-harness files [QUERY] [--name] [--kind] [--content] [--onlyin DIR]`
-prints one path a line; `macos-harness file-info PATH` prints JSON;
-`macos-harness shortcuts` lists, and `shortcuts NAME [--input F] [--output F]`
-runs one. What each reads, and how to prove a save: `data-first`.
-
-## Scrolling
-
-`mac.scroll` moves pixels unless `unit="line"`; a negative `delta_y` scrolls
-down. With no `x`/`y` it scrolls the center of the window in the app's last
-screenshot, else of the app's frontmost window:
-
-```python
-mac.see("Finder")
-mac.scroll(-300, app="Finder")
 ```
