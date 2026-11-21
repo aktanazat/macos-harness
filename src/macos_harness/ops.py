@@ -2444,7 +2444,7 @@ class Operations:
         # no `once`, so there is no reservation step here.
         with self._dispatch_lock, host._checked_input(postcondition is not None):
             try:
-                _match, element_index, _app_info, target = self._resolve_target(
+                match, element_index, app_info, target = self._resolve_target(
                     host,
                     builder,
                     app=app,
@@ -2506,6 +2506,23 @@ class Operations:
                     )
                 )
 
+            owner = match.get("app")
+            try:
+                target_pid = int(owner["pid"]) if isinstance(owner, dict) else int(app_info["pid"])
+            except (TypeError, ValueError, KeyError) as exc:
+                pid_error: ErrorPayload = {
+                    "code": ErrorCode.AX_ERROR.value,
+                    "message": f"Resolved target's owning app has a malformed pid: {exc}",
+                    "details": {},
+                }
+                return self._finish(
+                    builder.build(
+                        outcome=Outcome.FAILED, acted=Acted.NO, changed=False, verified=False,
+                        target=target, observed=_value_summary(before), error=pid_error,
+                    )
+                )
+
+            frontmost_before = None if deadline.exhausted() else host._frontmost_app()
             if deadline.exhausted():
                 return self._finish(
                     builder.build(
@@ -2526,6 +2543,18 @@ class Operations:
                     builder.build(
                         outcome=Outcome.FAILED, acted=Acted.NO if unsent else Acted.UNKNOWN,
                         changed=False if unsent else None, verified=False,
+                        target=target, observed=_value_summary(before), error=exc.to_json(),
+                    )
+                )
+
+            # An `AXFocused` or `AXMain` set can bring the app forward, as the
+            # press behind `toggle` can.
+            try:
+                host._guard_focus(frontmost_before, target_pid, "mac.do.set")
+            except FocusChangedError as exc:
+                return self._finish(
+                    builder.build(
+                        outcome=Outcome.FAILED, acted=Acted.YES, changed=None, verified=False,
                         target=target, observed=_value_summary(before), error=exc.to_json(),
                     )
                 )
