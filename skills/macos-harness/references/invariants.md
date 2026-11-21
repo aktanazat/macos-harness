@@ -31,7 +31,6 @@ After a failed verified burst, switch mode or stop; never repeat keys, clicks or
 - An inactive app drops menu shortcuts (`cmd+a`) and the first click in text views; the result's `target_is_frontmost` and `note` say so. Fix: `mac.activate(app)` first or `mac.do.press`.
 - `mac.type` into an inactive app sends one character per 10 ms; `mac.do.type` caps at 4096 chars; use `mac.do.paste` (front app only) for long text.
 - Input to one app is serialized across harness processes (`app_input_busy` after the wait). Pass `window_id` on `key`/`type` when other runs may share the app.
-- Never launch a closed app or use a URL scheme when focus is forbidden.
 
 ## Screenshots and windows
 

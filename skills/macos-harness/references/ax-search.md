@@ -36,4 +36,3 @@ Results carry `complete` and `visited`. A limit, failed read or skipped process 
 
 - Element indexes and screenshots last one run; an index only until the next search. Pass matches across runs; twins raise naming each `window_id`: `{**match, "window_id": id}`.
 - AXError -25204 (app did not answer) may still have acted: look before retrying. An element gone right after its action counts as done.
-- None of this gets past Touch ID, passkeys, CAPTCHA or recovery: `mac.handoff`.
