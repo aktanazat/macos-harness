@@ -3072,6 +3072,36 @@ def test_set_dispatch_failure_is_ambiguous_not_confirmed() -> None:
     assert host.set_calls == 1
 
 
+class _FocusPullingHost(FakeHost):
+    """Another app is in front until an `AXFocused` set brings Demo (pid 41)
+    forward, as a real app does; the real guard judges it."""
+
+    _guard_focus = MacOS._guard_focus
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.front: dict[str, object] = {"pid": 99, "name": "Notes", "bundle_id": "com.apple.Notes"}
+
+    def set(self, element_index: int, value: object, attribute: str = "AXValue") -> None:
+        super().set(element_index, value, attribute)
+        if attribute == "AXFocused" and value is True:
+            self.front = dict(self.app_info)
+
+    def _frontmost_app(self) -> dict[str, object]:
+        return dict(self.front)
+
+
+def test_set_that_pulls_the_app_forward_reports_the_focus_change() -> None:
+    host = _FocusPullingHost()
+    operations = Operations(host, _sleep=lambda _seconds: None)
+
+    error = _failed(lambda: operations.set(True, app="Demo", text="Field", attribute="AXFocused"))
+
+    assert error.code == ErrorCode.FOCUS_CHANGED
+    assert error.receipt.acted is Acted.YES
+    assert host.set_calls == 1
+
+
 def test_press_action_failure_is_ambiguous_not_confirmed() -> None:
     host, operations = _ops()
     host.press_results.append(MacOSError("press failed", code=ErrorCode.AX_ERROR))
