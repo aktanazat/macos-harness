@@ -796,8 +796,17 @@ final class AXExecutor {
   }
 
   /// Wakes `pid` if the agent screen companion paused it (SIGSTOP) to save battery: a stopped
-  /// app answers no Accessibility call. SIGCONT does nothing to a running process.
+  /// app answers no Accessibility call. SIGCONT does nothing to a running process. The mark
+  /// touched first in `~/.agent-display/acting`, as `_resume` in `macos.py` does, tells the
+  /// companion an agent is about to act on `pid`, so a pause it takes meanwhile undoes itself.
   private static func resume(_ pid: pid_t) {
+    let mark = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent(".agent-display/acting/\(pid)").path
+    let fd = open(mark, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
+    if fd >= 0 {
+      futimes(fd, nil)
+      close(fd)
+    }
     kill(pid, SIGCONT)
   }
 

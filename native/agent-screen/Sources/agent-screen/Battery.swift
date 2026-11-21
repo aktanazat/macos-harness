@@ -5,10 +5,14 @@ import IOKit.ps
 /// Goes easy on the battery: on battery power or a serious thermal state, the peek refreshes
 /// less often and agent-launched apps left idle in the background are paused (SIGSTOP). They
 /// resume on power, when he brings one forward or grabs its window, and when an agent acts on
-/// one (agent-display and macos-harness also send SIGCONT before acting on a pid).
+/// one: agent-display and macos-harness touch `acting/<pid>`, then send SIGCONT, before acting
+/// on a pid. A pause re-reads that mark after SIGSTOP and undoes itself when an agent touched it
+/// since the idle check, so no agent's SIGCONT lands before a pause that then sticks; a mark
+/// newer than a pause means an agent woke the app.
 enum Battery {
   private(set) static var saving = false
-  private static var paused: Set<pid_t> = []
+  /// Apps this companion paused, and when.
+  private static var paused: [pid_t: Date] = [:]
   private static var activity = WindowActivity()
   private static var sweepTimer: Timer?
   /// Called on the main queue when `saving` changes.
@@ -16,12 +20,19 @@ enum Battery {
 
   /// Pids this companion paused, kept on disk so a restarted companion resumes them.
   private static var pausedFile: URL { AgentDisplay.stateDir.appendingPathComponent("paused") }
+  private static var actingDir: URL { AgentDisplay.stateDir.appendingPathComponent("acting", isDirectory: true) }
 
-  /// Resumes the apps a previous companion paused and left paused (it crashed or was killed).
+  /// Resumes the apps a previous companion paused and left paused (it crashed or was killed),
+  /// and forgets the wake marks of processes that ended.
   static func resumeLeftovers() {
     let left = ((try? String(contentsOf: pausedFile, encoding: .utf8)) ?? "").split(whereSeparator: \.isNewline)
     for pid in left.compactMap({ pid_t($0) }) { kill(pid, SIGCONT) }
     persist()
+    try? FileManager.default.createDirectory(at: actingDir, withIntermediateDirectories: true)
+    for name in (try? FileManager.default.contentsOfDirectory(atPath: actingDir.path)) ?? [] {
+      if let pid = pid_t(name), kill(pid, 0) == 0 { continue }
+      try? FileManager.default.removeItem(at: actingDir.appendingPathComponent(name))
+    }
   }
 
   static func start() {
@@ -65,37 +76,61 @@ enum Battery {
   }
 
   static func resume(_ pid: pid_t) {
-    guard paused.remove(pid) != nil else { return }
+    guard let at = paused.removeValue(forKey: pid) else { return }
     kill(pid, SIGCONT)
     activity.touch(pid, at: Date())
     persist()
+    guard !wokenByAgent(pid, since: at) else { return }
     log("resumed \(NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)")")
   }
 
   static func resumeAll() {
-    for pid in paused { kill(pid, SIGCONT) }
-    paused = []
+    for pid in paused.keys { kill(pid, SIGCONT) }
+    paused = [:]
     persist()
   }
 
   private static func sweep() {
     let now = Date()
+    for (pid, at) in paused where wokenByAgent(pid, since: at) {
+      // The agent that marked it may have died before its SIGCONT.
+      kill(pid, SIGCONT)
+      paused[pid] = nil
+      activity.touch(pid, at: now)
+    }
     let claims = Claims.all().filter(\.launched)
     let launched = claims.map(\.pid)
     let signatures = windowSignatures(Set(launched))
     for pid in launched { activity.observe(pid, signature: signatures[pid] ?? 0, at: now) }
     activity.keep(Set(launched))
+    var acting: [pid_t: Date] = [:]
+    for pid in launched { acting[pid] = lastActing(pid) }
     let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
     let grabbed = Set(Grabs.book.grabs.map(\.pid))
-    let apps = claims.filter { !paused.contains($0.pid) }.map { c in
+    let apps = claims.filter { paused[$0.pid] == nil }.map { c in
       Power.App(pid: c.pid, launched: true, frontmost: c.pid == front, grabbed: grabbed.contains(c.pid),
-                hasUserWindow: hasUserWindow(c), lastActivity: activity.last(c.pid) ?? now)
+                hasUserWindow: hasUserWindow(c),
+                lastActivity: max(activity.last(c.pid) ?? now, acting[c.pid] ?? .distantPast))
     }
     for pid in Power.toPause(apps, now: now) where kill(pid, SIGSTOP) == 0 {
-      paused.insert(pid)
+      guard lastActing(pid) == acting[pid] else {
+        kill(pid, SIGCONT)
+        continue
+      }
+      paused[pid] = now
       log("paused \(NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)"): idle 10 min on battery")
     }
     persist()
+  }
+
+  /// When an agent last marked `pid` as about to act on it.
+  private static func lastActing(_ pid: pid_t) -> Date? {
+    let path = actingDir.appendingPathComponent(String(pid)).path
+    return (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+  }
+
+  private static func wokenByAgent(_ pid: pid_t, since pause: Date) -> Bool {
+    lastActing(pid).map { $0 > pause } ?? false
   }
 
   /// Whether the app has a window off the agent displays that the agents never claimed, as the
@@ -126,7 +161,7 @@ enum Battery {
   }
 
   private static func persist() {
-    let text = paused.map(String.init).joined(separator: "\n")
+    let text = paused.keys.map(String.init).joined(separator: "\n")
     try? text.write(to: pausedFile, atomically: true, encoding: .utf8)
   }
 
