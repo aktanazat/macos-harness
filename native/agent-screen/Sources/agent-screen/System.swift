@@ -217,14 +217,12 @@ func agentHost(of pid: pid_t) -> (pid: pid_t, name: String)? {
 
 // MARK: - Claims
 
-/// The claims file agent-display keeps, read and written as it does.
+/// The claims file agent-display keeps, shared through `ClaimsStore`.
 enum Claims {
-  private static var url: URL { AgentDisplay.stateDir.appendingPathComponent("claims") }
+  private static var store: ClaimsStore { ClaimsStore(directory: AgentDisplay.stateDir) }
 
-  /// Live claims; a claim ends when its app exits.
-  static func all() -> [Claim] {
-    ClaimsFile.parse((try? String(contentsOf: url, encoding: .utf8)) ?? "").filter { kill($0.pid, 0) == 0 }
-  }
+  /// Live claims; a claim ends when its process exits.
+  static func all() -> [Claim] { store.all() }
 
   static func owns(_ pid: pid_t, window: CGWindowID?) -> Bool {
     guard let window else { return false }
@@ -232,12 +230,20 @@ enum Claims {
   }
 
   static func add(_ pid: pid_t, windows: Set<CGWindowID>, wholeApp: Bool, launched: Bool) {
-    save(ClaimsFile.adding(all(), pid: pid, windows: windows, wholeApp: wholeApp, launched: launched))
+    guard let start = ProcessStart.of(pid) else { return }
+    store.update { claims in
+      claims = ClaimsFile.adding(claims, pid: pid, start: start, windows: windows, wholeApp: wholeApp,
+                                 launched: launched)
+    }
   }
 
-  static func remove(_ pid: pid_t) { save(all().filter { $0.pid != pid }) }
-
-  private static func save(_ claims: [Claim]) {
-    try? ClaimsFile.format(claims).write(to: url, atomically: true, encoding: .utf8)
+  /// Removes `claim`, or marks it quitting, when no other writer changed it since it was read.
+  @discardableResult
+  static func end(_ claim: Claim, quitting: Bool) -> Bool {
+    store.update { claims in
+      guard let ended = ClaimsFile.ending(claims, claim, quitting: quitting) else { return false }
+      claims = ended
+      return true
+    } == true
   }
 }

@@ -72,18 +72,36 @@ enum WindowGuard {
     return moved
   }
 
+  /// An agent that joins a claim after this read changes it, so `Claims.end` refuses and the
+  /// app stays; one that comes after the mark finds it quitting and starts a fresh copy.
   private static func quitAppsOfEndedAgents() {
-    for c in Claims.all() where !c.owners.isEmpty && c.owners.allSatisfy({ kill($0, 0) != 0 }) {
-      Claims.remove(c.pid)
-      guard c.launched, let app = NSRunningApplication(processIdentifier: c.pid) else { continue }
-      Battery.resume(c.pid)
-      if axWindows(c.pid).contains(where: { windowID($0).map(c.windows.contains) != true }) {
-        log("left \(app.localizedName ?? "pid \(c.pid)") open: the user has his own windows in it")
-        continue
+    for step in ClaimsFile.sweep(Claims.all(), ownerAlive: { kill($0, 0) == 0 }) {
+      switch step {
+      case .release(let c):
+        if Claims.end(c, quitting: false) {
+          log("left \(NSRunningApplication(processIdentifier: c.pid)?.localizedName ?? "pid \(c.pid)") open: it did not quit")
+        }
+      case .quit(let c):
+        quit(c)
       }
-      app.terminate()
-      log("quit \(app.localizedName ?? "pid \(c.pid)"): the agents that opened it have finished")
     }
+  }
+
+  private static func quit(_ c: Claim) {
+    guard c.launched, let app = NSRunningApplication(processIdentifier: c.pid) else {
+      Claims.end(c, quitting: false)
+      return
+    }
+    Battery.resume(c.pid)
+    if axWindows(c.pid).contains(where: { windowID($0).map(c.windows.contains) != true }) {
+      if Claims.end(c, quitting: false) {
+        log("left \(app.localizedName ?? "pid \(c.pid)") open: the user has his own windows in it")
+      }
+      return
+    }
+    guard Claims.end(c, quitting: true) else { return }
+    app.terminate()
+    log("quit \(app.localizedName ?? "pid \(c.pid)"): the agents that opened it have finished")
   }
 
   // MARK: frontmost app
