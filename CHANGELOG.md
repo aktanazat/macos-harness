@@ -13,8 +13,8 @@ follows [Semantic Versioning](https://semver.org/).
   entry, and to send any to macOS's sign-in and authorization prompts or a
   password manager. The refusal comes before any key, focus change or
   clipboard write (`unsupported_op`, reason `secure_input_in_app`,
-  `secure_input_elsewhere` or `secret_keeper_app`). `mac.script` is not
-  covered.
+  `secure_input_elsewhere` or `secret_keeper_app`). `mac.script` and
+  `mac.do.run` are not covered.
   Ideas from [sur-cai/macos-computer-use-kit](https://github.com/sur-cai/macos-computer-use-kit)
   and [uoox/amcu](https://github.com/uoox/amcu).
 
