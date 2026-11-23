@@ -105,6 +105,13 @@ func agentDisplays() -> [CGDirectDisplayID] {
   return AgentDisplay.all().map(\.displayID).filter(active.contains)
 }
 
+/// The agents' screen: the agent display named "Agents", when it is on. Other agent displays
+/// (test displays, ones under agent-display's default name) are never it.
+func agentsDisplay() -> CGDirectDisplayID? {
+  guard let id = AgentDisplay.all().first(where: { $0.name == "Agents" })?.displayID else { return nil }
+  return activeDisplays().contains(id) ? id : nil
+}
+
 func displayFor(point p: CGPoint) -> CGDirectDisplayID? {
   activeDisplays().first { CGDisplayBounds($0).contains(p) }
 }
@@ -173,6 +180,21 @@ func windowTitle(_ id: CGWindowID) -> String? {
   serverWindows([.optionIncludingWindow], relativeTo: id).first?.title
 }
 
+// MARK: - Input
+
+/// Seconds since the person at this Mac last pressed a key or used a mouse, trackpad or tablet.
+/// macOS counts an event posted to one process, the way macos-harness sends input, under
+/// kCGAnyInputEventType but never under its own type, so these clocks leave agents' input out
+/// (macos-harness `MacOS._since_person`, measured on macOS 27).
+func secondsSincePersonInput() -> TimeInterval {
+  let kinds: [CGEventType] = [
+    .keyDown, .keyUp, .flagsChanged, .mouseMoved, .scrollWheel,
+    .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .rightMouseUp, .rightMouseDragged,
+    .otherMouseDown, .otherMouseUp, .otherMouseDragged, .tabletPointer, .tabletProximity,
+  ]
+  return kinds.map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }.min() ?? .infinity
+}
+
 // MARK: - Processes
 
 struct ProcessFacts {
@@ -210,14 +232,12 @@ func agentHost(of pid: pid_t) -> (pid: pid_t, name: String)? {
 
 // MARK: - Claims
 
-/// The claims file agent-display keeps, read and written as it does.
+/// The claims file agent-display keeps, shared through `ClaimsStore`.
 enum Claims {
-  private static var url: URL { AgentDisplay.stateDir.appendingPathComponent("claims") }
+  private static var store: ClaimsStore { ClaimsStore(directory: AgentDisplay.stateDir) }
 
-  /// Live claims; a claim ends when its app exits.
-  static func all() -> [Claim] {
-    ClaimsFile.parse((try? String(contentsOf: url, encoding: .utf8)) ?? "").filter { kill($0.pid, 0) == 0 }
-  }
+  /// Live claims; a claim ends when its process exits.
+  static func all() -> [Claim] { store.all() }
 
   static func owns(_ pid: pid_t, window: CGWindowID?) -> Bool {
     guard let window else { return false }
@@ -225,12 +245,20 @@ enum Claims {
   }
 
   static func add(_ pid: pid_t, windows: Set<CGWindowID>, wholeApp: Bool, launched: Bool) {
-    save(ClaimsFile.adding(all(), pid: pid, windows: windows, wholeApp: wholeApp, launched: launched))
+    guard let start = ProcessStart.of(pid) else { return }
+    store.update { claims in
+      claims = ClaimsFile.adding(claims, pid: pid, start: start, windows: windows, wholeApp: wholeApp,
+                                 launched: launched)
+    }
   }
 
-  static func remove(_ pid: pid_t) { save(all().filter { $0.pid != pid }) }
-
-  private static func save(_ claims: [Claim]) {
-    try? ClaimsFile.format(claims).write(to: url, atomically: true, encoding: .utf8)
+  /// Removes `claim`, or marks it quitting, when no other writer changed it since it was read.
+  @discardableResult
+  static func end(_ claim: Claim, quitting: Bool) -> Bool {
+    store.update { claims in
+      guard let ended = ClaimsFile.ending(claims, claim, quitting: quitting) else { return false }
+      claims = ended
+      return true
+    } == true
   }
 }

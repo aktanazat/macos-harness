@@ -29,7 +29,7 @@ import ApplicationServices as AS
 import objc
 
 from .errors import AccessibilityPermissionError, ErrorCode, MacOSError
-from .macos import _KEYCODES, _SECURE_SUBROLE, MacOS
+from .macos import _KEYCODES, _SECURE_SUBROLE, MacOS, _secure_input_holder
 from .ops import _MAX_TYPE_CHARS, _Deadline
 from .receipts import (
     Equals,
@@ -73,9 +73,6 @@ _CLIMB = 6
 _MAX_STEPS = 64
 _STOP_KEY = _KEYCODES["."]
 _STOP_FLAGS = AS.kCGEventFlagMaskControl | AS.kCGEventFlagMaskAlternate | AS.kCGEventFlagMaskCommand
-# The session names the process that turned on secure keyboard entry; while
-# it is on, no event tap sees a key, the stop hotkey included.
-_SECURE_INPUT = "kCGSSessionSecureInputPID"
 _MODIFIERS = (
     ("cmd", AS.kCGEventFlagMaskCommand),
     ("ctrl", AS.kCGEventFlagMaskControl),
@@ -198,11 +195,6 @@ def _point(event: _Event) -> tuple[float, float]:
 
 def _focused(target: _Locator) -> Equals:
     return Equals(**target.query(), attribute="AXFocused", value=True)
-
-
-def _secure_input_holder() -> int | None:
-    holder = (AS.CGSessionCopyCurrentDictionary() or {}).get(_SECURE_INPUT)
-    return None if holder is None else int(holder)
 
 
 class _Watcher:

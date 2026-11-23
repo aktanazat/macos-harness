@@ -66,3 +66,22 @@ def test_steps_matches_every_step_to_its_verb_before_sending_the_first() -> None
         operations.steps([{"op": "press", "text": "Save"}, {"op": "press", "txt": "Save"}], app="Demo")
 
     assert host.press_calls == []
+
+
+def test_steps_stops_at_a_type_step_refused_under_secure_input() -> None:
+    host = _StepsHost()
+    host.secret_refusal = MacOSError(
+        "type refuses to send text while the app it targets holds secure keyboard entry",
+        code=ErrorCode.UNSUPPORTED_OP,
+        details={"reason": "secure_input_in_app", "operation": "type", "pid": 41, "holder_pid": 41},
+    )
+
+    result = Operations(host, _sleep=lambda _seconds: None).steps(
+        [{"op": "type", "text": "dummy"}, {"op": "key", "key": "return"}], app="Demo"
+    )
+    if isinstance(result.strip, tuple):
+        shutil.rmtree(result.strip[-1].parent)
+
+    assert (result.status, result.stopped_at) == ("stopped", 0)
+    assert result.receipts[0].error["details"]["reason"] == "secure_input_in_app"
+    assert (host.type_calls, host.key_calls) == ([], [])

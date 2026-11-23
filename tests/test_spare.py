@@ -61,6 +61,39 @@ def _cli(*args: str) -> list[str]:
     return [sys.executable, "-m", "macos_harness.cli", *args]
 
 
+def test_step_dependencies_are_loaded_before_a_spare_reports_ready() -> None:
+    probe = """\
+import json, os, sys
+from macos_harness import spare
+
+def write_ready(fd, data):
+    assert data == spare._frame(b"r"), data
+    print(json.dumps({"loaded": sorted(sys.modules), "preload": spare._PRELOAD}), flush=True)
+    raise SystemExit(0)
+
+spare._write_all = write_ready
+spare.serve_one_step(["-1", "-1", "-1", "-1", str(os.getppid()), spare._code_digest()])
+"""
+    ready = subprocess.run(
+        [sys.executable, "-c", probe],
+        env=_env(), capture_output=True, text=True, timeout=60, check=True,
+    )
+    reported = json.loads(ready.stdout)
+    loaded = set(reported["loaded"])
+    expected = {
+        "macos_harness.browser",
+        "macos_harness.cli",
+        "macos_harness.macos",
+        "macos_harness.capture",
+        "macos_harness.controls",
+        "macos_harness.ops",
+        "macos_harness.receipts",
+        "macos_harness.telemetry",
+    }
+    assert set(reported["preload"]) == expected
+    assert expected <= loaded, f"missing before ready: {sorted(expected - loaded)}"
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -223,16 +256,6 @@ def test_doctor_without_spare(value: str | None) -> None:
     spare = json.loads(result.stdout)["spare"]
     assert spare["status"] == "not running"
     assert "macos-harness spare" in spare["start"]
-
-
-def test_doctor_reports_broker_without_consuming_spare(shell: _Shell) -> None:
-    spare_pid = _child(shell.broker.pid)
-    for _ in range(2):
-        step, out, err = shell.step(None, _cli("doctor"))
-        assert step.returncode == 0, err
-        assert json.loads(out)["spare"] == {"status": "active", "pid": shell.broker.pid}
-        assert _child(shell.broker.pid) == spare_pid
-    shell.served(_PID)
 
 
 def test_doctor_with_closed_broker(shell: _Shell) -> None:

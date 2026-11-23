@@ -1,91 +1,69 @@
 ---
 name: macos-harness
-description: "Drive native or Electron macOS apps, dialogs, menus, file prompts, or cross-app steps. Web pages: safari skill. For Mac-control code, read only the needed reference."
+description: "Drive native/Electron macOS apps, dialogs, menus, file prompts, cross-app steps. Web: safari skill."
 ---
 
 # macOS Harness
 
-In OMP, pick `mac_*` tools unasked; otherwise Python.
-Never put secrets in tool arguments: `credentials`.
+In OMP use the `mac_*` tools; otherwise Python. Never put secrets in tool arguments: `credentials`.
 
-One synchronous call per decision. Preloaded: `mac`, `Path`, `subprocess`,
-`present`, `gone`. `-c CODE`: one line; `run flow.py`: a file.
-`--agent-id NAME`: pointer name and state diffs. After compaction:
-`macos-harness skill signatures`.
+One synchronous call per decision. Preloaded: `mac`, `Path`, `subprocess`, `present`, `gone`. `-c CODE` one line; `run flow.py` a file; `--agent-id NAME` for pointer and state diffs. After compaction: `macos-harness skill signatures`.
 
-Default: spare per bash shell:
+Start a spare once per bash shell (zsh: `spare`):
 
 ```bash
 coproc SPARE { macos-harness spare; }; export MACOS_HARNESS_SPARE="${SPARE[0]},${SPARE[1]}"
 ```
 
-Stdin steps use it when ready, with nonterminal output;
-also `run flow.py </dev/null`. Close the shell to stop.
-[spare](references/spare.md): zsh, fallbacks.
+```bash
+macos-harness <<'PY'
+print(mac.see("Finder"))
+PY
+```
 
-In omp, `tool.read` the PNG.
+In omp, `tool.read` the PNG. Bundle reversible steps and verify once at the end; stop only for unclear identity, an irreversible action, or unexpected state.
 
-Bundle reversible steps; verify once at the end. Stop only for unclear
-identity, an irreversible action, or unexpected state.
+## Verbs
 
-## Seven verbs
-
-- `mac.state(app)`: the window as text, then only changes; `state[id]` is a match.
+- `mac.state(app)`: window as text, then only changes; `state[id]` is a match.
 - `mac.see(app)`: capture a window; clicks map through the latest or `screenshot=<png>`.
-- `mac.key("cmd+k", app=...)`: a key or combo.
-- `mac.type(text, app=...)`: typed text.
-- `mac.click(x, y, app=...)`: a click at screenshot points, or `element=match`.
-- `mac.ax.query/wait/press(text, role=..., app=...)`: find, await, press; keep matches, not indexes.
+- `mac.key("cmd+k", app=)`, `mac.type(text, app=)`, `mac.click(x, y, app=)` or `element=match`.
+- `mac.ax.query/wait/press(text, role=, app=)`: keep matches, not indexes.
 - `mac.script(source)`: AppleScript with the harness's Accessibility.
-
-`mac.windows(all_layers=True)` lists menus and panels for `window_id=`;
-`see(display=0)` or a `region=` replaces `screencapture`.
-
-`mac.launch(app)` opens unfocused, awaiting its window.
-Never `sleep`: `mac.wait_change(app)` returns once the window changed and
-settled; `see(app, after_change=True)` waits first.
+- `mac.windows(all_layers=True)` lists menus and panels for `window_id=`; `see(display=0)` or `region=` replaces `screencapture`.
+- `mac.launch(app)` opens unfocused. Never `sleep`: `mac.wait_change(app)` or `see(app, after_change=True)`.
 
 ## Receipts
 
-For a change, use `mac.do.press/set/fill/type/menu/...`;
-`mac.menu_search(text, app=)` finds any menu item. Each returns a
-`Receipt` or raises `OperationError` with `exc.receipt`. `postcondition=`
-proves the effect; `once=` guards an action you cannot repeat. Await the
-next control in one program:
+Changes go through `mac.do.press/set/fill/type/menu/...`; `mac.menu_search(text, app=)` finds any menu item. Each returns a `Receipt` or raises `OperationError` (`exc.receipt`). `postcondition=` proves the effect; `once=` guards an action you cannot repeat.
 
 ```python
 mac.do.menu("Product > Archive", app="Xcode")
 mac.ax.wait("Distribute App", role="button", app="Xcode", timeout=600)
 ```
 
-## Focus invariants
+## Focus
 
-- Input goes to a running app's process; only `mac.activate(app)` brings it forward.
-- A target that comes forward itself raises `FocusChangedError`; never move focus back.
+- Only `mac.activate(app)` brings an app forward. A target that comes forward itself raises `FocusChangedError`; never move focus back.
 - Never launch a closed app or open a URL scheme when focus is forbidden.
 - After one verified failure, switch mode or stop; never repeat keys or clicks.
-- Never close or quit what you did not open: `invariants`.
+- Never close or quit what you did not open.
 
-## Handoff and credentials
-
-At Touch ID, a passkey, a CAPTCHA, a code, or a sign-in approval,
-print `mac.handoff(reason="authentication_required", app=...)` and end the turn.
-Passwords, a VM's too, web pages: `credentials`.
-
-`macos-harness doctor` only after a permission or connection error.
+Touch ID, passkey, CAPTCHA, code or sign-in approval: print `mac.handoff(reason="authentication_required", app=...)` and end the turn. `macos-harness doctor` only after a permission or connection error.
 
 ## References
 
 `macos-harness skill <name>`:
 
-- `signatures`: signatures
+- `signatures`: every call and its arguments
 - `receipts`: outcomes, errors, once tokens, logs
-- `ax-search`: roles, scopes, waits
+- `ax-search`: roles, scopes, matching, waits
 - `invariants`: cleanup, focus, input, windows
 - `routes`: saved navigation
-- `data-first`: read data first; prove saves
-- `diagnostics`: inspect a failure first
+- `data-first`: read app data; prove saves
+- `diagnostics`: inspect a failure
 - `handoff`: the call and what follows
 - `credentials`: logins, permissions
-- `native-backend`: an optional backend
+- `native-backend`: optional backend
 - `vm`: apps off the user's screen
+- `spare`: zsh, fallbacks

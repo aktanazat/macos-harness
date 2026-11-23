@@ -7,6 +7,17 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `mac.type`, `mac.key`, `mac.set` with text and `mac.do.type`, `key`,
+  `fill`, `paste`, `set` and `steps` refuse to send
+  text or keys while any app, the target included, holds secure keyboard
+  entry, and to send any to macOS's sign-in and authorization prompts or a
+  password manager. The refusal comes before any key, focus change or
+  clipboard write (`unsupported_op`, reason `secure_input_in_app`,
+  `secure_input_elsewhere` or `secret_keeper_app`). `mac.script` is not
+  covered.
+  Ideas from [sur-cai/macos-computer-use-kit](https://github.com/sur-cai/macos-computer-use-kit)
+  and [uoox/amcu](https://github.com/uoox/amcu).
+
 - `native/agent-screen`, a menu bar companion for agents' hidden virtual
   display: it keeps your windows off it and the display in the corner,
   peeks at it with each window labelled by its agent, each agent's arrow,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -31,6 +32,9 @@ from macos_harness.macos import (
 from macos_harness.native import NativeQueryResult
 from macos_harness.ops import Operations
 from macos_harness.receipts import Acted, Postcondition, equals, gone, present
+
+# Read at import, before the autouse `no_secure_input` fixture swaps it out.
+real_secure_input_holder = macos_module._secure_input_holder
 
 
 def _on_screen_windows(monkeypatch, *windows: tuple[int | float, ...]) -> list[dict[str, object]]:
@@ -2585,6 +2589,9 @@ def _typing_fakes(monkeypatch, mac: MacOS, *, frontmost_pid: int) -> tuple[list,
     monkeypatch.setattr(mac, "_pid", lambda app: 42)
     monkeypatch.setattr(mac, "_frontmost_app", lambda: {"name": "Front", "pid": frontmost_pid})
     monkeypatch.setattr(mac, "_post", lambda event, pid: posted.append((event, pid)))
+    monkeypatch.setattr(mac, "_application_with_pid", lambda pid: None)
+    monkeypatch.setattr(mac, "_running_applications", list)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: None)
     monkeypatch.setattr(macos_module.time, "sleep", sleeps.append)
     monkeypatch.setattr(
         macos_module.AS,
@@ -2704,6 +2711,191 @@ def test_typing_into_the_app_in_front_sends_nothing_while_the_person_never_pause
     assert refused.value.details["reason"] == "person_active"
     assert posted == []
     assert mac.ms == 2500
+
+
+class _RunningApp:
+    def __init__(self, bundle_id: str, name: str, pid: int = 42) -> None:
+        self._bundle_id, self._name, self._pid = bundle_id, name, pid
+
+    def processIdentifier(self) -> int:
+        return self._pid
+
+    def bundleIdentifier(self) -> str:
+        return self._bundle_id
+
+    def localizedName(self) -> str:
+        return self._name
+
+
+def test_type_sends_nothing_while_another_app_holds_secure_keyboard_entry(monkeypatch) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=7)
+    apps = {42: _RunningApp("com.apple.TextEdit", "TextEdit"), 77: _RunningApp("com.apple.Terminal", "Terminal")}
+    monkeypatch.setattr(mac, "_application_with_pid", apps.get)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 77)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.type("hunter2", app="TextEdit")
+
+    assert refused.value.code == ErrorCode.UNSUPPORTED_OP.value
+    assert refused.value.details == {
+        "reason": "secure_input_elsewhere", "operation": "type", "pid": 42,
+        "holder_pid": 77, "holder": "Terminal",
+    }
+    assert "hunter2" not in str(refused.value)
+    assert posted == []
+
+
+def test_type_sends_nothing_while_the_app_itself_holds_secure_keyboard_entry(monkeypatch) -> None:
+    """A hidden-answer prompt in the target app holds secure entry itself:
+    its password field has focus, and typed text would land in it."""
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 42)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.type("dummy", app="System Events")
+
+    assert refused.value.code == ErrorCode.UNSUPPORTED_OP.value
+    assert refused.value.details == {
+        "reason": "secure_input_in_app", "operation": "type", "pid": 42, "holder_pid": 42,
+    }
+    assert posted == []
+
+
+@pytest.mark.parametrize("holder", [42, 77], ids=["the-app", "another-app"])
+def test_key_sends_nothing_while_secure_keyboard_entry_is_on(monkeypatch, holder: int) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: holder)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.key("cmd+v", app="TextEdit")
+
+    assert refused.value.details["reason"] == (
+        "secure_input_in_app" if holder == 42 else "secure_input_elsewhere"
+    )
+    assert refused.value.details["operation"] == "key"
+    assert posted == []
+
+
+def test_key_sends_nothing_to_an_app_that_keeps_secrets(monkeypatch) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    monkeypatch.setattr(mac, "_application_with_pid",
+                        lambda pid: _RunningApp("com.apple.keychainaccess", "Keychain Access"))
+
+    with pytest.raises(MacOSError) as refused:
+        mac.key("cmd+v", app="Keychain Access")
+
+    assert refused.value.details["reason"] == "secret_keeper_app"
+    assert posted == []
+
+
+def _set_fakes(monkeypatch, mac: MacOS) -> list:
+    written: list = []
+    monkeypatch.setattr(mac, "_element", lambda index: object())
+    monkeypatch.setattr(mac, "_element_pid", lambda index: 42)
+    monkeypatch.setattr(mac, "_yield_to_person", lambda pid, doing, forward=False: None)
+    monkeypatch.setattr(mac, "_hold_before_input", lambda pid: None)
+    monkeypatch.setattr(mac, "_show_element_pointer", lambda index: False)
+    monkeypatch.setattr(mac, "_is_ax_element", lambda element: True)
+    monkeypatch.setattr(mac, "_application_with_pid", lambda pid: None)
+    monkeypatch.setattr(mac, "_running_applications", list)
+    monkeypatch.setattr(
+        macos_module.AS, "AXUIElementSetAttributeValue",
+        lambda element, attribute, value: written.append((attribute, value)) or 0,
+    )
+    return written
+
+
+def test_set_writes_no_text_while_secure_keyboard_entry_is_on(monkeypatch) -> None:
+    mac = MacOS()
+    written = _set_fakes(monkeypatch, mac)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 77)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.set(3, "dummy")
+
+    assert refused.value.details["reason"] == "secure_input_elsewhere"
+    assert refused.value.details["operation"] == "set"
+    assert written == []
+
+
+def test_set_writes_no_text_to_an_app_that_keeps_secrets(monkeypatch) -> None:
+    mac = MacOS()
+    written = _set_fakes(monkeypatch, mac)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: None)
+    monkeypatch.setattr(mac, "_application_with_pid",
+                        lambda pid: _RunningApp("com.1password.1password", "1Password"))
+
+    with pytest.raises(MacOSError) as refused:
+        mac.set(3, "dummy")
+
+    assert refused.value.details["reason"] == "secret_keeper_app"
+    assert written == []
+
+
+def test_set_of_a_non_text_value_goes_on_under_secure_keyboard_entry(monkeypatch) -> None:
+    mac = MacOS()
+    written = _set_fakes(monkeypatch, mac)
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 77)
+
+    mac.set(3, True, "AXExpanded")
+
+    assert written == [("AXExpanded", True)]
+
+
+@pytest.mark.parametrize("bundle_id", sorted(macos_module._SECRET_KEEPERS))
+def test_type_sends_nothing_to_an_app_that_keeps_secrets(monkeypatch, bundle_id: str) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    monkeypatch.setattr(mac, "_application_with_pid", lambda pid: _RunningApp(bundle_id, "Keeper"))
+
+    with pytest.raises(MacOSError) as refused:
+        mac.type("hunter2", app="Keeper")
+
+    assert refused.value.code == ErrorCode.UNSUPPORTED_OP.value
+    assert refused.value.details["reason"] == "secret_keeper_app"
+    assert refused.value.details["bundle_id"] == bundle_id
+    assert posted == []
+
+
+def test_type_finds_a_secret_keeper_the_direct_pid_lookup_misses(monkeypatch) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    monkeypatch.setattr(mac, "_running_applications",
+                        lambda: [_RunningApp("com.apple.TextEdit", "TextEdit", pid=7),
+                                 _RunningApp("com.bitwarden.desktop", "Bitwarden", pid=42)])
+
+    with pytest.raises(MacOSError) as refused:
+        mac.type("hunter2", app="Bitwarden")
+
+    assert refused.value.details["reason"] == "secret_keeper_app"
+    assert refused.value.details["bundle_id"] == "com.bitwarden.desktop"
+    assert posted == []
+
+
+def test_type_names_a_secure_input_holder_the_direct_pid_lookup_misses(monkeypatch) -> None:
+    mac = MacOS()
+    posted, _ = _typing_fakes(monkeypatch, mac, frontmost_pid=42)
+    monkeypatch.setattr(mac, "_running_applications",
+                        lambda: [_RunningApp("com.apple.Terminal", "Terminal", pid=77)])
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: 77)
+
+    with pytest.raises(MacOSError) as refused:
+        mac.type("hunter2", app="TextEdit")
+
+    assert refused.value.details["holder"] == "Terminal"
+    assert posted == []
+
+
+def test_secure_input_holder_reads_the_session_dictionary(monkeypatch) -> None:
+    monkeypatch.setattr(macos_module.AS, "CGSessionCopyCurrentDictionary",
+                        lambda: {"kCGSSessionSecureInputPID": 77})
+    assert real_secure_input_holder() == 77
+    monkeypatch.setattr(macos_module.AS, "CGSessionCopyCurrentDictionary", dict)
+    assert real_secure_input_holder() is None
 
 
 def test_type_waits_while_another_run_sends_the_app_input(monkeypatch, hold_app_input) -> None:
@@ -4362,3 +4554,27 @@ def test_macos_native_lock_after_fork_fails_fast_instead_of_deadlocking() -> Non
     assert "CHILD close code=unsupported_op" in result.stdout, result.stdout
     assert "CHILD acquire code=unsupported_op" in result.stdout, result.stdout
     assert "PARENT_DONE child_exit_ok=True" in result.stdout, result.stdout
+
+
+def test_waking_an_app_marks_it_for_the_companion_before_continuing_it(tmp_path) -> None:
+    # The mark is a FIFO, so touching it blocks until it is read: the app must
+    # still be stopped then, since the companion re-reads the mark after its
+    # SIGSTOP and only a mark made before SIGCONT undoes that pause.
+    app = subprocess.Popen(["/bin/sleep", "30"])
+    try:
+        os.mkfifo(tmp_path / str(app.pid))
+        os.kill(app.pid, signal.SIGSTOP)
+        assert os.WIFSTOPPED(os.waitpid(app.pid, os.WUNTRACED)[1])
+        waking = threading.Thread(target=macos_module._resume, args=(app.pid, tmp_path))
+        waking.start()
+        time.sleep(0.3)
+
+        while_marking = os.waitpid(app.pid, os.WCONTINUED | os.WNOHANG)
+        os.close(os.open(tmp_path / str(app.pid), os.O_RDONLY | os.O_NONBLOCK))
+        waking.join(5)
+
+        assert while_marking == (0, 0)
+        assert os.WIFCONTINUED(os.waitpid(app.pid, os.WCONTINUED)[1])
+    finally:
+        app.kill()
+        app.wait()

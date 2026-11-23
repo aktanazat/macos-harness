@@ -124,7 +124,10 @@ enum Activity {
       pointers[name] = p
     case "action":
       guard let op = e.op, !TrailWording.quiet.contains(op) else { return }
-      if let app = e.appPid { Battery.agentActed(on: app) }
+      if let app = e.appPid {
+        Battery.agentActed(on: app)
+        WindowGuard.agentActed(on: app)
+      }
       let appName = e.appPid.flatMap { NSRunningApplication(processIdentifier: $0)?.localizedName } ?? e.app
       let title = e.windowID.flatMap(windowTitle)
       let text = TrailWording.phrase(op: op, target: e.target, app: appName, window: title, key: e.key,

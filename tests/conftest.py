@@ -10,7 +10,18 @@ import pytest
 import macos_harness._input_lock as input_lock_module
 import macos_harness.activity as activity_module
 import macos_harness.capture as capture_module
+import macos_harness.macos as macos_module
 import macos_harness.overlay as overlay_module
+import macos_harness.watch as watch_module
+
+
+@pytest.fixture(autouse=True)
+def no_secure_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A password prompt open on the Mac running the tests would turn on
+    secure keyboard entry and refuse every typing test; tests that need it
+    on say so."""
+    monkeypatch.setattr(macos_module, "_secure_input_holder", lambda: None)
+    monkeypatch.setattr(watch_module, "_secure_input_holder", lambda: None)
 
 
 @pytest.fixture(autouse=True)

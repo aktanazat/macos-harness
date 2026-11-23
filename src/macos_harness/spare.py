@@ -45,11 +45,14 @@ _LOCK_SPAN = 1 << 62
 _STALE = 3
 _PACKAGE = os.path.dirname(os.path.abspath(__file__))
 _PRELOAD = (
+    "macos_harness.browser",
     "macos_harness.cli",
     "macos_harness.macos",
     "macos_harness.capture",
     "macos_harness.controls",
     "macos_harness.ops",
+    "macos_harness.receipts",
+    "macos_harness.telemetry",
 )
 _STARTUP_PREFIXES = ("PYTHON", "PYOBJC", "LC_", "__CF")
 _STARTUP_NAMES = frozenset({"HOME", "LANG", "TMPDIR", "TZ"})

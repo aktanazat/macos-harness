@@ -4,26 +4,39 @@ import ApplicationServices
 
 /// Keeps the user's own windows off agent displays, event-driven.
 ///
-/// - The frontmost app is the user's. When it comes forward, opens a window, or a window of it
-///   changes focus or stops moving on an agent display, that window moves to the screen he is on.
-/// - When displays change (lid closed, monitor unplugged), macOS moves windows from the lost
-///   screen to a remaining one, which can be an agent display. Windows never seen on an agent
-///   display before the change and on one after are moved back.
+/// - The frontmost app is the user's, except an app an agent claimed that came forward without
+///   his input or while an agent was acting on it (`Frontmost.isHis`). When it comes forward,
+///   opens a window, or a window of it changes focus or stops moving on an agent display, that
+///   window moves to the screen he is on.
+/// - When displays change (lid closed, monitor unplugged, wake, the agent display's host
+///   restarting), macOS moves windows from a lost screen to a remaining one. Afterwards every
+///   window on an agent display that no agent owns moves to his screen; when the Agents display
+///   came back under a new id (its host restarted), claimed windows macOS left on his screens go
+///   back to it.
 /// - Agent displays sit diagonally off the bottom-right corner of his screens, touching them at
 ///   one point only, so his mouse cannot cross over.
-/// - Agents' windows stay: Safari's (the Safari helper keeps its agent windows there) and apps
-///   claimed by agent-display `launch`/`move`.
+/// - Agents own exactly the windows claimed by agent-display `launch`/`move`, and Safari's,
+///   whose placement is the Safari helper's. Its sweeps, which run only while agent windows are
+///   open, send its windows home and move windows holding only his tabs to his screen; after a
+///   display change the companion touches `~/.agent-display/displays-changed`, and a helper that
+///   watches it then runs that stray check even with no agent windows open.
 /// - When every agent session that started an app has ended, the app is quit.
 enum WindowGuard {
   private static let agentOwnedBundles: Set<String> = ["com.apple.Safari"]
   private static var observer: AXObserver?
   private static var observedPid: pid_t = 0
-  /// Windows seen on an agent display while displays were steady: agents' windows.
-  private static var knownOnAgents: Set<CGWindowID> = []
   private static var pendingMoves: [(window: AXUIElement, work: DispatchWorkItem)] = []
   /// Windows the companion just put back on the agents' screen, which the guard must not take
   /// for his while he is still in their app.
   private static var returning: [CGWindowID: Date] = [:]
+  /// When an agent last reported acting on each app (harness activity datagrams).
+  private static var agentActedAt: [pid_t: Date] = [:]
+
+  static func agentActed(on pid: pid_t) {
+    let now = Date()
+    agentActedAt = agentActedAt.filter { now.timeIntervalSince($0.value) < Frontmost.agentWindow }
+    agentActedAt[pid] = now
+  }
 
   static func start() {
     NSWorkspace.shared.notificationCenter.addObserver(
@@ -32,13 +45,10 @@ enum WindowGuard {
     CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
       WindowGuard.displaysChanging(flags)
     }, nil)
-    noteAgentWindows()
     keepAgentDisplaysCornered()
+    settledAgents = agentsDisplay()
     frontmostChanged()
-    let sweep = Timer(timeInterval: 30, repeats: true) { _ in
-      noteAgentWindows()
-      quitAppsOfEndedAgents()
-    }
+    let sweep = Timer(timeInterval: 30, repeats: true) { _ in quitAppsOfEndedAgents() }
     sweep.tolerance = 5
     RunLoop.main.add(sweep, forMode: .common)
   }
@@ -72,18 +82,36 @@ enum WindowGuard {
     return moved
   }
 
+  /// An agent that joins a claim after this read changes it, so `Claims.end` refuses and the
+  /// app stays; one that comes after the mark finds it quitting and starts a fresh copy.
   private static func quitAppsOfEndedAgents() {
-    for c in Claims.all() where !c.owners.isEmpty && c.owners.allSatisfy({ kill($0, 0) != 0 }) {
-      Claims.remove(c.pid)
-      guard c.launched, let app = NSRunningApplication(processIdentifier: c.pid) else { continue }
-      Battery.resume(c.pid)
-      if axWindows(c.pid).contains(where: { windowID($0).map(c.windows.contains) != true }) {
-        log("left \(app.localizedName ?? "pid \(c.pid)") open: the user has his own windows in it")
-        continue
+    for step in ClaimsFile.sweep(Claims.all(), ownerAlive: { kill($0, 0) == 0 }) {
+      switch step {
+      case .release(let c):
+        if Claims.end(c, quitting: false) {
+          log("left \(NSRunningApplication(processIdentifier: c.pid)?.localizedName ?? "pid \(c.pid)") open: it did not quit")
+        }
+      case .quit(let c):
+        quit(c)
       }
-      app.terminate()
-      log("quit \(app.localizedName ?? "pid \(c.pid)"): the agents that opened it have finished")
     }
+  }
+
+  private static func quit(_ c: Claim) {
+    guard c.launched, let app = NSRunningApplication(processIdentifier: c.pid) else {
+      Claims.end(c, quitting: false)
+      return
+    }
+    Battery.resume(c.pid)
+    if axWindows(c.pid).contains(where: { windowID($0).map(c.windows.contains) != true }) {
+      if Claims.end(c, quitting: false) {
+        log("left \(app.localizedName ?? "pid \(c.pid)") open: the user has his own windows in it")
+      }
+      return
+    }
+    guard Claims.end(c, quitting: true) else { return }
+    app.terminate()
+    log("quit \(app.localizedName ?? "pid \(c.pid)"): the agents that opened it have finished")
   }
 
   // MARK: frontmost app
@@ -159,40 +187,64 @@ enum WindowGuard {
     let id = windowID(window)
     guard AXUIElementGetPid(window, &pid) == .success, pid == observedPid,
           (axString(window, kAXSubroleAttribute) ?? kAXStandardWindowSubrole) == kAXStandardWindowSubrole,
-          !ownedByAgents(app, window: id), !isReturning(id) else { return }
+          !ownedByAgents(app, window: id), !isReturning(id), inFrontForHim(app) else { return }
     moveToUser(window, app: app)
+  }
+
+  private static func inFrontForHim(_ app: NSRunningApplication) -> Bool {
+    let pid = app.processIdentifier
+    return Frontmost.isHis(appClaimed: Claims.all().contains { $0.pid == pid },
+                           sincePerson: secondsSincePersonInput(),
+                           sinceAgentActed: agentActedAt[pid].map { Date().timeIntervalSince($0) })
   }
 
   // MARK: display changes
 
+  /// The Agents display's id as the last display change found it. A restarted agent-display
+  /// host comes back under a new id, after macOS moved the agents' windows to his screens.
+  private static var settledAgents: CGDirectDisplayID?
+
   private static func displaysChanging(_ flags: CGDisplayChangeSummaryFlags) {
-    if flags.contains(.beginConfigurationFlag) {
-      noteAgentWindows()
-      return
-    }
+    guard !flags.contains(.beginConfigurationFlag) else { return }
+    let agents = agentsDisplay()
+    let hostRestarted = agents != nil && agents != settledAgents
+    if agents != nil { settledAgents = agents }
     // macOS relocates windows shortly after the change completes.
     for delay in [1.0, 3.0] {
       DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
         keepAgentDisplaysCornered()
-        rescueRelocated()
+        settleRelocated(returningClaimed: hostRestarted)
+        // The Safari helper watches this file and then moves his Safari windows off the
+        // Agents display, which the companion leaves to it.
+        if delay == 3.0 {
+          try? Data().write(to: AgentDisplay.stateDir.appendingPathComponent("displays-changed"))
+        }
       }
     }
   }
 
-  /// Adds windows now on agent displays and forgets windows that no longer exist. The begin
-  /// notification can arrive after a change already applied, so a window once seen there keeps
-  /// counting as the agents'.
-  private static func noteAgentWindows() {
-    let alive = Set(serverWindows([.optionAll]).map(\.id))
-    knownOnAgents = knownOnAgents.intersection(alive).union(windowsOnAgentDisplays().map(\.id))
-  }
-
-  private static func rescueRelocated() {
-    for w in windowsOnAgentDisplays() where !knownOnAgents.contains(w.id) && !Claims.owns(w.pid, window: w.id) {
-      guard let app = NSRunningApplication(processIdentifier: w.pid), let ax = axWindow(pid: w.pid, id: w.id) else { continue }
+  /// Moves windows no agent owns off agent displays. After a host restart, also returns claimed
+  /// windows macOS left on his screens; at other times a claimed window there is one he moved.
+  private static func settleRelocated(returningClaimed: Bool) {
+    for w in windowsOnAgentDisplays() {
+      guard let app = NSRunningApplication(processIdentifier: w.pid), !ownedByAgents(app, window: w.id) else { continue }
+      Battery.resume(w.pid)
+      guard let ax = axWindow(pid: w.pid, id: w.id) else { continue }
       moveToUser(ax, app: app)
     }
-    noteAgentWindows()
+    guard returningClaimed, let display = agentsDisplay() else { return }
+    let bounds = CGDisplayBounds(display)
+    var claimed: [CGWindowID: pid_t] = [:]
+    for c in Claims.all() { for id in c.windows { claimed[id] = c.pid } }
+    for w in serverWindows([.optionAll, .excludeDesktopElements])
+    where w.layer == 0 && claimed[w.id] == w.pid && !Grabs.book.contains(w.id) && agentDisplay(containing: w.frame) == nil {
+      Battery.resume(w.pid)
+      guard let ax = axWindow(pid: w.pid, id: w.id) else { continue }
+      returningWindow(w.id)
+      setFrame(ax, CGRect(x: bounds.minX + 20, y: bounds.minY + 40,
+                          width: min(w.frame.width, bounds.width - 40), height: min(w.frame.height, bounds.height - 60)))
+      log("returned a \(w.owner) window to the agents' screen")
+    }
   }
 
   /// Puts agent displays past the bottom-right corner of the user's screens, side by side, when

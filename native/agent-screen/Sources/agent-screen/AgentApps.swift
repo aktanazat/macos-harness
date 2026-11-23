@@ -42,7 +42,7 @@ enum AgentApps {
     guard AXUIElementGetPid(window, &pid) == .success,
           NSWorkspace.shared.frontmostApplication?.processIdentifier != pid,
           let id = windowID(window) else { return }
-    guard let display = agentDisplays().first, let frame = axFrame(window) else { return }
+    guard let display = agentsDisplay(), let frame = axFrame(window) else { return }
     if agentDisplay(containing: frame) == nil {
       let bounds = CGDisplayBounds(display)
       setFrame(window, CGRect(x: bounds.minX + 20, y: bounds.minY + 40,
