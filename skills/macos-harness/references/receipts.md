@@ -14,7 +14,7 @@ receipt = mac.do.type("hello", app="TextEdit", postcondition=equals(role="text a
 
 - `set`/`toggle` report `already` instead of re-mutating; they take no `once`.
 - `fill(value, app=, identifier=)`: focuses one enabled field, selects all, types once, verifies; `""` clears; refuses secure fields; never submits. Add an app-level postcondition (e.g. a button's `AXEnabled`) to prove the app took it.
-- `type`, `key`, `fill`, `paste`, text `set` refuse while any app holds secure keyboard entry (`secure_input_in_app`, `secure_input_elsewhere`) or for sign-in prompts and password managers (`secret_keeper_app`): ask the person. `mac.script` is not guarded.
+- `type`, `key`, `fill`, `paste`, text `set` refuse while any app holds secure keyboard entry (`secure_input_in_app`, `secure_input_elsewhere`) or for sign-in prompts and password managers (`secret_keeper_app`): ask the person. `mac.script` and `mac.do.run` are not guarded.
 - `paste(text, app=)` (also `html=`, `rtf=`, `tsv=`, `files=`) needs the app in front (`target_in_background` otherwise), restores the clipboard, and reports `observed["input"]["pasteboard"]`.
 - `open_files(files, app=)` hands files over without activating and waits for each window's `AXDocument`; use a postcondition for apps that name no document (Preview).
 - `steps([...], app=)`: first failure ends the run; nothing is retried.

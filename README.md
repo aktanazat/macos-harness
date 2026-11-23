@@ -86,9 +86,9 @@ PY
   (Passwords, Keychain Access, 1Password, Bitwarden, LastPass, KeePassXC).
   Each fails with `unsupported_op`, `acted="no"`, reason
   `secure_input_in_app`, `secure_input_elsewhere` or `secret_keeper_app`,
-  before the clipboard or the field is touched. `mac.script` runs arbitrary
-  AppleScript or JXA and is not covered by this guard: a script can still
-  send keystrokes anywhere.
+  before the clipboard or the field is touched. `mac.script` and `mac.do.run`
+  run arbitrary AppleScript or JXA and are not covered by this guard: a
+  script can still send keystrokes anywhere.
   Give `fill` an app-level postcondition when the result matters beyond the
   field itself: `equals(title="Check", role="button", attribute="AXEnabled",
   value=True)` checks that the app accepted the input.
