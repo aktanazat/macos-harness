@@ -421,7 +421,8 @@ _SECURE_INPUT = "kCGSSessionSecureInputPID"
 # Apps whose text is a password, a PIN or an admin's credentials: macOS's own
 # sign-in and authorization prompts and the password managers in common use.
 # `type`, `key`, `set` with text and the `do` verbs on them refuse to send
-# them any. `script` runs arbitrary code and is not covered.
+# them any, and so do the keys of a `script`; its other Apple events are
+# not covered.
 _SECRET_KEEPERS = frozenset({
     "com.apple.SecurityAgent",
     "com.apple.LocalAuthentication.UIAgent",
@@ -659,13 +660,12 @@ def _menu_shortcut(character: object, modifiers: object) -> str | None:
     return "+".join((*names, character.casefold()))
 
 
-# The app an AppleScript addresses, by name or bundle ID.
-_SECURE_INPUT = "kCGSSessionSecureInputPID"
 # System Events' keystroke and key code events, its key down and key up,
 # and the modifier names a script's ``using`` carries.
 _SCRIPT_KEY_EVENTS = frozenset({"kprs", "kcod"})
 _SCRIPT_HELD_KEYS = frozenset({"keyF", "keyU"})
 _SCRIPT_MODIFIERS = {"Kcmd": "cmd", "Kctl": "ctrl", "Kopt": "alt", "Ksft": "shift"}
+# The app an AppleScript addresses, by name or bundle ID.
 _SCRIPT_TARGET = re.compile(r'\btell application (?:id )?"([^"]+)"', re.IGNORECASE)
 
 
@@ -955,13 +955,6 @@ def _hides_match(error: int) -> bool:
     hide a match.
     """
     return error != AS.kAXErrorFailure
-
-
-def _secure_input_holder() -> int | None:
-    """The process holding Secure Input, None when none does. An app turns
-    it on while a password field has its keyboard focus."""
-    holder = (AS.CGSessionCopyCurrentDictionary() or {}).get(_SECURE_INPUT)
-    return None if holder is None else int(holder)
 
 
 def _secure(identity: Mapping[str, object]) -> bool:
@@ -8339,6 +8332,7 @@ class MacOS:
                 raise self._script_refusal(
                     event, "secure_field", "the keyboard focus is a password field", app_pid=pid
                 )
+        self._refuse_secret_input(pid, "script")
         return pid
 
     def _script_keys(self, event: _script_host.ScriptEvent, deadline: float) -> None:

@@ -3890,6 +3890,7 @@ class _ScriptedMac:
         self.holder: int | None = None
         self.focus_role: str | None = "AXTextArea"
         self.front = _NOTES_PID
+        self.front_bundle = "com.example.app"
         self.pressed: list[tuple[int, str | None, int]] = []
         self.sent: list[str] = []
 
@@ -3918,6 +3919,9 @@ class _ScriptedMac:
         monkeypatch.setattr(mac, "_copy_attribute", lambda element, name, **_: ("focus", element))
         monkeypatch.setattr(
             mac, "_copy_attributes", lambda element, names, **_: {"AXRole": self.focus_role}
+        )
+        monkeypatch.setattr(
+            mac, "_running_app_with_pid", lambda pid: _RunningApp(self.front_bundle, "Front")
         )
         monkeypatch.setattr(mac, "_script_post", post)
 
@@ -4007,6 +4011,20 @@ def test_a_script_key_is_refused_when_the_focus_is_a_password_field_without_secu
 
     assert caught.value.code == ErrorCode.UNSUPPORTED_OP
     assert caught.value.details["reason"] == "secure_field"
+    assert scripted.pressed == []
+
+
+def test_a_script_key_is_refused_for_an_app_that_keeps_secrets(monkeypatch) -> None:
+    """The same refusal `type` and `key` give: the app in front is a
+    password manager, whatever its focus reports."""
+    scripted = _ScriptedMac(monkeypatch, [_script_event(text="dummy")])
+    scripted.front_bundle = "com.apple.keychainaccess"
+
+    with pytest.raises(MacOSError) as caught:
+        scripted.mac.script("return 1")
+
+    assert caught.value.code == ErrorCode.UNSUPPORTED_OP
+    assert caught.value.details["reason"] == "secret_keeper_app"
     assert scripted.pressed == []
 
 
