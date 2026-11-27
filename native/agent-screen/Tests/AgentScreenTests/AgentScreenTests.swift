@@ -320,14 +320,34 @@ final class FrontmostTests: XCTestCase {
 }
 
 /// The browser harness drives Safari or Ladybird Harness; on 11-27 the companion moved every
-/// Ladybird agent window to his screen a second after the harness put it on the Agents display.
+/// Ladybird agent window to his screen a second after the harness put it on the Agents display,
+/// and in Ladybird mode left five of his Safari windows on the Agents display.
 final class HarnessBrowsersTests: XCTestCase {
-  func testTheHarnessPlacesSafariAndItsLadybirdCopiesButNoOtherApp() {
-    XCTAssertTrue(HarnessBrowsers.places(bundleID: "com.apple.Safari"))
-    XCTAssertTrue(HarnessBrowsers.places(bundleID: "org.ladybird.Ladybird.Harness"))
-    XCTAssertTrue(HarnessBrowsers.places(bundleID: "org.ladybird.Ladybird.HarnessTest"))
-    XCTAssertFalse(HarnessBrowsers.places(bundleID: "org.ladybird.Ladybird"))
-    XCTAssertFalse(HarnessBrowsers.places(bundleID: "com.google.Chrome"))
-    XCTAssertFalse(HarnessBrowsers.places(bundleID: nil))
+  func testInLadybirdModeTheHarnessPlacesItsLadybirdCopiesAndNotSafari() {
+    XCTAssertTrue(HarnessBrowsers.places(bundleID: "org.ladybird.Ladybird.Harness", mode: "ladybird"))
+    XCTAssertTrue(HarnessBrowsers.places(bundleID: "org.ladybird.Ladybird.HarnessTest", mode: "ladybird"))
+    XCTAssertFalse(HarnessBrowsers.places(bundleID: "com.apple.Safari", mode: "ladybird"))
+    XCTAssertFalse(HarnessBrowsers.places(bundleID: "org.ladybird.Ladybird", mode: "ladybird"))
+    XCTAssertFalse(HarnessBrowsers.places(bundleID: nil, mode: "ladybird"))
+  }
+
+  func testInSafariModeTheHarnessPlacesSafariAlone() {
+    XCTAssertTrue(HarnessBrowsers.places(bundleID: "com.apple.Safari", mode: "safari"))
+    XCTAssertFalse(HarnessBrowsers.places(bundleID: "org.ladybird.Ladybird.Harness", mode: "safari"))
+    XCTAssertFalse(HarnessBrowsers.places(bundleID: "com.google.Chrome", mode: "safari"))
+  }
+
+  func testTheModeIsLadybirdOnlyWhenTheChoiceSaysSo() throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let file = dir.appendingPathComponent("browser.json")
+    XCTAssertEqual(HarnessBrowsers.mode(at: file), "safari")
+    try Data(#"{"bundle":"org.ladybird.Ladybird.Harness","mode":"ladybird"}"#.utf8).write(to: file)
+    XCTAssertEqual(HarnessBrowsers.mode(at: file), "ladybird")
+    try Data(#"{"mode":"safari"}"#.utf8).write(to: file)
+    XCTAssertEqual(HarnessBrowsers.mode(at: file), "safari")
+    try Data("not json".utf8).write(to: file)
+    XCTAssertEqual(HarnessBrowsers.mode(at: file), "safari")
   }
 }
