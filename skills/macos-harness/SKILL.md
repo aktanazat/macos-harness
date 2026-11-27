@@ -1,6 +1,6 @@
 ---
 name: macos-harness
-description: "Drive native/Electron macOS apps, dialogs, menus, file prompts, cross-app steps. Web: safari skill."
+description: "Drive native/Electron macOS apps, dialogs, menus, file prompts, cross-app steps. Web: browser skill."
 ---
 
 # macOS Harness
