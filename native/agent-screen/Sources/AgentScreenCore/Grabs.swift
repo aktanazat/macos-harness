@@ -7,7 +7,8 @@ public struct Grab: Equatable, Sendable {
   public let pid: pid_t
   /// Its frame on the agent display when he took it, in global top-left coordinates.
   public let home: CGRect
-  /// A Safari helper window, which goes back sooner (see `GrabBook.safariIdleLimit`).
+  /// A window of a browser the browser harness drives, which goes back sooner (see
+  /// `GrabBook.safariIdleLimit`).
   public let safari: Bool
   public let grabbedAt: Date
   public fileprivate(set) var lastUsed: Date
@@ -17,8 +18,8 @@ public struct Grab: Equatable, Sendable {
 public struct GrabBook: Sendable {
   /// A grabbed window he has not used for this long goes back.
   public static let idleLimit: TimeInterval = 120
-  /// The Safari helper checks its agent windows every 60 s and takes one found off the agents'
-  /// display as moved there by the user, for good; one he left alone goes back before that.
+  /// The browser harness checks its agent windows every 60 s and takes one found off the
+  /// agents' display as moved there by the user, for good; one he left alone goes back before that.
   public static let safariIdleLimit: TimeInterval = 45
 
   public private(set) var grabs: [Grab] = []

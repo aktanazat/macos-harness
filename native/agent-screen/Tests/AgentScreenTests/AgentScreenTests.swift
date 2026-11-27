@@ -318,3 +318,16 @@ final class FrontmostTests: XCTestCase {
     XCTAssertTrue(Frontmost.isHis(appClaimed: false, sincePerson: 60, sinceAgentActed: 0.1))
   }
 }
+
+/// The browser harness drives Safari or Ladybird Harness; on 11-27 the companion moved every
+/// Ladybird agent window to his screen a second after the harness put it on the Agents display.
+final class HarnessBrowsersTests: XCTestCase {
+  func testTheHarnessPlacesSafariAndItsLadybirdCopiesButNoOtherApp() {
+    XCTAssertTrue(HarnessBrowsers.places(bundleID: "com.apple.Safari"))
+    XCTAssertTrue(HarnessBrowsers.places(bundleID: "org.ladybird.Ladybird.Harness"))
+    XCTAssertTrue(HarnessBrowsers.places(bundleID: "org.ladybird.Ladybird.HarnessTest"))
+    XCTAssertFalse(HarnessBrowsers.places(bundleID: "org.ladybird.Ladybird"))
+    XCTAssertFalse(HarnessBrowsers.places(bundleID: "com.google.Chrome"))
+    XCTAssertFalse(HarnessBrowsers.places(bundleID: nil))
+  }
+}

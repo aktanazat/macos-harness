@@ -15,14 +15,14 @@ import ApplicationServices
 ///   back to it.
 /// - Agent displays sit diagonally off the bottom-right corner of his screens, touching them at
 ///   one point only, so his mouse cannot cross over.
-/// - Agents own exactly the windows claimed by agent-display `launch`/`move`, and Safari's,
-///   whose placement is the Safari helper's. Its sweeps, which run only while agent windows are
-///   open, send its windows home and move windows holding only his tabs to his screen; after a
-///   display change the companion touches `~/.agent-display/displays-changed`, and a helper that
-///   watches it then runs that stray check even with no agent windows open.
+/// - Agents own exactly the windows claimed by agent-display `launch`/`move`, and those of the
+///   browsers the browser harness drives (`HarnessBrowsers`), whose placement is the harness's.
+///   Its sweeps, which run only while agent windows are open, send its windows home and move
+///   windows holding only his tabs to his screen; after a display change the companion touches
+///   `~/.agent-display/displays-changed`, and a helper that watches it then runs that stray
+///   check even with no agent windows open.
 /// - When every agent session that started an app has ended, the app is quit.
 enum WindowGuard {
-  private static let agentOwnedBundles: Set<String> = ["com.apple.Safari"]
   private static var observer: AXObserver?
   private static var observedPid: pid_t = 0
   private static var pendingMoves: [(window: AXUIElement, work: DispatchWorkItem)] = []
@@ -54,7 +54,7 @@ enum WindowGuard {
   }
 
   static func ownedByAgents(_ app: NSRunningApplication, window: CGWindowID?) -> Bool {
-    agentOwnedBundles.contains(app.bundleIdentifier ?? "") || Claims.owns(app.processIdentifier, window: window)
+    HarnessBrowsers.places(bundleID: app.bundleIdentifier) || Claims.owns(app.processIdentifier, window: window)
   }
 
   /// The companion is putting `id` back on the agents' screen.

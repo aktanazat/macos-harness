@@ -24,7 +24,7 @@ enum Grabs {
           let home = WindowGuard.moveToUser(ax, app: app) else { return false }
     // A window no agent owns is his: it stays on his screen, never sent back.
     if WindowGuard.ownedByAgents(app, window: id) {
-      book.grab(windowID: id, pid: pid, home: home, safari: app.bundleIdentifier == "com.apple.Safari", at: Date())
+      book.grab(windowID: id, pid: pid, home: home, safari: HarnessBrowsers.places(bundleID: app.bundleIdentifier), at: Date())
     }
     AXUIElementPerformAction(ax, kAXRaiseAction as CFString)
     app.activate()
